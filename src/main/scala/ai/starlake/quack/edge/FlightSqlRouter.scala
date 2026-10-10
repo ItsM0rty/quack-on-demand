@@ -510,15 +510,17 @@ final class FlightSqlRouter(
       else None
 
     // Trigger DDL is reserved to superusers and the pool tenant's admins, whatever the ACL mode
-    // and the lockdown flag (TriggerScreen's scaladoc has the why).
-    val poolTenantId =
-      supervisor
-        .getTenant(poolKey.tenant)
-        .orElse(supervisor.getTenantById(poolKey.tenant))
-        .map(_.id)
+    // and the lockdown flag (TriggerScreen's scaladoc has the why). The screen runs first so the
+    // tenant lookup is paid only by a statement that actually is trigger DDL.
     val triggerDenial =
-      if TriggerScreen.mayManageTriggers(effectiveSet, poolTenantId) then None
-      else TriggerScreen.screen(sql)
+      TriggerScreen.screen(sql).filterNot { _ =>
+        val poolTenantId =
+          supervisor
+            .getTenant(poolKey.tenant)
+            .orElse(supervisor.getTenantById(poolKey.tenant))
+            .map(_.id)
+        TriggerScreen.mayManageTriggers(effectiveSet, poolTenantId)
+      }
     val preGateDenial: Option[String] =
       lockdownDenial.map(r => s"lockdown: $r").orElse(triggerDenial.map(r => s"trigger: $r"))
 

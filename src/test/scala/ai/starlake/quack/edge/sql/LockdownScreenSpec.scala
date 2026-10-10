@@ -495,3 +495,26 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SET allow_extension_repositories = 'allowed'") shouldBe true
     denied("RESET allow_extension_repositories") shouldBe true
   }
+
+  "the statement splitter" should "not lose a statement behind a dollar-quoted or E-string literal" in {
+    // DuckDB reads `$x$'$x$` as a dollar-quoted string holding one quote, and `E'\''` as an
+    // escape string holding one quote. A splitter that knew only '...' opened a single-quoted
+    // run at that inner quote and merged the ATTACH into the leading `select` fragment.
+    denied("SELECT $x$'$x$; ATTACH 'x.db' AS y") shouldBe true
+    denied("SELECT E'\\''; ATTACH 'x.db' AS y") shouldBe true
+  }
+
+  it should "not split on a semicolon inside a dollar-quoted string" in {
+    denied("SELECT $$a; ATTACH 'x' AS y$$") shouldBe false
+    LockdownScreen.splitStatements("SELECT $$a; b$$; SELECT 2") shouldBe
+      List("SELECT $$a; b$$", " SELECT 2")
+  }
+
+  it should "split after an identifier ending in a dollar-tag shape, as DuckDB does" in {
+    // DuckDB 2.0: `x$a$` is ONE identifier (identifiers continue through `$`), so the `;` after it
+    // is a statement boundary and no dollar-quoted string opens there.
+    LockdownScreen
+      .splitStatements("SELECT 1 AS x$a$; ATTACH 'x' AS q; SELECT 2 AS y$a$")
+      .length shouldBe 3
+    denied("SELECT 1 AS x$a$; ATTACH 'x' AS q; SELECT 2 AS y$a$") shouldBe true
+  }

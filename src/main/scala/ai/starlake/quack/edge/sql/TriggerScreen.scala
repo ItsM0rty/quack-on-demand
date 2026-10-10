@@ -18,10 +18,21 @@ object TriggerScreen:
 
   val RefusalMessage = "CREATE TRIGGER is restricted to tenant administrators"
 
-  private val TriggerDdl =
-    ("^(?:explain\\s+analyze\\s+)?" +
-      "(?:create\\s+(?:or\\s+replace\\s+)?(?:temp\\s+|temporary\\s+)?trigger" +
-      "|drop\\s+trigger|alter\\s+trigger)\\b").r
+  /** The statement shapes that create, replace, drop or alter a trigger. `PERSISTENT` is DuckDB
+    * 2.0's third spelling of the CREATE persistence slot (`Temporary <- PERSISTENT / TEMP /
+    * TEMPORARY` in its grammar), next to the two temporary ones.
+    */
+  private val TriggerVerb =
+    "(?:create\\s+(?:or\\s+replace\\s+)?(?:(?:temp|temporary|persistent)\\s+)?trigger" +
+      "|drop\\s+trigger|alter\\s+trigger)\\b"
+
+  /** Trigger DDL as the statement itself, or anywhere behind EXPLAIN. `EXPLAIN` takes an optional
+    * ANALYZE / ANALYSE keyword and an optional parenthesized option list whose options carry
+    * ARBITRARY expressions, so no fixed prefix can name everything that may sit between EXPLAIN and
+    * the explained statement. Fail closed: the verb anywhere after EXPLAIN refuses, which also
+    * refuses an EXPLAIN whose string literal spells a trigger verb, a shape nobody needs.
+    */
+  private val TriggerDdl = ("(?s)^(?:explain\\b.*\\b)?" + TriggerVerb).r
 
   /** `Some(RefusalMessage)` when any statement of `sql` is trigger DDL. */
   def screen(sql: String): Option[String] =

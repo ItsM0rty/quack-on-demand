@@ -184,11 +184,21 @@ object LockdownScreen:
           .orElse(deniedFunctionIn(lower, deniedBuckets))
           .orElse(barePathFrom(lower, deniedBuckets))
 
-  /** Splits the input on top-level semicolons: semicolons inside single-quoted strings,
-    * double-quoted identifiers, line comments, or (nested) block comments do not split.
+  /** Splits the input on top-level semicolons: a semicolon inside any of DuckDB's quoting forms
+    * (plain `'...'`, escape `E'...'`, double-quoted identifiers, dollar-quoted `$$...$$` /
+    * `$tag$...$tag$`), a line comment, or a (nested) block comment does not split. Fragments come
+    * back verbatim; blank ones are dropped.
     *
-    * `private[sql]`, not `private`, so `CatalogWriteScreen` can reuse the same quote- and
-    * comment-aware splitter to judge a batch statement by statement instead of by its first token.
+    * `private[sql]`, not `private`, so `CatalogWriteScreen` and `TriggerScreen` can reuse the same
+    * quote- and comment-aware splitter to judge a batch statement by statement instead of by its
+    * first token.
+    *
+    * Quoted regions are read by `SqlCommentStripper.quotedEnd`, the stripper's own reader, so the
+    * two can never disagree on where a literal ends. Knowing only `'...'` and `"..."` was a desync,
+    * not a cosmetic gap: DuckDB reads `$x$'$x$` and `E'\''` as complete strings holding one quote
+    * each, while a `'`-only splitter opened a single-quoted run at that inner quote and merged
+    * every following statement into the leading `select` fragment, hiding an ATTACH from this
+    * screen and a CREATE TRIGGER from `TriggerScreen` (both verified to run on DuckDB 2.0).
     *
     * The line-comment arm ends at a line feed OR at a bare carriage return, the same pair
     * `SqlTrivia.stripLeading` and `SqlCommentStripper.stripComments` already end one at (verified
@@ -202,64 +212,30 @@ object LockdownScreen:
     * that must refuse it BEFORE a node ever sees it.)
     */
   private[sql] def splitStatements(sql: String): List[String] =
-    val out        = ListBuffer.empty[String]
-    val buf        = new StringBuilder
-    var i          = 0
-    var inSingle   = false
-    var inDouble   = false
-    var inLine     = false
-    var blockDepth = 0
+    val out = ListBuffer.empty[String]
+    val buf = new StringBuilder
+    var i   = 0
     while i < sql.length do
       val c = sql(i)
-      if inSingle then
-        buf.append(c)
-        if c == '\'' then inSingle = false
-        i += 1
-      else if inDouble then
-        buf.append(c)
-        if c == '"' then inDouble = false
-        i += 1
-      else if inLine then
-        buf.append(c)
-        if c == '\n' || c == '\r' then inLine = false
-        i += 1
-      else if blockDepth > 0 then
-        if i + 1 < sql.length && c == '/' && sql(i + 1) == '*' then
-          blockDepth += 1
-          buf.append("/*")
-          i += 2
-        else if i + 1 < sql.length && c == '*' && sql(i + 1) == '/' then
-          blockDepth -= 1
-          buf.append("*/")
-          i += 2
-        else
+      // Index just past a comment or quoted region opening at `i`; a line comment stops AT its
+      // terminator, which the next iteration appends as an ordinary character.
+      val skipTo =
+        if c == '/' && i + 1 < sql.length && sql(i + 1) == '*' then
+          Some(SqlCommentStripper.blockCommentEnd(sql, i))
+        else if c == '-' && i + 1 < sql.length && sql(i + 1) == '-' then
+          Some(SqlCommentStripper.lineCommentEnd(sql, i))
+        else SqlCommentStripper.quotedEnd(sql, i)
+      skipTo match
+        case Some(end) =>
+          buf.append(sql.substring(i, end))
+          i = end
+        case None if c == ';' =>
+          out += buf.toString
+          buf.clear()
+          i += 1
+        case None =>
           buf.append(c)
           i += 1
-      else
-        c match
-          case '\'' =>
-            inSingle = true
-            buf.append(c)
-            i += 1
-          case '"' =>
-            inDouble = true
-            buf.append(c)
-            i += 1
-          case '-' if i + 1 < sql.length && sql(i + 1) == '-' =>
-            inLine = true
-            buf.append("--")
-            i += 2
-          case '/' if i + 1 < sql.length && sql(i + 1) == '*' =>
-            blockDepth = 1
-            buf.append("/*")
-            i += 2
-          case ';' =>
-            out += buf.toString
-            buf.clear()
-            i += 1
-          case _ =>
-            buf.append(c)
-            i += 1
     out += buf.toString
     out.toList.filter(_.trim.nonEmpty)
 

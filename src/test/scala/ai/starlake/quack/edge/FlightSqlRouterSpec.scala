@@ -1877,6 +1877,73 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     out.isRight shouldBe true
 
+  it should "be admitted for a superuser" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val superuser = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser.copy(tenant = None, kind = "admin"),
+      Nil,
+      Nil,
+      Nil,
+      Nil
+    )
+    val out = router
+      .execute("trg-4", "alice", poolKey, createTrigger, effectiveSet = Some(superuser))
+      .unsafeRunSync()
+    out.isRight shouldBe true
+
+  it should "be refused for an admin of another tenant" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val foreignAdmin = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser.copy(tenant = Some("globex"), kind = "admin"),
+      Nil,
+      Nil,
+      Nil,
+      Nil
+    )
+    val out = router
+      .execute("trg-5", "alice", poolKey, createTrigger, effectiveSet = Some(foreignAdmin))
+      .unsafeRunSync()
+    out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    out.swap.toOption.get.reason should include(
+      ai.starlake.quack.edge.sql.TriggerScreen.RefusalMessage
+    )
+
+  it should "yield to lockdown when both screens refuse the same batch" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si,
+      lockdownFor = _ => true
+    )
+    val out = router
+      .execute(
+        "trg-6",
+        "alice",
+        poolKey,
+        s"ATTACH 'x.db' AS y; $createTrigger",
+        effectiveSet = Some(effWithPolicies(Nil))
+      )
+      .unsafeRunSync()
+    out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    out.swap.toOption.get.reason should startWith("access denied: lockdown:")
+
   // ---- node lockdown (QOD_NODE_LOCKDOWN) ----
 
   "lockdown" should "deny ATTACH for a tenant caller when enabled" in:

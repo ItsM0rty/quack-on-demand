@@ -65,19 +65,8 @@ object SqlCommentStripper:
           if i < length then
             result.append(sql.charAt(i))
             i += 1
-        else if c == '\'' then
-          val end = singleQuotedEnd(sql, i, isEscapeStringOpener(sql, i))
-          result.append(sql.substring(i, end))
-          i = end
-        else if c == '"' then
-          val end = doubleQuotedEnd(sql, i)
-          result.append(sql.substring(i, end))
-          i = end
         else
-          // `$` opens a dollar-quoted string only when a well-formed tag and its matching close
-          // are both there; otherwise it is an ordinary character (a positional parameter, say).
-          val dollar = if c == '$' then dollarQuotedEnd(sql, i) else None
-          dollar match
+          quotedEnd(sql, i) match
             case Some(end) =>
               result.append(sql.substring(i, end))
               i = end
@@ -87,11 +76,25 @@ object SqlCommentStripper:
 
       removeEmptyLines(result.toString())
 
+  /** Index just past the quoted region (any of DuckDB's four quoting forms) that opens at `at`, or
+    * None when no quoted region opens there. The one quote reader shared with
+    * `LockdownScreen.splitStatements`, so the statement splitter and this stripper can never
+    * disagree on where a literal ends. A `$` opens a dollar-quoted string only when a well-formed
+    * tag and its matching close are both there; otherwise it is an ordinary character (a positional
+    * parameter, say).
+    */
+  private[starlake] def quotedEnd(sql: String, at: Int): Option[Int] =
+    sql.charAt(at) match
+      case '\'' => Some(singleQuotedEnd(sql, at, isEscapeStringOpener(sql, at)))
+      case '"'  => Some(doubleQuotedEnd(sql, at))
+      case '$'  => dollarQuotedEnd(sql, at)
+      case _    => None
+
   /** Index just past the marker closing the block comment that opens at `from`, tracking nesting
     * depth the way DuckDB's lexer does. An unterminated comment consumes the rest of the input --
     * DuckDB rejects such a statement outright, so nothing executable is being hidden.
     */
-  private def blockCommentEnd(sql: String, from: Int): Int =
+  private[starlake] def blockCommentEnd(sql: String, from: Int): Int =
     var i     = from + 2
     var depth = 1
     while i < sql.length && depth > 0 do
@@ -109,7 +112,7 @@ object SqlCommentStripper:
     * neither of the other line-ish characters (vertical tab, form feed, U+0085, U+2028, U+2029 all
     * leave the comment open) -- each of the seven probed individually against DuckDB 1.5.4.
     */
-  private def lineCommentEnd(sql: String, from: Int): Int =
+  private[starlake] def lineCommentEnd(sql: String, from: Int): Int =
     var i = from + 2
     while i < sql.length && sql.charAt(i) != '\n' && sql.charAt(i) != '\r' do i += 1
     i
@@ -170,11 +173,21 @@ object SqlCommentStripper:
   private def dollarQuotedEnd(sql: String, from: Int): Option[Int] =
     var t = from + 1
     while t < sql.length && isTagChar(sql.charAt(t), t == from + 1) do t += 1
-    if t >= sql.length || sql.charAt(t) != '$' then None
+    if continuesWord(sql, from) || t >= sql.length || sql.charAt(t) != '$' then None
     else
       val tag   = sql.substring(from, t + 1)
       val close = sql.indexOf(tag, t + 1)
       if close < 0 then None else Some(close + tag.length)
+
+  /** True when the `$` at `at` continues a word rather than starting a token. DuckDB identifiers
+    * continue through `$` (verified on 2.0: `SELECT 1 AS x$a$; SELECT 2` runs both statements, the
+    * first aliased `x$a$`), so a `$` after a letter, digit, underscore or `$` opens no string. A
+    * digit or `$` before it is sometimes a token end on DuckDB (`1$a$...$a$` is the integer then a
+    * string); refusing those too only ever leaves more text visible to a screening caller, and
+    * DuckDB rejects every such statement anyway.
+    */
+  private def continuesWord(sql: String, at: Int): Boolean =
+    at > 0 && (isIdentChar(sql.charAt(at - 1)) || sql.charAt(at - 1) == '$')
 
   private def isTagChar(c: Char, first: Boolean): Boolean =
     if first then c.isLetter || c == '_' else c.isLetterOrDigit || c == '_'

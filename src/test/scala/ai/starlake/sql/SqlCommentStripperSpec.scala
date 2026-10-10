@@ -142,6 +142,13 @@ class SqlCommentStripperSpec extends AnyFlatSpec with Matchers:
       "PREPARE p AS SELECT $1, * FROM read_csv('/etc/passwd.csv') /*c*/"
     ) shouldBe "PREPARE p AS SELECT $1, * FROM read_csv('/etc/passwd.csv')  "
 
+  it should "not open a dollar-quoted string inside an identifier that continues through `$`" in:
+    // DuckDB 2.0 (verified): `x$a$` is one identifier, so the comment after it is a real comment
+    // and is stripped; reading `$a$ ... $a$` as a quoted region would have left it in place.
+    SqlCommentStripper.stripComments(
+      "SELECT 1 AS x$a$, /*c*/ 2 AS y$a$"
+    ) shouldBe "SELECT 1 AS x$a$,   2 AS y$a$"
+
   it should "not read a dollar with no matching closing tag as a quote opener" in:
     // An unmatched opener is a parser error on DuckDB, so nothing executes either way; treating
     // the remainder as one long "string" would nonetheless stop stripping comments from it, which
