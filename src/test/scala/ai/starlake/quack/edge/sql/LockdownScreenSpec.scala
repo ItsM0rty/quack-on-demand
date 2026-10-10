@@ -518,3 +518,12 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
       .length shouldBe 3
     denied("SELECT 1 AS x$a$; ATTACH 'x' AS q; SELECT 2 AS y$a$") shouldBe true
   }
+
+  it should "lex the batch the way DuckDB 2.0 does: non-ASCII tags, backticks, the unicode pre-pass" in {
+    // Each batch attaches `y` on the DuckDB 2.0 CLI.
+    denied("SELECT $\u20AC$ ' $\u20AC$; ATTACH 'x.db' AS y") shouldBe true
+    denied("SELECT 1 AS `a/*`; ATTACH 'x.db' AS y; SELECT 1 AS `*/`") shouldBe true
+    denied(
+      "SELECT 1 /* ' */ AS a\u00A0$q$; ATTACH 'x.db' AS y; SELECT 1 AS b\u00A0$q$ /* ' */"
+    ) shouldBe true
+  }

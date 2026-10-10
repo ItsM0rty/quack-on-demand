@@ -231,3 +231,40 @@ class SqlCommentStripperSpec extends AnyFlatSpec with Matchers:
       }
     finally src.close()
   }
+
+  // ---- one DuckDB 2.0-faithful lexer (SqlLexer) shared with the splitter and the classifier ----
+
+  it should "strip a comment that follows an identifier ending in a dollar-tag shape" in:
+    // `a$q$` is one identifier on DuckDB (identifiers continue through `$`), so nothing opens.
+    SqlCommentStripper.stripComments("SELECT a$q$ /* x */ FROM t") should not include "/*"
+
+  it should "read a non-ASCII dollar tag as a tag, keeping a comment marker inside it" in:
+    // DuckDB: `SELECT $<EURO>$ /* $<EURO>$ AS x` returns the string ` /* `.
+    SqlCommentStripper.stripComments(
+      "SELECT $\u20AC$ /* $\u20AC$ AS x"
+    ) shouldBe "SELECT $\u20AC$ /* $\u20AC$ AS x"
+
+  it should "not take an e after a non-ASCII identifier character as an escape-string prefix" in:
+    // `<EURO>e` is one identifier, so `'a\'` is a complete PLAIN string and the comment after it
+    // is a real comment.
+    SqlCommentStripper.stripComments(
+      "SELECT \u20ACe'a\\' /* b */ FROM t"
+    ) shouldBe "SELECT \u20ACe'a\\'   FROM t"
+
+  it should "take an e right after a number as an escape-string prefix, as DuckDB does" in:
+    // DuckDB lexes `1e'...'` as the number 1 then an escape string: the `\'` does not close it.
+    SqlCommentStripper.stripComments(
+      "SELECT 1e'a\\' /* b */' AS s /* c */"
+    ) shouldBe "SELECT 1e'a\\' /* b */' AS s  "
+
+  it should "keep a comment marker inside a backtick identifier (DuckDB 2.0)" in:
+    SqlCommentStripper.stripComments(
+      "SELECT 1 AS `a/*b`, 2 AS `c*/d`"
+    ) shouldBe "SELECT 1 AS `a/*b`, 2 AS `c*/d`"
+
+  it should "follow DuckDB's unicode-space pre-pass around a dollar-tag-shaped identifier" in:
+    // The `'` in the first comment makes DuckDB's pre-pass keep both NBSPs, so `a<NBSP>$q$` is one
+    // identifier and `/* x */` is a real comment (DuckDB returns two columns for this statement).
+    SqlCommentStripper.stripComments(
+      "SELECT 1 /* ' */ AS a\u00A0$q$ /* x */, 2 AS b\u00A0$q$ /* ' */"
+    ) should not include "/* x */"

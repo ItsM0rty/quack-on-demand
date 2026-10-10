@@ -1,7 +1,7 @@
 package ai.starlake.quack.edge.sql
 
 import ai.starlake.quack.model.BucketKeys
-import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
+import ai.starlake.sql.{SqlCommentStripper, SqlLexer, SqlTrivia}
 
 import java.util.Locale
 
@@ -185,58 +185,43 @@ object LockdownScreen:
           .orElse(barePathFrom(lower, deniedBuckets))
 
   /** Splits the input on top-level semicolons: a semicolon inside any of DuckDB's quoting forms
-    * (plain `'...'`, escape `E'...'`, double-quoted identifiers, dollar-quoted `$$...$$` /
-    * `$tag$...$tag$`), a line comment, or a (nested) block comment does not split. Fragments come
-    * back verbatim; blank ones are dropped.
+    * (plain `'...'`, escape `E'...'`, double-quoted and backtick identifiers, dollar-quoted
+    * `$$...$$` / `$tag$...$tag$`), a line comment, or a (nested) block comment does not split.
+    * Blank fragments are dropped.
     *
     * `private[sql]`, not `private`, so `CatalogWriteScreen` and `TriggerScreen` can reuse the same
     * quote- and comment-aware splitter to judge a batch statement by statement instead of by its
     * first token.
     *
-    * Quoted regions are read by `SqlCommentStripper.quotedEnd`, the stripper's own reader, so the
-    * two can never disagree on where a literal ends. Knowing only `'...'` and `"..."` was a desync,
-    * not a cosmetic gap: DuckDB reads `$x$'$x$` and `E'\''` as complete strings holding one quote
-    * each, while a `'`-only splitter opened a single-quoted run at that inner quote and merged
-    * every following statement into the leading `select` fragment, hiding an ATTACH from this
-    * screen and a CREATE TRIGGER from `TriggerScreen` (both verified to run on DuckDB 2.0).
+    * Every boundary comes from `ai.starlake.sql.SqlLexer`, the one reader shared with
+    * `SqlCommentStripper` and `StatementClassifier` and ported from DuckDB 2.0's own front end, so
+    * the splitter, the stripper and the engine can never disagree on where a literal ends. Knowing
+    * only `'...'` and `"..."` was a desync, not a cosmetic gap: DuckDB reads `$x$'$x$`,
+    * `$<EURO>$'$<EURO>$` and `E'\''` as complete strings holding one quote each, and a backtick
+    * identifier as an identifier, while a `'`-only splitter opened a single-quoted run at that
+    * inner quote (or a comment at a backticked comment opener) and merged every following statement
+    * into the leading `select` fragment, hiding an ATTACH from this screen and a CREATE TRIGGER
+    * from `TriggerScreen` (each verified to run on DuckDB 2.0). A line comment ends at a line feed
+    * OR a bare carriage return, as on DuckDB: ending it at a line feed alone once made
+    * `SELECT 1 -- c<CR>; INSERT INTO <read-only>.t VALUES (1)` one fragment that classified
+    * `Select` while DuckDB ran the INSERT.
     *
-    * The line-comment arm ends at a line feed OR at a bare carriage return, the same pair
-    * `SqlTrivia.stripLeading` and `SqlCommentStripper.stripComments` already end one at (verified
-    * against a real DuckDB 1.5.4). Ending it at a line feed alone was NOT a cosmetic divergence
-    * here: with no line feed anywhere after the `--`, the comment stayed open to end of input, so a
-    * top-level `;` behind the carriage return never split and the whole batch came back as ONE
-    * fragment. `CatalogWriteScreen` reads that fragment's first token on its cheap admit path, so
-    * `SELECT 1 -- c<CR>; INSERT INTO <read-only>.t VALUES (1)` classified `Select`, screened clean,
-    * and reached a node where DuckDB ends the comment at the carriage return and runs the INSERT.
-    * (The engine-level `READ_ONLY` on the ATTACH still refused that write; this screen is the layer
-    * that must refuse it BEFORE a node ever sees it.)
+    * Each fragment is cut from `SqlLexer.engineView(sql)`, not from `sql`: verbatim except that the
+    * unicode spaces DuckDB's own pre-pass turns into spaces ARE spaces, and those it keeps are
+    * pinned to stand-ins. Every caller re-lexes its fragments (stripping comments, classifying),
+    * and the pre-pass state at a statement boundary depends on everything before it: a fragment cut
+    * from the original text would lex alone differently from how DuckDB lexed it in place.
     */
   private[sql] def splitStatements(sql: String): List[String] =
-    val out = ListBuffer.empty[String]
-    val buf = new StringBuilder
-    var i   = 0
-    while i < sql.length do
-      val c = sql(i)
-      // Index just past a comment or quoted region opening at `i`; a line comment stops AT its
-      // terminator, which the next iteration appends as an ordinary character.
-      val skipTo =
-        if c == '/' && i + 1 < sql.length && sql(i + 1) == '*' then
-          Some(SqlCommentStripper.blockCommentEnd(sql, i))
-        else if c == '-' && i + 1 < sql.length && sql(i + 1) == '-' then
-          Some(SqlCommentStripper.lineCommentEnd(sql, i))
-        else SqlCommentStripper.quotedEnd(sql, i)
-      skipTo match
-        case Some(end) =>
-          buf.append(sql.substring(i, end))
-          i = end
-        case None if c == ';' =>
-          out += buf.toString
-          buf.clear()
-          i += 1
-        case None =>
-          buf.append(c)
-          i += 1
-    out += buf.toString
+    val view = SqlLexer.engineView(sql)
+    val out  = ListBuffer.empty[String]
+    var from = 0
+    SqlLexer.tokens(view).foreach { t =>
+      if t.kind == SqlLexer.Kind.Punct && view.charAt(t.start) == ';' then
+        out += view.substring(from, t.start)
+        from = t.end
+    }
+    out += view.substring(from)
     out.toList.filter(_.trim.nonEmpty)
 
   /** The setting name as a standalone word after the SET/RESET/PRAGMA keyword. */

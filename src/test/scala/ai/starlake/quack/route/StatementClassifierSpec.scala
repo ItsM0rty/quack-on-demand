@@ -568,3 +568,95 @@ class StatementClassifierSpec extends AnyFlatSpec with Matchers:
     StatementClassifier.classify(
       "WITH w AS (SELECT E'DELETE \\' FROM t' AS s) SELECT * FROM w"
     ) shouldBe StatementKind.Select
+
+  // ---- Task 3 review, round 2: one DuckDB-faithful lexer (SqlLexer) behind every screen ----
+  //
+  // Every Dml case below deletes both rows of `t` on the DuckDB 2.0 CLI (v2.0.0-alpha b15358c), and
+  // classified Select before `wordTokens` moved onto `ai.starlake.sql.SqlLexer`. Non-ASCII is
+  // written as `\uXXXX` escapes (this file's hygiene test forbids raw codepoints above ASCII).
+
+  it should "classify a TRUNCATE CTE body as DML (DuckDB 2.0 parses it as a DELETE) (N1)" in:
+    StatementClassifier.classify("WITH w AS (TRUNCATE t) SELECT 1") shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH w AS (TRUNCATE TABLE t) SELECT * FROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH w AS (truncate t), v AS (SELECT 2) SELECT * FROM v"
+    ) shouldBe StatementKind.Dml
+
+  it should "read a non-ASCII character as an identifier and dollar-tag character, as DuckDB does (N2)" in:
+    // `a<EURO>$q$` is ONE identifier on DuckDB, so no dollar quote opens there.
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1 AS a\u20AC$q$), w AS (DELETE FROM t RETURNING *) " +
+        "SELECT 1 AS b\u20AC$q$ FROM w"
+    ) shouldBe StatementKind.Dml
+    // `$<EURO>$ ' $<EURO>$` is a complete dollar-quoted string holding one quote.
+    StatementClassifier.classify(
+      "WITH a AS (SELECT $\u20AC$ ' $\u20AC$ AS x), w AS (DELETE FROM t RETURNING *) " +
+        "SELECT ' ' FROM w"
+    ) shouldBe StatementKind.Dml
+    // `x<EURO>e` is one identifier, so the quote after it opens a PLAIN string: the backslash does
+    // not escape the closing quote (DuckDB runs this once the type `x<EURO>e` exists).
+    StatementClassifier.classify(
+      "WITH a AS (SELECT x\u20ACe'\\' AS v), w AS (DELETE FROM t RETURNING *) " +
+        "SELECT 1 AS v /* ' */ FROM w"
+    ) shouldBe StatementKind.Dml
+
+  it should "lex comments next to dollar-tag-shaped identifiers the way DuckDB does (N3)" in:
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1 AS a$q$) /* ' */ , w AS (DELETE FROM t RETURNING *) " +
+        "SELECT 1 AS b$q$ /* ' */ FROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1 AS a$q$) -- '\n, w AS (DELETE FROM t RETURNING *) " +
+        "SELECT 1 AS b$q$ -- '\nFROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH a AS (SELECT $\u20AC$ /* $\u20AC$ AS x), w AS (DELETE FROM t RETURNING *) " +
+        "SELECT 1 /* */ FROM w"
+    ) shouldBe StatementKind.Dml
+
+  it should "follow DuckDB's unicode-space pre-pass, which keeps a space it believes is quoted" in:
+    // DuckDB's front end turns U+00A0 into a space only OUTSIDE what its own (simpler) quote scan
+    // thinks is a literal; the `'` inside each block comment opens such a "literal", so both NBSPs
+    // survive and `a<NBSP>$q$` is one identifier to the tokenizer.
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1 /* ' */ AS a\u00A0$q$), w AS (DELETE FROM t RETURNING *) " +
+        "SELECT 1 AS b\u00A0$q$ /* ' */ FROM w"
+    ) shouldBe StatementKind.Dml
+    // A NBSP is a valid dollar-tag character: `$<NBSP>$ ' $<NBSP>$` is one string.
+    StatementClassifier.classify(
+      "WITH a AS (SELECT $\u00A0$ ' $\u00A0$ AS x), w AS (DELETE FROM t RETURNING *) " +
+        "SELECT ' ' FROM w"
+    ) shouldBe StatementKind.Dml
+
+  it should "honour DuckDB 2.0's backtick identifiers, control-character identifiers and number tokens" in:
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1 AS `'`), w AS (DELETE FROM t RETURNING *) SELECT 1 AS `'` FROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1 AS a\u0001$q$), w AS (DELETE FROM t RETURNING *) " +
+        "SELECT 1 AS b\u0001$q$ FROM w"
+    ) shouldBe StatementKind.Dml
+    // `1e'\''` is the number 1 then the escape string e'\'' (a lone quote), not `1e` + plain.
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1e'\\''), w AS (DELETE FROM t RETURNING *) SELECT 'a' FROM w"
+    ) shouldBe StatementKind.Dml
+
+  it should "not count a DML word inside a non-ASCII-tagged dollar string" in:
+    StatementClassifier.classify(
+      "WITH w AS (SELECT $\u20AC$DELETE FROM t$\u20AC$ AS s) SELECT * FROM w"
+    ) shouldBe StatementKind.Select
+
+  it should "classify a WITH read that names a column delete as DML (accepted false positive)" in:
+    // Intended, not a bug: the WITH rule deliberately does not tell a CTE body's verb from the same
+    // word used as an identifier (DuckDB 2.0 accepts `delete`, `update`, `copy`, `replace`,
+    // `merge`, `insert` and `truncate` as bare column names). Telling them apart needs a parser;
+    // erring toward Dml only routes a read to a writer, while erring the other way routes a write
+    // past ProtectedWriteGuard. This statement deletes nothing on DuckDB 2.0.
+    StatementClassifier.classify(
+      "WITH w AS (SELECT x.delete FROM (SELECT 1 AS delete) x) SELECT * FROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH w AS (SELECT 1 AS truncate) SELECT * FROM w"
+    ) shouldBe StatementKind.Dml
