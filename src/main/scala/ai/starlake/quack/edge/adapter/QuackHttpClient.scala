@@ -1,7 +1,7 @@
 package ai.starlake.quack.edge.adapter
 
 import java.util.Locale
-import cats.effect.IO
+import cats.effect.{IO, Poll}
 import cats.effect.unsafe.IORuntime
 import com.typesafe.scalalogging.LazyLogging
 import org.apache.arrow.memory.BufferAllocator
@@ -140,33 +140,66 @@ open class QuackHttpClient(
     * fires the `DISCONNECT_MESSAGE`. The `QuackResponse.Ok` close callback therefore MUST call only
     * `reader.close()` -- wrapping a separate `conn.close()` here would double-send DISCONNECT. The
     * reader is the sole owner of the teardown chain.
+    *
+    * Release on every outcome. A [[Connection]] holds a node session and a heartbeat fiber until
+    * closed, so it is acquired under a mask: an error after `open` closes it, and a cancel is only
+    * observed at [[checkpoint]] / [[handOver]], where whatever is held gets closed. Callers wrap
+    * this in `.timeout`, and the JDK send is uninterruptible, so a cancel typically lands right
+    * after PREPARE returns: the reader built from that response is closed, not dropped.
     */
   private def queryNative(
       endpoint: String,
       token: String,
       sql: String
   ): IO[QuackResponse] =
-    IO.monotonic.flatMap { startNanos =>
-      // We need IORuntime in scope so `Connection.execute(sql)` can
-      // capture it for the synchronous closures the chained reader
-      // calls on `loadNextBatch` / `close`. The global runtime is the
-      // same one cats-effect IOApp installs for `Main.run`.
-      given IORuntime = IORuntime.global
-      (for
-        conn   <- nativeProtocol.open(endpoint, token)
-        reader <- conn.execute(sql)
-      yield reader).attempt.flatMap {
-        case Right(reader) =>
-          IO.monotonic.map { endNanos =>
-            val elapsedMs = (endNanos - startNanos).toMillis
-            // DISCONNECT-owner rule: see scaladoc above. `reader.close()`
-            // already cascades to `Connection.close()`; do NOT also call
-            // `conn.close()` here.
-            QuackResponse.Ok(reader, elapsedMs, () => reader.close())
+    IO.uncancelable { poll =>
+      IO.monotonic.flatMap { startNanos =>
+        // We need IORuntime in scope so `Connection.execute(sql)` can
+        // capture it for the synchronous closures the chained reader
+        // calls on `loadNextBatch` / `close`. The global runtime is the
+        // same one cats-effect IOApp installs for `Main.run`.
+        given IORuntime = IORuntime.global
+        nativeProtocol
+          .open(endpoint, token)
+          .flatMap { conn =>
+            (checkpoint(poll, conn.close()) *> conn.execute(sql))
+              .handleErrorWith(t => conn.close() *> IO.raiseError(t))
           }
-        case Left(t) => mapNativeFailure(t, startNanos)
+          .attempt
+          .flatMap {
+            case Right(reader) =>
+              IO.monotonic.flatMap { endNanos =>
+                val elapsedMs = (endNanos - startNanos).toMillis
+                // DISCONNECT-owner rule: see scaladoc above. `reader.close()`
+                // already cascades to `Connection.close()`; do NOT also call
+                // `conn.close()` here.
+                handOver(
+                  poll,
+                  QuackResponse.Ok(reader, elapsedMs, () => reader.close()),
+                  IO.blocking(reader.close())
+                )
+              }
+            case Left(t) => mapNativeFailure(t, startNanos)
+          }
       }
     }
+
+  /** A cancel point between two masked node calls: a cancel requested meanwhile is observed here,
+    * and `release` frees what the step before acquired. Without it a timed-out caller would still
+    * send the next PREPARE (and, for a write, run it).
+    */
+  private def checkpoint(poll: Poll[IO], release: IO[Unit]): IO[Unit] =
+    poll(IO.unit).onCancel(release)
+
+  /** Hands `ok` to the caller, or runs `release` when a cancel is already pending: the last step of
+    * a masked acquisition, so the response is closed rather than dropped with its connection.
+    */
+  private def handOver(
+      poll: Poll[IO],
+      ok: QuackResponse.Ok,
+      release: IO[Unit]
+  ): IO[QuackResponse] =
+    poll(IO.pure[QuackResponse](ok)).onCancel(release)
 
   /** Map a native-path failure to a [[QuackResponse.Failed]] with elapsed time. */
   private def mapNativeFailure(t: Throwable, startNanos: FiniteDuration): IO[QuackResponse] =
@@ -185,6 +218,10 @@ open class QuackHttpClient(
     * `sql`'s result reaches the caller byte-identical to the plain path; COMMIT fires through
     * [[StampedCommitArrowReader]] once that result is consumed.
     *
+    * Same release discipline as [[queryNative]]. A cancel that lands once `sql` has run closes the
+    * inner reader, not the stamped one: the caller was told the write failed, so DISCONNECT rolls
+    * the BEGIN back instead of committing it.
+    *
     * Fail-open: a prelude failure never blocks the write. The bracket connection is dropped
     * (server-side session teardown rolls the BEGIN back) and the statement is re-sent unstamped on
     * a fresh plain connection, with a warning.
@@ -201,40 +238,48 @@ open class QuackHttpClient(
   ): IO[QuackResponse] =
     if !nativeClient then query(endpoint, token, sql, None)
     else
-      IO.monotonic.flatMap { startNanos =>
-        given IORuntime = IORuntime.global
-        nativeProtocol.open(endpoint, token).attempt.flatMap {
-          case Left(t)     => mapNativeFailure(t, startNanos)
-          case Right(conn) =>
-            conn.executeDiscard(prelude).attempt.flatMap {
-              case Left(t) =>
-                logger.warn(
-                  s"stamping prelude failed on $endpoint; write proceeds unstamped: ${t.getMessage}"
-                )
-                conn.close() *> queryNative(endpoint, token, sql)
-              case Right(()) =>
-                conn.execute(sql).attempt.flatMap {
-                  case Left(t) =>
-                    // DISCONNECT tears the server session down, rolling the open BEGIN back;
-                    // no explicit ROLLBACK round-trip needed.
-                    conn.close() *> mapNativeFailure(t, startNanos)
-                  case Right(reader) =>
-                    IO.monotonic.map { endNanos =>
-                      val committed = new java.util.concurrent.atomic.AtomicBoolean(false)
-                      val commitSync: () => Unit = () =>
-                        if committed.compareAndSet(false, true) then
-                          conn.executeDiscard("COMMIT").unsafeRunSync()
-                      val stamped = new StampedCommitArrowReader(allocator, reader, commitSync)
-                      // DISCONNECT-owner rule: stamped.close() delegates to reader.close(),
-                      // which cascades Connection.close(); no separate conn.close() here.
-                      QuackResponse.Ok(
-                        stamped,
-                        (endNanos - startNanos).toMillis,
-                        () => stamped.close()
-                      )
-                    }
-                }
-            }
+      IO.uncancelable { poll =>
+        IO.monotonic.flatMap { startNanos =>
+          given IORuntime = IORuntime.global
+          nativeProtocol.open(endpoint, token).attempt.flatMap {
+            case Left(t)     => mapNativeFailure(t, startNanos)
+            case Right(conn) =>
+              (checkpoint(poll, conn.close()) *> conn.executeDiscard(prelude)).attempt.flatMap {
+                case Left(t) =>
+                  logger.warn(
+                    s"stamping prelude failed on $endpoint; write proceeds unstamped: ${t.getMessage}"
+                  )
+                  // Nothing is held once conn is closed, so the fallback may be cancelled whole.
+                  conn.close() *> poll(queryNative(endpoint, token, sql))
+                case Right(()) =>
+                  (checkpoint(poll, conn.close()) *> conn.execute(sql)).attempt.flatMap {
+                    case Left(t) =>
+                      // DISCONNECT tears the server session down, rolling the open BEGIN back;
+                      // no explicit ROLLBACK round-trip needed.
+                      conn.close() *> mapNativeFailure(t, startNanos)
+                    case Right(reader) =>
+                      IO.monotonic.flatMap { endNanos =>
+                        val committed = new java.util.concurrent.atomic.AtomicBoolean(false)
+                        val commitSync: () => Unit = () =>
+                          if committed.compareAndSet(false, true) then
+                            conn.executeDiscard("COMMIT").unsafeRunSync()
+                        val stamped = new StampedCommitArrowReader(allocator, reader, commitSync)
+                        // DISCONNECT-owner rule: stamped.close() delegates to reader.close(),
+                        // which cascades Connection.close(); no separate conn.close() here.
+                        handOver(
+                          poll,
+                          QuackResponse.Ok(
+                            stamped,
+                            (endNanos - startNanos).toMillis,
+                            () => stamped.close()
+                          ),
+                          // reader, not stamped: no COMMIT for a caller that was told it failed.
+                          IO.blocking(reader.close())
+                        )
+                      }
+                  }
+              }
+          }
         }
       }
 

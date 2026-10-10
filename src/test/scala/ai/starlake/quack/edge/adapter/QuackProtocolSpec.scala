@@ -37,6 +37,15 @@ class QuackProtocolSpec extends AnyFunSpec with Matchers:
       responses.next()
     }
 
+  /** Polls `cond` until it holds or `within` elapses; true iff it held. */
+  private def eventually(within: FiniteDuration)(cond: => Boolean): Boolean =
+    val deadline = System.nanoTime() + within.toNanos
+    var ok       = cond
+    while !ok && System.nanoTime() < deadline do
+      Thread.sleep(25)
+      ok = cond
+    ok
+
   private val endpoint = "quack:127.0.0.1:21900"
   private val token    = "test-token"
   private val connId   = "conn-test-abc"
@@ -116,14 +125,60 @@ class QuackProtocolSpec extends AnyFunSpec with Matchers:
       try
         val protocol = new QuackProtocol(transport, allocator, nodeLeaseSec = 3) // beat every 1s
         val conn     = protocol.open(endpoint, token).unsafeRunSync()
-        Thread.sleep(2500)
-        val beats = transport.types.asScala.count(_ == heartbeatType)
-        beats should be >= 2
+        def beats    = transport.types.asScala.count(_ == heartbeatType)
+        eventually(5.seconds)(beats >= 2) shouldBe true
         conn.close().unsafeRunSync()
-        val afterClose = transport.types.asScala.count(_ == heartbeatType)
+        val afterClose = beats
         Thread.sleep(1500)
-        transport.types.asScala.count(_ == heartbeatType) shouldBe afterClose
+        beats shouldBe afterClose
       finally allocator.close()
+    }
+
+    it("asks the node for the configured lease in CONNECTION_REQUEST") {
+      val transport = FakeTransport(
+        Iterator(QuackTestFixtures.serializeSampleConnectionResponse(connId))
+      )
+      val allocator = new RootAllocator()
+      try
+        val protocol = new QuackProtocol(transport, allocator, nodeLeaseSec = 42)
+        protocol.open(endpoint, token).unsafeRunSync()
+        val sent = ai.starlake.quack.edge.quack.QuackWire
+          .frame(transport.requests.head._2)
+          .flatMap(ai.starlake.quack.edge.quack.QuackWire.decodeConnectionRequest)
+          .fold(e => fail(s"undecodable CONNECTION_REQUEST: $e"), identity)
+        sent.heartbeatTimeoutSec shouldBe 42L
+        sent.authString shouldBe token
+      finally allocator.close()
+    }
+
+    it("closes promptly, DISCONNECT included, while a heartbeat hangs") {
+      val beatStarted = new java.util.concurrent.CountDownLatch(1)
+      val releaseBeat = new java.util.concurrent.CountDownLatch(1)
+      final class HangingBeatTransport extends QuackTransport:
+        val types = java.util.concurrent.ConcurrentLinkedQueue[Int]()
+        def post(uri: URI, body: Array[Byte]): IO[Array[Byte]] = IO.defer {
+          val t = QuackNativeBridge.parseMessageType(body)
+          types.add(t)
+          if t == MessageType.HeartbeatRequest.wireOrdinal then
+            // Uninterruptible, like JdkHttpTransport's IO.blocking send to a hung node.
+            IO.blocking {
+              beatStarted.countDown()
+              releaseBeat.await()
+              QuackTestFixtures.serializeSampleConnectionResponse(connId)
+            }
+          else IO(QuackTestFixtures.serializeSampleConnectionResponse(connId))
+        }
+      val transport = HangingBeatTransport()
+      val allocator = new RootAllocator()
+      try
+        val protocol = new QuackProtocol(transport, allocator, nodeLeaseSec = 3)
+        val conn     = protocol.open(endpoint, token).unsafeRunSync()
+        beatStarted.await(5, java.util.concurrent.TimeUnit.SECONDS) shouldBe true
+        scala.concurrent.Await.result(conn.close().unsafeToFuture(), 3.seconds)
+        transport.types.asScala.count(_ == MessageType.DisconnectMessage.wireOrdinal) shouldBe 1
+      finally
+        releaseBeat.countDown()
+        allocator.close()
     }
 
     it("rejects a lease below one second at construction") {
