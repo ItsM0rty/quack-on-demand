@@ -1721,6 +1721,10 @@ FlightSQL prepare-time probe needs a real table - schema-qualify
 
 Two-part names are only unambiguous when the head is a schema in the pool's default catalog, as in `tpch1.customer` above. When the head instead names an attached catalog (the tenant-db itself, e.g. `acme_tpch`, or a federation alias) under ACL, it's rejected as ambiguous - the engine would bind it catalog-first while the ACL check can't tell which catalog you meant. Write the full three-part form instead: `acme_tpch.tpch1.customer`.
 
+`VARIANT` columns reach FlightSQL clients as the Arrow `arrow.parquet.variant` extension type. A
+client that does not know that extension sees a struct of two binary fields (`metadata`,
+`value`); cast to JSON in the query for such clients (`SELECT v::JSON AS v ...`).
+
 ## Connecting from DuckDB (native Quack protocol)
 
 Besides FlightSQL, the manager serves DuckDB's own Quack protocol on a dedicated port
@@ -1772,6 +1776,10 @@ Things to know:
   raw node): a multi-column result larger than the client's inline batch (about 24k rows)
   fails inside the client with `Attempted to access index 1 within vector of size 1`.
   Single-column results of any size, and multi-column results that fit inline, work.
+- **Long statements.** A DuckDB 2.0 client gives up on a request after its `http_timeout`
+  (default 30 seconds) and fails with `Timeout was reached`, whatever the gateway is doing.
+  Before a statement that may run longer, raise it in the client session:
+  `SET http_timeout = 600;` (seconds). FlightSQL clients are not affected.
 - **Personal access tokens are not accepted** on this wire (same rule as FlightSQL); use
   a user and password or an OIDC bearer.
 

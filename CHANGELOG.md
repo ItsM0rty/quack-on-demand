@@ -11,6 +11,11 @@
   loaders and the demo seed attach as-is. The migration is one-way: back up catalog databases
   before upgrading, there is no downgrade. Until DuckDB v2.0.0 is released the toolchain is built
   from source with `scripts/dev/build-duckdb-prerelease.sh`.
+  A DuckDB 2.0 client on the native front door gives up on a statement after its `http_timeout`
+  (default 30 s); run `SET http_timeout = <seconds>` in the client session before a longer one
+  (FlightSQL is unaffected). `VARIANT` columns reach FlightSQL clients as the Arrow
+  `arrow.parquet.variant` extension type, a struct of two binary fields to a client that does not
+  know it: cast to JSON for those clients.
 
 - **Native client lease.** The manager-to-node native client heartbeats each node connection
   under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).
@@ -32,7 +37,9 @@
   - Four-part (nested schema) names fail closed.
   - Executing EXPLAIN forms (ANALYZE / ANALYSE, option lists) classify as the explained statement.
   - Lockdown denies `CONNECT` / `DISCONNECT` and extension repository DDL, protects
-    `allow_extension_repositories`, and judges path-shaped quoted identifiers.
+    `allow_extension_repositories`, `extension_directories` and the other settings that move
+    extension, secret or file locations, switch the parser dialect, or redirect the node's
+    outbound connections, and judges path-shaped quoted identifiers.
   - Trigger DDL is reserved to superusers and own-tenant admins ("CREATE TRIGGER is restricted to
     tenant administrators").
   - The edge's comment stripper, statement splitter and classifier share one lexer ported from
