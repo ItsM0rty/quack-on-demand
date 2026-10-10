@@ -735,6 +735,13 @@ object Main extends IOApp with LazyLogging:
       logger.warn(
         "SL_ENABLED=true but SL_URL is empty; the Starlake menu and logout callback are disabled"
       )
+    DuckDbExtensionSource.fromEnv.dir.foreach { d =>
+      logger.warn(
+        s"${DuckDbExtensionSource.EnvVar}=$d: the manager's DuckDB loads extensions from this " +
+          "directory with allow_unsigned_extensions on. Use only for the DuckDB pre-release " +
+          "toolchain or an air-gapped mirror you control."
+      )
+    }
     // Management-plane auth wiring; component contracts in ManagementAuthWiring.
     val mgmtAuth = ManagementAuthWiring.build(
       mgrCfg,

@@ -132,7 +132,8 @@ object DuckLakeInitializer extends LazyLogging:
       try adminConn.close()
       catch case _: Throwable => ()
 
-    val conn = DriverManager.getConnection("jdbc:duckdb:")
+    val ext  = DuckDbExtensionSource.fromEnv
+    val conn = DriverManager.getConnection("jdbc:duckdb:", ext.connectionProperties)
     try
       val stmt = conn.createStatement()
       try
@@ -150,8 +151,8 @@ object DuckLakeInitializer extends LazyLogging:
         proxyHostPort.foreach { hp =>
           stmt.execute(s"SET http_proxy = ${duckdbLiteral(hp)}")
         }
-        stmt.execute("INSTALL ducklake; LOAD ducklake;")
-        stmt.execute("INSTALL postgres; LOAD postgres;")
+        stmt.execute(ext.loadSql("ducklake"))
+        stmt.execute(ext.loadSql("postgres_scanner"))
         storageSqlFor(dataPath).foreach(stmt.execute)
         // Two-layer escape: libpq parses the post-`ducklake:postgres:`
         // payload as a keyword=value connstring, which is itself wrapped

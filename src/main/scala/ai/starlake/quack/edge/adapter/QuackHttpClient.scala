@@ -258,12 +258,14 @@ open class QuackHttpClient(
     */
   private def freshDuckDB(): DuckDBConnection = {
     Class.forName("org.duckdb.DuckDBDriver")
-    val c    = DriverManager.getConnection("jdbc:duckdb:").asInstanceOf[DuckDBConnection]
+    val ext = ai.starlake.quack.ondemand.DuckDbExtensionSource.fromEnv
+    val c   = DriverManager
+      .getConnection("jdbc:duckdb:", ext.connectionProperties)
+      .asInstanceOf[DuckDBConnection]
     val stmt = c.createStatement()
     try
       QuackHttpClient.proxyHostPort.foreach(hp => stmt.execute(s"SET http_proxy = '$hp'"))
-      stmt.execute("INSTALL quack")
-      stmt.execute("LOAD quack")
+      stmt.execute(ext.loadSql("quack"))
     finally stmt.close()
     c
   }
