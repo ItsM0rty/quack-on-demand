@@ -1912,6 +1912,80 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
     out.swap.toOption.get.reason should startWith("access denied: lockdown:")
 
+  // ---- parser settings (DuckDB 2.0) ----
+
+  "a parser setting" should "be refused for a regular user with acl disabled, lockdown off" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val out = router
+      .execute(
+        "psr-1",
+        "alice",
+        poolKey,
+        "SET GLOBAL dialect_compatibility_mode = 'spark'",
+        effectiveSet = Some(effWithPolicies(Nil))
+      )
+      .unsafeRunSync()
+    out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    out.swap.toOption.get.reason shouldBe
+      s"access denied: parser: ${ai.starlake.quack.edge.sql.ParserSettingScreen.RefusalMessage}"
+
+  it should "be refused for a superuser too, lockdown off" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val superuser = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser.copy(tenant = None, kind = "admin"),
+      Nil,
+      Nil,
+      Nil,
+      Nil
+    )
+    val out = router
+      .execute(
+        "psr-2",
+        "alice",
+        poolKey,
+        "SELECT 1; RESET show_behavior",
+        effectiveSet = Some(superuser)
+      )
+      .unsafeRunSync()
+    out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    out.swap.toOption.get.reason should include(
+      ai.starlake.quack.edge.sql.ParserSettingScreen.RefusalMessage
+    )
+
+  it should "be refused when the effective set is missing, and leave other settings alone" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val refused = router
+      .execute("psr-3", "alice", poolKey, "IMPORT DATABASE 'x'", effectiveSet = None)
+      .unsafeRunSync()
+    refused.swap.toOption.get.reason should include(
+      ai.starlake.quack.edge.sql.ParserSettingScreen.ImportRefusalMessage
+    )
+    val admitted = router
+      .execute("psr-4", "alice", poolKey, "SET http_timeout = 300", effectiveSet = None)
+      .unsafeRunSync()
+    admitted.isRight shouldBe true
+
   // ---- node lockdown (QOD_NODE_LOCKDOWN) ----
 
   "lockdown" should "deny ATTACH for a tenant caller when enabled" in:

@@ -63,12 +63,6 @@ object LockdownScreen:
     "custom_extension_repository",
     "autoinstall_extension_repository",
     "allow_extensions_metadata_mismatch",
-    // Parser and grammar: a dialect the edge lexer does not model desyncs every screen from the
-    // engine (spark compatibility mode reads backslash escapes inside '...' literals).
-    "active_grammar_extensions",
-    "allow_parser_override_extension",
-    "current_dialect",
-    "dialect_compatibility_mode",
     // Secrets: where they persist and whether they print unredacted.
     "allow_persistent_secrets",
     "default_secret_storage",
@@ -101,7 +95,7 @@ object LockdownScreen:
     "threads",
     "worker_threads",
     "max_temp_directory_size"
-  )
+  ) ++ ParserSettingScreen.Settings // also refused for every caller by ParserSettingScreen
 
   private val DeniedFunctions = Set(
     "read_text",

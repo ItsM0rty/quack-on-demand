@@ -8,6 +8,7 @@ import ai.starlake.quack.edge.sql.{
   CatalogWriteScreen,
   Denied,
   LockdownScreen,
+  ParserSettingScreen,
   StatementValidator,
   TriggerScreen,
   ValidationContext,
@@ -529,8 +530,15 @@ final class FlightSqlRouter(
             .map(_.id)
         TriggerScreen.mayManageTriggers(effectiveSet, poolTenantId)
       }
+    // Parser settings (and IMPORT DATABASE, which can carry them) are refused for every caller,
+    // superusers included, whatever the ACL mode and the lockdown flag: one session switching how
+    // the node parses desyncs the ACL for every session on it (ParserSettingScreen's scaladoc).
+    val parserDenial                  = ParserSettingScreen.screen(sql)
     val preGateDenial: Option[String] =
-      lockdownDenial.map(r => s"lockdown: $r").orElse(triggerDenial.map(r => s"trigger: $r"))
+      lockdownDenial
+        .map(r => s"lockdown: $r")
+        .orElse(triggerDenial.map(r => s"trigger: $r"))
+        .orElse(parserDenial.map(r => s"parser: $r"))
 
     val aclCheck: Either[RouterFailure, Unit] = preGateDenial match
       case Some(reason) =>
