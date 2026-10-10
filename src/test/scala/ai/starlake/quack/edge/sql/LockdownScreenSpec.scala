@@ -550,6 +550,40 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SET http_timeout = 300") shouldBe false
   }
 
+  "protected settings" should "be denied with a quoted name glued to the keyword" in {
+    // Each applies on the 2.0 CLI: the tokenizer needs no whitespace before a quoted name.
+    denied("SET\"memory_limit\"='1GB'") shouldBe true
+    denied("SET`memory_limit`='1GB'") shouldBe true
+    denied("SET GLOBAL\"memory_limit\"='1GB'") shouldBe true
+    denied("SET SESSION`extension_directories`=['/tmp']") shouldBe true
+    denied("PRAGMA\"memory_limit\"='1GB'") shouldBe true
+    denied("RESET\"enable_external_access\"") shouldBe true
+    denied("SET/**/\"temp_directory\"='/tmp/x'") shouldBe true
+  }
+
+  it should "be denied behind EXPLAIN ANALYZE, which executes the statement it carries" in {
+    // Verified on the 2.0 CLI: each of these applies the setting.
+    denied("EXPLAIN ANALYZE SET memory_limit = '1GB'") shouldBe true
+    denied("EXPLAIN (ANALYZE) SET memory_limit = '1GB'") shouldBe true
+    denied("EXPLAIN(ANALYZE)SET\"memory_limit\"='1GB'") shouldBe true
+    denied("EXPLAIN ANALYZE PRAGMA memory_limit = '1GB'") shouldBe true
+    denied("EXPLAIN ANALYZE RESET memory_limit") shouldBe true
+    denied("EXPLAIN ANALYZE (FORMAT json) SET threads = 64") shouldBe true
+  }
+
+  "statements behind EXPLAIN ANALYZE" should "meet the same first-token rules" in {
+    // Verified on the 2.0 CLI: EXPLAIN ANALYZE COPY ... TO writes the file and EXPLAIN ANALYZE
+    // LOAD attempts the load. ATTACH / INSTALL / CONNECT behind EXPLAIN are syntax errors on 2.0
+    // and are denied anyway.
+    denied("EXPLAIN ANALYZE COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+    denied("EXPLAIN ANALYZE LOAD spatial") shouldBe true
+    denied("EXPLAIN (ANALYZE) LOAD spatial") shouldBe true
+    denied("EXPLAIN ANALYZE ATTACH 'x.db' AS y") shouldBe true
+    denied("EXPLAIN ANALYZE COPY (SELECT 1) TO 's3://staging/x.csv'") shouldBe false
+    denied("EXPLAIN ANALYZE SELECT * FROM t") shouldBe false
+    denied("EXPLAIN UPDATE t SET threads = 1") shouldBe false
+  }
+
   "enable_logging" should "be denied in every call form, since file storage writes local files" in {
     // Verified on the 2.0 CLI: both forms write duckdb_log_entries.csv under the path, and the
     // entries carry query text and write_log() payloads.

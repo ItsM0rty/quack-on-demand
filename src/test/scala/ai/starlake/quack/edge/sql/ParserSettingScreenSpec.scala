@@ -45,14 +45,33 @@ class ParserSettingScreenSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "refuse a quoted name glued to the keyword before it (no whitespace needed on 2.0)" in
+    // Each applies the setting on the 2.0 CLI: the tokenizer ends a keyword at the quote.
+    values.foreach { case (name, value) =>
+      withClue(name) {
+        refused(s"SET\"$name\"=$value") shouldBe true
+        refused(s"SET`$name`=$value") shouldBe true
+        refused(s"SET GLOBAL\"$name\"=$value") shouldBe true
+        refused(s"SET SESSION\"$name\" TO $value") shouldBe true
+        refused(s"SET LOCAL`$name`=$value") shouldBe true
+        refused(s"PRAGMA\"$name\"=$value") shouldBe true
+        refused(s"RESET\"$name\"") shouldBe true
+        refused(s"RESET GLOBAL`$name`") shouldBe true
+        refused(s"SET/**/$name=$value") shouldBe true
+        refused(s"SET/**/GLOBAL/**/\"$name\"=$value") shouldBe true
+        refused(s"EXPLAIN ANALYZE SET\"$name\"=$value") shouldBe true
+        refused(s"EXPLAIN(ANALYZE)SET\"$name\"=$value") shouldBe true
+      }
+    }
+
   it should "see through comments, unicode spaces and leading trivia" in {
     refused("/* x */ SET dialect_compatibility_mode = 'spark'") shouldBe true
     refused("SET/**/dialect_compatibility_mode = 'spark'") shouldBe true
     refused(
       "SET -- c\n GLOBAL /* a /* b */ c */ dialect_compatibility_mode = 'spark'"
     ) shouldBe true
-    refused("SET dialect_compatibility_mode = 'spark'") shouldBe true
-    refused("﻿  SET show_behavior = 'setting'") shouldBe true
+    refused("SET\u00a0dialect_compatibility_mode = 'spark'") shouldBe true
+    refused("\ufeff  SET\u2003show_behavior = 'setting'") shouldBe true
   }
 
   it should "refuse a parser setting anywhere in a batch" in {
@@ -66,6 +85,19 @@ class ParserSettingScreenSpec extends AnyFlatSpec with Matchers:
     refused("EXPLAIN ANALYSE SET dialect_compatibility_mode = 'spark'") shouldBe true
     refused("EXPLAIN (ANALYZE true, FORMAT json) RESET show_behavior") shouldBe true
     refused("EXPLAIN SET current_dialect = 'spark'") shouldBe true
+    refused("EXPLAIN (ANALYZE) SET show_behavior = 'setting'") shouldBe true
+    refused("EXPLAIN ANALYZE (FORMAT json) SET show_behavior = 'setting'") shouldBe true
+    refused("EXPLAIN (ANALYZE, FORMAT ')') SET show_behavior = 'setting'") shouldBe true
+    refused("EXPLAIN /* ( */ ANALYZE SET show_behavior = 'setting'") shouldBe true
+  }
+
+  it should "judge only the statement an EXPLAIN carries, not a SET clause inside it" in {
+    // A column named like a setting in an UPDATE's SET clause is not a setting.
+    refused("EXPLAIN UPDATE t SET show_behavior = 1") shouldBe false
+    refused("EXPLAIN ANALYZE UPDATE t SET current_dialect = 'x' WHERE id = 1") shouldBe false
+    refused("UPDATE t SET show_behavior = 1") shouldBe false
+    refused("EXPLAIN SELECT 'set current_dialect = 1' AS s") shouldBe false
+    refused("EXPLAIN (FORMAT 'set show_behavior') SELECT 1") shouldBe false
   }
 
   it should "refuse a parser setting hidden behind a dollar-quoted or E-string splitter desync" in {

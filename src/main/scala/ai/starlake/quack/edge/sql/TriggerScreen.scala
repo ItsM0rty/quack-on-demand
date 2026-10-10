@@ -1,9 +1,6 @@
 package ai.starlake.quack.edge.sql
 
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
-import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
-
-import java.util.Locale
 
 /** Trigger DDL is reserved to superusers and to admins of the pool's own tenant.
   *
@@ -32,14 +29,14 @@ object TriggerScreen:
     * the explained statement. Fail closed: the verb anywhere after EXPLAIN refuses, which also
     * refuses an EXPLAIN whose string literal spells a trigger verb, a shape nobody needs.
     */
-  private val TriggerDdl = ("(?s)^(?:explain\\b.*\\b)?" + TriggerVerb).r
+  private val TriggerDdl = (StatementHead.ExplainPrefix + TriggerVerb).r
 
   /** `Some(RefusalMessage)` when any statement of `sql` is trigger DDL. */
   def screen(sql: String): Option[String] =
     LockdownScreen
       .splitStatements(sql)
       .iterator
-      .map(normalize)
+      .map(StatementHead.normalize)
       .find(s => TriggerDdl.findFirstIn(s).isDefined)
       .map(_ => RefusalMessage)
 
@@ -51,13 +48,3 @@ object TriggerScreen:
       e.user.tenant.isEmpty ||
       (e.user.kind == "admin" && poolTenantId.exists(id => e.user.tenant.contains(id)))
     }
-
-  /** Lexes the ORIGINAL statement and folds case only afterwards. DuckDB compares dollar-quote tags
-    * case-sensitively (`$A$` is not closed by `$a$`), so lowercasing first let the lexer end a
-    * literal where DuckDB does not and read the trigger DDL behind it as a comment.
-    */
-  private def normalize(stmt: String): String =
-    SqlTrivia
-      .normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt)))
-      .toLowerCase(Locale.ROOT)
-      .trim

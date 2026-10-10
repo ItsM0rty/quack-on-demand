@@ -226,10 +226,14 @@ object LockdownScreen:
       SqlTrivia
         .normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt)))
         .toLowerCase(Locale.ROOT)
-    val first         = FirstToken.findFirstMatchIn(lower).map(_.group(1))
+    // The first-token rules judge the statement an EXPLAIN carries: EXPLAIN ANALYZE executes it
+    // (SET, PRAGMA, RESET, COPY ... TO and LOAD verified on 2.0), so `explain` itself says nothing.
+    val head          = StatementHead.of(stmt)
+    val headLower     = if head.start == 0 then lower else StatementHead.normalize(head.text)
+    val first         = FirstToken.findFirstMatchIn(headLower).map(_.group(1))
     val repositoryHit =
       ExtensionRepositoryDdl
-        .findFirstIn(lower)
+        .findFirstIn(headLower)
         .map(_ => "extension repositories are disabled on this deployment")
     first.flatMap(DeniedFirstTokens.get).orElse(repositoryHit) match
       case some @ Some(_) => some

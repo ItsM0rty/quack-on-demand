@@ -1,9 +1,5 @@
 package ai.starlake.quack.edge.sql
 
-import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
-
-import java.util.Locale
-
 /** Settings that change how a node lexes, parses or resolves SQL are refused for EVERY caller,
   * superusers included, whatever the ACL mode, OPA mode and the lockdown flag.
   *
@@ -17,9 +13,9 @@ import java.util.Locale
   * directory the edge never reads (verified on 2.0: a `SET dialect_compatibility_mode` in
   * `schema.sql` takes effect), so it can carry any of these settings past this screen.
   *
-  * Token-based like [[TriggerScreen]]: each statement is split and lexed from the ORIGINAL text and
-  * case is folded afterwards. Manager-internal SQL (DuckLake initializer, node bootstrap, demo
-  * seed) never goes through the router and sets none of these.
+  * Token-based: each statement is split and lexed from the ORIGINAL text by DuckDB 2.0's own
+  * tokenizer and names are folded afterwards. Manager-internal SQL (DuckLake initializer, node
+  * bootstrap, demo seed) never goes through the router and sets none of these.
   */
 object ParserSettingScreen:
 
@@ -40,43 +36,29 @@ object ParserSettingScreen:
     "table_function_identifier_conversion"
   )
 
-  private val Names = Settings.toList.sorted.mkString("|")
-
-  /** EXPLAIN takes ANALYZE / ANALYSE and an option list of arbitrary expressions, and EXPLAIN
-    * ANALYZE executes a SET (verified on 2.0), so the statement counts anywhere after EXPLAIN, as
-    * in [[TriggerScreen]].
-    */
-  private val ExplainPrefix = "(?s)^(?:explain\\b.*\\b)?"
-
-  /** SET / RESET / PRAGMA with an optional SESSION / GLOBAL / LOCAL scope, naming the setting bare,
-    * double-quoted or backtick-quoted (DuckDB 2.0 accepts all three, case-insensitively).
-    */
-  private val SettingTarget =
-    (ExplainPrefix + "(?:set|reset|pragma)\\s+(?:(?:session|global|local)\\s+)?" +
-      s"(?:\"(?:$Names)\"|`(?:$Names)`|(?:$Names)(?![a-z0-9_$$]))").r
-
-  private val ImportDatabase = (ExplainPrefix + "import\\s+database\\b").r
+  private val Scopes = Set("session", "global", "local")
 
   /** The refusal for the first statement of `sql` that changes a parser setting or imports a
     * database, if any.
     */
   def screen(sql: String): Option[String] =
-    LockdownScreen
-      .splitStatements(sql)
-      .iterator
-      .map(normalize)
-      .flatMap { s =>
-        if SettingTarget.findFirstIn(s).isDefined then Some(RefusalMessage)
-        else if ImportDatabase.findFirstIn(s).isDefined then Some(ImportRefusalMessage)
-        else None
-      }
-      .nextOption()
+    LockdownScreen.splitStatements(sql).iterator.flatMap(screenOne).nextOption()
 
-  /** Lexes the ORIGINAL statement and folds case only afterwards (dollar-quote tags compare
-    * case-sensitively in DuckDB; see [[TriggerScreen]]).
+  /** Read from DuckDB 2.0's own tokens, never from a regex over the text: the tokenizer needs no
+    * whitespace between a keyword and a quoted name, so `SET"show_behavior"='setting'`,
+    * ``SET GLOBAL`show_behavior`=...`` and `PRAGMA"show_behavior"=...` all apply on 2.0, and a
+    * comment between two tokens separates them like a space. The statement is the one an EXPLAIN
+    * carries, if any ([[StatementHead]]): `EXPLAIN ANALYZE SET ...` applies the setting, while
+    * `EXPLAIN UPDATE t SET show_behavior = 1` names a column.
     */
-  private def normalize(stmt: String): String =
-    SqlTrivia
-      .normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt)))
-      .toLowerCase(Locale.ROOT)
-      .trim
+  private def screenOne(stmt: String): Option[String] =
+    val h = StatementHead.of(stmt)
+    val i = h.start
+    h.word(i) match
+      case Some("set" | "reset" | "pragma") =>
+        // SET [SESSION | GLOBAL | LOCAL] <name>: a scope word followed by a name is a scope
+        val target =
+          if h.word(i + 1).exists(Scopes) && h.identifier(i + 2).isDefined then i + 2 else i + 1
+        h.identifier(target).filter(Settings).map(_ => RefusalMessage)
+      case Some("import") if h.word(i + 1).contains("database") => Some(ImportRefusalMessage)
+      case _                                                    => None
