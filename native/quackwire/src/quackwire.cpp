@@ -25,6 +25,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_properties.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -567,6 +568,12 @@ namespace {
 //
 // This is the cheapest viable workaround. A v2 would let the gateway
 // hand in a real ClientContext from its own DuckLake-backed connection.
+//
+// The instance is opened with a fixed thread budget (`threads=1`,
+// `async_threads=1`): DuckDB 2.0 defaults to one worker per core plus an
+// async I/O pool of 4 x cores, ~79 native threads on a 16-core host for an
+// instance that never runs a query. Same budget as the manager's JDBC instances
+// (DuckDbExtensionSource.connectionProperties on the Scala side).
 duckdb::ClientProperties& shared_client_properties() {
   static std::mutex mtx;
   static std::unique_ptr<duckdb::DuckDB> db;
@@ -574,7 +581,10 @@ duckdb::ClientProperties& shared_client_properties() {
   static std::unique_ptr<duckdb::ClientProperties> props;
   std::lock_guard<std::mutex> lock(mtx);
   if (!props) {
-    db = std::make_unique<duckdb::DuckDB>(nullptr);
+    duckdb::DBConfig config;
+    config.SetOptionByName("threads", duckdb::Value::BIGINT(1));
+    config.SetOptionByName("async_threads", duckdb::Value::BIGINT(1));
+    db = std::make_unique<duckdb::DuckDB>(nullptr, &config);
     conn = std::make_unique<duckdb::Connection>(*db);
     props = std::make_unique<duckdb::ClientProperties>(conn->context->GetClientProperties());
   }

@@ -1,5 +1,6 @@
 package ai.starlake.quack.edge.adapter
 
+import ai.starlake.quack.ondemand.InProcessDuckDb
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector.{BigIntVector, BitVector, IntVector, VarCharVector}
 import org.apache.arrow.vector.ipc.ArrowReader
@@ -34,7 +35,7 @@ object TestArrow:
     * `arrowExportStream`). Batches hold at most 1024 rows, as the old export did.
     */
   def readerFor(sql: String): ArrowReader =
-    val conn = DriverManager.getConnection("jdbc:duckdb:")
+    val conn = DriverManager.getConnection("jdbc:duckdb:", InProcessDuckDb.properties)
     try fromResultSet(conn, conn.createStatement().executeQuery(sql))
     catch
       case e: Throwable =>

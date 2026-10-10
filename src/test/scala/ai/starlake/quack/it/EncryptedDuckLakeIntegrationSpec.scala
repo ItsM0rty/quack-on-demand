@@ -1,6 +1,7 @@
 package ai.starlake.quack.it
 
 import ai.starlake.quack.ondemand.DuckLakeInitializer
+import ai.starlake.quack.ondemand.InProcessDuckDb
 import ai.starlake.quack.ondemand.state.testkit.TestPostgres
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -112,7 +113,7 @@ class EncryptedDuckLakeIntegrationSpec extends AnyFlatSpec with Matchers:
     }
 
   private def withDuckdb[A](body: java.sql.Statement => A): A =
-    val conn: Connection = DriverManager.getConnection("jdbc:duckdb:")
+    val conn: Connection = DriverManager.getConnection("jdbc:duckdb:", InProcessDuckDb.properties)
     try
       val st = conn.createStatement()
       try body(st)

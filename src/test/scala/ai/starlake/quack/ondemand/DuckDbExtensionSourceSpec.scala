@@ -3,13 +3,16 @@ package ai.starlake.quack.ondemand
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import scala.jdk.CollectionConverters.*
+
 class DuckDbExtensionSourceSpec extends AnyFlatSpec with Matchers:
 
   "unset" should "install from the official repository, signed only" in {
     val s = DuckDbExtensionSource(None)
     s.loadSql("ducklake") shouldBe "INSTALL ducklake; LOAD ducklake;"
     s.loadSql("postgres_scanner") shouldBe "INSTALL postgres_scanner; LOAD postgres_scanner;"
-    s.connectionProperties.isEmpty shouldBe true
+    // Only the in-process thread budget: no unsigned extensions without a directory.
+    s.connectionProperties.asScala.toMap shouldBe InProcessDuckDb.Settings.toMap
   }
 
   "a directory" should "LOAD the file by path and allow unsigned extensions" in {
