@@ -37,6 +37,6 @@ class SpawnScriptDuckDb20Spec extends AnyFlatSpec with Matchers with SpawnScript
       withClue(line)((line.contains("INSTALL ") && line.contains("LOAD ")) shouldBe false)
     }
 
-  it should "auto-migrate the DuckLake catalog on the read-write ATTACH" in {
-    ducklake() should include("AUTOMATIC_MIGRATION TRUE")
+  it should "NOT carry AUTOMATIC_MIGRATION on the node ATTACH" in {
+    ducklake() should not include "AUTOMATIC_MIGRATION"
   }

@@ -12,7 +12,7 @@ class DuckLakeInitializerSqlSpec extends AnyFlatSpec with Matchers:
 
   private val connstr = "ducklake:postgres:host=h port=5432 dbname=d user=u password=p"
 
-  "attachSql" should "carry only DATA_PATH when encryption is off" in {
+  "attachSql" should "carry DATA_PATH and AUTOMATIC_MIGRATION when encryption is off" in {
     val sql = DuckLakeInitializer.attachSql(connstr, "acme_lake", "/var/lake", encrypted = false)
     sql should include("DATA_PATH '/var/lake', AUTOMATIC_MIGRATION TRUE")
     sql should endWith("(DATA_PATH '/var/lake', AUTOMATIC_MIGRATION TRUE)")

@@ -313,11 +313,11 @@ case "$kind" in
     INIT_SQL+="ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS qod_init_pg (TYPE postgres);"$'\n'
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
     INIT_SQL+="ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS \"$catalogAlias\""$'\n'
-    # DuckDB 2.0: a catalog from an older DuckLake migrates on first attach (latest version only).
+    # Nodes attach as-is: the manager's DuckLakeInitializer migrates older catalogs once per boot.
     if [[ "${encrypted:-}" == "true" ]]; then
-      INIT_SQL+="  (DATA_PATH '$dataPath', ENCRYPTED, AUTOMATIC_MIGRATION TRUE);"$'\n'
+      INIT_SQL+="  (DATA_PATH '$dataPath', ENCRYPTED);"$'\n'
     else
-      INIT_SQL+="  (DATA_PATH '$dataPath', AUTOMATIC_MIGRATION TRUE);"$'\n'
+      INIT_SQL+="  (DATA_PATH '$dataPath');"$'\n'
     fi
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
     INIT_SQL+=$'DETACH qod_init_pg;\n'

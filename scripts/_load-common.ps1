@@ -162,7 +162,7 @@ CREATE OR REPLACE SECRET quack_azure (
 
 # The DuckLake ATTACH statement shared by the probe and the load script.
 function Get-AttachSql($cfg) {
-  "ATTACH 'ducklake:postgres:host=$($cfg.PgHost) port=$($cfg.PgPort) dbname=$($cfg.DbName) user=$($cfg.PgUser) password=$($cfg.PgPass)' AS $($cfg.DbName)`n  (DATA_PATH '$($cfg.DataPath)', AUTOMATIC_MIGRATION TRUE);"
+  "ATTACH 'ducklake:postgres:host=$($cfg.PgHost) port=$($cfg.PgPort) dbname=$($cfg.DbName) user=$($cfg.PgUser) password=$($cfg.PgPass)' AS $($cfg.DbName)`n  (DATA_PATH '$($cfg.DataPath)');"
 }
 
 # Stream SQL to the DuckDB CLI via `-c ".read '<tempfile>'"`. Writes the temp

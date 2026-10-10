@@ -216,7 +216,7 @@ LOAD postgres;
 ${1:-}
 $STORAGE_SQL
 ATTACH 'ducklake:postgres:host=$PG_HOST port=$PG_PORT dbname=$DB_NAME user=$PG_USER password=$PG_PASS' AS $DB_NAME
-  (DATA_PATH '$DATA_PATH', AUTOMATIC_MIGRATION TRUE);
+  (DATA_PATH '$DATA_PATH');
 SQL
 }
 

@@ -314,8 +314,10 @@ object DuckLakeInitializer extends LazyLogging:
       dataPath: String,
       encrypted: Boolean
   ): String =
-    // DuckDB 2.0: latest DuckLake only; an older catalog migrates here, once, under the
-    // per-dbname advisory lock, before any node attaches it.
+    // The initializer migrates a catalog older than the latest DuckLake version once per manager
+    // boot, under the per-dbname advisory lock. On DuckDB 2.0 an attach without the flag accepts
+    // any catalog >= 1.0 as-is; nodes never pass it, because each flagged attach re-runs the
+    // migration DDL (ACCESS EXCLUSIVE in Postgres) on every spawn.
     val opts =
       if encrypted then s"DATA_PATH ${duckdbLiteral(dataPath)}, ENCRYPTED, AUTOMATIC_MIGRATION TRUE"
       else s"DATA_PATH ${duckdbLiteral(dataPath)}, AUTOMATIC_MIGRATION TRUE"

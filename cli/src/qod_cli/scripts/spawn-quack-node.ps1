@@ -226,9 +226,9 @@ switch ($kind) {
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS ""$catalogAlias""")
     if ($encrypted -ceq 'true') {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', ENCRYPTED, AUTOMATIC_MIGRATION TRUE);")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', ENCRYPTED);")
     } else {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', AUTOMATIC_MIGRATION TRUE);")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPath');")
     }
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("DETACH qod_init_pg;")

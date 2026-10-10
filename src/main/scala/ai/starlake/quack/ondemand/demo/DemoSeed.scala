@@ -40,7 +40,7 @@ object DemoSeed extends LazyLogging:
        |INSTALL tpch;
        |LOAD tpch;
        |ATTACH 'ducklake:postgres:host=${pg.host} port=${pg.port} dbname=$dbName user=${pg.user} password=${pg.password}' AS $dbName
-       |  (DATA_PATH '$dataPath', AUTOMATIC_MIGRATION TRUE);
+       |  (DATA_PATH '$dataPath');
        |CREATE SCHEMA IF NOT EXISTS $dbName.$schema;
        |CALL dbgen(sf = $sf);
        |$ctas
