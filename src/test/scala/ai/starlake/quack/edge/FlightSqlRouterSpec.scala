@@ -1820,6 +1820,63 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     // The existing "pool is empty" error must surface immediately - no 60s hold.
     (System.nanoTime() - t0) should be < 2_000_000_000L
 
+  // ---- trigger DDL (DuckDB 2.0) ----
+
+  private val createTrigger =
+    "CREATE TRIGGER t AFTER INSERT ON a FOR EACH STATEMENT INSERT INTO b VALUES (1)"
+
+  "trigger DDL" should "be refused for a regular tenant user, lockdown off" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val out = router
+      .execute("trg-1", "alice", poolKey, createTrigger, effectiveSet = Some(effWithPolicies(Nil)))
+      .unsafeRunSync()
+    out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    out.swap.toOption.get.reason should include(
+      ai.starlake.quack.edge.sql.TriggerScreen.RefusalMessage
+    )
+
+  it should "be refused when the effective set is missing" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val out = router
+      .execute("trg-2", "alice", poolKey, "DROP TRIGGER t", effectiveSet = None)
+      .unsafeRunSync()
+    out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+
+  it should "be admitted for an admin of the pool's own tenant" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val admin = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser.copy(kind = "admin"),
+      Nil,
+      Nil,
+      Nil,
+      Nil
+    )
+    val out = router
+      .execute("trg-3", "alice", poolKey, createTrigger, effectiveSet = Some(admin))
+      .unsafeRunSync()
+    out.isRight shouldBe true
+
   // ---- node lockdown (QOD_NODE_LOCKDOWN) ----
 
   "lockdown" should "deny ATTACH for a tenant caller when enabled" in:

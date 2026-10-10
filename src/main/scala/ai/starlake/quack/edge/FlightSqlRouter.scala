@@ -9,6 +9,7 @@ import ai.starlake.quack.edge.sql.{
   Denied,
   LockdownScreen,
   StatementValidator,
+  TriggerScreen,
   ValidationContext,
   ValidatorUnavailable
 }
@@ -508,15 +509,28 @@ final class FlightSqlRouter(
         LockdownScreen.screen(sql, deniedBuckets())
       else None
 
-    val aclCheck: Either[RouterFailure, Unit] = lockdownDenial match
+    // Trigger DDL is reserved to superusers and the pool tenant's admins, whatever the ACL mode
+    // and the lockdown flag (TriggerScreen's scaladoc has the why).
+    val poolTenantId =
+      supervisor
+        .getTenant(poolKey.tenant)
+        .orElse(supervisor.getTenantById(poolKey.tenant))
+        .map(_.id)
+    val triggerDenial =
+      if TriggerScreen.mayManageTriggers(effectiveSet, poolTenantId) then None
+      else TriggerScreen.screen(sql)
+    val preGateDenial: Option[String] =
+      lockdownDenial.map(r => s"lockdown: $r").orElse(triggerDenial.map(r => s"trigger: $r"))
+
+    val aclCheck: Either[RouterFailure, Unit] = preGateDenial match
       case Some(reason) =>
         maybeRecord(
           nodeId = "-",
           durationMs = 0,
           status = "denied",
-          error = Some("lockdown: " + reason)
+          error = Some(reason)
         )
-        Left(RouterFailure.AccessDenied(s"access denied: lockdown: $reason"))
+        Left(RouterFailure.AccessDenied(s"access denied: $reason"))
       case None =>
         validator.validate(ctx) match
           case Denied(reason, deniedRefs, meta) =>
