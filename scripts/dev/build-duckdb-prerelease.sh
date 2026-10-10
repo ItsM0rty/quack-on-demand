@@ -10,13 +10,14 @@
 set -euo pipefail
 
 DUCKDB_SHA="${DUCKDB_SHA:-b15358c371daf10dad799a43b6167f6ccdce84d8}"
-DUCKDB_JAVA_REF="${DUCKDB_JAVA_REF:-v2.0-cyanoptera}"
+# Full commit SHA (v2.0-cyanoptera, vendors engine b15358c371): pinned so the build is reproducible.
+DUCKDB_JAVA_REF="${DUCKDB_JAVA_REF:-dd398c408ac52939265d47ae0e8eb672fb3efb66}"
 ABI="2.0.0"
 JDBC_VERSION="2.0.0.0-pre-${DUCKDB_SHA:0:7}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-MAIN_DIR="$(cd "$(git -C "$REPO_DIR" rev-parse --git-common-dir)/.." && pwd)"
+MAIN_DIR="$(cd "$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)"
 WORK="${QOD_PRERELEASE_WORK:-$HOME/.cache/qod-duckdb-prerelease}"
 CACHE="${DUCKDB_CACHE_DIR:-$MAIN_DIR/.duckdb}/$ABI"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN)}"
@@ -43,13 +44,13 @@ if [[ ! -d "$WORK/duckdb-java/.git" ]]; then
 fi
 git -C "$WORK/duckdb-java" fetch origin "$DUCKDB_JAVA_REF"
 git -C "$WORK/duckdb-java" checkout --detach FETCH_HEAD
-vendored="$(grep -o 'DUCKDB_SOURCE_ID "[0-9a-f]*"' \
-  "$WORK/duckdb-java/src/duckdb/src/function/table/version/pragma_version.cpp" | head -1 | cut -d'"' -f2)"
+PRAGMA_CPP="$WORK/duckdb-java/src/duckdb/src/function/table/version/pragma_version.cpp"
+[[ -f "$PRAGMA_CPP" ]] || { echo "missing $PRAGMA_CPP (duckdb-java layout changed?)" >&2; exit 1; }
+vendored="$(grep -o 'DUCKDB_SOURCE_ID "[0-9a-f]*"' "$PRAGMA_CPP" | head -1 | cut -d'"' -f2)"
 [[ "${DUCKDB_SHA:0:10}" == "$vendored" ]] || {
-  echo "duckdb-java $DUCKDB_JAVA_REF vendors $vendored, not ${DUCKDB_SHA:0:10}: pick a matching DUCKDB_JAVA_REF commit" >&2
+  echo "duckdb-java $DUCKDB_JAVA_REF vendors $vendored, not ${DUCKDB_SHA:0:10}: DUCKDB_JAVA_REF must be a FULL 40-character duckdb-java commit SHA vendoring the pinned engine" >&2
   exit 1; }
-ENGINE_VERSION="$(grep -o 'DUCKDB_VERSION "[^"]*"' \
-  "$WORK/duckdb-java/src/duckdb/src/function/table/version/pragma_version.cpp" | head -1 | cut -d'"' -f2)"
+ENGINE_VERSION="$(grep -o 'DUCKDB_VERSION "[^"]*"' "$PRAGMA_CPP" | head -1 | cut -d'"' -f2)"
 [[ -n "$ENGINE_VERSION" ]] || { echo "no DUCKDB_VERSION in duckdb-java's vendored engine" >&2; exit 1; }
 
 # ---- 1. engine + extensions ---------------------------------------------------------------
@@ -77,9 +78,10 @@ EOF
 
 LINK="-L$PG_ROOT/lib -lpq"
 # A loadable extension only loads in an engine with the same version string, and the JDBC's string comes from duckdb-java's vendoring.
+# DUCKDB_EXPLICIT_VERSION beats both the DUCKDB_VERSION and OVERRIDE_GIT_DESCRIBE env knobs in DuckDB's CMakeLists.
 cmake -S "$WORK/duckdb" -B "$WORK/duckdb/build/release" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DOVERRIDE_GIT_DESCRIBE="$ENGINE_VERSION" \
+  -DDUCKDB_EXPLICIT_VERSION="$ENGINE_VERSION" \
   -DDUCKDB_EXTENSION_CONFIGS="$WORK/qod_extensions.cmake" \
   -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
   -DPostgreSQL_ROOT="$PG_ROOT" -DCMAKE_PREFIX_PATH="$PG_ROOT" \
@@ -108,6 +110,9 @@ for e in quack ducklake postgres_scanner httpfs; do
   [[ -f "$CACHE/extensions/$e.duckdb_extension" ]] || { echo "missing loadable $e" >&2; exit 1; }
 done
 
+sid="$("$CACHE/bin/duckdb" -csv -noheader -c "SELECT source_id FROM pragma_version()")"
+[[ "$sid" == "${DUCKDB_SHA:0:10}" ]] || {
+  echo "built CLI source_id $sid, expected ${DUCKDB_SHA:0:10}" >&2; exit 1; }
 # ---- 3. build and install duckdb-java ----------------------------------------------------
 ( cd "$WORK/duckdb-java" && GEN=ninja make release )
 M2="$HOME/.m2/repository/org/duckdb/duckdb_jdbc/$JDBC_VERSION"
