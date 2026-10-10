@@ -368,3 +368,46 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
       ctx
     ) shouldBe Allow
   }
+
+  // What a DuckDB 2.0 quack client sends when it uses an attached catalog.
+
+  it should "allow the quack client's BEGIN TRANSACTION for a principal with policies" in {
+    guardWithCls().check(
+      "BEGIN TRANSACTION",
+      StatementKind.Begin,
+      eff(tenantUser, cols = List(maskEmail), rows = List(rowPolicy)),
+      ctx
+    ) shouldBe Allow
+  }
+
+  it should "allow a client-fed INSERT for a principal with policies" in {
+    // the rows come from the client's own SEND_DATA stream: no protected table is read
+    guardWithCls().check(
+      "INSERT INTO tpch1.customer SELECT * FROM scan_data_from_quack_client(" +
+        "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(col0 BIGINT), ordered := true)",
+      StatementKind.Dml,
+      eff(tenantUser, cols = List(maskEmail), rows = List(rowPolicy)),
+      ctx
+    ) shouldBe Allow
+  }
+
+  it should "still deny a client-fed INSERT that also reads a row-policy table" in {
+    guardWithCls().check(
+      "INSERT INTO tpch1.scratch SELECT * FROM scan_data_from_quack_client(" +
+        "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(col0 BIGINT), ordered := true) " +
+        "WHERE col0 IN (SELECT c_id FROM tpch1.customer)",
+      StatementKind.Dml,
+      eff(tenantUser, rows = List(rowPolicy)),
+      ctx
+    ) shouldBe a[Deny]
+  }
+
+  it should "deny a malformed client data scan for a principal with policies" in {
+    guardWithCls().check(
+      "INSERT INTO tpch1.scratch SELECT * FROM scan_data_from_quack_client('x', " +
+        "NULL::STRUCT(col0 BIGINT), ordered := true)",
+      StatementKind.Dml,
+      eff(tenantUser, rows = List(rowPolicy)),
+      ctx
+    ) shouldBe a[Deny]
+  }

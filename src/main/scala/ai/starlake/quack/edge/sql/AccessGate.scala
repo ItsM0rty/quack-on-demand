@@ -77,8 +77,14 @@ object AccessGate:
     // exactly `<function>()`: `duckdb_tables('x')`, `main.duckdb_tables()` and the
     // bare-name marker for `FROM duckdb_tables` are not that shape and stay
     // unsupported.
+    //
+    // A DuckDB 2.0 client's INSERT through an attached catalog reads its rows from
+    // scan_data_from_quack_client, which reads only what the same connection sends: as the
+    // source of a write it is set aside here, the INSERT target staying a gated Write
+    // (TableExtractor.gatedUnsupported).
     val allUnsupported = extraction.statements.collect {
-      case StatementResult.Extracted(_, _, _, _, u) if u.nonEmpty => u
+      case StatementResult.Extracted(_, _, a, _, u) if u.nonEmpty =>
+        TableExtractor.gatedUnsupported(a, u)
     }.flatten
     val (catalogFunctions, unsupported) =
       if filteredMetadata then

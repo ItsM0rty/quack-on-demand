@@ -134,6 +134,69 @@ object TableExtractor:
       marker.drop(TableFunctionMarkerPrefix.length)
     )
 
+  /** The table function a DuckDB 2.0 quack client's INSERT through an attached catalog reads its
+    * rows from (duckdb-quack `src/storage/quack_insert.cpp`): `INSERT INTO <t> SELECT * FROM
+    * scan_data_from_quack_client('<uuid>', NULL::STRUCT(...), ordered := true|false)`, the rows
+    * then arriving as SEND_DATA messages on the same connection.
+    *
+    * It reads nothing but those messages: its bind needs the quack server's per-connection session
+    * state and CREATES a fresh stream there (refusing an id that already exists), SEND_DATA looks
+    * the stream up in the session of the connection that sent it, and the next statement or an
+    * abort clears every stream of that session. So it reaches no table, file or other session, and
+    * has no grantable object. It is still reported (under [[clientDataScanMarker]], never as an
+    * ordinary table function) so a consumer that does not know it fails closed;
+    * [[gatedUnsupported]] sets it aside where it is the source of a write.
+    */
+  val ClientDataScanFunction = "scan_data_from_quack_client"
+
+  // The stream id the client mints: UUID::ToString, lowercase hex.
+  private val ClientStreamId =
+    "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}".r
+
+  /** True only for the exact call shape the client composes: the unqualified, unquoted name; a
+    * single-quoted uuid literal; `NULL` cast to a STRUCT type (a type, so no expression or subquery
+    * can ride in it); `ordered := true|false`; nothing else on the call (no LATERAL, DISTINCT,
+    * ORDER BY, FILTER or attribute, checked by re-printing the call from its three arguments).
+    */
+  private[parser] def isClientDataScan(tf: TableFunction): Boolean =
+    val f      = tf.getFunction
+    val params =
+      Option(f).flatMap(fn => Option(fn.getParameters)).map(_.asScala.toList).getOrElse(Nil)
+    val nameOk = Option(f).exists(fn =>
+      Option(fn.getMultipartName).exists(_.size == 1) &&
+        Option(fn.getName).exists(_.equalsIgnoreCase(ClientDataScanFunction))
+    )
+    val argsOk = params match
+      case List(id: StringValue, proto: CastExpression, ordered: PostgresNamedFunctionParameter) =>
+        ClientStreamId.matches(id.getValue) &&
+        proto.getLeftExpression.isInstanceOf[NullValue] &&
+        Option(proto.getColDataType)
+          .flatMap(t => Option(t.getDataType))
+          .exists(_.trim.equalsIgnoreCase("STRUCT")) &&
+        Option(ordered.getName).exists(_.equalsIgnoreCase("ordered")) &&
+        Option(ordered.getExpression).map(_.toString.toLowerCase(Locale.ROOT)).exists { v =>
+          v == "true" || v == "false"
+        }
+      case _ => false
+    nameOk && argsOk && tf.getPrefix == null && f.getNamedParameters == null &&
+    f.toString == s"${f.getName}(${params.mkString(", ")})"
+
+  private val ClientDataScanMarkerPrefix = "client data scan "
+
+  /** The `unsupported` marker for a call [[isClientDataScan]] accepted. */
+  def clientDataScanMarker(call: String): String = ClientDataScanMarkerPrefix + call
+
+  def isClientDataScanMarker(marker: String): Boolean =
+    marker != null && marker.startsWith(ClientDataScanMarkerPrefix)
+
+  /** The `unsupported` markers of one statement that still deny: all of them, except client data
+    * scans in a statement that writes a table (the client's INSERT, whose target stays a gated
+    * Write). A client data scan anywhere else keeps denying.
+    */
+  def gatedUnsupported(accesses: Set[TableAccess], unsupported: List[String]): List[String] =
+    if accesses.exists(_.verb == Verb.Write) then unsupported.filterNot(isClientDataScanMarker)
+    else unsupported
+
   /** The marker for a DuckDB default view referenced by a bare table name. Deliberately NOT a
     * [[tableFunctionMarker]]: the manager cannot tell whether a real table of that name shadows the
     * system view on the node, so this spelling is never admitted (only wildcard ALL and superusers,
@@ -356,7 +419,9 @@ private[parser] class TableExtractorVisitor:
         // filtered-metadata flag (TableExtractor.catalogFunctionCall reads it back);
         // a ROWS FROM list has no single function and prints as itself.
         val call = Option(tf.getFunction).map(_.toString).getOrElse(tf.toString)
-        unsupported += TableExtractor.tableFunctionMarker(call)
+        if TableExtractor.isClientDataScan(tf) then
+          unsupported += TableExtractor.clientDataScanMarker(call)
+        else unsupported += TableExtractor.tableFunctionMarker(call)
       case pfi: ParenthesedFromItem =>
         // `FROM (a JOIN b ON ...)`: recurse into the wrapped item and its joins.
         val inner = pfi.getFromItem

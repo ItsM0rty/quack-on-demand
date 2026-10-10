@@ -138,6 +138,26 @@ object SqlParser:
     *   ExtractionResult with per-statement results and aggregated tables
     */
   def extract(sql: String, config: Config): ExtractionResult =
+    if isClientBeginTransaction(sql) then
+      ExtractionResult.fromStatements(List(clientBeginTransaction(0, sql)))
+    else extractParsed(sql, config)
+
+  /** `BEGIN TRANSACTION`, the statement a DuckDB 2.0 quack client sends when it first touches an
+    * attached catalog (duckdb-quack `src/storage/quack_transaction.cpp`, `ForceStart`; its COMMIT
+    * and ROLLBACK already parse). JSqlParser cannot parse it, so it is recognized here, ahead of
+    * the parser, and ONLY as the whole input: case-insensitive, ASCII whitespace, one optional
+    * trailing semicolon. A comment, a modifier (`READ ONLY`) or any second statement leaves the
+    * input to the parser, whose fail-closed arms are unchanged.
+    */
+  private val ClientBeginTransaction = "(?i)\\A\\s*BEGIN\\s+TRANSACTION\\s*;?\\s*\\z".r
+
+  private def isClientBeginTransaction(sql: String): Boolean =
+    sql != null && ClientBeginTransaction.matches(sql)
+
+  private def clientBeginTransaction(index: Int, sql: String): StatementResult =
+    StatementResult.ControlFlow(index, truncateSnippet(sql.trim), "BeginTransaction")
+
+  private def extractParsed(sql: String, config: Config): ExtractionResult =
     try
       val stmts: Statements = CCJSqlParserUtil.parseStatements(
         stripTimeTravelClauses(sql),
@@ -179,8 +199,8 @@ object SqlParser:
     */
   def extractSingle(sql: String, config: Config): StatementResult =
     try
-      val stmt = CCJSqlParserUtil.parse(sql)
-      processStatement(stmt, 0, config)
+      if isClientBeginTransaction(sql) then clientBeginTransaction(0, sql)
+      else processStatement(CCJSqlParserUtil.parse(sql), 0, config)
     catch
       case e: JSQLParserException =>
         val snippet = truncateSnippet(sql)

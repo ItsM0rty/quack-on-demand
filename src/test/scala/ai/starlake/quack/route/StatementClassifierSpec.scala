@@ -35,6 +35,16 @@ class StatementClassifierSpec extends AnyFlatSpec with Matchers:
     StatementClassifier.classify("COMMIT") shouldBe StatementKind.Commit
     StatementClassifier.classify("ROLLBACK") shouldBe StatementKind.Rollback
 
+  it should "classify what a DuckDB 2.0 quack client sends through an attached catalog" in:
+    // duckdb-quack src/storage/quack_transaction.cpp and src/storage/quack_insert.cpp
+    StatementClassifier.classify("BEGIN TRANSACTION") shouldBe StatementKind.Begin
+    StatementClassifier.classify("COMMIT") shouldBe StatementKind.Commit
+    StatementClassifier.classify("ROLLBACK") shouldBe StatementKind.Rollback
+    StatementClassifier.classify(
+      "INSERT INTO tpch1.customer SELECT * FROM scan_data_from_quack_client(" +
+        "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(col0 BIGINT), ordered := true)"
+    ) shouldBe StatementKind.Dml
+
   it should "classify unknown / DuckDB-specific as Other" in:
     StatementClassifier.classify("PRAGMA threads = 4") shouldBe StatementKind.Other
     StatementClassifier.classify("SET search_path = 'main'") shouldBe StatementKind.Other

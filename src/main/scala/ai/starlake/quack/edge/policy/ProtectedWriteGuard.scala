@@ -1,7 +1,7 @@
 package ai.starlake.quack.edge.policy
 
 import ai.starlake.acl.model.{Config, TableRef}
-import ai.starlake.acl.parser.{SqlParser, StatementResult, Verb}
+import ai.starlake.acl.parser.{SqlParser, StatementResult, TableExtractor, Verb}
 import ai.starlake.quack.edge.sql.CatalogReachingCalls
 import ai.starlake.quack.edge.cls.{
   ColumnCatalog,
@@ -119,7 +119,9 @@ final class ProtectedWriteGuard(
         val colHit = reads.exists(t => covers(colKeys, t))
         if rowHit then GuardOutcome.Deny(deny(firstCovered(reads, rowKeys)))
         else if colHit then preciseCls(ast, eff, ctx, firstCovered(reads, colKeys))
-        else if e.unsupported.nonEmpty || e.qualificationErrors.nonEmpty then
+        else if TableExtractor.gatedUnsupported(e.accesses, e.unsupported).nonEmpty ||
+          e.qualificationErrors.nonEmpty
+        then
           // Extraction is incomplete, so a protected read may be unaccounted for. Fail closed.
           GuardOutcome.Deny(IncompleteDeny)
         else GuardOutcome.Allow

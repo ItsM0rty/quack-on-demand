@@ -86,3 +86,43 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
     eval("SELECT table_name FROM information_schema.tables", fm = true) shouldBe
       a[GateOutcome.NothingGated]
     eval("SELECT table_name FROM information_schema.tables") shouldBe a[GateOutcome.Gated]
+
+  // What a DuckDB 2.0 quack client sends when it uses an attached catalog.
+
+  private val ClientScan =
+    "scan_data_from_quack_client('0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', " +
+      "NULL::STRUCT(col0 BIGINT, col1 VARCHAR), ordered := true)"
+
+  it should "gate nothing for the quack client's transaction statements" in:
+    eval("BEGIN TRANSACTION") shouldBe a[GateOutcome.NothingGated]
+    eval("COMMIT") shouldBe a[GateOutcome.NothingGated]
+    eval("ROLLBACK") shouldBe a[GateOutcome.NothingGated]
+
+  it should "still refuse a batch that only starts with BEGIN TRANSACTION" in:
+    eval("BEGIN TRANSACTION; DROP TABLE orders") shouldBe a[GateOutcome.Refuse]
+
+  it should "gate a client-fed INSERT on its target only" in:
+    eval(s"INSERT INTO orders SELECT * FROM $ClientScan") match
+      case GateOutcome.Gated(g, _) =>
+        g.map(a => a.table.table -> a.verb) shouldBe Set("orders" -> Verb.Write)
+      case other => fail(other.toString)
+
+  it should "keep gating every other read of a client-fed INSERT" in:
+    eval(
+      s"INSERT INTO orders SELECT * FROM $ClientScan WHERE col0 IN (SELECT k FROM lineitem)"
+    ) match
+      case GateOutcome.Gated(g, _) =>
+        g.map(a => a.table.table -> a.verb) shouldBe Set(
+          "orders"   -> Verb.Write,
+          "lineitem" -> Verb.Read
+        )
+      case other => fail(other.toString)
+
+  it should "refuse a client data scan that is not the source of a write" in:
+    eval(s"SELECT * FROM $ClientScan") shouldBe a[GateOutcome.Refuse]
+
+  it should "refuse a malformed client data scan" in:
+    eval(
+      "INSERT INTO orders SELECT * FROM scan_data_from_quack_client('x', NULL::STRUCT(a INT), " +
+        "ordered := true)"
+    ) shouldBe a[GateOutcome.Refuse]
