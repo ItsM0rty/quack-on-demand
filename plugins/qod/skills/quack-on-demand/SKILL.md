@@ -1725,14 +1725,15 @@ Two-part names are only unambiguous when the head is a schema in the pool's defa
 
 Besides FlightSQL, the manager serves DuckDB's own Quack protocol on a dedicated port
 (default `9494`, env `QOD_QUACK_PORT`; `QOD_QUACK_ENABLED=false` turns the listener off).
-Any DuckDB that carries the `quack` extension (the CLI, the Python package, an embedded
+Any DuckDB 2.0 that carries the `quack` extension (the CLI, the Python package, an embedded
 DuckDB) attaches the gateway as a database, with no driver in between, and joins it with
 its local tables. The token string is the same set of parameters the FlightSQL JDBC URL
 takes after `?`; a superuser adds `&superuser=true`, an OIDC bearer replaces
 `user`/`password` with `token=<jwt>`.
 
 ```sql
--- attach once, then query like any other catalog
+-- attach once (DuckDB 2.0 client; a 1.x client fails with
+-- "requires a DuckDB 2.0 client"), then query like any other catalog
 ATTACH 'quack:localhost:9494' AS qod
   (TYPE quack, TOKEN 'tenant=acme&pool=bi&user=alice&password=<password>');
 SELECT count(*) FROM qod.tpch1.customer WHERE c_mktsegment = 'BUILDING';

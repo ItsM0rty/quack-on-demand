@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **DuckDB 2.0.** Engine, nodes, JDBC and libquackwire move to DuckDB 2.0 and Quack protocol v3.
+  BREAKING: the manager and every node upgrade together (restart every node). The native front
+  door requires DuckDB 2.0 clients; a 1.x client gets "requires a DuckDB 2.0 client". It also
+  admits a 2.0 client's `BEGIN TRANSACTION` and its INSERT data path (`scan_data_from_quack_client`,
+  scoped to the client's own connection). DuckLake catalogs older than the latest version are
+  migrated by the manager's DuckLake initializer, once per boot under its advisory lock; nodes,
+  loaders and the demo seed attach as-is. The migration is one-way: back up catalog databases
+  before upgrading, there is no downgrade. Until DuckDB v2.0.0 is released the toolchain is built
+  from source with `scripts/dev/build-duckdb-prerelease.sh`.
+
+- **Native client lease.** The manager-to-node native client heartbeats each node connection
+  under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).
+  Node connections are released on error and on cancel. New `QOD_DUCKDB_EXTENSION_DIR` points the
+  manager's DuckDB at a local extension directory and turns on unsigned extensions.
+
+- **Known limitation.** The DuckDB 2.0 pre-release JDBC disables Arrow export, so the embedded
+  fallback client (`QOD_NATIVE_CLIENT=false`, and the automatic fallback on Windows ARM64) does
+  not work on this pre-release. The native client (the default) is unaffected.
+
+- **Security: DuckDB 2.0 hardening.**
+  - Data-modifying CTEs classify as writes and fail closed in the ACL.
+  - Four-part (nested schema) names fail closed.
+  - Executing EXPLAIN forms (ANALYZE / ANALYSE, option lists) classify as the explained statement.
+  - Lockdown denies `CONNECT` / `DISCONNECT` and extension repository DDL, protects
+    `allow_extension_repositories`, and judges path-shaped quoted identifiers.
+  - Trigger DDL is reserved to superusers and own-tenant admins ("CREATE TRIGGER is restricted to
+    tenant administrators").
+  - The edge's comment stripper, statement splitter and classifier share one lexer ported from
+    DuckDB 2.0's tokenizer (dollar and E-strings, backtick identifiers, unicode spaces), and
+    function calls are detected from its tokens (backtick and double-quoted names).
+
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left
   by an earlier `qod serve` captured the default: on a machine running `qod start` against its own
