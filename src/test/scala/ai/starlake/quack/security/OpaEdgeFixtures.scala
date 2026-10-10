@@ -17,8 +17,6 @@ import com.github.tomakehurst.wiremock.matching.RequestPatternBuilder
 import org.apache.arrow.flight.sql.FlightSqlClient
 import org.apache.arrow.flight.sql.impl.FlightSql
 import org.apache.arrow.flight.{FlightCallHeaders, HeaderCallOption, Ticket}
-import org.apache.arrow.vector.ipc.ArrowReader
-import org.duckdb.{DuckDBConnection, DuckDBResultSet}
 
 import java.sql.DriverManager
 import java.util.Base64
@@ -199,12 +197,12 @@ object OpaEdgeFixtures:
     * in the result rows the client receives.
     */
   def duckNode(setup: String): String => QuackResponse = sql =>
-    val conn  = DriverManager.getConnection("jdbc:duckdb:").asInstanceOf[DuckDBConnection]
+    val conn  = DriverManager.getConnection("jdbc:duckdb:")
     val stmt  = conn.createStatement()
     val parts = (setup.split(";") ++ sql.split(";")).map(_.trim).filter(_.nonEmpty).toList
     parts.init.foreach(stmt.execute)
-    val rs     = stmt.executeQuery(parts.last).asInstanceOf[DuckDBResultSet]
-    val reader = rs.arrowExportStream(TestArrow.sharedAllocator, 1024L).asInstanceOf[ArrowReader]
+    val rs     = stmt.executeQuery(parts.last)
+    val reader = TestArrow.fromResultSet(conn, rs)
     QuackResponse.Ok(reader, 1L, () => ())
 
   /** `orders(id, email)` with two rows, shared by the Flight specs. */
