@@ -1,6 +1,6 @@
 package ai.starlake.acl.parser
 
-import ai.starlake.acl.model.{Config, TableRef}
+import ai.starlake.acl.model.{Config, DenyReason, TableRef}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -352,4 +352,16 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
     val e = extracted("WITH w AS (SELECT * FROM db.main.t) SELECT * FROM w")
     e.unsupported shouldBe empty
     e.accesses.map(_.table) should contain(TableRef("db", "main", "t"))
+  }
+
+  test("a four-part (nested schema) name is a qualification error, never a three-part ref") {
+    val e = extracted("SELECT * FROM db.finance.reports.r")
+    e.qualificationErrors should contain(DenyReason.NestedSchemaRef("db.finance.reports.r"))
+    e.accesses.map(_.table) should not contain TableRef("finance", "reports", "r")
+  }
+
+  test("a four-part DML target is a qualification error too") {
+    extracted("INSERT INTO db.finance.reports.r VALUES (1)").qualificationErrors should contain(
+      DenyReason.NestedSchemaRef("db.finance.reports.r")
+    )
   }

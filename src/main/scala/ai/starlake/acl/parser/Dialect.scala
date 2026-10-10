@@ -72,12 +72,17 @@ private[parser] object DuckDBDialectMapper extends DialectMapper:
     val tableName  = table.getUnquotedName
     val schemaName = Option(table.getUnquotedSchemaName)
     val dbName     = Option(table.getUnquotedDatabaseName)
-    (dbName, schemaName) match
-      case (None, Some(head))
-          if config.normalizedAttachedCatalogs.contains(head.toLowerCase(Locale.ROOT)) =>
-        Left(DenyReason.AmbiguousCatalogRef(s"$head.$tableName", head))
-      case _ =>
-        AnsiDialectMapper.toTableRef(table, config)
+    // JSqlParser 5.4 leaves `getDatabase.getServer` null for a four-part name (the extra part only
+    // shows in the name-part list), so count the parts instead.
+    val hasServerPart = table.getNameParts.size > 3
+    if hasServerPart then Left(DenyReason.NestedSchemaRef(table.getFullyQualifiedName))
+    else
+      (dbName, schemaName) match
+        case (None, Some(head))
+            if config.normalizedAttachedCatalogs.contains(head.toLowerCase(Locale.ROOT)) =>
+          Left(DenyReason.AmbiguousCatalogRef(s"$head.$tableName", head))
+        case _ =>
+          AnsiDialectMapper.toTableRef(table, config)
 
   /** Check whether a JSqlParser Table represents a string-literal file reference. The caller should
     * use this to filter before calling toTableRef.

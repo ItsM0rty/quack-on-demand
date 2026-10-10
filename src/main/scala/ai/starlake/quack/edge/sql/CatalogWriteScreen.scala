@@ -274,6 +274,8 @@ object CatalogWriteScreen extends LazyLogging:
         s"qualify fully as '$catalog.<schema>.<table>'"
     case DenyReason.UnqualifiedTable(tableName, missingPart) =>
       s"unqualified table '$tableName' (missing $missingPart)"
+    case DenyReason.NestedSchemaRef(tableName) =>
+      s"four-part name '$tableName': nested schemas are not grantable"
     case DenyReason.ParseError(message) => message
 
   /** First segment of a canonical `db.schema.table` ref, already lowercased by the parser. */
