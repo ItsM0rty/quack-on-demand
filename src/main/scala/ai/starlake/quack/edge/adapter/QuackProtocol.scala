@@ -102,7 +102,7 @@ final class QuackProtocol(
       guard()
       // Inside the IO too: a malformed endpoint fails the IO rather than throwing at call time.
       val url     = QuackProtocol.endpointToHttp(endpoint)
-      val reqBody = QuackNativeBridge.serializeConnectionRequest(token)
+      val reqBody = QuackNativeBridge.serializeConnectionRequest(token, 30L)
       transport.post(url, reqBody).map { respBytes =>
         val wireOrdinal = QuackNativeBridge.parseMessageType(respBytes)
         MessageType.fromWireOrdinal(wireOrdinal) match
@@ -199,8 +199,11 @@ final class Connection private[adapter] (
           // Materialising the IO with the caller-supplied runtime
           // keeps the reader implementation free of cats-effect
           // imports and free of any global-runtime assumption.
-          val fetchSync: () => Array[Byte] = () => fetch(resultUuid).unsafeRunSync()
-          val closeSync: () => Unit        = () => close().unsafeRunSync()
+          // Quack v3 FETCHes name their batch: 1, 2, ... in order, one per call.
+          val nextBatch                    = java.util.concurrent.atomic.AtomicLong(0L)
+          val fetchSync: () => Array[Byte] =
+            () => fetch(resultUuid, nextBatch.incrementAndGet()).unsafeRunSync()
+          val closeSync: () => Unit = () => close().unsafeRunSync()
           new ChainedQuackArrowReader(
             allocator,
             initial,
@@ -246,8 +249,11 @@ final class Connection private[adapter] (
   /** Internal hook used by [[ChainedQuackArrowReader]] to fire the next FETCH_REQUEST.
     * Public-package-private because the reader is in the same package.
     */
-  private[adapter] def fetch(resultUuid: java.math.BigInteger): IO[Array[Byte]] =
-    transport.post(url, QuackNativeBridge.serializeFetchRequest(connectionId, resultUuid))
+  private[adapter] def fetch(resultUuid: java.math.BigInteger, batchIndex: Long): IO[Array[Byte]] =
+    transport.post(
+      url,
+      QuackNativeBridge.serializeFetchRequest(connectionId, resultUuid, batchIndex)
+    )
 
 /** Lazy chained [[ArrowReader]] that pulls batches from the initial PREPARE_RESPONSE reader, then
   * issues FETCH_REQUEST/FETCH_RESPONSE round-trips until the server signals end-of-stream (empty

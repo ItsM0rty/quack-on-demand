@@ -29,9 +29,10 @@ enum MessageType(val wireOrdinal: Int):
   case PrepareResponse    extends MessageType(4)
   case FetchRequest       extends MessageType(7)
   case FetchResponse      extends MessageType(8)
-  case AppendRequest      extends MessageType(9)
+  case SendDataRequest    extends MessageType(9)
   case SuccessResponse    extends MessageType(10)
   case DisconnectMessage  extends MessageType(11)
+  case HeartbeatRequest   extends MessageType(16)
   case ErrorResponse      extends MessageType(100)
 
 object MessageType:

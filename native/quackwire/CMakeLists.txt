@@ -24,22 +24,11 @@ target_sources(quackwire PRIVATE
   ${DUCKDB_QUACK_DIR}/src/quack_uri.cpp
 )
 
-# Order matters: include/shim/ comes first so quack_message.cpp's
-# `#include "quack_server.hpp"` resolves to our minimal stub (which only
-# forward-declares QuackServer::QUACK_VERSION) instead of the upstream
-# header that transitively drags in httplib.hpp. The BEFORE keyword
-# guarantees this entry stays at the very front of the include search
-# path, even if a later `target_include_directories` call appends paths
-# under the duckdb-quack tree.
-target_include_directories(quackwire BEFORE PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/shim
-)
 target_include_directories(quackwire PRIVATE
   ${DUCKDB_QUACK_DIR}/src/include
 )
 
-# libduckdb v1.5.6 link target (duckdb-quack pin: 7e80f7ffcc98, branch
-# v1.5-variegata).
+# libduckdb 2.0.0 link target (duckdb-quack pin: 974927a, Quack protocol v3).
 #
 # CI assembles DUCKDB_HOME from the official v1.5.6 release zips on ALL
 # platforms (see .github/workflows/quackwire.yml). The system-package hints

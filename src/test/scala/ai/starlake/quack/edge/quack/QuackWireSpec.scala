@@ -151,7 +151,7 @@ class QuackWireSpec extends AnyFlatSpec with Matchers:
     isTerminalFetch(fetchGen3More) shouldBe false
 
   "native cross-check" should "decode what libquackwire serializes" in:
-    val c = frame(QuackNativeBridge.serializeConnectionRequest("tok")).toOption.get
+    val c = frame(QuackNativeBridge.serializeConnectionRequest("tok", 30L)).toOption.get
     decodeConnectionRequest(c).toOption.get.authString shouldBe "tok"
     val p = frame(QuackNativeBridge.serializePrepareRequest("C", "SELECT 1")).toOption.get
     p.header.connectionId shouldBe "C"

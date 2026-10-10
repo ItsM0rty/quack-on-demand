@@ -9,8 +9,11 @@ object QuackNativeBridge:
 
   /** Serializes a `CONNECTION_REQUEST` message with the supplied auth token. The returned bytes are
     * the binary `QuackMessage` ready to POST to a Quack node's `/quack` endpoint.
+    *
+    * `heartbeatTimeoutSec` (Quack v3) is the connection lease the node grants: every request renews
+    * it, and once it lapses the node interrupts the running statement.
     */
-  @native def serializeConnectionRequest(token: String): Array[Byte]
+  @native def serializeConnectionRequest(token: String, heartbeatTimeoutSec: Long): Array[Byte]
 
   /** Serializes a `PREPARE_REQUEST` message binding `sql` to an existing connection identified by
     * `connectionId`.
@@ -23,11 +26,18 @@ object QuackNativeBridge:
     * `resultUuid` is the 128-bit identifier threaded through from the `PREPARE_RESPONSE`; pass it
     * as a `java.math.BigInteger` so the JNI layer can unpack it into the native
     * `hugeint_t {upper:int64, lower:uint64}` pair without sign-mangling on the boundary.
+    *
+    * `batchIndex` (Quack v3) is the 1-based index of the batch asked for, counted after the batches
+    * the PREPARE_RESPONSE carried inline; the request also acks every batch before it.
     */
   @native def serializeFetchRequest(
       connectionId: String,
-      resultUuid: java.math.BigInteger
+      resultUuid: java.math.BigInteger,
+      batchIndex: Long
   ): Array[Byte]
+
+  /** Serializes a `HEARTBEAT_REQUEST` that renews the connection's lease (Quack v3). */
+  @native def serializeHeartbeat(connectionId: String): Array[Byte]
 
   /** Serializes a `DISCONNECT_MESSAGE` that releases server-side state for the supplied connection.
     */
