@@ -32,6 +32,8 @@
   - The edge's comment stripper, statement splitter and classifier share one lexer ported from
     DuckDB 2.0's tokenizer (dollar and E-strings, backtick identifiers, unicode spaces), and
     function calls are detected from its tokens (backtick and double-quoted names).
+  - The edge screens lex the SQL before folding case (dollar-quote tags are case-sensitive in
+    DuckDB), and the catalog write screen classifies the original statement text.
 
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left

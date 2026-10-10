@@ -33,7 +33,8 @@ bundled automatically whenever `libquackwire/binaries/windows-x86_64/quackwire.d
 exists in the checkout; without it (or on Windows ARM64, where the dll is
 x86_64-only) `QuackNativeSupport.effectiveNativeClient` probes the jar at boot
 and falls back to the embedded client with a WARN, so no env flag is needed --
-`QOD_NATIVE_CLIENT=false` only forces that path.
+`QOD_NATIVE_CLIENT=false` only forces that path. On the DuckDB 2.0 pre-release the embedded client
+does not work (its JDBC disables Arrow export), so Windows ARM64 has no working path until 2.0.0.
 
 **DuckDB 2.0 pre-release toolchain.** Until DuckDB v2.0.0 is released, the engine and JDBC are built from source with `scripts/dev/build-duckdb-prerelease.sh` (engine `b15358c371`, JDBC `2.0.0.0-pre-b15358c` installed into `~/.m2`). Run it once before `sbt compile` on a fresh machine.
 
@@ -395,6 +396,6 @@ Two security-critical knobs should be pinned before any non-localhost deploy: `Q
 - **Don't disable JVM forking** in build.sbt - see "JVM forking" above.
 - **Don't invoke `scripts/spawn-quack-node.sh` directly** - it's spawned by `LocalQuackBackend` with the right port + token + env contract. Manual invocation will leak ports and confuse the supervisor.
 - **Refresh the bundled copies whenever you touch `scripts/` or the operator skill.** The CLI wheel ships its own copies at `cli/src/qod_cli/scripts/spawn-quack-node.{sh,ps1}` and `cli/src/qod_cli/skills/quack-on-demand/SKILL.md`. Nothing generates them: a plain `cp` is the mechanism, and `cli/tests/test_demo.py` / `test_skill_freshness.py` are the only enforcement. Editing a canonical script without refreshing its copy fails those tests in a way that reads like an unrelated pre-existing failure.
-- **SQL fed to the DuckDB CLI holds one statement per line.** The CLI splits and reads its input line by line, so a statement spread over several lines or two statements on one line are misread. Keep each statement on a single line.
+- **Never put two statements on one line of SQL fed to the DuckDB CLI.** When a statement fails, the CLI skips the rest of that line, so a failing `INSTALL` would silently skip the `LOAD` after it. A single statement may span several lines (the spawn script spreads one ATTACH over two).
 - **Don't edit the bundled `application.conf` for local tweaks** - set the `QOD_*` env var instead, or the change vanishes on the next `sbt assembly`.
 - **Always tear the manager down with `scripts/stop-jar.sh`, never an IDE/JVM kill** (or a bare `kill` of the java PID). The spawn script keeps each DuckDB node alive via a held-open FIFO/stdin, so an unclean manager exit orphans the `duckdb` grandchildren (reparented to PID 1) and they keep holding node ports `21900+`. The next manager then spawns onto an occupied port, its node never passes the `SELECT 1` health probe, and it shows `healthy=false` / `served=0`. Recovery: kill the orphans (blunt reset: `scripts/kill-quack-nodes.sh`), then `POST /api/node/restart` (or scale the pool) so the node re-binds a free port. `stop-jar.sh` does SIGTERM -> wait -> SIGKILL and reaps the children, so it never leaves orphans. Ctrl-C on a foreground `run-jar.sh` (or `qod start`) is safe: both supervise the JVM in its own process group and turn the interrupt into that same teardown.
