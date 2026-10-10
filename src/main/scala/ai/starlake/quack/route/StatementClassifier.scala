@@ -120,9 +120,10 @@ final class StatementClassifier(
       case Some("WITH") if cfg.select.contains("WITH") =>
         // DuckDB 2.0 allows DML inside a CTE body (WITH w AS (DELETE ... RETURNING *) SELECT ...),
         // so the verb after the list alone would misroute it as a read.
-        if cteBodyStartsWithDml(sql) then StatementKind.Dml
+        val toks = wordTokens(sql)
+        if hasDmlKeyword(toks) then StatementKind.Dml
         else
-          verbAfterWithClause(sql) match
+          verbAfterWithClause(toks) match
             case Some(tok) =>
               kindOf(tok) match
                 case StatementKind.Other => StatementKind.Select // unknown verb: legacy bucket
@@ -160,119 +161,115 @@ final class StatementClassifier(
     val tok = SqlTrivia.firstToken(sql).takeWhile(_ != ';').dropWhile(_ == '(')
     Option.when(tok.nonEmpty)(tok)
 
-  /** The first depth-0 keyword token after the leading WITH's CTE list, uppercased: the statement's
-    * real verb. The scan is quote-aware (single-quoted literals with '' doubling and backslash
-    * escapes in e'...' strings, double-quoted identifiers with "" doubling, dollar-quoted
-    * $tag$...$tag$ strings) so parens or verbs inside a CTE body's literals cannot desync it. CTE
-    * names, AS, RECURSIVE, MATERIALIZED and column lists are all either non-keyword words or
-    * parenthesized groups, so the first token that matches a configured bucket IS the verb
-    * (reserved words cannot be unquoted CTE names). None when the scan runs out, which the caller
-    * maps to the legacy select bucket.
+  /** The first keyword token at the leading WITH's depth after its CTE list, uppercased: the
+    * statement's real verb. Read through [[wordTokens]], so parens or verbs inside a CTE body's
+    * literals cannot desync it. CTE names, AS, RECURSIVE, MATERIALIZED and column lists are all
+    * either non-keyword words or parenthesized groups, so the first token that matches a configured
+    * bucket IS the verb (reserved words cannot be unquoted CTE names). None when the scan runs out,
+    * which the caller maps to the legacy select bucket.
     */
-  private def verbAfterWithClause(sql: String): Option[String] =
-    val s = sql.trim
-    val n = s.length
-    // start just past the leading WITH token
-    var i = 0
-    while i < n && !s(i).isWhitespace do i += 1
-    def isWordChar(c: Char) = c.isLetterOrDigit || c == '_'
-    def skipSingle(from: Int, eString: Boolean): Int =
-      // from points at the opening quote; returns index just past the closing quote
-      var p = from + 1
-      while p < n do
-        if eString && s(p) == '\\' then p += 2
-        else if s(p) == '\'' then
-          if p + 1 < n && s(p + 1) == '\'' then p += 2
-          else return p + 1
-        else p += 1
-      n
-    def skipDouble(from: Int): Int =
-      var p = from + 1
-      while p < n do
-        if s(p) == '"' then
-          if p + 1 < n && s(p + 1) == '"' then p += 2
-          else return p + 1
-        else p += 1
-      n
-    def skipDollar(from: Int): Int =
-      // from points at the opening '$'; the tag runs to the next '$'
-      var t = from + 1
-      while t < n && isWordChar(s(t)) do t += 1
-      if t >= n || s(t) != '$' then from + 1 // lone '$': not a dollar-quote, step over it
-      else
-        val tag   = s.substring(from, t + 1)
-        val close = s.indexOf(tag, t + 1)
-        if close < 0 then n else close + tag.length
-    var depth = 0
-    while i < n do
-      val c = s(i)
-      if c == '\'' then
-        val ePrefixed = i > 0 && (s(i - 1) == 'e' || s(i - 1) == 'E') &&
-          (i < 2 || !isWordChar(s(i - 2)))
-        i = skipSingle(i, ePrefixed)
-      else if c == '"' then i = skipDouble(i)
-      else if c == '$' then i = skipDollar(i)
-      else if c == '(' then
-        depth += 1; i += 1
-      else if c == ')' then
-        depth -= 1; i += 1
-      else if depth == 0 && isWordChar(c) then
-        var w = i
-        while w < n && isWordChar(s(w)) do w += 1
-        val word = s.substring(i, w).toUpperCase(Locale.ROOT)
-        if kindOf(word) != StatementKind.Other then return Some(word)
-        i = w
-      else i += 1
-    None
+  private def verbAfterWithClause(toks: Vector[StatementClassifier.WordToken]): Option[String] =
+    // depth relative to the leading WITH, which a parenthesized statement opens at depth 1
+    toks.headOption.flatMap(w =>
+      toks.iterator
+        .drop(1)
+        .find(t => t.depth == w.depth && kindOf(t.upper) != StatementKind.Other)
+        .map(_.upper)
+    )
 
-  /** True when any parenthesized group of the statement starts with a DML verb, i.e. a
-    * data-modifying CTE (`WITH w AS (DELETE ... RETURNING *) SELECT ...`, DuckDB 2.0). Literals,
-    * quoted identifiers and dollar-quoted strings are skipped, so a DML word inside them does not
-    * count. A false positive (a column literally named `copy` as a group's first word) only routes
-    * a read to a writer, which is safe.
+  /** True when any word of a WITH statement, outside literals and quoted identifiers and at any
+    * paren depth, is a configured DML keyword: a data-modifying CTE (DuckDB 2.0,
+    * `WITH w AS (DELETE ... RETURNING *) SELECT ...`), including one behind a CTE body's own nested
+    * WITH, is a write whatever verb follows the CTE list. Deliberately fail closed: it does not try
+    * to tell a CTE body's verb from the same word used elsewhere, so a read that carries a DML
+    * keyword as a bare word (a column named `copy`, `update` or `delete`, say) is a false positive.
+    * A false positive is not free: the read routes to a writer, is author-stamped, switches prepare
+    * to SkipExecute and is refused for a branch-only token on a main pool. The one carve-out is
+    * `REPLACE` immediately followed (after optional whitespace) by `(`, which is DuckDB's string
+    * function (and the `SELECT * REPLACE (...)` star modifier), not a write verb. `COPY (SELECT
+    * ...) TO ...` still counts.
     */
-  private def cteBodyStartsWithDml(sql: String): Boolean =
-    val s                                   = sql.trim
-    val n                                   = s.length
-    def isWordChar(c: Char)                 = c.isLetterOrDigit || c == '_'
-    def skipQuoted(from: Int, q: Char): Int =
+  private def hasDmlKeyword(toks: Vector[StatementClassifier.WordToken]): Boolean =
+    toks.exists(t => cfg.dml.contains(t.upper) && !(t.upper == "REPLACE" && t.beforeParen))
+
+  /** The word tokens of `sql` (already comment-stripped and normalized) outside every literal and
+    * quoted identifier, uppercased, each with its paren depth and whether the next non-blank
+    * character is `(`. The ONE quote-aware reader of this class; a sibling scanner with its own
+    * quote rules is how a literal that one reader honours and another does not hides a verb.
+    *
+    *   - `'...'` with `''` doubling;
+    *   - `E'...'` / `e'...'` (the prefix being a whole word, i.e. not preceded by a word character)
+    *     additionally with backslash escapes, so `E'\''` does not close early;
+    *   - `"..."` identifiers with `""` doubling;
+    *   - `$tag$...$tag$` (the tag empty or starting with a letter or `_`) only when the `$` starts
+    *     a token: a word consumes `$` as an identifier character the way DuckDB's lexer does, so
+    *     `a$q$` is one identifier, never an opener.
+    *
+    * An unterminated literal runs to the end of the statement (DuckDB rejects the statement).
+    */
+  private def wordTokens(sql: String): Vector[StatementClassifier.WordToken] =
+    val s                   = sql.trim
+    val n                   = s.length
+    def isWordChar(c: Char) = c.isLetterOrDigit || c == '_'
+    // from points at the opening quote; returns the index just past the closing one
+    def skipQuoted(from: Int, q: Char, backslash: Boolean): Int =
       var p    = from + 1
       var done = false
       while p < n && !done do
-        if s(p) == q then
+        if backslash && s(p) == '\\' then p += 2
+        else if s(p) == q then
           if p + 1 < n && s(p + 1) == q then p += 2
           else
             p += 1
             done = true
         else p += 1
-      p
+      math.min(p, n)
+    // from points at a token-initial '$'; a lone '$' (or `$1`) is stepped over
     def skipDollar(from: Int): Int =
       var t = from + 1
-      while t < n && isWordChar(s(t)) do t += 1
+      if t < n && (s(t).isLetter || s(t) == '_') then while t < n && isWordChar(s(t)) do t += 1
       if t >= n || s(t) != '$' then from + 1
       else
         val tag   = s.substring(from, t + 1)
         val close = s.indexOf(tag, t + 1)
         if close < 0 then n else close + tag.length
-    def firstWordAfter(open: Int): String =
-      var p = open + 1
-      while p < n && (s(p).isWhitespace || s(p) == '(') do p += 1
-      var w = p
-      while w < n && isWordChar(s(w)) do w += 1
-      s.substring(p, w).toUpperCase(Locale.ROOT)
+    val out   = Vector.newBuilder[StatementClassifier.WordToken]
+    var depth = 0
     var i     = 0
-    var found = false
-    while i < n && !found do
+    while i < n do
       val c = s(i)
-      if c == '\'' || c == '"' then i = skipQuoted(i, c)
+      if c == '\'' then i = skipQuoted(i, '\'', backslash = false)
+      else if c == '"' then i = skipQuoted(i, '"', backslash = false)
       else if c == '$' then i = skipDollar(i)
       else if c == '(' then
-        if cfg.dml.contains(firstWordAfter(i)) then found = true
+        depth += 1
         i += 1
+      else if c == ')' then
+        depth -= 1
+        i += 1
+      else if isWordChar(c) then
+        var w = i
+        while w < n && (isWordChar(s(w)) || s(w) == '$') do w += 1
+        if w - i == 1 && (c == 'e' || c == 'E') && w < n && s(w) == '\'' then
+          i = skipQuoted(w, '\'', backslash = true)
+        else
+          var p = w
+          while p < n && s(p).isWhitespace do p += 1
+          out += StatementClassifier.WordToken(
+            s.substring(i, w).toUpperCase(Locale.ROOT),
+            depth,
+            p < n && s(p) == '('
+          )
+          i = w
       else i += 1
-    found
+    out.result()
 
 object StatementClassifier:
+
+  /** One word of a statement outside literals: uppercased text, paren depth, and whether the next
+    * non-blank character is `(`.
+    */
+  private final case class WordToken(upper: String, depth: Int, beforeParen: Boolean)
 
   /** Default classifier instance backed by [[StatementClassifierConfig.Defaults]]. Used by tests
     * and by call sites that haven't been threaded with a config-driven instance.

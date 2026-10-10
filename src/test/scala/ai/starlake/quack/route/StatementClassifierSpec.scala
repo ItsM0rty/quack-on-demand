@@ -506,7 +506,7 @@ class StatementClassifierSpec extends AnyFlatSpec with Matchers:
     finally src.close()
   }
 
-  it should "classify a CTE whose body is INSERT/UPDATE/DELETE/MERGE as DML (DuckDB 2.0)" in:
+  it should "classify a CTE whose body is INSERT/UPDATE/DELETE as DML (DuckDB 2.0)" in:
     StatementClassifier.classify(
       "WITH w AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM w"
     ) shouldBe StatementKind.Dml
@@ -526,4 +526,45 @@ class StatementClassifierSpec extends AnyFlatSpec with Matchers:
     ) shouldBe StatementKind.Select
     StatementClassifier.classify(
       "WITH w AS (SELECT * FROM (SELECT update_ts FROM t) x) SELECT * FROM w"
+    ) shouldBe StatementKind.Select
+
+  // ---- Task 3 review: the DML-CTE check must share the quote-aware reader and fail closed ----
+  //
+  // Each Dml case below deletes both rows of `t` on a real DuckDB 2.0 (v2.0.0-alpha b15358c) yet
+  // classified as Select before the fix, routing a write to a reader and past ProtectedWriteGuard.
+
+  it should "honour backslash escapes in an E-string ahead of a DML CTE (C1)" in:
+    StatementClassifier.classify(
+      "WITH a AS (SELECT E'\\'' AS x), w AS (DELETE FROM t RETURNING *) SELECT * FROM w"
+    ) shouldBe StatementKind.Dml
+
+  it should "see a DML verb behind a CTE body's own nested WITH (C2)" in:
+    StatementClassifier.classify(
+      "WITH w AS (WITH x AS (SELECT 1) DELETE FROM t RETURNING *) SELECT * FROM w"
+    ) shouldBe StatementKind.Dml
+
+  it should "not read a dollar sign inside an identifier as a dollar-quote opener (C3)" in:
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1 AS a$q$), w AS (DELETE FROM t RETURNING *) SELECT 1 AS b$q$ FROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1 AS a$q$) INSERT INTO t SELECT 1 AS b$q$"
+    ) shouldBe StatementKind.Dml
+
+  it should "classify a CTE whose body is COPY ... TO as DML" in:
+    StatementClassifier.classify(
+      "WITH w AS (COPY (SELECT 1) TO '/tmp/x.csv') SELECT 1"
+    ) shouldBe StatementKind.Dml
+
+  it should "treat REPLACE( as the string function, not a write (I1)" in:
+    StatementClassifier.classify(
+      "WITH w AS (SELECT (replace(s,'a','b')) AS r FROM t) SELECT * FROM w"
+    ) shouldBe StatementKind.Select
+
+  it should "not count a DML word inside a dollar-quoted or E-string literal" in:
+    StatementClassifier.classify(
+      "WITH w AS (SELECT $$DELETE FROM t$$ AS s) SELECT * FROM w"
+    ) shouldBe StatementKind.Select
+    StatementClassifier.classify(
+      "WITH w AS (SELECT E'DELETE \\' FROM t' AS s) SELECT * FROM w"
     ) shouldBe StatementKind.Select
