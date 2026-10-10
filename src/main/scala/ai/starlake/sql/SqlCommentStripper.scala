@@ -87,6 +87,43 @@ object SqlCommentStripper:
 
       removeEmptyLines(result.toString())
 
+  /** The input split into its top-level statements, at every `;` DuckDB's lexer would treat as a
+    * separator and at no other. Built on the same scanners as [[stripComments]], so a `;` inside
+    * any of the four quoting forms or inside a (nested) comment never splits, and a quote that sits
+    * inside another quoting form never opens a string that would swallow a real separator:
+    * `SELECT $$'$$; USE x; SELECT 1` and `SELECT e'\''; USE x; SELECT 1` are three statements on
+    * DuckDB, and a tracker that only knows plain `'...'` strings reads each as one.
+    *
+    * Each fragment is the ORIGINAL text, comments and quoting intact. A fragment holding nothing
+    * but whitespace, trivia and comments is dropped, since DuckDB runs nothing for it, so `USE x;`
+    * and `USE x; -- done` are both one statement.
+    */
+  def splitStatements(sql: String): List[String] =
+    if sql == null || sql.isEmpty then Nil
+    else
+      val out    = List.newBuilder[String]
+      val length = sql.length
+      var start  = 0
+      var i      = 0
+      while i < length do
+        val c = sql.charAt(i)
+        if c == '/' && i + 1 < length && sql.charAt(i + 1) == '*' then i = blockCommentEnd(sql, i)
+        // Lands ON the terminator, which the next pass reads as an ordinary character.
+        else if c == '-' && i + 1 < length && sql.charAt(i + 1) == '-' then
+          i = lineCommentEnd(sql, i)
+        else if c == '\'' then i = singleQuotedEnd(sql, i, isEscapeStringOpener(sql, i))
+        else if c == '"' then i = doubleQuotedEnd(sql, i)
+        else if c == ';' then
+          out += sql.substring(start, i)
+          i += 1
+          start = i
+        else if c == '$' then i = dollarQuotedEnd(sql, i).getOrElse(i + 1)
+        else i += 1
+      out += sql.substring(start)
+      out
+        .result()
+        .filter(f => SqlTrivia.normalize(stripComments(SqlTrivia.stripLeading(f))).trim.nonEmpty)
+
   /** Index just past the marker closing the block comment that opens at `from`, tracking nesting
     * depth the way DuckDB's lexer does. An unterminated comment consumes the rest of the input --
     * DuckDB rejects such a statement outright, so nothing executable is being hidden.

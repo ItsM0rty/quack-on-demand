@@ -31,7 +31,10 @@ import java.util.Locale
   *      catalog does NOT take this path. Note this path DOES trust the classifier's `select` /
   *      `begin` / `commit` / `rollback` buckets, which are as operator-tunable as any other bucket:
   *      an operator who moves a write verb into `select` disables the screen for that verb without
-  *      it ever reaching step 3.
+  *      it ever reaching step 3. A submission that does not take this cheap path and changes the
+  *      schema or search path (`USE`, `SET search_path`, `SET schema`; see `SessionScopeScreen`) is
+  *      denied outright: the parse below qualifies bare names against the pool's default schema,
+  *      which such a batch moves away from on the node.
   *   3. Otherwise the submission is parsed once with `SqlParser.extract`. `SqlParser.extract`
   *      itself has two shapes of failure, and the screen treats them differently:
   *      - If jsqlparser can split the submission into one node per statement, each result is judged
@@ -148,6 +151,16 @@ object CatalogWriteScreen extends LazyLogging:
         // Cheap path: no fragment of the batch is even shaped like a write, so nothing to parse.
         // An empty fragment list (blank submission) also lands here vacuously.
         None
+      else if SessionScopeScreen.find(sql).isDefined then
+        // The parse below qualifies bare names against `config`'s default schema, exactly like
+        // the ACL, so `USE ro.main; INSERT INTO t ...` would resolve `t` outside the read-only
+        // catalog here and inside it on the node. This screen is independent of grants (it
+        // binds superusers and ACL-off deployments too), so it refuses the batch itself.
+        val roList = readOnlyCatalogs.map(FederatedAlias.fold).toList.sorted.mkString(", ")
+        Some(
+          "a batch that changes the schema or search path cannot write while a catalog on this " +
+            s"pool is read-only ($roList); send USE / SET search_path as its own statement"
+        )
       else
         // `FederatedAlias.fold`, NOT `toLowerCase`: the other side of the `denied.contains` below
         // is `TableAccess.table.canonical`, which the ACL parser lowercased with `Locale.ROOT`.

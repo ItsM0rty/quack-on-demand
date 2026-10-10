@@ -47,9 +47,15 @@ object AccessGate:
   ): GateOutcome =
     // Ahead of every other arm, and never wildcard-coverable: the target of these calls is
     // a string the parser cannot see, so the wildcard's tenant-catalog scoping cannot apply.
+    // The same holds for a batch that moves the schema or search path: every bare name after
+    // it resolves somewhere `config` does not describe, possibly in a catalog outside the
+    // tenant's (see SessionScopeScreen).
     CatalogReachingCalls.find(statement) match
       case Some(fn) => GateOutcome.Refuse(CatalogReachingCalls.denyReason(fn), false, "")
-      case None     => evaluateParsed(statement, config, sessionCatalog, filteredMetadata)
+      case None     =>
+        SessionScopeScreen.find(statement) match
+          case Some(reason) => GateOutcome.Refuse(reason, false, "")
+          case None         => evaluateParsed(statement, config, sessionCatalog, filteredMetadata)
 
   private def evaluateParsed(
       statement: String,

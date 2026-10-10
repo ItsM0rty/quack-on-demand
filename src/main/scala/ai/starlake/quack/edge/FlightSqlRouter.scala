@@ -18,7 +18,7 @@ import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.telemetry.{AuditActions, AuditEvent, EventJournal, StatementEvent}
 import ai.starlake.quack.route.{PoolSnapshot, Router, RoutingDecision, StatementClassifier}
 import ai.starlake.quack.spi.{ManagerEvent, ManagerEventSink}
-import ai.starlake.sql.SqlTrivia
+import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
 
 import ai.starlake.quack.observability.metrics.StatementInstruments
 import cats.effect.IO
@@ -899,18 +899,26 @@ final class FlightSqlRouter(
     * session, where `schema` is the tenant-db's `defaultSchema` when set and its metastore
     * `schemaName` otherwise. It MUST differ from the catalog name (same-named catalog+schema is
     * ambiguous in DuckDB). The schema itself is pre-created by HealthProbe's first successful probe
-    * per node. Skipped for USE / SET / txn control / ATTACH / DETACH so the operator can escape the
-    * default.
+    * per node. Skipped for a LONE USE / SET / txn control / ATTACH / DETACH so the operator can
+    * escape the default.
+    *
+    * Never skipped for a multi-statement submission, whatever its first statement: the validator
+    * qualified every bare name in it against that schema, and a node connection the session keeps
+    * (a client transaction on the native front door, the embedded client's cached session) may
+    * still carry an earlier lone `USE` or `SET search_path`. `BEGIN; SELECT * FROM t` used to run
+    * there with no prelude and read whichever `t` that left current. Prepending is harmless for
+    * such a batch: whatever its own statements select still runs after the prelude.
     */
   private def wrapWithDefaultSchema(
       state: Option[ai.starlake.quack.ondemand.PoolState],
       sql: String
   ): String =
     val trimmed = sql.trim.toUpperCase(Locale.ROOT)
-    val skip    = trimmed.startsWith("USE ") || trimmed.startsWith("SET ") ||
+    val skip    = (trimmed.startsWith("USE ") || trimmed.startsWith("SET ") ||
       trimmed.startsWith("BEGIN") || trimmed.startsWith("COMMIT") ||
       trimmed.startsWith("ROLLBACK") || trimmed.startsWith("ATTACH") ||
-      trimmed.startsWith("DETACH")
+      trimmed.startsWith("DETACH")) &&
+      SqlCommentStripper.splitStatements(sql).lengthCompare(2) < 0
     // The alias is `catalogAlias` when set (branch catalogs attach under their parent's alias),
     // else `dbName`: see TenantDb.catalogAlias.
     state match

@@ -81,6 +81,8 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
            |CREATE TABLE acme_db.tpch1.customer AS SELECT range AS c_custkey, 'name' || range AS c_name FROM range(2000);
            |CREATE TABLE acme_db.tpch1.secret AS SELECT 1 AS x;
            |CREATE TABLE acme_db.tpch1.ids AS SELECT range AS id FROM range(60000);
+           |CREATE SCHEMA acme_db.other;
+           |CREATE TABLE acme_db.other.ids AS SELECT range AS id FROM range(7);
            |USE acme_db.tpch1;
            |CALL quack_serve('quack:127.0.0.1:$nodePort', token := '$nodeToken');
            |.shell sleep 600
@@ -256,6 +258,30 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
     router.history
       .snapshot(20)
       .exists(r => r.status == "denied" && r.sql.contains("secret")) shouldBe true
+
+  it should "refuse a schema change batched ahead of a bare table name" in:
+    assume(duckdbPresent, "duckdb CLI not on PATH")
+    // alice reads acme_db.tpch1.ids (60000 rows); acme_db.other.ids (7 rows) is not hers. Each
+    // batch runs after the router's `USE acme_db.tpch1` prelude, so before the fix the node read
+    // the 7-row table while the ACL had checked the granted one.
+    List(
+      "SET search_path=''acme_db.other''; SELECT count(*) FROM ids",
+      "SET schema=''other''; SELECT count(*) FROM ids",
+      "USE acme_db.other; SELECT count(*) FROM ids"
+    ).foreach { inner =>
+      val (rc, out, err) =
+        cli(s"SELECT * FROM quack_query('$endpoint', '$inner', token := '$Token');")
+      withClue(s"$inner -> rc=$rc out=$out err=$err") {
+        out should not be "7"
+        rc should not be 0
+        err should include("own statement")
+      }
+    }
+    // Sent on its own, the same SET is still accepted (and dies with the statement's connection).
+    val (rc, _, err) = cli(
+      s"SELECT * FROM quack_query('$endpoint', 'SET search_path=''acme_db.other''', token := '$Token');"
+    )
+    withClue(err)(rc shouldBe 0)
 
   it should "refuse a malformed token at connect time" in:
     assume(duckdbPresent, "duckdb CLI not on PATH")
