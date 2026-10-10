@@ -91,7 +91,8 @@ object LockdownScreen:
   private val FirstToken = "^\\s*([a-zA-Z_]+)".r
 
   // DuckDB 2.0 custom extension repositories: registering one is a code-loading path.
-  private val ExtensionRepositoryDdl = "^(?:create|drop)\\s+extension\\s+repository\\b".r
+  private val ExtensionRepositoryDdl =
+    "^(?:create(?:\\s+or\\s+replace)?|drop)\\s+extension\\s+repository\\b".r
 
   // A single-quoted literal immediately following the FROM keyword (replacement-scan position). The
   // negative lookbehind keeps `from` a standalone keyword, not the tail of an identifier. `\s*`

@@ -482,6 +482,10 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("CREATE EXTENSION REPOSITORY r WITH PREFIX 'https://x/'") shouldBe true
     denied("create  extension\nrepository r with prefix 'https://x/'") shouldBe true
     denied("DROP EXTENSION REPOSITORY r") shouldBe true
+    denied("CREATE OR REPLACE EXTENSION REPOSITORY r WITH PREFIX 'https://x/'") shouldBe true
+    denied("create or  replace\nextension repository r with prefix 'https://x/'") shouldBe true
+    denied("DROP EXTENSION REPOSITORY IF EXISTS r") shouldBe true
+    denied("CONNECT LOCAL") shouldBe true
     denied("SELECT 1; CONNECT 'quack:h:1'") shouldBe true
     denied("CREATE TABLE connections(a INT)") shouldBe false
     denied("SELECT * FROM connect_log") shouldBe false
