@@ -380,15 +380,29 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
     ) shouldBe Allow
   }
 
-  it should "allow a client-fed INSERT for a principal with policies" in {
+  private val ClientFedInsert =
+    "INSERT INTO tpch1.customer SELECT * FROM scan_data_from_quack_client(" +
+      "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(col0 BIGINT), ordered := true)"
+
+  it should "allow a client-fed INSERT from the native front door for a principal with policies" in {
     // the rows come from the client's own SEND_DATA stream: no protected table is read
     guardWithCls().check(
-      "INSERT INTO tpch1.customer SELECT * FROM scan_data_from_quack_client(" +
-        "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(col0 BIGINT), ordered := true)",
+      ClientFedInsert,
+      StatementKind.Dml,
+      eff(tenantUser, cols = List(maskEmail), rows = List(rowPolicy)),
+      ctx,
+      clientDataScans = true
+    ) shouldBe Allow
+  }
+
+  it should "deny the same client-fed INSERT when it did not arrive through the native front door" in {
+    // any other edge cannot feed the scan, so it stays an incomplete extraction there
+    guardWithCls().check(
+      ClientFedInsert,
       StatementKind.Dml,
       eff(tenantUser, cols = List(maskEmail), rows = List(rowPolicy)),
       ctx
-    ) shouldBe Allow
+    ) shouldBe a[Deny]
   }
 
   it should "still deny a client-fed INSERT that also reads a row-policy table" in {
@@ -398,7 +412,8 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
         "WHERE col0 IN (SELECT c_id FROM tpch1.customer)",
       StatementKind.Dml,
       eff(tenantUser, rows = List(rowPolicy)),
-      ctx
+      ctx,
+      clientDataScans = true
     ) shouldBe a[Deny]
   }
 
@@ -408,6 +423,7 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
         "NULL::STRUCT(col0 BIGINT), ordered := true)",
       StatementKind.Dml,
       eff(tenantUser, rows = List(rowPolicy)),
-      ctx
+      ctx,
+      clientDataScans = true
     ) shouldBe a[Deny]
   }

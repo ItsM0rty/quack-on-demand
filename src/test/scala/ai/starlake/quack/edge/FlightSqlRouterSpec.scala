@@ -2538,3 +2538,117 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         nbspOffenders shouldBe empty
       }
     finally src.close()
+
+  // ---- DuckDB 2.0 client data scans: admitted on the native front door only ----
+
+  private val ClientFedInsert =
+    "INSERT INTO orders SELECT * FROM scan_data_from_quack_client(" +
+      "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(a INTEGER), ordered := true)"
+
+  // A narrow writer: RW on memory.main.orders and nothing else.
+  private val ordersWriter = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+    tenantUser,
+    Nil,
+    Nil,
+    List(
+      ai.starlake.quack.ondemand.state
+        .RolePermission("p-1", "r-1", "memory", "main", "orders", "RW")
+    ),
+    Nil
+  )
+
+  private def okSend: FlightSqlRouter.NodeSend[String] =
+    (_, _, _, _) => IO.pure(NodeOutcome.Ok("count", 1L, () => ()))
+
+  it should "refuse a client-fed INSERT on the FlightSQL path (the scan would wait forever)" in:
+    val (router, _, _) =
+      setupWithRewriter(validator = new ai.starlake.quack.edge.sql.PostgresAclValidator())
+    router
+      .execute("cds-1", "alice", poolKey, ClientFedInsert, effectiveSet = Some(ordersWriter))
+      .unsafeRunSync() match
+      case Left(RouterFailure.AccessDenied(m)) => m should include("scan_data_from_quack_client")
+      case other                               => fail(s"expected AccessDenied, got $other")
+    // executeWith without the front door's flag refuses it too, whatever the audit source
+    router
+      .executeWith(
+        "cds-2",
+        "alice",
+        poolKey,
+        ClientFedInsert,
+        Some(ordersWriter),
+        okSend,
+        source = "quack"
+      )
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+
+  it should "admit the same client-fed INSERT, same principal and grants, from the front door" in:
+    val (router, _, _) =
+      setupWithRewriter(validator = new ai.starlake.quack.edge.sql.PostgresAclValidator())
+    router
+      .executeWith(
+        "cds-3",
+        "alice",
+        poolKey,
+        ClientFedInsert,
+        Some(ordersWriter),
+        okSend,
+        source = "quack",
+        clientDataScans = true
+      )
+      .unsafeRunSync()
+      .map(_.value) shouldBe Right("count")
+
+  it should "carry the client-data-scan flag into validation only when the caller sets it" in:
+    val capturer       = new CapturingValidator
+    val (router, _, _) = setupWithRewriter(validator = capturer)
+    router.execute("cds-4", "alice", poolKey, "SELECT 1").unsafeRunSync()
+    capturer.lastCtx.clientDataScans shouldBe false
+    router
+      .executeWith("cds-5", "alice", poolKey, "SELECT 1", None, okSend, source = "quack")
+      .unsafeRunSync()
+    capturer.lastCtx.clientDataScans shouldBe false
+    router
+      .executeWith(
+        "cds-6",
+        "alice",
+        poolKey,
+        "SELECT 1",
+        None,
+        okSend,
+        source = "quack",
+        clientDataScans = true
+      )
+      .unsafeRunSync()
+    capturer.lastCtx.clientDataScans shouldBe true
+
+  it should "let the protected-write guard admit a client-fed INSERT only from the front door" in:
+    val guard = new ai.starlake.quack.edge.policy.ProtectedWriteGuard(
+      new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+        Map(("memory", "main", "customer") -> List("c_id"))
+      ),
+      clsEnabled = true,
+      rlsEnabled = true
+    )
+    val withRowPolicy = ordersWriter.copy(rowPolicies =
+      List(
+        ai.starlake.quack.ondemand.state
+          .RoleRowPolicy("rp-1", "r-1", "*", "main", "customer", "1=1")
+      )
+    )
+    val (router, _, _) = setupWithRewriter(protectedWriteGuard = guard)
+    router
+      .executeWith("cds-7", "alice", poolKey, ClientFedInsert, Some(withRowPolicy), okSend)
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+    router
+      .executeWith(
+        "cds-8",
+        "alice",
+        poolKey,
+        ClientFedInsert,
+        Some(withRowPolicy),
+        okSend,
+        source = "quack",
+        clientDataScans = true
+      )
+      .unsafeRunSync()
+      .map(_.value) shouldBe Right("count")

@@ -119,7 +119,9 @@ class DuckDb20SyntaxSpec extends AnyFunSuite with Matchers:
       ClientScan.replace("ordered := true", "ordered := (SELECT true FROM secret)"),
       // qualified or quoted name
       "main." + ClientScan,
-      ClientScan.replace("scan_data_from_quack_client", "\"scan_data_from_quack_client\"")
+      ClientScan.replace("scan_data_from_quack_client", "\"scan_data_from_quack_client\""),
+      // a clause on the table function itself
+      ClientScan + " WITH ORDINALITY"
     )
     variants.foreach { v =>
       outcome(clientInsert(v)) match

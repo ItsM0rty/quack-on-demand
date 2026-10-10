@@ -217,7 +217,10 @@ final class QuackFrontDoor(
         prep.sql,
         Some(s.bound.effectiveSet),
         relaySend(s, cq, prep, reopenTx),
-        source = "quack"
+        source = "quack",
+        // The one edge that relays SEND_DATA on the statement's own node connection, so the
+        // one edge where a 2.0 client's scan_data_from_quack_client can ever be fed.
+        clientDataScans = true
       )
       .flatMap {
         case Left(fail)    => IO.pure(encodeError(fail.reason))

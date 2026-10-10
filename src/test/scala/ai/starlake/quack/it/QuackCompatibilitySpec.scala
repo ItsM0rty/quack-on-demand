@@ -58,12 +58,19 @@ import scala.sys.process.{Process, ProcessLogger}
 class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAfterAll:
 
   // -no-agent: under an AI agent (AI_AGENT / CLAUDECODE set) the 2.0 CLI switches its output format.
+  // Total: with no `duckdb` on PATH, starting the process throws (IOException "Cannot run program"),
+  // which must cancel every case rather than abort the suite.
   private val duckdbPresent: Boolean =
     val out = new StringBuilder
-    val rc  = Process(Seq("duckdb", "-no-agent", "-version"))
-      .!(ProcessLogger(l => out.append(l), _ => ()))
-    rc == 0 && out.toString.trim.startsWith("v2.")
-  private val uvPresent: Boolean = Process("which uv").!(ProcessLogger(_ => ())) == 0
+    scala.util
+      .Try(
+        Process(Seq("duckdb", "-no-agent", "-version"))
+          .!(ProcessLogger(l => out.append(l), _ => ()))
+      )
+      .toOption
+      .contains(0) && out.toString.trim.startsWith("v2.")
+  private val uvPresent: Boolean =
+    scala.util.Try(Process("which uv").!(ProcessLogger(_ => ()))).toOption.contains(0)
 
   private def freePort(): Int =
     val s = new ServerSocket(0)

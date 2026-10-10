@@ -290,6 +290,19 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     fx.journal.drainNow()
     fx.store.events.map(_.origin).toList shouldBe List("quack")
 
+  it should "validate its statements as able to feed a client data scan" in:
+    // The front door is the one edge that relays SEND_DATA, so it alone sets the flag that lets
+    // a DuckDB 2.0 client's scan_data_from_quack_client INSERT through the gate.
+    val seen      = ArrayBuffer.empty[Boolean]
+    val capturing = new StatementValidator:
+      def validate(ctx: ValidationContext): ValidationResult =
+        seen += ctx.clientDataScans
+        Allowed
+    val fx     = setup(validator = capturing)
+    val connId = connect(fx)
+    prepare(fx, connId, "SELECT 1")
+    seen.toList shouldBe List(true)
+
   it should "answer an unknown connection id like a node does" in:
     val fx = setup()
     errorText(prepare(fx, "NOPE", "SELECT 1")) shouldBe "Invalid connection id"

@@ -38,7 +38,14 @@ case class ValidationContext(
     // ADVISORY ONLY: the classifier looks at the first statement, so a multi-statement batch
     // may carry more than this says. The parsed table-access set (the `accesses` a validator
     // gates, each with its own verb) is authoritative; never authorize on this field alone.
-    statementClass: String = ""
+    statementClass: String = "",
+    // True only for a statement that arrived through the native Quack front door, the one edge
+    // that relays SEND_DATA on the client's own node connection. A DuckDB 2.0 client's INSERT
+    // reads its rows from scan_data_from_quack_client, which waits for that data: admitting it
+    // anywhere else would park the statement on the node forever. Set by the front door's call
+    // into `FlightSqlRouter.executeWith` and nowhere else; false keeps the scan refused as an
+    // unsupported construct (AccessGate, ProtectedWriteGuard).
+    clientDataScans: Boolean = false
 )
 
 sealed trait ValidationResult

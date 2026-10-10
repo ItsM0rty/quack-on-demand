@@ -51,7 +51,18 @@ final class ProtectedWriteGuard(
   private val oracle =
     new ColumnPolicyRewriter(catalog, unresolvedMode = UnresolvedMode.Deny, enabled = true)
 
-  def check(sql: String, kind: StatementKind, eff: EffectiveSet, ctx: SchemaContext): GuardOutcome =
+  /** `clientDataScans`: the statement came through the native Quack front door, so a DuckDB 2.0
+    * client's scan_data_from_quack_client source is set aside like AccessGate does
+    * ([[ai.starlake.quack.edge.sql.ValidationContext.clientDataScans]]). False denies it as an
+    * incomplete extraction.
+    */
+  def check(
+      sql: String,
+      kind: StatementKind,
+      eff: EffectiveSet,
+      ctx: SchemaContext,
+      clientDataScans: Boolean = false
+  ): GuardOutcome =
     val colPolicies = if clsEnabled then eff.columnPolicies else Nil
     val rowPolicies = if rlsEnabled then eff.rowPolicies else Nil
     if eff.user.tenant.isEmpty then Allow // superuser
@@ -62,14 +73,15 @@ final class ProtectedWriteGuard(
       CatalogReachingCalls.find(sql) match
         case Some(fn) => Deny(s"access denied: ${CatalogReachingCalls.denyReason(fn)}")
         case None if kind == StatementKind.Select => Allow
-        case None => checkWrite(sql, eff, ctx, colPolicies, rowPolicies)
+        case None => checkWrite(sql, eff, ctx, colPolicies, rowPolicies, clientDataScans)
 
   private def checkWrite(
       sql: String,
       eff: EffectiveSet,
       ctx: SchemaContext,
       colPolicies: List[ai.starlake.quack.ondemand.state.RoleColumnPolicy],
-      rowPolicies: List[ai.starlake.quack.ondemand.state.RoleRowPolicy]
+      rowPolicies: List[ai.starlake.quack.ondemand.state.RoleRowPolicy],
+      clientDataScans: Boolean
   ): GuardOutcome =
     val config  = Config.forDuckDB(ctx.defaultDatabase, ctx.defaultSchema, Set.empty)
     val results = SqlParser.extract(sql, config).statements
@@ -78,7 +90,7 @@ final class ProtectedWriteGuard(
     // we cannot isolate, so it denies.
     parseAsts(sql) match
       case Some(asts) if asts.size == results.size =>
-        evaluate(results.zip(asts), eff, ctx, colPolicies, rowPolicies)
+        evaluate(results.zip(asts), eff, ctx, colPolicies, rowPolicies, clientDataScans)
       case _ => Deny(IncompleteDeny)
 
   private def evaluate(
@@ -86,7 +98,8 @@ final class ProtectedWriteGuard(
       eff: EffectiveSet,
       ctx: SchemaContext,
       colPolicies: List[ai.starlake.quack.ondemand.state.RoleColumnPolicy],
-      rowPolicies: List[ai.starlake.quack.ondemand.state.RoleRowPolicy]
+      rowPolicies: List[ai.starlake.quack.ondemand.state.RoleRowPolicy],
+      clientDataScans: Boolean
   ): GuardOutcome =
     val rowKeys = rowPolicies.map(p => (p.catalogName, p.schemaName, p.tableName))
     val colKeys = colPolicies.map(p => (p.catalogName, p.schemaName, p.tableName))
@@ -98,7 +111,9 @@ final class ProtectedWriteGuard(
 
     // First statement that denies wins; Allow only when every statement is clean.
     val firstDeny = pairs.iterator
-      .map { case (result, ast) => evaluateOne(result, ast, eff, ctx, rowKeys, colKeys, covers) }
+      .map { case (result, ast) =>
+        evaluateOne(result, ast, eff, ctx, rowKeys, colKeys, covers, clientDataScans)
+      }
       .collectFirst { case d: Deny => d }
     firstDeny.getOrElse(Allow)
 
@@ -109,7 +124,8 @@ final class ProtectedWriteGuard(
       ctx: SchemaContext,
       rowKeys: List[(String, String, String)],
       colKeys: List[(String, String, String)],
-      covers: (List[(String, String, String)], TableRef) => Boolean
+      covers: (List[(String, String, String)], TableRef) => Boolean,
+      clientDataScans: Boolean
   ): GuardOutcome =
     result match
       case e: StatementResult.Extracted =>
@@ -119,7 +135,9 @@ final class ProtectedWriteGuard(
         val colHit = reads.exists(t => covers(colKeys, t))
         if rowHit then GuardOutcome.Deny(deny(firstCovered(reads, rowKeys)))
         else if colHit then preciseCls(ast, eff, ctx, firstCovered(reads, colKeys))
-        else if TableExtractor.gatedUnsupported(e.accesses, e.unsupported).nonEmpty ||
+        else if TableExtractor
+            .gatedUnsupported(e.accesses, e.unsupported, clientDataScans)
+            .nonEmpty ||
           e.qualificationErrors.nonEmpty
         then
           // Extraction is incomplete, so a protected read may be unaccounted for. Fail closed.

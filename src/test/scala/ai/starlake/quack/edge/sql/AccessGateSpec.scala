@@ -9,7 +9,10 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
 
   private val cfg = Config.forDuckDB(Some("tpch"), Some("main"), Set("tpch"))
 
-  private def eval(sql: String, fm: Boolean = false) = AccessGate.evaluate(sql, cfg, "tpch", fm)
+  // `frontDoor` = the statement arrived through the native Quack front door, the only edge that
+  // can feed a client data scan (SEND_DATA on the client's own connection).
+  private def eval(sql: String, fm: Boolean = false, frontDoor: Boolean = false) =
+    AccessGate.evaluate(sql, cfg, "tpch", fm, clientDataScans = frontDoor)
 
   "AccessGate" should "gate every table a join touches" in:
     eval("SELECT * FROM orders o JOIN lineitem l ON o.k = l.k") match
@@ -78,7 +81,7 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
 
   it should "refuse an ambiguous two-part name on an attached catalog as not wildcard-coverable" in:
     val attached = Config.forDuckDB(Some("tpch"), Some("main"), Set("tpch", "fedpg"))
-    AccessGate.evaluate("SELECT * FROM fedpg.orders", attached, "tpch", false) match
+    AccessGate.evaluate("SELECT * FROM fedpg.orders", attached, "tpch", false, false) match
       case GateOutcome.Refuse(_, false, _) => succeed
       case other                           => fail(other.toString)
 
@@ -102,14 +105,22 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
     eval("BEGIN TRANSACTION; DROP TABLE orders") shouldBe a[GateOutcome.Refuse]
 
   it should "gate a client-fed INSERT on its target only" in:
-    eval(s"INSERT INTO orders SELECT * FROM $ClientScan") match
+    eval(s"INSERT INTO orders SELECT * FROM $ClientScan", frontDoor = true) match
       case GateOutcome.Gated(g, _) =>
         g.map(a => a.table.table -> a.verb) shouldBe Set("orders" -> Verb.Write)
       case other => fail(other.toString)
 
+  it should "refuse a client-fed INSERT that did not arrive through the native front door" in:
+    // Only the front door relays SEND_DATA: on any other edge the scan waits for rows that can
+    // never come, so it stays an unsupported construct there.
+    eval(s"INSERT INTO orders SELECT * FROM $ClientScan") match
+      case GateOutcome.Refuse(msg, true, _) => msg should include("scan_data_from_quack_client")
+      case other                            => fail(other.toString)
+
   it should "keep gating every other read of a client-fed INSERT" in:
     eval(
-      s"INSERT INTO orders SELECT * FROM $ClientScan WHERE col0 IN (SELECT k FROM lineitem)"
+      s"INSERT INTO orders SELECT * FROM $ClientScan WHERE col0 IN (SELECT k FROM lineitem)",
+      frontDoor = true
     ) match
       case GateOutcome.Gated(g, _) =>
         g.map(a => a.table.table -> a.verb) shouldBe Set(
@@ -119,10 +130,12 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
       case other => fail(other.toString)
 
   it should "refuse a client data scan that is not the source of a write" in:
+    eval(s"SELECT * FROM $ClientScan", frontDoor = true) shouldBe a[GateOutcome.Refuse]
     eval(s"SELECT * FROM $ClientScan") shouldBe a[GateOutcome.Refuse]
 
   it should "refuse a malformed client data scan" in:
     eval(
       "INSERT INTO orders SELECT * FROM scan_data_from_quack_client('x', NULL::STRUCT(a INT), " +
-        "ordered := true)"
+        "ordered := true)",
+      frontDoor = true
     ) shouldBe a[GateOutcome.Refuse]

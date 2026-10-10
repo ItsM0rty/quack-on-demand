@@ -38,24 +38,30 @@ object AccessGate:
 
   /** `sessionCatalog` must be the same catalog `parserConfig` used as its default database, so the
     * filtered-metadata admit and the parser's qualification agree (see below).
+    *
+    * `clientDataScans` is [[ValidationContext.clientDataScans]]: true only for a statement from the
+    * native Quack front door. Required, so no caller can admit the scan by omission.
     */
   def evaluate(
       statement: String,
       config: Config,
       sessionCatalog: String,
-      filteredMetadata: Boolean
+      filteredMetadata: Boolean,
+      clientDataScans: Boolean
   ): GateOutcome =
     // Ahead of every other arm, and never wildcard-coverable: the target of these calls is
     // a string the parser cannot see, so the wildcard's tenant-catalog scoping cannot apply.
     CatalogReachingCalls.find(statement) match
       case Some(fn) => GateOutcome.Refuse(CatalogReachingCalls.denyReason(fn), false, "")
-      case None     => evaluateParsed(statement, config, sessionCatalog, filteredMetadata)
+      case None     =>
+        evaluateParsed(statement, config, sessionCatalog, filteredMetadata, clientDataScans)
 
   private def evaluateParsed(
       statement: String,
       config: Config,
       sessionCatalog: String,
-      filteredMetadata: Boolean
+      filteredMetadata: Boolean,
+      clientDataScans: Boolean
   ): GateOutcome =
     val extraction = SqlParser.extract(statement, config)
 
@@ -81,10 +87,12 @@ object AccessGate:
     // A DuckDB 2.0 client's INSERT through an attached catalog reads its rows from
     // scan_data_from_quack_client, which reads only what the same connection sends: as the
     // source of a write it is set aside here, the INSERT target staying a gated Write
-    // (TableExtractor.gatedUnsupported).
+    // (TableExtractor.gatedUnsupported). Only on the native front door, the one edge that
+    // relays SEND_DATA: from FlightSQL, MCP or `qod sql` nothing can feed the stream, the
+    // statement would park on the node forever, so the scan stays unsupported there.
     val allUnsupported = extraction.statements.collect {
       case StatementResult.Extracted(_, _, a, _, u) if u.nonEmpty =>
-        TableExtractor.gatedUnsupported(a, u)
+        TableExtractor.gatedUnsupported(a, u, clientDataScans)
     }.flatten
     val (catalogFunctions, unsupported) =
       if filteredMetadata then

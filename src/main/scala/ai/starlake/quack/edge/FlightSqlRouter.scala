@@ -415,6 +415,12 @@ final class FlightSqlRouter(
     * module event (`"flightsql"` or `"quack"`). `edge` is the OPA `client.edge` value used ONLY for
     * `ValidationContext.edge`; empty (the default) means "same as `source`" and is otherwise
     * independent of it (see `execute`'s scaladoc).
+    *
+    * `clientDataScans` is set by the native Quack front door alone, the one caller that relays
+    * SEND_DATA on the statement's node connection; it lets a DuckDB 2.0 client's
+    * scan_data_from_quack_client INSERT through the ACL gate and the protected-write guard
+    * (`ValidationContext.clientDataScans`). It is deliberately not derived from `source` or `edge`,
+    * which are audit and OPA labels. Every other caller leaves it false.
     */
   def executeWith[A](
       connectionId: String,
@@ -428,7 +434,8 @@ final class FlightSqlRouter(
       recordExecution: Boolean = true,
       prepareDurationMs: Option[Long] = None,
       patId: Option[String] = None,
-      edge: String = ""
+      edge: String = "",
+      clientDataScans: Boolean = false
   ): IO[Either[RouterFailure, Routed[A]]] =
     val resolvedEdge = if edge.isEmpty then source else edge
     val s            = sessions.get(connectionId).getOrElse {
@@ -466,6 +473,7 @@ final class FlightSqlRouter(
       attachedCatalogs = attachedCatalogsOf(poolKey),
       poolKey = Some(poolKey),
       edge = resolvedEdge,
+      clientDataScans = clientDataScans,
       statementClass = kind match
         case StatementKind.Ddl => "DDL"
         case StatementKind.Dml => "WRITE"
@@ -595,7 +603,7 @@ final class FlightSqlRouter(
       case None      => Right(())
       case Some(eff) =>
         val g0        = System.nanoTime()
-        val outcome   = protectedWriteGuard.check(sql, kind, eff, schemaCtx)
+        val outcome   = protectedWriteGuard.check(sql, kind, eff, schemaCtx, clientDataScans)
         val elapsedMs = (System.nanoTime() - g0) / 1_000_000L
         stmtInstruments.recordProtectedWriteDuration(poolKey.tenant, poolKey.pool, elapsedMs)
         outcome match

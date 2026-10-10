@@ -145,7 +145,9 @@ object TableExtractor:
     * abort clears every stream of that session. So it reaches no table, file or other session, and
     * has no grantable object. It is still reported (under [[clientDataScanMarker]], never as an
     * ordinary table function) so a consumer that does not know it fails closed;
-    * [[gatedUnsupported]] sets it aside where it is the source of a write.
+    * [[gatedUnsupported]] sets it aside where it is the source of a write AND the statement came
+    * through the native Quack front door, the one edge that relays SEND_DATA. On any other edge
+    * nothing can feed the stream and the statement would wait on the node forever.
     */
   val ClientDataScanFunction = "scan_data_from_quack_client"
 
@@ -156,7 +158,8 @@ object TableExtractor:
   /** True only for the exact call shape the client composes: the unqualified, unquoted name; a
     * single-quoted uuid literal; `NULL` cast to a STRUCT type (a type, so no expression or subquery
     * can ride in it); `ordered := true|false`; nothing else on the call (no LATERAL, DISTINCT,
-    * ORDER BY, FILTER or attribute, checked by re-printing the call from its three arguments).
+    * ORDER BY, FILTER or attribute, checked by re-printing the call from its three arguments, and
+    * no `WITH ORDINALITY`). An alias is allowed: it names the scan's output and reads nothing.
     */
   private[parser] def isClientDataScan(tf: TableFunction): Boolean =
     val f      = tf.getFunction
@@ -178,7 +181,8 @@ object TableExtractor:
           v == "true" || v == "false"
         }
       case _ => false
-    nameOk && argsOk && tf.getPrefix == null && f.getNamedParameters == null &&
+    nameOk && argsOk && tf.getPrefix == null && tf.getWithClause == null &&
+    f.getNamedParameters == null &&
     f.toString == s"${f.getName}(${params.mkString(", ")})"
 
   private val ClientDataScanMarkerPrefix = "client data scan "
@@ -191,10 +195,16 @@ object TableExtractor:
 
   /** The `unsupported` markers of one statement that still deny: all of them, except client data
     * scans in a statement that writes a table (the client's INSERT, whose target stays a gated
-    * Write). A client data scan anywhere else keeps denying.
+    * Write) when `clientDataScans` says the statement came through the native Quack front door. A
+    * client data scan anywhere else, or from any other edge, keeps denying.
     */
-  def gatedUnsupported(accesses: Set[TableAccess], unsupported: List[String]): List[String] =
-    if accesses.exists(_.verb == Verb.Write) then unsupported.filterNot(isClientDataScanMarker)
+  def gatedUnsupported(
+      accesses: Set[TableAccess],
+      unsupported: List[String],
+      clientDataScans: Boolean
+  ): List[String] =
+    if clientDataScans && accesses.exists(_.verb == Verb.Write) then
+      unsupported.filterNot(isClientDataScanMarker)
     else unsupported
 
   /** The marker for a DuckDB default view referenced by a bare table name. Deliberately NOT a
