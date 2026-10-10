@@ -45,9 +45,12 @@ $sc = $cfg.Schema
 # schema. DROP first so a previous partial run is overwritten cleanly.
 $sql = @"
 $preamble
-INSTALL ducklake; LOAD ducklake;
-INSTALL postgres; LOAD postgres;
-INSTALL tpch;     LOAD tpch;
+INSTALL ducklake;
+LOAD ducklake;
+INSTALL postgres;
+LOAD postgres;
+INSTALL tpch;
+LOAD tpch;
 $($storage.Sql)
 
 $attach

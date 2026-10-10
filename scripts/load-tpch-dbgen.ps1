@@ -56,9 +56,12 @@ $ctas = ($tables | ForEach-Object {
 
 $sql = @"
 $preamble
-INSTALL ducklake; LOAD ducklake;
-INSTALL postgres; LOAD postgres;
-INSTALL tpch;     LOAD tpch;
+INSTALL ducklake;
+LOAD ducklake;
+INSTALL postgres;
+LOAD postgres;
+INSTALL tpch;
+LOAD tpch;
 $($storage.Sql)
 
 $attach

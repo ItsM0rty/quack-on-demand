@@ -118,7 +118,7 @@ function Resolve-Storage($cfg) {
   switch -Regex ($dp) {
     '^(s3|s3a|gs|r2)://' {
       $isRemote = $true
-      $storageSql = "INSTALL httpfs; LOAD httpfs;"
+      $storageSql = "INSTALL httpfs;`nLOAD httpfs;"
       if ($env:QOD_S3_ACCESS_KEY_ID -and $env:QOD_S3_SECRET_ACCESS_KEY) {
         $ep = $env:QOD_S3_ENDPOINT
         if ($ep) { $ep = $ep -replace '^https?://','' -replace '/$','' }
@@ -139,7 +139,7 @@ CREATE OR REPLACE SECRET quack_s3 (
     }
     '^(az|azure|abfss)://' {
       $isRemote = $true
-      $storageSql = "INSTALL azure; LOAD azure;"
+      $storageSql = "INSTALL azure;`nLOAD azure;"
       if ($env:QOD_AZURE_CONNECTION_STRING) {
         $storageSql += @"
 
@@ -162,7 +162,7 @@ CREATE OR REPLACE SECRET quack_azure (
 
 # The DuckLake ATTACH statement shared by the probe and the load script.
 function Get-AttachSql($cfg) {
-  "ATTACH 'ducklake:postgres:host=$($cfg.PgHost) port=$($cfg.PgPort) dbname=$($cfg.DbName) user=$($cfg.PgUser) password=$($cfg.PgPass)' AS $($cfg.DbName)`n  (DATA_PATH '$($cfg.DataPath)');"
+  "ATTACH 'ducklake:postgres:host=$($cfg.PgHost) port=$($cfg.PgPort) dbname=$($cfg.DbName) user=$($cfg.PgUser) password=$($cfg.PgPass)' AS $($cfg.DbName)`n  (DATA_PATH '$($cfg.DataPath)', AUTOMATIC_MIGRATION TRUE);"
 }
 
 # Stream SQL to the DuckDB CLI via `-c ".read '<tempfile>'"`. Writes the temp
@@ -219,8 +219,10 @@ function Test-AlreadyLoaded {
   param($cfg, [string]$StorageSql, [Parameter(Mandatory)] [string]$ProbeTable, [string]$ProbeColumn = '*')
   $attach = Get-AttachSql $cfg
   $countSql = @"
-INSTALL ducklake; LOAD ducklake;
-INSTALL postgres; LOAD postgres;
+INSTALL ducklake;
+LOAD ducklake;
+INSTALL postgres;
+LOAD postgres;
 $StorageSql
 $attach
 .mode csv
@@ -233,8 +235,10 @@ SELECT count(*) FROM $($cfg.DbName).$($cfg.Schema).$ProbeTable;
 
   # count(*) says rows exist; verify the parquet files are actually reachable.
   $fileSql = @"
-INSTALL ducklake; LOAD ducklake;
-INSTALL postgres; LOAD postgres;
+INSTALL ducklake;
+LOAD ducklake;
+INSTALL postgres;
+LOAD postgres;
 $StorageSql
 $attach
 .mode csv

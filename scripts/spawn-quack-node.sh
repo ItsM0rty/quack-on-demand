@@ -65,7 +65,7 @@ STORAGE_SQL=""
 case "$dataPath" in
   s3://*|s3a://*|gs://*|r2://*)
     IS_REMOTE=1
-    STORAGE_SQL="INSTALL httpfs; LOAD httpfs;"
+    STORAGE_SQL="INSTALL httpfs;"$'\n'"LOAD httpfs;"
     if [[ -n "${QOD_S3_ACCESS_KEY_ID:-}" && -n "${QOD_S3_SECRET_ACCESS_KEY:-}" ]]; then
       # Strip http(s):// from the endpoint - DuckDB wants "host:port".
       ep="${QOD_S3_ENDPOINT:-}"
@@ -84,7 +84,7 @@ CREATE OR REPLACE SECRET quack_s3 (
     ;;
   az://*|azure://*|abfss://*)
     IS_REMOTE=1
-    STORAGE_SQL="INSTALL azure; LOAD azure;"
+    STORAGE_SQL="INSTALL azure;"$'\n'"LOAD azure;"
     if [[ -n "${QOD_AZURE_CONNECTION_STRING:-}" ]]; then
       STORAGE_SQL="$STORAGE_SQL
 CREATE OR REPLACE SECRET quack_azure (
@@ -283,7 +283,7 @@ INIT_SQL+="$RESOURCE_SQL"
 if [[ -n "${dbInitSql:-}" ]]; then
   INIT_SQL+="$dbInitSql"$'\n'
 fi
-INIT_SQL+=$'INSTALL quack;    LOAD quack;\n'
+INIT_SQL+=$'INSTALL quack;\nLOAD quack;\n'
 
 # Per-database object-store secret (objectStoreSql env, authored by ObjectStoreSecret.scala).
 # A scoped CREATE SECRET for this database's own bucket/credentials, emitted for EVERY kind:
@@ -301,22 +301,23 @@ fi
 # local encrypted database would miss it.
 ENCRYPTION_SQL=""
 if [[ "${encrypted:-}" == "true" ]]; then
-  ENCRYPTION_SQL=$'INSTALL httpfs; LOAD httpfs;\n'
+  ENCRYPTION_SQL=$'INSTALL httpfs;\nLOAD httpfs;\n'
 fi
 INIT_SQL+="$ENCRYPTION_SQL"
 
 case "$kind" in
   ducklake)
-    INIT_SQL+=$'INSTALL ducklake; LOAD ducklake;\n'
-    INIT_SQL+=$'INSTALL postgres; LOAD postgres;\n'
+    INIT_SQL+=$'INSTALL ducklake;\nLOAD ducklake;\n'
+    INIT_SQL+=$'INSTALL postgres;\nLOAD postgres;\n'
     INIT_SQL+="$STORAGE_SQL"$'\n'
     INIT_SQL+="ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS qod_init_pg (TYPE postgres);"$'\n'
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
     INIT_SQL+="ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS \"$catalogAlias\""$'\n'
+    # DuckDB 2.0: a catalog from an older DuckLake migrates on first attach (latest version only).
     if [[ "${encrypted:-}" == "true" ]]; then
-      INIT_SQL+="  (DATA_PATH '$dataPath', ENCRYPTED);"$'\n'
+      INIT_SQL+="  (DATA_PATH '$dataPath', ENCRYPTED, AUTOMATIC_MIGRATION TRUE);"$'\n'
     else
-      INIT_SQL+="  (DATA_PATH '$dataPath');"$'\n'
+      INIT_SQL+="  (DATA_PATH '$dataPath', AUTOMATIC_MIGRATION TRUE);"$'\n'
     fi
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
     INIT_SQL+=$'DETACH qod_init_pg;\n'
@@ -354,7 +355,8 @@ fi
 # fleet join process passes the server's advertised data interface so a node never listens on a
 # management NIC by accident.
 NODE_BIND="${QOD_NODE_BIND:-0.0.0.0}"
-INIT_SQL+="CALL quack_serve('quack:${NODE_BIND}:$PORT', token := '$TOKEN', allow_other_hostname := true);"$'\n'
+# DuckDB 2.0 serves HTTPS by default off localhost; the manager speaks plain HTTP (node TLS: #27).
+INIT_SQL+="CALL quack_serve('quack:${NODE_BIND}:$PORT', token := '$TOKEN', allow_other_hostname := true, disable_ssl := true);"$'\n'
 
 # Test seam: print the assembled init SQL and exit without launching duckdb.
 # Used by SpawnScriptEncryptionSpec to assert the emitted SQL, which is the only

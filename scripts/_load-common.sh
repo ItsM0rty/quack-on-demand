@@ -140,7 +140,7 @@ load_resolve_storage() {
   case "$DATA_PATH" in
     s3://*|s3a://*|gs://*|r2://*)
       IS_REMOTE=1
-      STORAGE_SQL="INSTALL httpfs; LOAD httpfs;"
+      STORAGE_SQL="INSTALL httpfs;"$'\n'"LOAD httpfs;"
       if [[ -n "${QOD_S3_ACCESS_KEY_ID:-}" && -n "${QOD_S3_SECRET_ACCESS_KEY:-}" ]]; then
         local ep="${QOD_S3_ENDPOINT:-}"
         ep="${ep#http://}"; ep="${ep#https://}"; ep="${ep%/}"
@@ -158,7 +158,7 @@ CREATE OR REPLACE SECRET quack_s3 (
       ;;
     az://*|azure://*|abfss://*)
       IS_REMOTE=1
-      STORAGE_SQL="INSTALL azure; LOAD azure;"
+      STORAGE_SQL="INSTALL azure;"$'\n'"LOAD azure;"
       if [[ -n "${QOD_AZURE_CONNECTION_STRING:-}" ]]; then
         STORAGE_SQL="$STORAGE_SQL
 CREATE OR REPLACE SECRET quack_azure (
@@ -209,12 +209,14 @@ load_preamble_sql() {
 -- is a tty) overprints the manager's log lines and leaves the display
 -- misaligned. Plain line output interleaves cleanly.
 SET enable_progress_bar = false;
-INSTALL ducklake; LOAD ducklake;
-INSTALL postgres; LOAD postgres;
+INSTALL ducklake;
+LOAD ducklake;
+INSTALL postgres;
+LOAD postgres;
 ${1:-}
 $STORAGE_SQL
 ATTACH 'ducklake:postgres:host=$PG_HOST port=$PG_PORT dbname=$DB_NAME user=$PG_USER password=$PG_PASS' AS $DB_NAME
-  (DATA_PATH '$DATA_PATH');
+  (DATA_PATH '$DATA_PATH', AUTOMATIC_MIGRATION TRUE);
 SQL
 }
 

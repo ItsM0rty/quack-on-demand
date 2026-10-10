@@ -87,7 +87,7 @@ SET temp_directory='$TEMP_DIR';
 -- overrunning the container cgroup limit and getting OOM-killed (exit 137).
 $MEMORY_LIMIT_SQL
 
-$(load_preamble_sql "INSTALL tpch;     LOAD tpch;")
+$(load_preamble_sql "INSTALL tpch;"$'\n'"LOAD tpch;")
 
 CREATE SCHEMA IF NOT EXISTS $DB_NAME.$SCHEMA_NAME;
 

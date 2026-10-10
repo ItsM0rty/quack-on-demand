@@ -85,7 +85,7 @@ $storageSql = ''
 switch -Regex ($dataPath) {
   '^(s3|s3a|gs|r2)://' {
     $isRemote = $true
-    $storageSql = "INSTALL httpfs; LOAD httpfs;"
+    $storageSql = "INSTALL httpfs;`nLOAD httpfs;"
     $s3Key = [Environment]::GetEnvironmentVariable('QOD_S3_ACCESS_KEY_ID')
     $s3Sec = [Environment]::GetEnvironmentVariable('QOD_S3_SECRET_ACCESS_KEY')
     if (-not [string]::IsNullOrEmpty($s3Key) -and -not [string]::IsNullOrEmpty($s3Sec)) {
@@ -111,7 +111,7 @@ CREATE OR REPLACE SECRET quack_s3 (
   }
   '^(az|azure|abfss)://' {
     $isRemote = $true
-    $storageSql = "INSTALL azure; LOAD azure;"
+    $storageSql = "INSTALL azure;`nLOAD azure;"
     $azConn = [Environment]::GetEnvironmentVariable('QOD_AZURE_CONNECTION_STRING')
     if (-not [string]::IsNullOrEmpty($azConn)) {
       $storageSql += @"
@@ -195,7 +195,8 @@ $encryptionKey = [Environment]::GetEnvironmentVariable('encryptionKey')
 $sb = [System.Text.StringBuilder]::new()
 if (-not [string]::IsNullOrEmpty($proxySql))  { [void]$sb.AppendLine($proxySql) }
 if (-not [string]::IsNullOrEmpty($dbInitSql)) { [void]$sb.AppendLine($dbInitSql) }
-[void]$sb.AppendLine("INSTALL quack;    LOAD quack;")
+[void]$sb.AppendLine("INSTALL quack;")
+[void]$sb.AppendLine("LOAD quack;")
 
 # Per-database object-store secret, emitted for EVERY kind: a `memory` or `duckdb-file`
 # database may carry an objectStore (TenantDb.validate permits it), and a `memory` database
@@ -210,21 +211,24 @@ if (-not [string]::IsNullOrEmpty($objectStoreSql)) { [void]$sb.AppendLine($objec
 # code always emits the lowercase string "true", but staying case-sensitive keeps the two
 # scripts behaving identically for any other caller of the env var.
 if ($encrypted -ceq 'true') {
-  [void]$sb.AppendLine("INSTALL httpfs; LOAD httpfs;")
+  [void]$sb.AppendLine("INSTALL httpfs;")
+  [void]$sb.AppendLine("LOAD httpfs;")
 }
 
 switch ($kind) {
   'ducklake' {
-    [void]$sb.AppendLine("INSTALL ducklake; LOAD ducklake;")
-    [void]$sb.AppendLine("INSTALL postgres; LOAD postgres;")
+    [void]$sb.AppendLine("INSTALL ducklake;")
+    [void]$sb.AppendLine("LOAD ducklake;")
+    [void]$sb.AppendLine("INSTALL postgres;")
+    [void]$sb.AppendLine("LOAD postgres;")
     if (-not [string]::IsNullOrEmpty($storageSql)) { [void]$sb.AppendLine($storageSql) }
     [void]$sb.AppendLine("ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS qod_init_pg (TYPE postgres);")
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS ""$catalogAlias""")
     if ($encrypted -ceq 'true') {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', ENCRYPTED);")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', ENCRYPTED, AUTOMATIC_MIGRATION TRUE);")
     } else {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath');")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', AUTOMATIC_MIGRATION TRUE);")
     }
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("DETACH qod_init_pg;")
@@ -254,7 +258,7 @@ if (-not [string]::IsNullOrEmpty($extraSetupSql)) { [void]$sb.AppendLine($extraS
 # node serves any tenant statement.
 if (-not [string]::IsNullOrEmpty($lockdownSql)) { [void]$sb.AppendLine($lockdownSql) }
 
-[void]$sb.AppendLine("CALL quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true);")
+[void]$sb.AppendLine("CALL quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
 
 $initSql = $sb.ToString()
 

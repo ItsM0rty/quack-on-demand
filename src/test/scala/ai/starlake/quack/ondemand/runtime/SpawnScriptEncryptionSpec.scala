@@ -58,7 +58,7 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath');")
+    sql should include(s"(DATA_PATH '$dataPath', AUTOMATIC_MIGRATION TRUE);")
     sql should not include "ENCRYPTED"
   }
 
@@ -73,8 +73,9 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED);")
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED, AUTOMATIC_MIGRATION TRUE);")
+    sql should include("INSTALL httpfs;")
+    sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTED")
   }
 
@@ -94,7 +95,8 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "dataPath"      -> dataPath
     )
     sql should include(s"ATTACH '$dataPath' AS \"acme_lake\" (ENCRYPTION_KEY 'c2VjcmV0');")
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include("INSTALL httpfs;")
+    sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTION_KEY")
   }
 
@@ -134,7 +136,7 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath');")
+    sql should include(s"(DATA_PATH '$dataPath', AUTOMATIC_MIGRATION TRUE);")
     sql should not include "ENCRYPTED"
   }
 
@@ -150,8 +152,9 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED);")
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED, AUTOMATIC_MIGRATION TRUE);")
+    sql should include("INSTALL httpfs;")
+    sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTED")
   }
 
@@ -173,6 +176,7 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "dataPath"      -> dataPath
     )
     sql should include(s"ATTACH '$dataPath' AS \"acme_lake\" (ENCRYPTION_KEY 'c2VjcmV0');")
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include("INSTALL httpfs;")
+    sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTION_KEY")
   }
