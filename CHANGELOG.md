@@ -38,8 +38,19 @@
   - Executing EXPLAIN forms (ANALYZE / ANALYSE, option lists) classify as the explained statement.
   - Lockdown denies `CONNECT` / `DISCONNECT` and extension repository DDL, protects
     `allow_extension_repositories`, `extension_directories` and the other settings that move
-    extension, secret or file locations, switch the parser dialect, or redirect the node's
-    outbound connections, and judges path-shaped quoted identifiers.
+    extension, secret or file locations, or redirect the node's outbound connections, and judges
+    path-shaped quoted identifiers. It also denies the `enable_logging()` call and protects the
+    logging settings (`enable_logging`, `logging_level`, `logging_storage`, `logging_mode`,
+    `enabled_log_types`, `disabled_log_types`, `pg_debug_show_queries`), and judges the statement
+    an `EXPLAIN ANALYZE` carries, which DuckDB 2.0 executes.
+  - BREAKING: settings that change how a node parses SQL (`dialect_compatibility_mode`,
+    `current_dialect`, `active_grammar_extensions`, `allow_parser_override_extension`,
+    `preserve_identifier_case`, `show_behavior`, `table_function_identifier_conversion`) and
+    `redact_http_logs` / `allow_unredacted_secrets` are refused for every caller, superusers
+    included, whatever the ACL mode and the lockdown flag: most are GLOBAL, so one session would
+    change how every session on the node is parsed, or expose the node's credentials in its logs.
+  - BREAKING: `IMPORT DATABASE` is refused for every caller, superusers included: it replays SQL
+    files the gateway never reads.
   - Trigger DDL is reserved to superusers and own-tenant admins ("CREATE TRIGGER is restricted to
     tenant administrators").
   - The edge's comment stripper, statement splitter and classifier share one lexer ported from
