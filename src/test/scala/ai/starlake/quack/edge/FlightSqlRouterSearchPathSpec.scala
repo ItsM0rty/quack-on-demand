@@ -177,3 +177,12 @@ class FlightSqlRouterSearchPathSpec extends AnyFlatSpec with Matchers:
     run("BEGIN", eff = root)._2 shouldBe List("BEGIN")
     run("SET threads=2", eff = root)._2 shouldBe List("SET threads=2")
     run("USE other", eff = root)._2 shouldBe List("USE acme_db.other")
+
+  "a SET VARIABLE that reads a table" should "be refused for a user without a grant on it" in:
+    val (out, sent) =
+      run(
+        "SET VARIABLE x = (SELECT string_agg(v, ',') FROM acme_db.other.t); SELECT getvariable('x')"
+      )
+    out shouldBe a[Left[?, ?]]
+    out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    sent shouldBe empty

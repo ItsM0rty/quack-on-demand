@@ -283,6 +283,18 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
     )
     withClue(err)(rc shouldBe 0)
 
+  it should "refuse a SET VARIABLE that reads an ungranted table" in:
+    assume(duckdbPresent, "duckdb CLI not on PATH")
+    val inner =
+      "SET VARIABLE v = (SELECT 41 + max(x) FROM acme_db.tpch1.secret); SELECT getvariable(''v'')"
+    val (rc, out, err) =
+      cli(s"SELECT * FROM quack_query('$endpoint', '$inner', token := '$Token');")
+    withClue(s"rc=$rc out=$out err=$err") {
+      out should not be "42"
+      rc should not be 0
+      err should include("access denied")
+    }
+
   it should "refuse a malformed token at connect time" in:
     assume(duckdbPresent, "duckdb CLI not on PATH")
     val (rc, _, err) = cli(s"SELECT * FROM quack_query('$endpoint', 'SELECT 1', token := 'nope');")

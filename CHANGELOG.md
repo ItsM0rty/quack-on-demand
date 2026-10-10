@@ -13,6 +13,12 @@
   cannot write. Every multi-statement request now also starts from the pool's default schema, even
   when it opens with `BEGIN` or `SET`.
 
+- **Security: `SET VARIABLE` can no longer read a table without a grant.** Its value is a query,
+  so `SET VARIABLE x = (SELECT ... FROM any_table); SELECT getvariable('x')` returned rows from any
+  table the node could reach, with no grant at all: the `SET` passed as table-free control flow.
+  A `SET` whose value reads a table is now denied unless the user holds the unrestricted `ALL`
+  grant; `SET VARIABLE x = 42` still works.
+
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left
   by an earlier `qod serve` captured the default: on a machine running `qod start` against its own

@@ -212,6 +212,18 @@ object SqlParser:
   private def selectReads(select: Option[Select]): TableExtraction =
     select.map(TableExtractor.extract).getOrElse(TableExtraction(Nil, Nil))
 
+  /** True when any value of a SET statement reaches a table, a table function or a construct the
+    * table walker cannot resolve.
+    */
+  private def setValueReads(set: SetStatement): Boolean =
+    val v = new TableExtractorVisitor()
+    (0 until set.getCount).foreach { i =>
+      Option(set.getExpressions(i))
+        .foreach(_.asScala.foreach(e => Option(e).foreach(v.visitExpression)))
+    }
+    val r = v.result
+    r.tables.nonEmpty || r.unsupported.nonEmpty
+
   // SHOW <keyword> forms that jsqlparser also parses as ShowStatement but that name
   // no table: they stay ControlFlow (v1 defers filtering them; see the spec).
   private val ShowKeywordForms: Set[String] = Set("DATABASES", "SCHEMAS")
@@ -372,6 +384,25 @@ object SqlParser:
         val (qTgt, errs) = TableQualifier.qualify(List(new Table(sh.getName)), config)
         StatementResult
           .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
+
+      // SET VARIABLE evaluates its value as a query: DuckDB runs
+      // `SET VARIABLE x = (SELECT v FROM db.other.t)` and getvariable('x') returns the row,
+      // while getvariable() itself names no table. A SET whose value reaches any table, table
+      // function or construct the walker cannot resolve is therefore NOT control flow. It
+      // takes the parse-error arm (denied unless the principal holds the unrestricted ALL
+      // grant, like any statement the walker cannot fully read) rather than having its reads
+      // gated: the CLS / RLS rewriters and the metadata filter only rewrite SELECTs, so
+      // admitting a granted read here would hand back unmasked, unfiltered values, and the
+      // protected-write guard denies a parse error outright for a principal with policies.
+      // (A plain setting cannot take a subquery at all: DuckDB refuses "SET value cannot
+      // contain subqueries".)
+      case set: SetStatement if setValueReads(set) =>
+        StatementResult.ParseError(
+          index,
+          snippet,
+          "SET whose value reads a table is not supported (deny, fail-closed); run the SELECT " +
+            "on its own instead"
+        )
 
       // Explicit allowlist of statement types that provably carry no grantable
       // table reference. Admitted unconditionally as ControlFlow. Anything NOT

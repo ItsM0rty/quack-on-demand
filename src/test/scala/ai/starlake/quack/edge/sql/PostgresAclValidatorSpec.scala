@@ -72,6 +72,22 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     validator.validate(ctx) shouldBe Allowed
   }
 
+  it should "deny a SET VARIABLE that reads a table the user holds no grant on" in {
+    // `SET VARIABLE x = (SELECT ...); SELECT getvariable('x')` hands the row back on DuckDB 1.5.6
+    // and 2.0. The SET used to pass as table-free control flow and getvariable() names no table,
+    // so a user with no grant at all could read any table the node could reach.
+    val eff = effectiveWith(permissions = List(perm("tpch", "main", "lineitem", "RO")))
+    List(
+      "SET VARIABLE x = (SELECT string_agg(o_comment, ',') FROM tpch.other.orders); " +
+        "SELECT getvariable('x')",
+      "SET VARIABLE x = (SELECT count(*) FROM orders)"
+    ).foreach { sql =>
+      withClue(sql)(validator.validate(mkCtx(sql, eff)) shouldBe a[Denied])
+    }
+    validator.validate(mkCtx("SET VARIABLE x = 42; SELECT getvariable('x')", eff)) shouldBe
+      Allowed
+  }
+
   it should "deny SELECT against a federated alias when no grant exists" in {
     val eff = effectiveWith(permissions = Nil)
     val ctx = mkCtx("SELECT * FROM fedpg.public.orders", eff)
