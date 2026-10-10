@@ -1,9 +1,5 @@
 package ai.starlake.quack.edge.sql
 
-import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
-
-import java.util.Locale
-
 /** DuckDB table functions that resolve their target from a STRING at run time: `query('<sql>')`,
   * `query_table('<name>')`, `json_execute_serialized_sql(...)` and the DuckLake extension's
   * `ducklake_*` family (`ducklake_table_insertions('<catalog>', '<schema>', '<table>', ...)`,
@@ -19,24 +15,28 @@ import java.util.Locale
   *     a protected table through one of these returns unfiltered, unmasked rows.
   *
   * Lexical on purpose, not an AST walk: an unparseable statement reaches the wildcard-coverable
-  * parse-error arm with no AST at all. The text is stripped of comments, trivia-normalized and only
-  * then lowercased, exactly as [[LockdownScreen]] does, then any call of a listed name (bare,
-  * qualified or double-quoted, whitespace or a comment before the paren) matches. String literals
-  * are not blanked, so a literal like `'query('` over-denies: the safe direction.
+  * parse-error arm with no AST at all. Calls are read from DuckDB 2.0's own tokens by
+  * [[FunctionCalls]]: a listed name, bare, double-quoted or backtick-quoted (DuckDB 2.0 runs
+  * `` `query_table`('orders') ``), qualified or not, followed past any trivia by an opening
+  * parenthesis, compared case-insensitively after unquoting. A name in a comment, or a quoted
+  * identifier with no parenthesis after it (a column named `query`), is not a call. String literal
+  * bodies are scanned too, so a literal like `'query('` over-denies: the safe direction.
   */
 object CatalogReachingCalls:
 
-  private val Names = "query|query_table|json_execute_serialized_sql|ducklake_[a-z0-9_]*"
+  private val Fixed = Set("query", "query_table", "json_execute_serialized_sql")
 
-  private val Call =
-    ("(?:\"(" + Names + ")\"|(?<![a-z0-9_$])(" + Names + "))\\s*\\(").r
-
-  /** The first catalog-reaching function called by `sql`, lowercased, or None. */
+  /** The first catalog-reaching function called by `sql`, lowercased, or None.
+    *
+    * A string literal nested past [[FunctionCalls.MaxDepth]] is left unscanned without denying: a
+    * literal only executes as SQL through a call that runs a string (`query`,
+    * `json_execute_serialized_sql`), which is itself listed here and found at a shallower level.
+    */
   def find(sql: String): Option[String] =
-    // Lex the ORIGINAL text, fold case after: DuckDB compares dollar-quote tags case-sensitively,
-    // so lowercasing first could end a literal where DuckDB does not and hide a call in a comment.
-    val lower = SqlTrivia.normalize(SqlCommentStripper.stripComments(sql)).toLowerCase(Locale.ROOT)
-    Call.findFirstMatchIn(lower).map(m => Option(m.group(1)).getOrElse(m.group(2)))
+    FunctionCalls.scan(sql).calls.iterator.map(_.name).find(isCatalogReaching)
+
+  private def isCatalogReaching(name: String): Boolean =
+    Fixed.contains(name) || name.startsWith("ducklake_")
 
   def denyReason(fn: String): String =
     s"table function $fn resolves its target at run time, so its access cannot be authorized; " +

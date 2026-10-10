@@ -536,3 +536,64 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
       "SELECT 1 /* ' */ AS a\u00A0$q$; ATTACH 'x.db' AS y; SELECT 1 AS b\u00A0$q$ /* ' */"
     ) shouldBe true
   }
+
+  // ---- function calls read from DuckDB 2.0's tokens, not a name regex ----
+  //
+  // DuckDB 2.0 accepts backtick-quoted identifiers, function names included: on the 2.0 CLI
+  // `SELECT * FROM `read_text`('/etc/hosts')` returns the file. A call is an identifier token
+  // (bare, double-quoted or backtick-quoted, possibly qualified) followed, past any trivia, by an
+  // opening parenthesis token; a regex accepting only a bare or double-quoted name admitted it.
+
+  "denied functions" should "be found under every DuckDB 2.0 identifier quoting" in {
+    denied("SELECT * FROM `read_text`('/etc/hosts')") shouldBe true
+    denied("SELECT * FROM `READ_TEXT`('/etc/hosts')") shouldBe true
+    denied("SELECT * FROM \"read_text\"('/etc/hosts')") shouldBe true
+    denied("SELECT * FROM `system`.`main`.`read_text`('/etc/hosts')") shouldBe true
+    denied("SELECT * FROM system.\"main\".`read_text` /* c */ ('/etc/hosts')") shouldBe true
+    denied("SELECT `getenv`('HOME')") shouldBe true
+    denied("SELECT * FROM `glob`('s3://b/*')") shouldBe true
+  }
+
+  it should "not treat a backtick-quoted identifier with no parenthesis as a call" in {
+    denied("SELECT `read_text` FROM t") shouldBe false
+    denied("SELECT `read_text`, \"getenv\" FROM t") shouldBe false
+  }
+
+  it should "keep the remote-literal exemption for the backtick form" in {
+    denied("SELECT * FROM `read_csv`('s3://bucket/x.csv')") shouldBe false
+    denied("SELECT * FROM `read_csv`('/etc/x.csv')") shouldBe true
+    deniedB("SELECT * FROM `read_csv`('s3://lakebucket/x.csv')") shouldBe true
+  }
+
+  it should "judge every occurrence, whatever its quoting" in {
+    denied("SELECT * FROM read_csv('s3://b/x.csv'), `read_csv`('/etc/x.csv')") shouldBe true
+  }
+
+  it should "find a backtick-quoted call inside a string literal a query() call runs" in {
+    // query() runs its argument as SQL; each of these reads /etc/hosts on the 2.0 CLI.
+    denied("SELECT * FROM query('SELECT * FROM `read_text`(''/etc/hosts'')')") shouldBe true
+    denied("SELECT * FROM query($$SELECT * FROM `read_text`('/etc/hosts')$$)") shouldBe true
+    // an escape string's \x72 is `r`
+    denied("SELECT * FROM query(e'SELECT * FROM \\x72ead_text(''/etc/hosts'')')") shouldBe true
+  }
+
+  "bare-path FROM" should "deny a quoted-identifier replacement scan of a local path" in {
+    // DuckDB 2.0 replacement-scans a quoted identifier as it does a literal: both forms read the
+    // file on the 2.0 CLI. A qualified name is joined with dots before the scan.
+    denied("SELECT * FROM `/etc/x.parquet`") shouldBe true
+    denied("SELECT * FROM \"/etc/x.parquet\"") shouldBe true
+    denied("SELECT * FROM \"/etc/x\".\"parquet\"") shouldBe true
+    denied("SELECT * FROM t JOIN `/etc/x.csv` ON true") shouldBe true
+    denied("SELECT * FROM `orders`") shouldBe false
+    denied("SELECT * FROM \"main\".\"orders\"") shouldBe false
+    denied("SELECT * FROM `s3://b/x.parquet`") shouldBe false
+    deniedB("SELECT * FROM `s3://lakebucket/x.parquet`") shouldBe true
+  }
+
+  "denied functions" should "fail closed past the string-literal nesting the scan follows" in {
+    // Each literal body is scanned as SQL (query() runs one), a bounded number of levels deep.
+    def nested(levels: Int): String =
+      "SELECT " + (1 to levels).foldLeft("x")((body, k) => "$t" + k + "$" + body + "$t" + k + "$")
+    denied(nested(3)) shouldBe false
+    denied(nested(FunctionCalls.MaxDepth + 1)) shouldBe true
+  }

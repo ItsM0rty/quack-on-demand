@@ -21,9 +21,10 @@ import scala.collection.mutable.ListBuffer
   * interior Unicode trivia character could. That holds for a nested comment too, and a comment
   * marker inside any of DuckDB's quoting forms is left alone rather than opening a comment; see
   * `ai.starlake.sql.SqlCommentStripper`, which is where both properties live and are tested. A
-  * denied function name (bare or double-quoted) followed by an open parenthesis is denied wherever
-  * it appears (subqueries included, EVERY occurrence), EXCEPT when every path argument is a string
-  * literal with an object-store scheme.
+  * denied function called anywhere (subqueries and string literal bodies included, EVERY
+  * occurrence, under any DuckDB 2.0 identifier quoting: see [[FunctionCalls]], which reads calls
+  * from the lexer's tokens) is denied, EXCEPT when every path argument is a string literal with an
+  * object-store scheme.
   *
   * What this screen does NOT claim: it is a deny-list of shapes, not a proof of safety. A statement
   * no rule below matches is ADMITTED. The strip passes exist so a rule cannot be dodged by hiding
@@ -140,8 +141,8 @@ object LockdownScreen:
     //      DuckDB treats a comment as a SEPARATOR, not a weld -- confirmed against a real DuckDB
     //      1.5.4, `SELECT * FROM/*x*/'/etc/passwd.parquet'` and `read_csv/*x*/('/etc/x.parquet')`
     //      both execute and return the target file's rows -- and a closed block comment is
-    //      replaced by a single ASCII space rather than nothing. For the three regexes that use
-    //      `\s*` (`FromLiteral`, `CopyPathLiteral`, `deniedFunctionIn`'s call regex) the space is
+    //      replaced by a single ASCII space rather than nothing. For the two regexes that use
+    //      `\s*` (`FromLiteral`, `CopyPathLiteral`) the space is
     //      not what makes them match, since they already match `from'...'`: what matters there is
     //      that the comment is GONE. The space is load-bearing for `FromEscapeLiteral`, which uses
     //      `\s+`; `SELECT * FROM/*x*/e'/tmp/x.csv'` executes on DuckDB and is admitted without the
@@ -158,6 +159,10 @@ object LockdownScreen:
     // `Locale.ROOT` on the lowercasing, not the default locale: under `-Duser.language=tr`,
     // `"INSTALL".toLowerCase` is a dotless-i `install` (U+0131), which matches no key in
     // `DeniedFirstTokens` and admits INSTALL on a locked-down deployment.
+    //
+    // The function-call rule and the quoted-identifier FROM rule do not read `lower`: they lex
+    // `stmt` itself (see `FunctionCalls`), so no quoting form DuckDB 2.0 accepts for a name can hide
+    // one from a regex, and only a call's argument list is normalized and folded afterwards.
     val lower =
       SqlTrivia
         .normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt)))
@@ -185,8 +190,9 @@ object LockdownScreen:
         // (SELECT * FROM '/etc/passwd.parquet') that carry no read-function call.
         settingHit
           .orElse(copyHit)
-          .orElse(deniedFunctionIn(lower, deniedBuckets))
+          .orElse(deniedFunctionIn(stmt, deniedBuckets))
           .orElse(barePathFrom(lower, deniedBuckets))
+          .orElse(quotedPathFrom(stmt, deniedBuckets))
 
   /** Splits the input on top-level semicolons: a semicolon inside any of DuckDB's quoting forms
     * (plain `'...'`, escape `E'...'`, double-quoted and backtick identifiers, dollar-quoted
@@ -240,37 +246,51 @@ object LockdownScreen:
     case Local
     case Bucket(name: String)
 
-  /** A denied function name (bare or double-quoted) followed by '(' anywhere in the statement.
-    * EVERY occurrence must pass the URL exemption (remote literal on a non-denied bucket) or the
-    * statement is denied.
+  /** A call of a denied function anywhere in the statement, read from the lexer's tokens by
+    * [[FunctionCalls]]: the name bare, double-quoted or backtick-quoted (DuckDB 2.0 runs
+    * `` `read_text`('/etc/hosts') ``), qualified or not, with any trivia before the paren, and
+    * inside string literal bodies too (`query('...')` runs one). EVERY occurrence must pass the URL
+    * exemption (remote literal on a non-denied bucket) or the statement is denied. The scan works
+    * on the statement as lexed, never on folded text (dollar tags compare case-sensitively); each
+    * argument list is then normalized and folded like the rest of this screen before it is judged.
     */
-  private def deniedFunctionIn(lower: String, deniedBuckets: Set[String]): Option[String] =
-    DeniedFunctions.iterator
-      .flatMap { fn =>
-        val call        = ("(?:\"" + fn + "\"|(?<![a-zA-Z0-9_])" + fn + ")\\s*\\(").r
-        val occurrences = call.findAllMatchIn(lower).toList
-        if occurrences.isEmpty then None
-        else if !UrlExempt.contains(fn) then
-          Some(s"$fn over local paths is disabled on this deployment")
-        else
-          val verdicts = occurrences.map(m => argsVerdict(lower, m.end, deniedBuckets))
-          if verdicts.forall(_ == LitVerdict.Safe) then None
+  private def deniedFunctionIn(stmt: String, deniedBuckets: Set[String]): Option[String] =
+    val scan = FunctionCalls.scan(stmt)
+    if scan.truncated then
+      Some("string literals nested too deeply to screen are disabled on this deployment")
+    else
+      DeniedFunctions.iterator
+        .flatMap { fn =>
+          val occurrences = scan.calls.filter(_.name == fn)
+          if occurrences.isEmpty then None
+          else if !UrlExempt.contains(fn) then
+            Some(s"$fn over local paths is disabled on this deployment")
           else
-            verdicts
-              .collectFirst { case LitVerdict.Bucket(b) => bucketMessage(b) }
-              .orElse(Some(s"$fn over local paths is disabled on this deployment"))
-      }
-      .nextOption()
+            val verdicts = occurrences
+              .map(c => argsVerdict(screened(c.text.substring(c.argsFrom)), deniedBuckets))
+            if verdicts.forall(_ == LitVerdict.Safe) then None
+            else
+              verdicts
+                .collectFirst { case LitVerdict.Bucket(b) => bucketMessage(b) }
+                .orElse(Some(s"$fn over local paths is disabled on this deployment"))
+        }
+        .nextOption()
 
-  /** Verdict for the argument list starting at `from` (index just past the open paren): Safe only
+  /** An argument list as the regex rules below read it: comments stripped, trivia normalized, case
+    * folded, in that order (see `screenOne`). A suffix starting just past a `(` token lexes as it
+    * did in place, since the paren sits outside every literal and comment.
+    */
+  private def screened(text: String): String =
+    SqlTrivia.normalize(SqlCommentStripper.stripComments(text)).toLowerCase(Locale.ROOT)
+
+  /** Verdict for the argument list `rest` (the text just past the open paren): Safe only
     * when every path-shaped argument is a string literal carrying a remote scheme on a non-denied
     * bucket. Handles a bare literal first argument (optionally followed by named args like `header
     * = true`), or a list-literal first argument (`['s3://..', 'gs://..']`) where every element must
     * be safe. Anything the scanner cannot prove safe (non-literal args, unbalanced brackets,
     * unterminated strings) answers Local (deny).
     */
-  private def argsVerdict(lower: String, from: Int, deniedBuckets: Set[String]): LitVerdict =
-    val rest    = lower.substring(from)
+  private def argsVerdict(rest: String, deniedBuckets: Set[String]): LitVerdict =
     val trimmed = rest.dropWhile(_.isWhitespace)
     if trimmed.startsWith("[") then
       val closing = trimmed.indexOf(']')
@@ -408,17 +428,64 @@ object LockdownScreen:
     val dollar = FromDollarLiteral.findAllMatchIn(lower).map(m => (m.start, m.group(2), true))
     (plain ++ esc ++ dollar)
       .filter { case (start, _, _) => parenDepthBefore(lower, start) == 0 }
-      .flatMap { case (_, inner, strict) =>
-        val lit = "'" + inner + "'"
-        deniedBucketOf(lit, deniedBuckets) match
-          case Some(b) => Some(bucketMessage(b))
-          case None    =>
-            if isRemoteLiteral(lit) then None
-            else if strict || looksLikePath(lit) then
-              Some("reading local files in FROM position is disabled on this deployment")
-            else None
-      }
+      .flatMap { case (_, inner, strict) => fromPathVerdict(inner, strict, deniedBuckets) }
       .nextOption()
+
+  /** The verdict on a name DuckDB may replacement-scan as a file: a denied bucket, else admitted
+    * when remote, else denied when `strict` or when it looks like a local path.
+    */
+  private def fromPathVerdict(
+      inner: String,
+      strict: Boolean,
+      deniedBuckets: Set[String]
+  ): Option[String] =
+    val lit = "'" + inner + "'"
+    deniedBucketOf(lit, deniedBuckets) match
+      case Some(b) => Some(bucketMessage(b))
+      case None    =>
+        if isRemoteLiteral(lit) then None
+        else if strict || looksLikePath(lit) then
+          Some("reading local files in FROM position is disabled on this deployment")
+        else None
+
+  /** Denies a QUOTED IDENTIFIER replacement scan of a local path: DuckDB 2.0 replacement-scans a
+    * table name it cannot resolve as a file, so `FROM "/etc/x.csv"` and `` FROM `/etc/x.csv` ``
+    * read the file exactly as `FROM '/etc/x.csv'` does (each verified on the 2.0 CLI), and a
+    * qualified name is joined with dots first (`"/etc/x"."csv"` reads `/etc/x.csv`). Read from the
+    * lexer's tokens after a FROM or JOIN keyword, at any depth: a column named like an absolute
+    * path is not a shape ordinary SQL takes, unlike the `trim(leading '/' from '/a')` literal that
+    * keeps [[barePathFrom]] at statement level. The name gets the plain literal's verdict (remote
+    * exemption, denied buckets, the path-shape heuristic), so `FROM "orders"` stays admitted.
+    */
+  private val TableKeywords = Set("from", "join")
+
+  private def quotedPathFrom(stmt: String, deniedBuckets: Set[String]): Option[String] =
+    val view  = SqlLexer.engineView(stmt)
+    val toks  = SqlLexer.tokens(view).filterNot(_.isTrivia)
+    val names = ListBuffer.empty[String]
+    var i     = 0
+    while i < toks.length do
+      val t = toks(i)
+      if t.kind == SqlLexer.Kind.Word &&
+        TableKeywords.contains(view.substring(t.start, t.end).toLowerCase(Locale.ROOT))
+      then
+        val parts  = ListBuffer.empty[String]
+        var quoted = false
+        var j      = i + 1
+        var more   = true
+        while more && j < toks.length do
+          FunctionCalls.identifier(view, toks(j)) match
+            case Some(part) =>
+              parts += part
+              quoted = quoted || FunctionCalls.quotedIdentifier(view, toks(j)).isDefined
+              val dot = j + 1 < toks.length && toks(j + 1).kind == SqlLexer.Kind.Number &&
+                view.substring(toks(j + 1).start, toks(j + 1).end) == "."
+              j += (if dot then 2 else 1)
+              more = dot
+            case None => more = false
+        if quoted then names += parts.mkString(".")
+      i += 1
+    names.iterator.flatMap(fromPathVerdict(_, strict = false, deniedBuckets)).nextOption()
 
   /** Net open-paren depth in `lower[0, index)`, ignoring parens inside single-quoted strings. Used
     * to prove a FROM keyword sits at statement level, not inside a function-call argument list.

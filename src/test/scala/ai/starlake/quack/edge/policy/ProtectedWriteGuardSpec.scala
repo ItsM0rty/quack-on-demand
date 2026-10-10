@@ -339,6 +339,16 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
     ) shouldBe a[Deny]
   }
 
+  it should "deny a backtick-quoted query_table for a principal with a row policy" in {
+    // DuckDB 2.0 accepts backtick-quoted function names; this reads the table on the 2.0 CLI.
+    guardWithCls().check(
+      "SELECT * FROM `query_table`('tpch1.customer')",
+      StatementKind.Select,
+      eff(tenantUser, rows = List(rowPolicy)),
+      ctx
+    ) shouldBe a[Deny]
+  }
+
   it should "leave principals without policies, and superusers, alone" in {
     val sql = "SELECT * FROM query_table('tpch1.customer')"
     guardWithCls().check(sql, StatementKind.Select, eff(tenantUser), ctx) shouldBe Allow

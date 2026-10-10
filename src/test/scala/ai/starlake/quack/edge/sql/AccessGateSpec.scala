@@ -54,6 +54,28 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
       "SELECT $a$x$a$ /* $a$, * FROM query_table('orders') -- */"
     ) shouldBe None
 
+  it should "find a catalog-reaching call under every DuckDB 2.0 identifier quoting" in:
+    // DuckDB 2.0 accepts backtick-quoted function names: `query_table`('orders') runs on the 2.0
+    // CLI. A call is an identifier token, bare, double-quoted or backtick-quoted and possibly
+    // qualified, followed past any trivia by an opening parenthesis token.
+    CatalogReachingCalls.find("SELECT * FROM `query_table`('orders')") shouldBe Some("query_table")
+    CatalogReachingCalls.find("SELECT * FROM `QUERY`('SELECT 1')") shouldBe Some("query")
+    CatalogReachingCalls.find("SELECT * FROM \"query_table\"('orders')") shouldBe
+      Some("query_table")
+    CatalogReachingCalls.find("SELECT * FROM `system`.`main`.`query_table`('orders')") shouldBe
+      Some("query_table")
+    CatalogReachingCalls.find("SELECT * FROM main.`query_table` /* c */ ('orders')") shouldBe
+      Some("query_table")
+    CatalogReachingCalls.find("SELECT * FROM `ducklake_snapshots`('cat')") shouldBe
+      Some("ducklake_snapshots")
+    eval("SELECT * FROM `query_table`('orders')") match
+      case GateOutcome.Refuse(_, false, _) => succeed
+      case other                           => fail(other.toString)
+
+  it should "not treat a backtick-quoted identifier with no parenthesis as a catalog-reaching call" in:
+    CatalogReachingCalls.find("SELECT `query_table`, `query` FROM t") shouldBe None
+    CatalogReachingCalls.find("SELECT \"query\" FROM t") shouldBe None
+
   it should "refuse an ambiguous two-part name on an attached catalog as not wildcard-coverable" in:
     val attached = Config.forDuckDB(Some("tpch"), Some("main"), Set("tpch", "fedpg"))
     AccessGate.evaluate("SELECT * FROM fedpg.orders", attached, "tpch", false) match
