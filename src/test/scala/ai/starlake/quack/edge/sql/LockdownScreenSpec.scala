@@ -595,5 +595,76 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     def nested(levels: Int): String =
       "SELECT " + (1 to levels).foldLeft("x")((body, k) => "$t" + k + "$" + body + "$t" + k + "$")
     denied(nested(3)) shouldBe false
+    denied(nested(FunctionCalls.MaxDepth)) shouldBe false
     denied(nested(FunctionCalls.MaxDepth + 1)) shouldBe true
+  }
+
+  // ---- a literal body is read from the ORIGINAL characters, then pre-passed again ----
+  //
+  // DuckDB's unicode-space pre-pass keeps a unicode space it believes sits inside a literal, so
+  // the literal's VALUE holds that character. When query() runs the value, DuckDB's parser runs
+  // the pre-pass again over it, and the character, now outside any literal, becomes a space. Each
+  // statement below reads /etc/hosts (or the environment) on the 2.0 CLI. A body decoded from the
+  // engine view instead carried the view's stand-in, an identifier character, which welded
+  // `FROM<NBSP>read_text` into one word and hid the call.
+
+  "denied functions" should "be found behind a unicode space kept inside a literal query() runs" in {
+    denied("SELECT count(*) FROM query('SELECT * FROM\u00A0read_text(''/etc/hosts'')')") shouldBe
+      true
+    denied("SELECT count(*) FROM query('SELECT * FROM\u3000read_text(''/etc/hosts'')')") shouldBe
+      true
+    denied("SELECT count(*) FROM query('SELECT * FROM read_text\uFEFF(''/etc/hosts'')')") shouldBe
+      true
+    denied("SELECT count(*) FROM query($$SELECT * FROM\u00A0read_text('/etc/hosts')$$)") shouldBe
+      true
+    denied("SELECT * FROM query('SELECT\u00A0getenv(''HOME'')')") shouldBe true
+    denied("SELECT * FROM query(e'SELECT * FROM\u00A0read_text(''/etc/hosts'')')") shouldBe true
+  }
+
+  it should "still admit a kept unicode space in an ordinary literal" in {
+    denied("SELECT 'a\u00A0b', 'read_text\u00A0x' FROM t") shouldBe false
+  }
+
+  // ---- a path-shaped quoted identifier is judged wherever it sits ----
+  //
+  // DuckDB 2.0 replacement-scans a table name it cannot resolve, so a quoted identifier naming a
+  // file reads it in every table position, not only after FROM or JOIN: each statement below
+  // reads the file on the 2.0 CLI. A path-shaped quoted identifier is not a shape ordinary SQL
+  // takes, so every one is judged.
+
+  "quoted identifiers" should "be judged as paths in every table position" in {
+    denied("SELECT * FROM (\"/abs/t.csv\")") shouldBe true
+    denied("SELECT * FROM (`/abs/t.csv`) x") shouldBe true
+    denied("SUMMARIZE \"/abs/t.csv\"") shouldBe true
+    denied("DESCRIBE `/abs/t.csv`") shouldBe true
+    denied("PIVOT \"/abs/t.csv\" ON a USING sum(b)") shouldBe true
+    denied("SELECT * FROM t, \"/abs/t.csv\"") shouldBe true
+    denied("SELECT * FROM t, `data/t.csv` x") shouldBe true
+  }
+
+  it should "admit ordinary and remote quoted identifiers anywhere" in {
+    denied("SELECT \"orders\".\"id\" AS \"Order Id\" FROM \"main\".\"orders\"") shouldBe false
+    denied("SELECT 1 AS \"a/b\", `x.csv` FROM t, \"main\".\"orders\"") shouldBe false
+    denied("SUMMARIZE `s3://b/x.parquet`") shouldBe false
+    deniedB("SUMMARIZE `s3://lakebucket/x.parquet`") shouldBe true
+  }
+
+  // ---- every file extension DuckDB 2.0's replacement scans recognize ----
+  //
+  // read_csv's scan takes .csv and .tsv, the json extension's .json, .jsonl, .ndjson, .geojson and
+  // .geojsonl, parquet's .parquet (each also behind .gz or .zst), and the core read_duckdb's .db,
+  // .ddb and .duckdb; an extension autoloaded by file suffix adds .xlsx, .avro, .shp, .gpkg and
+  // .fgb. A relative path with a separator is path-shaped only through its extension.
+
+  "bare-path FROM" should "recognize every extension DuckDB 2.0 replacement-scans" in {
+    denied("SELECT * FROM 'd/t.tsv'") shouldBe true
+    denied("SELECT * FROM 'd/t.jsonl'") shouldBe true
+    denied("SELECT * FROM 'd/t.tsv.gz'") shouldBe true
+    denied("SELECT * FROM 'd/t.csv.zst'") shouldBe true
+    denied("SELECT * FROM 'd/t.geojson'") shouldBe true
+    denied("SELECT * FROM 'd/t.duckdb'") shouldBe true
+    denied("SELECT * FROM 'd/t.db'") shouldBe true
+    denied("SELECT * FROM 'd/t.xlsx'") shouldBe true
+    denied("SELECT * FROM 'd/t.csv?v=1'") shouldBe true
+    denied("SELECT * FROM 'a/b'") shouldBe false
   }

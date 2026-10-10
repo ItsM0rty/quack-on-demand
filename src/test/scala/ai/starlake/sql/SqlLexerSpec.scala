@@ -33,7 +33,18 @@ class SqlLexerSpec extends AnyFlatSpec with Matchers:
     v.charAt(v.indexOf("$q$") - 1) should not be ' '
     v.length shouldBe "SELECT\u00A01 /* ' */ AS a\u00A0$q$".length
 
-  it should "be a fixpoint on itself and on every slice, so a cut statement lexes as it did in place" in:
+  "keptSpacesRestored" should "give back the pre-pass output: kept spaces as themselves, converted ones as spaces" in:
+    // what a literal's value is read from: the kept NBSP is in the value of `'a<NBSP>b'`, so
+    // query() running that value pre-passes it again and sees a space
+    val s = "SELECT\u00A01, 'x\uFEFFy' /* ' */ AS a\u3000$q$"
+    val r = SqlLexer.keptSpacesRestored(SqlLexer.engineView(s))
+    r.charAt(6) shouldBe ' '
+    r.charAt(r.indexOf("$q$") - 1) shouldBe '\u3000'
+    r.charAt(r.indexOf("y'") - 1) shouldBe '\uFEFF'
+    r.length shouldBe s.length
+    SqlLexer.keptSpacesRestored("SELECT 1") shouldBe "SELECT 1"
+
+  "engineView" should "be a fixpoint on itself and on every slice, so a cut statement lexes as it did in place" in:
     samples.foreach { s =>
       val v = SqlLexer.engineView(s)
       SqlLexer.engineView(v) shouldBe v

@@ -27,12 +27,14 @@ import scala.collection.mutable
   * String literal BODIES are scanned too, as SQL in their own right, because `query('...')` runs
   * its argument: `query('SELECT * FROM `read_text`(''/etc/hosts'')')` reads the file. Each body is
   * decoded the way DuckDB decodes it (`''` undoubled; an escape string's backslash escapes,
-  * including `\x72` and octal bytes; a dollar-quoted body verbatim) and lexed afresh. This is the
-  * over-deny the previous regex had by accident (it never blanked literals), kept on purpose; it is
-  * NOT a proof that `query()` is safe, since a string computed at run time (`'read' ||
-  * '_text(...)'`) carries a call no lexical scan sees. Nesting is followed [[MaxDepth]] levels
-  * deep, which bounds the work at `MaxDepth` passes over the input; past it the scan reports
-  * `truncated`.
+  * including `\x72` and octal bytes; a dollar-quoted body verbatim) from the characters DuckDB's
+  * unicode-space pre-pass kept, never the engine view's stand-ins, and lexed afresh: the fresh lex
+  * pre-passes the body again, as DuckDB's parser does when `query()` runs it, so
+  * `query('SELECT * FROM<NBSP>read_text(...)')` is a call. This is the over-deny the previous regex
+  * had by accident (it never blanked literals), kept on purpose; it is NOT a proof that `query()`
+  * is safe, since a string computed at run time (`'read' || '_text(...)'`) carries a call no
+  * lexical scan sees. Nesting is followed [[MaxDepth]] levels deep, which bounds the work at
+  * `MaxDepth` passes over the input; past it the scan reports `truncated`.
   */
 private[quack] object FunctionCalls:
 
@@ -55,13 +57,15 @@ private[quack] object FunctionCalls:
     while pending.nonEmpty do
       val (text, depth) = pending.dequeue()
       val view          = SqlLexer.engineView(text)
-      val toks          = SqlLexer.tokens(view).filterNot(_.isTrivia)
-      var i             = 0
+      // literal values are read from the characters DuckDB's pre-pass kept, not the stand-ins
+      val values = SqlLexer.keptSpacesRestored(view)
+      val toks   = SqlLexer.tokens(view).filterNot(_.isTrivia)
+      var i      = 0
       while i < toks.length do
         val t = toks(i)
         if i + 1 < toks.length && isOpenParen(view, toks(i + 1)) then
           identifier(view, t).foreach(name => calls += Call(name, view, toks(i + 1).end))
-        stringBody(view, t).foreach { body =>
+        stringBody(values, t).foreach { body =>
           if depth < MaxDepth then pending.enqueue((body, depth + 1))
           else truncated = true
         }
@@ -91,18 +95,25 @@ private[quack] object FunctionCalls:
   /** The decoded body of a string literal token: `'...'` and the `n` / `x` / `b` prefixed forms
     * with `''` undoubled, an escape string `e'...'` decoded, a dollar-quoted body verbatim. None
     * for a quoted identifier or any non-literal token.
+    *
+    * `values` is the token's text with the pre-pass's kept unicode spaces restored
+    * ([[ai.starlake.sql.SqlLexer.keptSpacesRestored]]), position for position the lexed view: a
+    * body is the literal's VALUE, which holds each kept space as itself, so that the body's own
+    * lex, which pre-passes it afresh as DuckDB does when `query()` runs it, turns the ones outside
+    * the body's literals into spaces. Every literal form, the escape string included, reads its
+    * body from it.
     */
-  private def stringBody(view: String, t: SqlLexer.Token): Option[String] =
+  private def stringBody(values: String, t: SqlLexer.Token): Option[String] =
     if t.kind != SqlLexer.Kind.Literal then None
     else
-      val c = view.charAt(t.start)
-      if c == '\'' then Some(undoubled(view, t.start + 1, t.end, '\''))
+      val c = values.charAt(t.start)
+      if c == '\'' then Some(undoubled(values, t.start + 1, t.end, '\''))
       else if c == '$' then
-        val tagEnd = view.indexOf('$', t.start + 1) + 1
-        Some(view.substring(tagEnd, math.max(tagEnd, t.end - (tagEnd - t.start))))
-      else if c == 'e' || c == 'E' then Some(escapeDecoded(view, t.start + 2, t.end))
+        val tagEnd = values.indexOf('$', t.start + 1) + 1
+        Some(values.substring(tagEnd, math.max(tagEnd, t.end - (tagEnd - t.start))))
+      else if c == 'e' || c == 'E' then Some(escapeDecoded(values, t.start + 2, t.end))
       else if c == '"' || c == '`' then None
-      else Some(undoubled(view, t.start + 2, t.end, '\''))
+      else Some(undoubled(values, t.start + 2, t.end, '\''))
 
   /** `s[from, end)` up to the closing delimiter `d`, a doubled `d` standing for one. */
   private def undoubled(s: String, from: Int, end: Int, d: Char): String =

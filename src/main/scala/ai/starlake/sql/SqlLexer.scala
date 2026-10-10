@@ -67,6 +67,20 @@ private[starlake] object SqlLexer:
         i += 1
       new String(out)
 
+  /** An [[engineView]] with each stand-in mapped back to the unicode space it stands for: the text
+    * DuckDB's pre-pass hands the tokenizer, and so the text a literal's VALUE is read from. A space
+    * the pre-pass kept (it believed the character sat inside a literal) is in the value as itself,
+    * not as a stand-in and not as an ASCII space; one it converted is an ASCII space in the value
+    * too, since the conversion ran before any quote was read. A literal body that will run as SQL
+    * (`query('...')` runs one) must be read from this text: DuckDB pre-passes that SQL again, and a
+    * kept space outside every literal of the BODY becomes a space there, where a stand-in would
+    * read as an identifier character. A lone low surrogate in the input that happens to equal a
+    * stand-in maps to a space character too; no decoded wire input carries one.
+    */
+  def keptSpacesRestored(view: String): String =
+    if view == null || !view.exists(isStandIn) then view
+    else view.map(c => if isStandIn(c) then PrepassSpaces(c - StandInBase) else c)
+
   /** Index just past the block comment opening at `from` (slash, star), tracking nesting depth. An
     * unterminated comment consumes the rest of the input (DuckDB rejects it).
     */
@@ -263,7 +277,12 @@ private[starlake] object SqlLexer:
 
   private def isPrepassSpace(c: Char): Boolean = PrepassSpaces.contains(c)
 
-  private def standIn(c: Char): Char = ('\uDC00' + PrepassSpaces.indexOf(c)).toChar
+  private val StandInBase = '\uDC00'
+
+  private def standIn(c: Char): Char = (StandInBase + PrepassSpaces.indexOf(c)).toChar
+
+  private def isStandIn(c: Char): Boolean =
+    c >= StandInBase && c < StandInBase + PrepassSpaces.length
 
   /** For each char of `sql`, whether DuckDB's pre-pass turns it into a space. A byte-for-byte port
     * (its loop bounds are byte offsets, so the emulation runs over the UTF-8 encoding).

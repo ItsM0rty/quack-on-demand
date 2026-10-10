@@ -28,9 +28,12 @@ object CatalogReachingCalls:
 
   /** The first catalog-reaching function called by `sql`, lowercased, or None.
     *
-    * A string literal nested past [[FunctionCalls.MaxDepth]] is left unscanned without denying: a
-    * literal only executes as SQL through a call that runs a string (`query`,
-    * `json_execute_serialized_sql`), which is itself listed here and found at a shallower level.
+    * A string literal nested past [[FunctionCalls.MaxDepth]] is left unscanned without denying. A
+    * literal runs as SQL only through a function that takes SQL text. On the node itself those are
+    * `query` and `json_execute_serialized_sql`, both listed here and so found at a shallower level.
+    * The others (`quack_query`, `quack_query_by_name`, `postgres_query`, `postgres_execute`) send
+    * their SQL to the server they name instead of running it here, and this gate makes no claim
+    * about what that server runs, nested or not.
     */
   def find(sql: String): Option[String] =
     FunctionCalls.scan(sql).calls.iterator.map(_.name).find(isCatalogReaching)

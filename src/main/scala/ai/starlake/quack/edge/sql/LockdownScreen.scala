@@ -113,9 +113,34 @@ object LockdownScreen:
   // ignored - a legit remote COPY with options is not over-denied.
   private val CopyPathLiteral = "(?<![a-zA-Z0-9_])(?:from|to)\\s*'([^']*)'".r
 
-  // Known data-file extensions used to spot path-shaped literals that carry a separator.
+  // The file extensions DuckDB 2.0's replacement scans recognize, used to spot a path-shaped name
+  // that carries a separator: read_csv's .csv / .tsv, the json extension's .json / .jsonl /
+  // .ndjson / .geojson / .geojsonl, parquet's .parquet, the core read_duckdb's .db / .ddb /
+  // .duckdb, and the suffixes that autoload an extension (`EXTENSION_FILE_POSTFIXES`): .xlsx,
+  // .avro, .shp, .gpkg, .fgb. Each scan also matches the extension followed by `?` anywhere in the
+  // name. Every scan but read_duckdb's drops a trailing .gz or .zst first; dropping it for all of
+  // them over-denies only a compressed DuckDB file name.
   private val DataExtensions =
-    List(".parquet.gz", ".csv.gz", ".json.gz", ".ndjson.gz", ".parquet", ".csv", ".json", ".ndjson")
+    List(
+      ".parquet",
+      ".csv",
+      ".tsv",
+      ".json",
+      ".jsonl",
+      ".ndjson",
+      ".geojson",
+      ".geojsonl",
+      ".db",
+      ".ddb",
+      ".duckdb",
+      ".xlsx",
+      ".avro",
+      ".shp",
+      ".gpkg",
+      ".fgb"
+    )
+
+  private val CompressionSuffixes = List(".gz", ".zst")
 
   private val DriveLetter = "^[a-z]:[\\\\/]".r
 
@@ -129,8 +154,9 @@ object LockdownScreen:
 
   private def screenOne(stmt: String, deniedBuckets: Set[String]): Option[String] =
     // Normalized ONLY for screening, in three passes, each closing a gap the previous one leaves
-    // open -- `stmt` itself, unnormalized, is never used past this point; only `lower` is matched
-    // against, and the ORIGINAL `stmt` text is what the caller relays to the node.
+    // open. Every regex rule matches against `lower`; the token-based rules (function calls and
+    // quoted identifiers, see the end of this comment) lex `stmt` instead. Neither rewrites what
+    // is relayed: the caller sends the ORIGINAL text to the node.
     //   1. `SqlTrivia.stripLeading` DELETES leading whitespace/trivia and any leading comment. It
     //      is the only pass that deletes rather than rewrites, which is what `FirstToken`'s
     //      index-0 anchor needs: `SqlTrivia.normalize` turns a leading NBSP into an ASCII space
@@ -160,7 +186,7 @@ object LockdownScreen:
     // `"INSTALL".toLowerCase` is a dotless-i `install` (U+0131), which matches no key in
     // `DeniedFirstTokens` and admits INSTALL on a locked-down deployment.
     //
-    // The function-call rule and the quoted-identifier FROM rule do not read `lower`: they lex
+    // The function-call rule and the quoted-identifier rule do not read `lower`: they lex
     // `stmt` itself (see `FunctionCalls`), so no quoting form DuckDB 2.0 accepts for a name can hide
     // one from a regex, and only a call's argument list is normalized and folded afterwards.
     val lower =
@@ -450,41 +476,41 @@ object LockdownScreen:
 
   /** Denies a QUOTED IDENTIFIER replacement scan of a local path: DuckDB 2.0 replacement-scans a
     * table name it cannot resolve as a file, so `FROM "/etc/x.csv"` and `` FROM `/etc/x.csv` ``
-    * read the file exactly as `FROM '/etc/x.csv'` does (each verified on the 2.0 CLI), and a
-    * qualified name is joined with dots first (`"/etc/x"."csv"` reads `/etc/x.csv`). Read from the
-    * lexer's tokens after a FROM or JOIN keyword, at any depth: a column named like an absolute
-    * path is not a shape ordinary SQL takes, unlike the `trim(leading '/' from '/a')` literal that
-    * keeps [[barePathFrom]] at statement level. The name gets the plain literal's verdict (remote
-    * exemption, denied buckets, the path-shape heuristic), so `FROM "orders"` stays admitted.
+    * read the file exactly as `FROM '/etc/x.csv'` does, and a qualified name is joined with dots
+    * first (`"/etc/x"."csv"` reads `/etc/x.csv`). A table name sits in many more places than after
+    * FROM or JOIN: `FROM ("/a/t.csv")`, a comma join, `SUMMARIZE`, `DESCRIBE` and `PIVOT` each read
+    * the file too (each verified on the 2.0 CLI). So EVERY quoted identifier is judged, read from
+    * the lexer's tokens at any depth, a qualified name (any of whose parts is quoted) joined with
+    * dots: an identifier shaped like a local file path is not a shape ordinary SQL takes, unlike
+    * the `trim(leading '/' from '/a')` literal that keeps [[barePathFrom]] at statement level. The
+    * name gets the plain literal's verdict (remote exemption, denied buckets, the path-shape
+    * heuristic), so `"orders"`, `"main"."orders"` and a remote name stay admitted. Identifiers
+    * inside a string literal body are not judged: a literal holding a JSON document with a path
+    * value is ordinary SQL.
     */
-  private val TableKeywords = Set("from", "join")
-
   private def quotedPathFrom(stmt: String, deniedBuckets: Set[String]): Option[String] =
     val view  = SqlLexer.engineView(stmt)
     val toks  = SqlLexer.tokens(view).filterNot(_.isTrivia)
     val names = ListBuffer.empty[String]
     var i     = 0
     while i < toks.length do
-      val t = toks(i)
-      if t.kind == SqlLexer.Kind.Word &&
-        TableKeywords.contains(view.substring(t.start, t.end).toLowerCase(Locale.ROOT))
-      then
-        val parts  = ListBuffer.empty[String]
-        var quoted = false
-        var j      = i + 1
-        var more   = true
-        while more && j < toks.length do
-          FunctionCalls.identifier(view, toks(j)) match
-            case Some(part) =>
-              parts += part
-              quoted = quoted || FunctionCalls.quotedIdentifier(view, toks(j)).isDefined
-              val dot = j + 1 < toks.length && toks(j + 1).kind == SqlLexer.Kind.Number &&
-                view.substring(toks(j + 1).start, toks(j + 1).end) == "."
-              j += (if dot then 2 else 1)
-              more = dot
-            case None => more = false
-        if quoted then names += parts.mkString(".")
-      i += 1
+      // the identifier chain starting at token i: `part (. part)*`
+      val parts  = ListBuffer.empty[String]
+      var quoted = false
+      var j      = i
+      var more   = true
+      while more && j < toks.length do
+        FunctionCalls.identifier(view, toks(j)) match
+          case Some(part) =>
+            parts += part
+            quoted = quoted || FunctionCalls.quotedIdentifier(view, toks(j)).isDefined
+            val dot = j + 1 < toks.length && toks(j + 1).kind == SqlLexer.Kind.Number &&
+              view.substring(toks(j + 1).start, toks(j + 1).end) == "."
+            j += (if dot then 2 else 1)
+            more = dot
+          case None => more = false
+      if quoted then names += parts.mkString(".")
+      i = math.max(j, i + 1)
     names.iterator.flatMap(fromPathVerdict(_, strict = false, deniedBuckets)).nextOption()
 
   /** Net open-paren depth in `lower[0, index)`, ignoring parens inside single-quoted strings. Used
@@ -509,11 +535,20 @@ object LockdownScreen:
     depth
 
   /** True when the (quoted) literal looks like a local filesystem path: it starts with an absolute
-    * or relative path prefix or a drive letter, or it contains a path separator AND ends in a known
-    * data-file extension. Ordinary values like 'a/b' (no data extension) do not match.
+    * or relative path prefix or a drive letter, or it contains a path separator AND carries a data
+    * file extension a replacement scan recognizes (see `DataExtensions`). Ordinary values like
+    * 'a/b' (no data extension) do not match.
     */
   private def looksLikePath(quoted: String): Boolean =
     val s = quoted.stripPrefix("'").stripSuffix("'")
     s.startsWith("/") || s.startsWith("./") || s.startsWith("../") ||
     DriveLetter.findFirstIn(s).isDefined ||
-    ((s.contains("/") || s.contains("\\")) && DataExtensions.exists(s.endsWith))
+    ((s.contains("/") || s.contains("\\")) && hasDataExtension(s))
+
+  /** `s` names a file a replacement scan reads by its extension: one of `DataExtensions` at the end
+    * (a trailing compression suffix dropped first) or followed by `?` anywhere, as DuckDB's
+    * `ReplacementScan::CanReplace` matches it.
+    */
+  private def hasDataExtension(s: String): Boolean =
+    val base = CompressionSuffixes.find(s.endsWith).fold(s)(c => s.dropRight(c.length))
+    DataExtensions.exists(e => base.endsWith(e) || s.contains(e + "?"))
