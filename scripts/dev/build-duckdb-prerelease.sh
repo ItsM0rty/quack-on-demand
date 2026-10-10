@@ -113,6 +113,11 @@ done
 sid="$("$CACHE/bin/duckdb" -csv -noheader -c "SELECT source_id FROM pragma_version()")"
 [[ "$sid" == "${DUCKDB_SHA:0:10}" ]] || {
   echo "built CLI source_id $sid, expected ${DUCKDB_SHA:0:10}" >&2; exit 1; }
+
+# A source build auto-installs into its own build repository, not `core`, so iceberg's load-time
+# auto-install of avro finds nothing there and every Iceberg ATTACH fails. An official release
+# auto-installs from `core`; pre-installing avro from `core` gives the same result.
+"$CACHE/bin/duckdb" -no-agent -c "INSTALL avro FROM core"
 # ---- 3. build and install duckdb-java ----------------------------------------------------
 ( cd "$WORK/duckdb-java" && GEN=ninja make release )
 M2="$HOME/.m2/repository/org/duckdb/duckdb_jdbc/$JDBC_VERSION"

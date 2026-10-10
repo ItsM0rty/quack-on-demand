@@ -32,7 +32,7 @@ class IcebergSetupSqlSpec extends AnyFlatSpec with Matchers:
     sql should include("""OAUTH2_SCOPE 'PRINCIPAL_ROLE:qod_reader'""")
     sql should include("""ATTACH 'sales' AS "sales_lake"""")
     sql should include("""SECRET "qod_ice_sales_lake"""")
-    sql should include("""ENDPOINT 'https://catalog.example.com/api/catalog'""")
+    sql should include("""URI 'https://catalog.example.com/api/catalog'""")
   }
 
   it should "omit AUTHORIZATION_TYPE for oauth2 because it is DuckDB's default" in {
@@ -59,23 +59,30 @@ class IcebergSetupSqlSpec extends AnyFlatSpec with Matchers:
     sql should include("""SECRET "qod_ice_lake"""")
   }
 
-  it should "emit ENDPOINT inside the oauth2 secret so ATTACH can reach the token endpoint" in {
-    // Regression test: without ENDPOINT in the SECRET, DuckDB fails ATTACH with
+  it should "emit URI inside the oauth2 secret so ATTACH can reach the token endpoint" in {
+    // Regression test: without URI in the SECRET, DuckDB fails ATTACH with
     // "AUTHORIZATION_TYPE is 'oauth2', yet no 'oauth2_server_uri' was provided, and no
-    // 'endpoint' was provided to fall back on" even though the ATTACH itself carries ENDPOINT -
+    // 'endpoint' was provided to fall back on" even though the ATTACH itself carries URI -
     // DuckDB only reads that fallback off the SECRET.
     val sql         = IcebergSetupSql.render(v(oauth2, "sales_lake"), readOnly = false)
     val secretBlock = sql.substring(0, sql.indexOf("ATTACH"))
-    secretBlock should include("""ENDPOINT 'https://catalog.example.com/api/catalog'""")
+    secretBlock should include("""URI 'https://catalog.example.com/api/catalog'""")
   }
 
-  it should "still carry ENDPOINT on the ATTACH alongside the secret's own ENDPOINT" in {
+  it should "still carry URI on the ATTACH alongside the secret's own URI" in {
     val sql         = IcebergSetupSql.render(v(oauth2, "sales_lake"), readOnly = false)
     val attachBlock = sql.substring(sql.indexOf("ATTACH"))
-    attachBlock should include("""ENDPOINT 'https://catalog.example.com/api/catalog'""")
+    attachBlock should include("""URI 'https://catalog.example.com/api/catalog'""")
   }
 
-  it should "not emit ENDPOINT inside a token secret, while the ATTACH still carries it" in {
+  it should "never emit the ENDPOINT spelling DuckDB 2.0 deprecates" in {
+    // DuckDB 2.0's Iceberg extension prints a deprecation WARNING for every SECRET or ATTACH that
+    // uses ENDPOINT; ENDPOINT_TYPE is a different option and stays.
+    val sql = IcebergSetupSql.render(v(oauth2, "sales_lake"), readOnly = false)
+    sql should not include "ENDPOINT '"
+  }
+
+  it should "not emit URI inside a token secret, while the ATTACH still carries it" in {
     val cfg = IcebergRestConfig(
       uri = "https://c.example.com",
       warehouse = "wh",
@@ -85,16 +92,16 @@ class IcebergSetupSqlSpec extends AnyFlatSpec with Matchers:
     val sql         = IcebergSetupSql.render(v(cfg, "lake"), readOnly = false)
     val secretBlock = sql.substring(0, sql.indexOf("ATTACH"))
     val attachBlock = sql.substring(sql.indexOf("ATTACH"))
-    secretBlock should not include "ENDPOINT"
-    attachBlock should include("""ENDPOINT 'https://c.example.com'""")
+    secretBlock should not include "URI '"
+    attachBlock should include("""URI 'https://c.example.com'""")
   }
 
-  it should "still emit OAUTH2_SERVER_URI plus the secret ENDPOINT when oauth2ServerUri is set" in {
+  it should "still emit OAUTH2_SERVER_URI plus the secret URI when oauth2ServerUri is set" in {
     val cfg = oauth2.copy(oauth2ServerUri = Some("https://auth.example.com/oauth/token"))
     val sql = IcebergSetupSql.render(v(cfg, "sales_lake"), readOnly = false)
     sql should include("""OAUTH2_SERVER_URI 'https://auth.example.com/oauth/token'""")
     val secretBlock = sql.substring(0, sql.indexOf("ATTACH"))
-    secretBlock should include("""ENDPOINT 'https://catalog.example.com/api/catalog'""")
+    secretBlock should include("""URI 'https://catalog.example.com/api/catalog'""")
   }
 
   it should "emit AUTHORIZATION_TYPE none and no secret for unauthenticated catalogs" in {
@@ -128,7 +135,7 @@ class IcebergSetupSqlSpec extends AnyFlatSpec with Matchers:
     val sql = IcebergSetupSql.render(v(cfg, "glue_lake"), readOnly = false)
     sql should include("""ENDPOINT_TYPE 'glue'""")
     sql should not include "AUTHORIZATION_TYPE"
-    sql should not include "ENDPOINT '"
+    sql should not include "URI '"
   }
 
   it should "emit ENDPOINT_TYPE s3_tables" in {
