@@ -32,16 +32,19 @@ import scala.collection.mutable.ListBuffer
 object LockdownScreen:
 
   private val DeniedFirstTokens = Map(
-    "attach"  -> "ATTACH is disabled on this deployment",
-    "detach"  -> "DETACH is disabled on this deployment",
-    "install" -> "INSTALL is disabled on this deployment",
-    "load"    -> "LOAD is disabled on this deployment"
+    "attach"     -> "ATTACH is disabled on this deployment",
+    "detach"     -> "DETACH is disabled on this deployment",
+    "install"    -> "INSTALL is disabled on this deployment",
+    "load"       -> "LOAD is disabled on this deployment",
+    "connect"    -> "CONNECT is disabled on this deployment",
+    "disconnect" -> "DISCONNECT is disabled on this deployment"
   )
 
   private val ProtectedSettings = Set(
     "disabled_filesystems",
     "allow_community_extensions",
     "allow_unsigned_extensions",
+    "allow_extension_repositories",
     "autoinstall_known_extensions",
     "autoload_known_extensions",
     "enable_external_access",
@@ -86,6 +89,9 @@ object LockdownScreen:
   private val RemoteSchemes = List("s3://", "gs://", "az://", "r2://", "http://", "https://")
 
   private val FirstToken = "^\\s*([a-zA-Z_]+)".r
+
+  // DuckDB 2.0 custom extension repositories: registering one is a code-loading path.
+  private val ExtensionRepositoryDdl = "^(?:create|drop)\\s+extension\\s+repository\\b".r
 
   // A single-quoted literal immediately following the FROM keyword (replacement-scan position). The
   // negative lookbehind keeps `from` a standalone keyword, not the tail of an identifier. `\s*`
@@ -151,8 +157,12 @@ object LockdownScreen:
       SqlTrivia.normalize(
         SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt.toLowerCase(Locale.ROOT)))
       )
-    val first = FirstToken.findFirstMatchIn(lower).map(_.group(1))
-    first.flatMap(DeniedFirstTokens.get) match
+    val first         = FirstToken.findFirstMatchIn(lower).map(_.group(1))
+    val repositoryHit =
+      ExtensionRepositoryDdl
+        .findFirstIn(lower)
+        .map(_ => "extension repositories are disabled on this deployment")
+    first.flatMap(DeniedFirstTokens.get).orElse(repositoryHit) match
       case some @ Some(_) => some
       case None           =>
         val settingHit = first match

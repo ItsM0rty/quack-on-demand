@@ -474,3 +474,20 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
       }
     finally src.close()
   }
+
+  "DuckDB 2.0 statements" should "deny CONNECT / DISCONNECT and extension repository DDL" in {
+    denied("CONNECT 'quack:evil.example:9494' (TOKEN 'x')") shouldBe true
+    denied("  /* c */ connect 'quack:h:1'") shouldBe true
+    denied("DISCONNECT") shouldBe true
+    denied("CREATE EXTENSION REPOSITORY r WITH PREFIX 'https://x/'") shouldBe true
+    denied("create  extension\nrepository r with prefix 'https://x/'") shouldBe true
+    denied("DROP EXTENSION REPOSITORY r") shouldBe true
+    denied("SELECT 1; CONNECT 'quack:h:1'") shouldBe true
+    denied("CREATE TABLE connections(a INT)") shouldBe false
+    denied("SELECT * FROM connect_log") shouldBe false
+  }
+
+  it should "protect allow_extension_repositories" in {
+    denied("SET allow_extension_repositories = 'allowed'") shouldBe true
+    denied("RESET allow_extension_repositories") shouldBe true
+  }
