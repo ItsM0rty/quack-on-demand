@@ -153,7 +153,7 @@ object DuckLakeInitializer extends LazyLogging:
         }
         stmt.execute(ext.loadSql("ducklake"))
         stmt.execute(ext.loadSql("postgres_scanner"))
-        storageSqlFor(dataPath).foreach(stmt.execute)
+        storageSqlFor(dataPath, ext).foreach(stmt.execute)
         // Two-layer escape: libpq parses the post-`ducklake:postgres:`
         // payload as a keyword=value connstring, which is itself wrapped
         // in a DuckDB string literal. Naive single-quote doubling alone
@@ -237,12 +237,12 @@ object DuckLakeInitializer extends LazyLogging:
     *
     * Returns Nil for local-filesystem `dataPath` values - no extension needed.
     */
-  private def storageSqlFor(dataPath: String): List[String] =
+  private[ondemand] def storageSqlFor(dataPath: String, ext: DuckDbExtensionSource): List[String] =
     val lower = dataPath.toLowerCase(Locale.ROOT)
     if lower.startsWith("s3://") || lower.startsWith("s3a://") ||
       lower.startsWith("gs://") || lower.startsWith("r2://")
     then
-      val install = "INSTALL httpfs; LOAD httpfs;"
+      val install = ext.loadSql("httpfs")
       val secret  = for
         key    <- sys.env.get("QOD_S3_ACCESS_KEY_ID").filter(_.nonEmpty)
         secret <- sys.env.get("QOD_S3_SECRET_ACCESS_KEY").filter(_.nonEmpty)
@@ -268,7 +268,7 @@ object DuckLakeInitializer extends LazyLogging:
     else if lower.startsWith("az://") || lower.startsWith("azure://") ||
       lower.startsWith("abfss://")
     then
-      val install = "INSTALL azure; LOAD azure;"
+      val install = ext.loadSql("azure")
       val secret  = sys.env.get("QOD_AZURE_CONNECTION_STRING").filter(_.nonEmpty).map { cs =>
         s"""CREATE OR REPLACE SECRET quack_azure (
            |  TYPE azure,

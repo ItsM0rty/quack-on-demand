@@ -53,3 +53,21 @@ class DuckLakeInitializerSqlSpec extends AnyFlatSpec with Matchers:
         "catalog: create a new database with encrypted=false and copy the data."
     )
   }
+
+  "storageSqlFor" should "keep INSTALL/LOAD for object stores when no extension dir is set" in {
+    val none = DuckDbExtensionSource(None)
+    DuckLakeInitializer.storageSqlFor("s3://b/p/", none).head shouldBe
+      "INSTALL httpfs; LOAD httpfs;"
+    DuckLakeInitializer.storageSqlFor("az://c/p/", none).head shouldBe
+      "INSTALL azure; LOAD azure;"
+    DuckLakeInitializer.storageSqlFor("/var/lake", none) shouldBe Nil
+  }
+
+  it should "LOAD object-store extensions by path under an extension dir, never INSTALL" in {
+    val src = DuckDbExtensionSource(Some("/opt/ext"))
+    val s3  = DuckLakeInitializer.storageSqlFor("s3://b/p/", src)
+    s3.head shouldBe "LOAD '/opt/ext/httpfs.duckdb_extension';"
+    val az = DuckLakeInitializer.storageSqlFor("abfss://c/p/", src)
+    az.head shouldBe "LOAD '/opt/ext/azure.duckdb_extension';"
+    (s3 ++ az).exists(_.contains("INSTALL")) shouldBe false
+  }
