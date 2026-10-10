@@ -38,7 +38,8 @@ class QuackNodeLinkSpec extends AnyFlatSpec with Matchers:
     None,
     Instant.EPOCH
   )
-  private val hello = ConnectionRequest("client-secret", "v1.5.4", "osx_arm64", 1L, 1L, "", 0L)
+  private val hello =
+    ConnectionRequest("client-secret", "v2.0.0", "osx_arm64", 3L, 3L, "qod-test", 0L)
 
   private def connResp(id: String)       = QuackTestFixtures.serializeSampleConnectionResponse(id)
   private def errorResp(msg: String)     = QuackTestFixtures.serializeSampleErrorResponse(msg)
@@ -75,12 +76,12 @@ class QuackNodeLinkSpec extends AnyFlatSpec with Matchers:
   "forward" should "rewrite the header to the node connection id and return the node's bytes" in:
     val t           = new FakeTransport(connResp("NODE1"), fetchResp(true))
     val link        = QuackNodeLink.open(t, node, hello, 1L).unsafeRunSync().toOption.get._1
-    val clientFetch = frame(encodeFetchRequest("CLIENT", 3L, Hugeint(1L, 2L))).toOption.get
+    val clientFetch = frame(encodeFetchRequest("CLIENT", 3L, Hugeint(1L, 2L), 4L)).toOption.get
     val out         = link.forward(clientFetch).unsafeRunSync()
     out.toOption.get shouldBe fetchResp(true)
     val relayed = frame(t.posted(1)._2).toOption.get
     relayed.header shouldBe Header(Type.FetchRequest, "NODE1", 3L)
-    decodeFetchRequest(relayed) shouldBe Right(FetchRequest(Hugeint(1L, 2L)))
+    decodeFetchRequest(relayed) shouldBe Right(FetchRequest(Hugeint(1L, 2L), 4L, 3L))
 
   "runDiscard" should "prepare, drain every fetch and stop at the terminal response" in:
     val t =
@@ -96,10 +97,26 @@ class QuackNodeLinkSpec extends AnyFlatSpec with Matchers:
     val prep = frame(t.posted(1)._2).toOption.get
     prep.header shouldBe Header(Type.PrepareRequest, "NODE1", 9L)
     decodePrepareRequest(prep).toOption.get.sql shouldBe "COMMIT"
-    decodeFetchRequest(frame(t.posted(2)._2).toOption.get).toOption.get.uuid shouldBe Hugeint(
-      0L,
-      77L
+    // Quack v3 names every query: a node refuses a PREPARE without a query uuid.
+    val uuid = decodePrepareRequest(prep).toOption.get.queryUuid
+    uuid.isDefined shouldBe true
+    uuid should not be Some(Hugeint(0L, 0L))
+    // Each FETCH names its 1-based batch and acks the ones before it.
+    decodeFetchRequest(frame(t.posted(2)._2).toOption.get) shouldBe Right(
+      FetchRequest(Hugeint(0L, 77L), 1L, 0L)
     )
+    decodeFetchRequest(frame(t.posted(3)._2).toOption.get) shouldBe Right(
+      FetchRequest(Hugeint(0L, 77L), 2L, 1L)
+    )
+
+  it should "name each of its queries with a fresh uuid" in:
+    val t =
+      new FakeTransport(connResp("NODE1"), prepareResp(false), prepareResp(false))
+    val link = QuackNodeLink.open(t, node, hello, 1L).unsafeRunSync().toOption.get._1
+    link.runDiscard("BEGIN", 1L).unsafeRunSync() shouldBe Right(())
+    link.runDiscard("COMMIT", 2L).unsafeRunSync() shouldBe Right(())
+    val uuids = t.posted.drop(1).map(p => decodePrepareRequest(frame(p._2).toOption.get))
+    uuids(0).toOption.get.queryUuid should not be uuids(1).toOption.get.queryUuid
 
   it should "not fetch when the prepare response is complete" in:
     val t    = new FakeTransport(connResp("NODE1"), prepareResp(false))

@@ -5,8 +5,9 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 /** Codec contract, pinned two ways: byte fixtures captured from the DuckDB 1.5.4 CLI (quack
-  * extension 40de7ba, protocol generation 1) talking to a real `quack_serve` node, and round-trips
-  * against the libquackwire native serializers the outbound client already uses.
+  * extension 40de7ba) talking to a real `quack_serve` node, for the messages whose fields Quack v3
+  * left unchanged, and round-trips against the libquackwire native (de)serializers of the pinned
+  * Quack v3 (DuckDB 2.0, quack 974927a) the nodes run.
   */
 class QuackWireSpec extends AnyFlatSpec with Matchers:
 
@@ -37,16 +38,12 @@ class QuackWireSpec extends AnyFlatSpec with Matchers:
   private val success = hex("01000a0300ffffffffffffffffff01ffffffff")
   private val error   =
     hex("0100640300ffffffffffffffffff01ffff01001541757468656e7469636174696f6e206661696c6564ffff")
-  private val appendPrefix = hex(
-    "0100090200204431433245464145393544414331363631314334373637374446423546333830030006ffff0100046d61696e020001740300012c01"
-  )
   private val prepareRespNoMore = hex(
     "0100040300ffffffffffffffffff01ffff01000264000effff640019ffff0200020269640173040003012c01"
   )
-  private val fetchRespChunks = hex("0100080300ffffffffffffffffff01ffff01000c012c01")
-  private val fetchTerminal1  = hex("0100080300ffffffffffffffffff01ffffffff")
-  private val fetchTerminal3  = hex("0100080300ffffffffffffffffff01ffff020004ffff")
-  private val fetchGen3More   = hex("0100080300ffffffffffffffffff01ffff010002030001ffff")
+  private val fetchTerminalBare = hex("0100080300ffffffffffffffffff01ffffffff")
+  private val fetchTerminal3    = hex("0100080300ffffffffffffffffff01ffff020004ffff")
+  private val fetchGen3More     = hex("0100080300ffffffffffffffffff01ffff010002030001ffff")
 
   "frame" should "read the header of every captured request" in:
     val f = frame(connReq).toOption.get
@@ -70,7 +67,7 @@ class QuackWireSpec extends AnyFlatSpec with Matchers:
     frame(Array.empty[Byte]).isLeft shouldBe true
     frame(connReq.take(5)).isLeft shouldBe true
 
-  "decodeConnectionRequest" should "read the generation 1 hello" in:
+  "decodeConnectionRequest" should "read a captured hello" in:
     decodeConnectionRequest(frame(connReq).toOption.get) shouldBe Right(
       ConnectionRequest("tok1234", "v1.5.4", "osx_arm64", 1L, 1L, "", 0L)
     )
@@ -82,37 +79,69 @@ class QuackWireSpec extends AnyFlatSpec with Matchers:
     f.header shouldBe Header(Type.ConnectionRequest, "", 9L)
     decodeConnectionRequest(f) shouldBe Right(hello)
 
-  "decodePrepareRequest" should "read the generation 1 shape" in:
+  "decodePrepareRequest" should "read a captured request without a query uuid" in:
     decodePrepareRequest(frame(prepareReq).toOption.get) shouldBe Right(
       PrepareRequest("SELECT * FROM t", None, None)
     )
 
-  it should "round-trip the generation 3 shape" in:
+  it should "round-trip the Quack v3 shape" in:
     val p     = PrepareRequest("SELECT 1", Some(Hugeint(-5L, 7L)), Some(0L))
     val bytes = encodePrepareRequest("ABC", 4L, p)
     val f     = frame(bytes).toOption.get
     f.header shouldBe Header(Type.PrepareRequest, "ABC", 4L)
     decodePrepareRequest(f) shouldBe Right(p)
 
-  it should "encode the generation 1 shape byte for byte" in:
-    toHex(encodePrepareRequest(ConnId, 3L, PrepareRequest("SELECT * FROM t", None, None))) shouldBe
-      toHex(prepareReq)
+  it should "always carry the query uuid, which a Quack v3 node requires" in:
+    val f =
+      frame(encodePrepareRequest("C", 1L, PrepareRequest("SELECT 1", None, None))).toOption.get
+    decodePrepareRequest(f) shouldBe Right(PrepareRequest("SELECT 1", Some(Hugeint(0L, 0L)), None))
 
   it should "reject an unknown field id without throwing" in:
     val f = frame(hex("010003ffff0900" + "01" + "ffff")).toOption.get
     decodePrepareRequest(f).swap.toOption.get.message should include("unknown field")
 
-  "decodeAppendRequest" should "read schema and table and stop before the chunks" in:
-    decodeAppendRequest(frame(appendPrefix).toOption.get) shouldBe Right(AppendRequest("main", "t"))
-
-  "decodeFetchRequest" should "read the uuid and re-encode the same body" in:
+  "decodeFetchRequest" should "read the uuid of a captured request" in:
     val f = frame(fetchReq).toOption.get
-    val u = decodeFetchRequest(f).toOption.get.uuid
-    toHex(encodeFetchRequest(f.header.connectionId, 3L, u)) shouldBe toHex(fetchReq)
+    decodeFetchRequest(f).toOption.get shouldBe FetchRequest(
+      Hugeint(-5906164766744752579L, -6256396838583600612L)
+    )
+
+  it should "read the batch and ack indexes of Quack v3" in:
+    val f = frame(encodeFetchRequest("c1", 5L, Hugeint(0L, 7L), 3L)).toOption.get
+    decodeFetchRequest(f) shouldBe Right(FetchRequest(Hugeint(0L, 7L), 3L, 2L))
+
+  "encodeFetchRequest" should "carry the batch and ack indexes of Quack v3" in:
+    val u     = Hugeint(0L, 7L)
+    val bytes = encodeFetchRequest("c1", 5L, u, 3L)
+    val f     = frame(bytes).toOption.get
+    f.header.msgType shouldBe Type.FetchRequest
+    decodeFetchRequest(f).toOption.get.uuid shouldBe u
+    bytes should not equal encodeFetchRequest("c1", 5L, u, 4L)
+
+  it should "write the body libquackwire writes for the same batch" in:
+    val u      = Hugeint(0L, 77L)
+    val native = frame(
+      QuackNativeBridge.serializeFetchRequest("C", java.math.BigInteger.valueOf(77L), 3L)
+    ).toOption.get
+    val ours = frame(encodeFetchRequest("C", 1L, u, 3L)).toOption.get
+    toHex(ours.bytes.drop(ours.bodyStart)) shouldBe toHex(native.bytes.drop(native.bodyStart))
 
   "encodeError / decodeErrorMessage" should "match the captured ERROR_RESPONSE" in:
     toHex(encodeError("Authentication failed")) shouldBe toHex(error)
     decodeErrorMessage(error) shouldBe Right("Authentication failed")
+
+  "decodeErrorMessage" should "keep the message of a Quack v3 error and skip type, info and flag" in:
+    // field 2 exception_type, field 3 extra_info (a list of {0: key, 1: value} objects), field 4
+    // must_invalidate (one raw byte)
+    val v3 = hex(
+      "0100640300ffffffffffffffffff01ffff" +
+        "010004626f6f6d" +
+        "020007436174616c6f67" +
+        "030002" + "000001610100017a" + "ffff" + "000001620100017b" + "ffff" +
+        "040001" +
+        "ffff"
+    )
+    decodeErrorMessage(v3) shouldBe Right("boom")
 
   "encodeSuccess" should "match the captured SUCCESS_RESPONSE" in:
     toHex(encodeSuccess()) shouldBe toHex(success)
@@ -144,9 +173,10 @@ class QuackWireSpec extends AnyFlatSpec with Matchers:
     messageType(prepareRespNoMore) shouldBe Type.PrepareResponse
     messageType(Array[Byte](1, 0)) shouldBe -1
 
-  "isTerminalFetch" should "recognise both generations' terminal responses only" in:
-    isTerminalFetch(fetchRespChunks) shouldBe false
-    isTerminalFetch(fetchTerminal1) shouldBe true
+  "isTerminalFetch" should "recognise Quack v3 terminal responses only" in:
+    isTerminalFetch(QuackTestFixtures.serializeSampleFetchResponse(true)) shouldBe false
+    isTerminalFetch(QuackTestFixtures.serializeSampleFetchResponse(false)) shouldBe true
+    isTerminalFetch(fetchTerminalBare) shouldBe true
     isTerminalFetch(fetchTerminal3) shouldBe true
     isTerminalFetch(fetchGen3More) shouldBe false
 
@@ -158,6 +188,10 @@ class QuackWireSpec extends AnyFlatSpec with Matchers:
     decodePrepareRequest(p).toOption.get.sql shouldBe "SELECT 1"
     val d = frame(QuackNativeBridge.serializeDisconnect("D")).toOption.get
     d.header shouldBe Header(Type.Disconnect, "D", InvalidIndex)
+    val fr = frame(
+      QuackNativeBridge.serializeFetchRequest("F", java.math.BigInteger.valueOf(9L), 2L)
+    ).toOption.get
+    decodeFetchRequest(fr) shouldBe Right(FetchRequest(Hugeint(0L, 9L), 2L, 1L))
 
   it should "produce what libquackwire parses" in:
     QuackNativeBridge.parseMessageType(encodeError("boom")) shouldBe Type.ErrorResponse
@@ -169,3 +203,14 @@ class QuackWireSpec extends AnyFlatSpec with Matchers:
     QuackNativeBridge.extractConnectionId(cr) shouldBe "ABC"
     val sample = QuackTestFixtures.serializeSampleErrorResponse("native")
     decodeErrorMessage(sample) shouldBe Right("native")
+    // A Quack v3 node deserializes every request in full: the requests the manager writes itself
+    // must carry every field the node reads with ReadProperty.
+    val hello = ConnectionRequest("t", "v2.0.0", "osx_arm64", 3L, 3L, "qod", 30L)
+    QuackNativeBridge.parseMessageType(encodeConnectionRequest(hello, 1L)) shouldBe
+      Type.ConnectionRequest
+    QuackNativeBridge.parseMessageType(
+      encodePrepareRequest("C", 1L, PrepareRequest("SELECT 1", None, None))
+    ) shouldBe Type.PrepareRequest
+    QuackNativeBridge.parseMessageType(encodeFetchRequest("C", 1L, Hugeint(0L, 7L), 1L)) shouldBe
+      Type.FetchRequest
+    QuackNativeBridge.parseMessageType(encodeDisconnect("C")) shouldBe Type.Disconnect

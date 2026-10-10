@@ -154,7 +154,8 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     val door      = new QuackFrontDoor(router, handshake, sessions, transport, sink, "test")
     Fixture(door, router, transport, sessions, journal, store, events, sup.get(poolKey).get.nodes)
 
-  private def hello(token: String) = ConnectionRequest(token, "v1.5.4", "osx_arm64", 1L, 1L, "", 0L)
+  private def hello(token: String) =
+    ConnectionRequest(token, "v2.0.0", "osx_arm64", 3L, 3L, "qod-test", 0L)
 
   private def connect(fx: Fixture, token: String = Token): String =
     val resp = fx.door.handle(encodeConnectionRequest(hello(token), 1L)).unsafeRunSync()
@@ -167,22 +168,10 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
 
   private def fetch(fx: Fixture, connId: String): Array[Byte] =
-    fx.door.handle(encodeFetchRequest(connId, 3L, Hugeint(0L, 5L))).unsafeRunSync()
+    fx.door.handle(encodeFetchRequest(connId, 3L, Hugeint(0L, 5L), 1L)).unsafeRunSync()
 
   private def bare(msgType: Int, connId: String): Array[Byte] =
     encodeHeader(Header(msgType, connId, InvalidIndex)) ++ Array[Byte](-1, -1)
-
-  private def appendBytes(connId: String, schema: String, table: String): Array[Byte] =
-    val body                          = ArrayBuffer[Byte]()
-    def str(id: Int, s: String): Unit =
-      body ++= Array[Byte](id.toByte, 0)
-      body += s.length.toByte
-      body ++= s.getBytes("UTF-8")
-    str(1, schema)
-    str(2, table)
-    body ++= Array[Byte](3, 0, 0) // field 3: empty chunk list
-    body ++= Array[Byte](-1, -1)
-    encodeHeader(Header(Type.DataRequest, connId, 6L)) ++ body.toArray
 
   private def errorText(resp: Array[Byte]): String =
     messageType(resp) shouldBe Type.ErrorResponse
@@ -193,7 +182,7 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     val resp        = fx.door.handle(encodeConnectionRequest(hello(Token), 1L)).unsafeRunSync()
     val (connId, r) = decodeConnectionResponse(resp).toOption.get
     connId should have length 32
-    r.quackVersion shouldBe 1L
+    r.quackVersion shouldBe 3L
     r.serverPlatform shouldBe "quack-on-demand"
     fx.sessions.get(connId).map(_.bound.user) shouldBe Some("alice")
     fx.events.toList should contain(ManagerEvent.SessionOpened("acme", "alice", "quack"))
@@ -214,6 +203,21 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
       .handle(encodeConnectionRequest(hello("tenant=acme&pool=nope&user=u&password=p"), 1L))
       .unsafeRunSync()
     errorText(resp) should include("not found")
+
+  it should "refuse a DuckDB 1.5 client with a clear message" in:
+    val fx  = setup()
+    val old = ConnectionRequest(Token, "v1.5.6", "osx_arm64", 1L, 1L, "", 0L)
+    errorText(fx.door.handle(encodeConnectionRequest(old, 1L)).unsafeRunSync()) should
+      include("requires a DuckDB 2.0 client")
+    fx.sessions.size shouldBe 0
+
+  it should "refuse a client whose range stops short of Quack v3 before authenticating" in:
+    val fx  = setup()
+    val old = ConnectionRequest("garbage", "v1.5.6", "osx_arm64", 1L, 2L, "", 0L)
+    val msg = errorText(fx.door.handle(encodeConnectionRequest(old, 1L)).unsafeRunSync())
+    msg shouldBe QuackFrontDoor.clientVersionMessage(old)
+    msg should include("v1.5.6")
+    fx.transport.posted shouldBe empty
 
   "PREPARE_REQUEST" should "relay the node's response bytes verbatim through the pipeline" in:
     val fx     = setup()
@@ -246,8 +250,8 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     fetch(fx, connId) shouldBe fetchResp(true)
     fx.transport.posted.last.header shouldBe Header(Type.FetchRequest, "NODE2", 3L)
     fetch(fx, connId) shouldBe fetchResp(false)
-    // The link stays open past the terminal response: the generation 1 client fetches from
-    // several threads, and a late fetch must still reach the node (which answers it empty)
+    // The link stays open past the terminal response: the client fetches ahead from several
+    // threads, and a late fetch must still reach the node (which answers it empty)
     // rather than a closed link. The sweeper releases the drained statement after a grace.
     fx.transport.types.last shouldBe Type.FetchRequest
     fx.sessions.get(connId).get.current.get().isDefined shouldBe true
@@ -299,34 +303,12 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     rendered should include("'ok'")
     rendered should include("status")
 
-  "APPEND_REQUEST" should "be authorized as a write on the named table before it reaches a node" in:
-    val denyWrites = new StatementValidator:
-      def validate(ctx: ValidationContext): ValidationResult =
-        if ctx.statement.toUpperCase.startsWith("INSERT") then Denied("read only", Set.empty)
-        else Allowed
-    val fx     = setup(validator = denyWrites)
-    val connId = connect(fx)
-    errorText(fx.door.handle(appendBytes(connId, "main", "t")).unsafeRunSync()) should include(
-      "read only"
-    )
-    fx.transport.types should not contain Type.DataRequest
-
-  it should "forward the original bytes to a node under the node connection id" in:
+  "SEND_DATA_REQUEST" should "answer like a node when no statement is streaming" in:
     val fx     = setup()
     val connId = connect(fx)
-    val bytes  = appendBytes(connId, "main", "t")
-    fx.door.handle(bytes).unsafeRunSync() shouldBe success
-    // The router's USE prefix runs on the link first: an append names schema.table and a fresh
-    // node connection's default catalog is the transient memory db, not the pool's catalog.
-    fx.transport.typesSinceHandshake shouldBe
-      List(Type.ConnectionRequest, Type.PrepareRequest, Type.DataRequest, Type.Disconnect)
-    decodePrepareRequest(fx.transport.sinceHandshake(1)).toOption.get.sql shouldBe "USE memory.main"
-    val fwd = fx.transport.sinceHandshake(2)
-    fwd.header.connectionId shouldBe "NODE2"
-    fwd.bytes.drop(fwd.bodyStart).toSeq shouldBe bytes
-      .drop(frame(bytes).toOption.get.bodyStart)
-      .toSeq
-    fx.router.history.snapshot(10).head.sql should include("INSERT INTO \"main\".\"t\"")
+    errorText(fx.door.handle(bare(Type.DataRequest, connId)).unsafeRunSync()) shouldBe
+      "No active data stream"
+    fx.transport.typesSinceHandshake shouldBe Nil
 
   "HEARTBEAT_REQUEST" should "renew the lease and answer SUCCESS" in:
     val fx     = setup()
@@ -418,13 +400,6 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     fx.transport.types.last shouldBe Type.Disconnect
     fx.sessions.get(connId) shouldBe None
 
-  "APPEND_REQUEST" should "answer a wire error when the USE prelude fails on the node" in:
-    val fx     = setup()
-    val connId = connect(fx)
-    fx.transport.prepareError = Some("Catalog Error: schema does not exist")
-    val response = fx.door.handle(appendBytes(connId, "main", "t")).unsafeRunSync()
-    errorText(response) should include("schema does not exist")
-
   "closeAll" should "release sessions opened after it was built" in:
     val fx       = setup()
     val shutdown = fx.door.closeAll()
@@ -492,15 +467,6 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     fx.router.registry.kill(fx.router.registry.list().head.id)
     fx.transport.prepareNeedsMore = false
     connId
-
-  "APPEND_REQUEST" should "be refused while the session's transaction is fenced" in:
-    val fx     = setup()
-    val connId = killedInTx(fx)
-    val posted = fx.transport.posted.size
-    errorText(fx.door.handle(appendBytes(connId, "main", "t")).unsafeRunSync()) should include(
-      "killed by an administrator"
-    )
-    fx.transport.posted.size shouldBe posted
 
   "ROLLBACK after a kill" should "keep the fence up when the recovery itself fails" in:
     val fx     = setup()

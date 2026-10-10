@@ -14,9 +14,9 @@ import scala.collection.concurrent.TrieMap
   * connection has at most one live statement (a new PREPARE supersedes the previous one, as on a
   * node). `pendingCommit` is set while an author-stamping bracket waits for the client to drain the
   * result; `drainedAt` is stamped by the terminal FETCH, after which the link stays open for a
-  * grace period (the generation 1 client fetches from several threads and late fetches must still
-  * reach the node) until the sweeper, the next statement or the disconnect finishes it. `close` is
-  * the router's close-and-deregister handle.
+  * grace period (the client fetches ahead from several threads and late fetches must still reach
+  * the node) until the sweeper, the next statement or the disconnect finishes it. `close` is the
+  * router's close-and-deregister handle.
   */
 final case class QuackStatement(
     link: QuackNodeLink,

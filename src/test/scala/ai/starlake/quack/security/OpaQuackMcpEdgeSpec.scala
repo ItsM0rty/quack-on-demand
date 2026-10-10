@@ -105,7 +105,7 @@ class OpaQuackMcpEdgeSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       s"&user=${SecurityFixtures.BobUsername}&password=${SecurityFixtures.BobPassword}"
 
   private def connect(d: QuackFrontDoor): String =
-    val hello = ConnectionRequest(bobToken, "v1.5.4", "osx_arm64", 1L, 1L, "", 0L)
+    val hello = ConnectionRequest(bobToken, "v2.0.0", "osx_arm64", 3L, 3L, "qod-test", 0L)
     val resp  = d.handle(encodeConnectionRequest(hello, 1L)).unsafeRunSync()
     withClue(decodeErrorMessage(resp)) {
       messageType(resp) shouldBe Type.ConnectionResponse
@@ -155,7 +155,7 @@ class OpaQuackMcpEdgeSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     stubConnect(wm, deny("not this pool"))
     withHarness { (h, fix) =>
       val d     = door(h, fix, new NodeTransport)
-      val hello = ConnectionRequest(bobToken, "v1.5.4", "osx_arm64", 1L, 1L, "", 0L)
+      val hello = ConnectionRequest(bobToken, "v2.0.0", "osx_arm64", 3L, 3L, "qod-test", 0L)
       val resp  = d.handle(encodeConnectionRequest(hello, 1L)).unsafeRunSync()
       messageType(resp) shouldBe Type.ErrorResponse
       decodeErrorMessage(resp).toOption.get should include("denied by policy")

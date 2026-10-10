@@ -88,11 +88,8 @@ final class QuackFrontDoor(
   private def dispatch(s: QuackSession, f: Frame): IO[Array[Byte]] =
     f.header.msgType match
       case Type.PrepareRequest => s.mutex.lock.surround(prepare(s, f))
-      case Type.DataRequest    =>
-        // Type 9 is APPEND_REQUEST for a generation 1 client and SEND_DATA_REQUEST otherwise.
-        if s.hello.maxVersion <= 1L then s.mutex.lock.surround(append(s, f))
-        else forwardToCurrent(s, f, encodeError("No active data stream"))
-      case Type.FetchRequest => forwardToCurrent(s, f, encodeError("Result has been closed"))
+      case Type.DataRequest    => forwardToCurrent(s, f, encodeError("No active data stream"))
+      case Type.FetchRequest   => forwardToCurrent(s, f, encodeError("Result has been closed"))
       case Type.CancelRequest | Type.Acknowledgement =>
         forwardToCurrent(s, f, encodeSuccess())
       case Type.HeartbeatRequest =>
@@ -111,7 +108,11 @@ final class QuackFrontDoor(
 
   private def connect(f: Frame): IO[Array[Byte]] =
     decodeConnectionRequest(f) match
-      case Left(e)      => IO.pure(encodeError(s"malformed CONNECTION_REQUEST: ${e.message}"))
+      case Left(e) => IO.pure(encodeError(s"malformed CONNECTION_REQUEST: ${e.message}"))
+      case Right(hello)
+          if hello.minVersion > QuackFrontDoor.ProtocolVersion ||
+            hello.maxVersion < QuackFrontDoor.ProtocolVersion =>
+        IO.pure(encodeError(QuackFrontDoor.clientVersionMessage(hello)))
       case Right(hello) =>
         QuackCredentials.parse(hello.authString) match
           case Left(reason) => IO.pure(encodeError(s"Authentication failed: $reason"))
@@ -141,7 +142,7 @@ final class QuackFrontDoor(
                         ConnectionResponse(
                           serverVersion.getOrElse(s"quack-on-demand $version"),
                           "quack-on-demand",
-                          hello.maxVersion,
+                          QuackFrontDoor.ProtocolVersion,
                           s.heartbeatSec
                         )
                       )
@@ -387,82 +388,6 @@ final class QuackFrontDoor(
         }
       }(node, wrappedSql, prelude, recordLoad)
 
-  // -------------------------------------------------------------------------------------------
-  // APPEND_REQUEST (generation 1)
-  // -------------------------------------------------------------------------------------------
-
-  private def append(s: QuackSession, f: Frame): IO[Array[Byte]] =
-    decodeAppendRequest(f) match
-      case Left(e) => IO.pure(encodeError(s"malformed APPEND_REQUEST: ${e.message}"))
-      case Right(a) if s.txAborted.get() =>
-        // Same fence as PREPARE: an append on a fresh connection would auto-commit.
-        IO.pure(encodeError(QuackFrontDoor.TxKilledMessage))
-      case Right(a) =>
-        val cq        = f.header.clientQueryId
-        val synthetic = s"INSERT INTO ${quoteIdent(a.schema)}.${quoteIdent(a.table)} SELECT NULL"
-        val send: FlightSqlRouter.NodeSend[PrepareOutcome] =
-          (node, wrappedSql, prelude, recordLoad) =>
-            onLink[PrepareOutcome](s, cq) { (link, stamped, reused, elapsed) =>
-              // An append names schema.table with no catalog and a fresh node connection's
-              // default catalog is the transient memory db: run the router's USE prefix (the
-              // head of the wrapped synthetic statement) on the link first, so the node resolves
-              // the table in the pool's catalog exactly as a relayed statement would.
-              val usePrefix: Option[String] =
-                Option(wrappedSql.trim)
-                  .filter(_.toUpperCase(Locale.ROOT).startsWith("USE "))
-                  .map(w =>
-                    w.indexOf(';') match
-                      case -1 => w
-                      case i  => w.substring(0, i)
-                  )
-                  .map(_.trim)
-              val useIO: IO[Either[LinkFailure, Unit]] = usePrefix match
-                case None    => IO.pure(Right(()))
-                case Some(u) => link.runDiscard(u, cq)
-              useIO.flatMap {
-                case Left(fail) =>
-                  dropLink(link, reused) *> elapsed().map(ms => toOutcome(fail, ms))
-                case Right(()) =>
-                  link.forward(f).flatMap {
-                    case Left(fail) =>
-                      dropLink(link, reused) *> elapsed().map(ms => toOutcome(fail, ms))
-                    case Right(resp) =>
-                      if messageType(resp) == Type.ErrorResponse then
-                        dropLink(link, reused) *> elapsed().map(ms =>
-                          NodeOutcome
-                            .Permanent(decodeErrorMessage(resp).getOrElse("node error"), ms)
-                        )
-                      else
-                        elapsed().map(ms =>
-                          NodeOutcome.Ok(
-                            PrepareOutcome(link, resp, stamped, reused),
-                            ms,
-                            closer(s, link, cq, reused)
-                          )
-                        )
-                  }
-              }
-            }(node, wrappedSql, prelude, recordLoad)
-        finishCurrent(s, commit = false) *>
-          router
-            .executeWith[PrepareOutcome](
-              s.connectionId,
-              s.bound.user,
-              s.bound.poolKey,
-              synthetic,
-              Some(s.bound.effectiveSet),
-              send,
-              source = "quack"
-            )
-            .flatMap {
-              case Left(fail)    => IO.pure(encodeError(fail.reason))
-              case Right(routed) =>
-                val po = routed.value
-                val st = QuackStatement(po.link, routed.nodeId, StatementKind.Dml, cq, routed.close)
-                st.pendingCommit.set(po.stamped)
-                finishStatement(s, st, commit = true).map(_.map(encodeError).getOrElse(po.response))
-            }
-
   private def quoteIdent(s: String): String = "\"" + s.replace("\"", "\"\"") + "\""
 
   // -------------------------------------------------------------------------------------------
@@ -669,6 +594,13 @@ final class QuackFrontDoor(
   def sessionCount: Int = sessions.size
 
 object QuackFrontDoor:
+  /** The one Quack protocol version the front door speaks: DuckDB 2.0 clients only. */
+  val ProtocolVersion: Long = 3L
+
+  def clientVersionMessage(hello: QuackWire.ConnectionRequest): String =
+    s"quack-on-demand requires a DuckDB 2.0 client (Quack protocol $ProtocolVersion); this " +
+      s"client (${hello.clientDuckdbVersion}) speaks ${hello.minVersion}..${hello.maxVersion}"
+
   /** Answer to every statement a client sends inside a transaction an admin kill tore down. */
   val TxKilledMessage: String =
     "transaction aborted: a statement was killed by an administrator; ROLLBACK to continue"

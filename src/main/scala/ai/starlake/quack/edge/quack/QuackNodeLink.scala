@@ -52,13 +52,14 @@ final class QuackNodeLink(
 
   /** Run `sql` on this connection and discard its result: the author-stamping prelude and the
     * COMMIT epilogue. Drains the FETCH loop so the node releases the result. A node
-    * `ERROR_RESPONSE` is `Permanent(message)`.
+    * `ERROR_RESPONSE` is `Permanent(message)`. The query gets its own random uuid, as a Quack v3
+    * client names every query it prepares.
     */
   def runDiscard(sql: String, clientQueryId: Long): IO[Either[LinkFailure, Unit]] =
     val prep = QuackWire.encodePrepareRequest(
       nodeConnectionId,
       clientQueryId,
-      QuackWire.PrepareRequest(sql, None, None)
+      QuackWire.PrepareRequest(sql, Some(QuackNodeLink.randomUuid()), None)
     )
     relay(prep).flatMap {
       case Left(f)     => IO.pure(Left(f))
@@ -72,23 +73,29 @@ final class QuackNodeLink(
             else
               QuackNodeLink.nativeResultUuid(resp) match
                 case None       => IO.pure(Right(()))
-                case Some(uuid) =>
-                  drain(QuackWire.encodeFetchRequest(nodeConnectionId, clientQueryId, uuid), 0)
+                case Some(uuid) => drain(uuid, clientQueryId, 1L)
           case other =>
             IO.pure(Left(LinkFailure.Permanent(s"unexpected response type $other after PREPARE")))
     }
 
-  private def drain(fetch: Array[Byte], rounds: Int): IO[Either[LinkFailure, Unit]] =
-    if rounds > QuackNodeLink.MaxDrainRounds then
+  /** Fetch batch after batch (Quack v3 names each one, 1-based, and acks the ones before it) until
+    * the terminal response.
+    */
+  private def drain(
+      uuid: QuackWire.Hugeint,
+      clientQueryId: Long,
+      batch: Long
+  ): IO[Either[LinkFailure, Unit]] =
+    if batch > QuackNodeLink.MaxDrainRounds then
       IO.pure(Left(LinkFailure.Permanent("result did not terminate while draining")))
     else
-      relay(fetch).flatMap {
+      relay(QuackWire.encodeFetchRequest(nodeConnectionId, clientQueryId, uuid, batch)).flatMap {
         case Left(f)     => IO.pure(Left(f))
         case Right(resp) =>
           if QuackWire.messageType(resp) == QuackWire.Type.ErrorResponse then
             IO.pure(Left(LinkFailure.Permanent(errorMessage(resp))))
           else if QuackWire.isTerminalFetch(resp) then IO.pure(Right(()))
-          else drain(fetch, rounds + 1)
+          else drain(uuid, clientQueryId, batch + 1)
       }
 
   private def errorMessage(resp: Array[Byte]): String =
@@ -102,7 +109,12 @@ final class QuackNodeLink(
 
 object QuackNodeLink:
 
-  private val MaxDrainRounds = 1_000_000
+  private val MaxDrainRounds = 1_000_000L
+
+  /** A fresh query uuid for a statement the manager runs itself. */
+  private[quack] def randomUuid(): QuackWire.Hugeint =
+    val u = java.util.UUID.randomUUID()
+    QuackWire.Hugeint(u.getMostSignificantBits, u.getLeastSignificantBits)
 
   /** Open a connection to `node` on the client's behalf: the client's own hello (versions,
     * platform, client id, heartbeat) with the node token as `auth_string`, so protocol negotiation
