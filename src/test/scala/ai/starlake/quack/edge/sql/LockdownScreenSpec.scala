@@ -512,6 +512,14 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     "allow_persistent_secrets"             -> "true",
     "default_secret_storage"               -> "'local_file'",
     "allow_unredacted_secrets"             -> "true",
+    "redact_http_logs"                     -> "false",
+    "enable_logging"                       -> "true",
+    "logging_level"                        -> "'DEBUG'",
+    "logging_mode"                         -> "'ENABLE_ALL'",
+    "logging_storage"                      -> "'stdout'",
+    "enabled_log_types"                    -> "'HTTP'",
+    "disabled_log_types"                   -> "'QueryLog'",
+    "pg_debug_show_queries"                -> "true",
     "home_directory"                       -> "'/tmp'",
     "file_search_path"                     -> "'/etc'",
     "log_query_path"                       -> "'/tmp/q.log'",
@@ -528,7 +536,7 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     "quack_authorization_function"         -> "'f'"
   )
 
-  it should "protect the DuckDB 2.0 extension, parser, secret, file and network settings" in
+  it should "protect the DuckDB 2.0 extension, parser, secret, file, network and logging settings" in
     Protected20.foreach { case (name, value) =>
       val upper = name.toUpperCase(java.util.Locale.ROOT)
       withClue(name) {
@@ -539,6 +547,13 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
         denied(s"RESET $name") shouldBe true
         denied(s"PRAGMA $name = $value") shouldBe true
         denied(s"SELECT 1; SET $name = $value") shouldBe true
+        // a quoted name glued to the keyword, and EXPLAIN ANALYZE, both apply on 2.0
+        denied(s"SET\"$name\"=$value") shouldBe true
+        denied(s"SET`$name`=$value") shouldBe true
+        denied(s"SET GLOBAL\"$name\"=$value") shouldBe true
+        denied(s"PRAGMA\"$name\"=$value") shouldBe true
+        denied(s"RESET\"$name\"") shouldBe true
+        denied(s"EXPLAIN ANALYZE SET\"$name\"=$value") shouldBe true
         // reading a protected setting stays admitted
         denied(s"SELECT current_setting('$name')") shouldBe false
       }

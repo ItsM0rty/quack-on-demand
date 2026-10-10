@@ -1934,7 +1934,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
     out.swap.toOption.get.reason shouldBe
-      s"access denied: parser: ${ai.starlake.quack.edge.sql.ParserSettingScreen.RefusalMessage}"
+      s"access denied: setting: ${ai.starlake.quack.edge.sql.NodeSettingScreen.RefusalMessage}"
 
   it should "be refused for a superuser too, lockdown off" in:
     val (base, _, _) = setup()
@@ -1963,7 +1963,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
     out.swap.toOption.get.reason should include(
-      ai.starlake.quack.edge.sql.ParserSettingScreen.RefusalMessage
+      ai.starlake.quack.edge.sql.NodeSettingScreen.RefusalMessage
     )
 
   it should "be refused when the effective set is missing, and leave other settings alone" in:
@@ -1979,12 +1979,40 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .execute("psr-3", "alice", poolKey, "IMPORT DATABASE 'x'", effectiveSet = None)
       .unsafeRunSync()
     refused.swap.toOption.get.reason should include(
-      ai.starlake.quack.edge.sql.ParserSettingScreen.ImportRefusalMessage
+      ai.starlake.quack.edge.sql.NodeSettingScreen.ImportRefusalMessage
     )
     val admitted = router
       .execute("psr-4", "alice", poolKey, "SET http_timeout = 300", effectiveSet = None)
       .unsafeRunSync()
     admitted.isRight shouldBe true
+
+  it should "refuse redact_http_logs to a superuser too, lockdown off" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val superuser = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser.copy(tenant = None, kind = "admin"),
+      Nil,
+      Nil,
+      Nil,
+      Nil
+    )
+    val out = router
+      .execute(
+        "psr-5",
+        "alice",
+        poolKey,
+        "SET GLOBAL\"redact_http_logs\" = false",
+        effectiveSet = Some(superuser)
+      )
+      .unsafeRunSync()
+    out.swap.toOption.get.reason shouldBe
+      s"access denied: setting: ${ai.starlake.quack.edge.sql.NodeSettingScreen.SecretRefusalMessage}"
 
   // ---- node lockdown (QOD_NODE_LOCKDOWN) ----
 

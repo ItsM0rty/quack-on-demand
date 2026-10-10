@@ -5,9 +5,9 @@ import org.scalatest.matchers.should.Matchers
 
 import java.util.Locale
 
-class ParserSettingScreenSpec extends AnyFlatSpec with Matchers:
+class NodeSettingScreenSpec extends AnyFlatSpec with Matchers:
 
-  private def refused(sql: String): Boolean = ParserSettingScreen.screen(sql).isDefined
+  private def refused(sql: String): Boolean = NodeSettingScreen.screen(sql).isDefined
 
   private val values = Map(
     "dialect_compatibility_mode"           -> "'spark'",
@@ -20,7 +20,7 @@ class ParserSettingScreenSpec extends AnyFlatSpec with Matchers:
   )
 
   "screen" should "cover exactly the parser settings it documents" in {
-    values.keySet shouldBe ParserSettingScreen.Settings
+    values.keySet shouldBe NodeSettingScreen.ParserSettings
   }
 
   it should "refuse every parser setting in every SET / RESET / PRAGMA form" in
@@ -118,8 +118,8 @@ class ParserSettingScreenSpec extends AnyFlatSpec with Matchers:
     refused("IMPORT DATABASE 's3://bucket/export'") shouldBe true
     refused("import  database\n'/tmp/export'") shouldBe true
     refused("SELECT 1; IMPORT DATABASE 'x'") shouldBe true
-    ParserSettingScreen.screen("IMPORT DATABASE 'x'") shouldBe
-      Some(ParserSettingScreen.ImportRefusalMessage)
+    NodeSettingScreen.screen("IMPORT DATABASE 'x'") shouldBe
+      Some(NodeSettingScreen.ImportRefusalMessage)
   }
 
   it should "not read a setting name inside a literal or a comment as a SET" in {
@@ -144,7 +144,30 @@ class ParserSettingScreenSpec extends AnyFlatSpec with Matchers:
     refused("SELECT * FROM import_log") shouldBe false
   }
 
+  it should "refuse the credential-exposing settings in every form, glued quotes included" in
+    // Verified on 2.0: SET redact_http_logs = false logs an http secret's bearer token unredacted.
+    NodeSettingScreen.SecretSettings.foreach { name =>
+      withClue(name) {
+        val msg = Some(NodeSettingScreen.SecretRefusalMessage)
+        NodeSettingScreen.screen(s"SET $name = false") shouldBe msg
+        NodeSettingScreen.screen(s"SET GLOBAL $name = false") shouldBe msg
+        NodeSettingScreen.screen(s"SET SESSION\"$name\" TO false") shouldBe msg
+        NodeSettingScreen.screen(s"SET`$name`=false") shouldBe msg
+        NodeSettingScreen.screen(s"RESET $name") shouldBe msg
+        NodeSettingScreen.screen(s"PRAGMA\"$name\"=false") shouldBe msg
+        NodeSettingScreen.screen(s"EXPLAIN ANALYZE SET $name = false") shouldBe msg
+        NodeSettingScreen.screen(s"SELECT 1; SET $name = false") shouldBe msg
+      }
+    }
+
+  it should "leave the other logging settings to lockdown" in {
+    NodeSettingScreen.Settings shouldBe
+      (NodeSettingScreen.ParserSettings ++ Set("redact_http_logs", "allow_unredacted_secrets"))
+    refused("SET logging_level = 'DEBUG'") shouldBe false
+    refused("SELECT current_setting('redact_http_logs')") shouldBe false
+  }
+
   it should "carry the documented refusal message" in {
-    ParserSettingScreen.screen("SET dialect_compatibility_mode = 'spark'") shouldBe
-      Some(ParserSettingScreen.RefusalMessage)
+    NodeSettingScreen.screen("SET dialect_compatibility_mode = 'spark'") shouldBe
+      Some(NodeSettingScreen.RefusalMessage)
   }

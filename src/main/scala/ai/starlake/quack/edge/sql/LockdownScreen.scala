@@ -63,10 +63,19 @@ object LockdownScreen:
     "custom_extension_repository",
     "autoinstall_extension_repository",
     "allow_extensions_metadata_mismatch",
-    // Secrets: where they persist and whether they print unredacted.
+    // Secrets: where they persist (whether they print unredacted is NodeSettingScreen's).
     "allow_persistent_secrets",
     "default_secret_storage",
-    "allow_unredacted_secrets",
+    // Logging: the settings twin of the denied enable_logging() call. A tenant turning the logger
+    // on, raising its level or pointing it at stdout reads or spills other sessions' query text
+    // and HTTP traffic (redact_http_logs, refused for every caller, is NodeSettingScreen's).
+    "enable_logging",
+    "logging_level",
+    "logging_mode",
+    "logging_storage",
+    "enabled_log_types",
+    "disabled_log_types",
+    "pg_debug_show_queries",
     // Local files read or written by path.
     "home_directory",
     "file_search_path",
@@ -95,7 +104,7 @@ object LockdownScreen:
     "threads",
     "worker_threads",
     "max_temp_directory_size"
-  ) ++ ParserSettingScreen.Settings // also refused for every caller by ParserSettingScreen
+  ) ++ NodeSettingScreen.Settings // also refused for every caller by NodeSettingScreen
 
   private val DeniedFunctions = Set(
     "read_text",
