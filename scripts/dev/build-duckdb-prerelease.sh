@@ -37,6 +37,21 @@ grep -q 'PQAUTHDATA_OAUTH_BEARER_TOKEN' "$PG_ROOT/include/libpq-fe.h" 2>/dev/nul
 
 mkdir -p "$WORK"
 
+# ---- 0. duckdb-java at the same engine commit (its version string is the engine's) -------
+if [[ ! -d "$WORK/duckdb-java/.git" ]]; then
+  git clone --filter=blob:none https://github.com/duckdb/duckdb-java.git "$WORK/duckdb-java"
+fi
+git -C "$WORK/duckdb-java" fetch origin "$DUCKDB_JAVA_REF"
+git -C "$WORK/duckdb-java" checkout --detach FETCH_HEAD
+vendored="$(grep -o 'DUCKDB_SOURCE_ID "[0-9a-f]*"' \
+  "$WORK/duckdb-java/src/duckdb/src/function/table/version/pragma_version.cpp" | head -1 | cut -d'"' -f2)"
+[[ "${DUCKDB_SHA:0:10}" == "$vendored" ]] || {
+  echo "duckdb-java $DUCKDB_JAVA_REF vendors $vendored, not ${DUCKDB_SHA:0:10}: pick a matching DUCKDB_JAVA_REF commit" >&2
+  exit 1; }
+ENGINE_VERSION="$(grep -o 'DUCKDB_VERSION "[^"]*"' \
+  "$WORK/duckdb-java/src/duckdb/src/function/table/version/pragma_version.cpp" | head -1 | cut -d'"' -f2)"
+[[ -n "$ENGINE_VERSION" ]] || { echo "no DUCKDB_VERSION in duckdb-java's vendored engine" >&2; exit 1; }
+
 # ---- 1. engine + extensions ---------------------------------------------------------------
 if [[ ! -d "$WORK/duckdb/.git" ]]; then
   git clone --filter=blob:none https://github.com/duckdb/duckdb.git "$WORK/duckdb"
@@ -61,8 +76,10 @@ duckdb_extension_statically_link(core_functions json parquet icu autocomplete tp
 EOF
 
 LINK="-L$PG_ROOT/lib -lpq"
+# A loadable extension only loads in an engine with the same version string, and the JDBC's string comes from duckdb-java's vendoring.
 cmake -S "$WORK/duckdb" -B "$WORK/duckdb/build/release" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DOVERRIDE_GIT_DESCRIBE="$ENGINE_VERSION" \
   -DDUCKDB_EXTENSION_CONFIGS="$WORK/qod_extensions.cmake" \
   -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
   -DPostgreSQL_ROOT="$PG_ROOT" -DCMAKE_PREFIX_PATH="$PG_ROOT" \
@@ -80,7 +97,8 @@ find "$B/extension" -name '*.duckdb_extension' -exec cp {} "$CACHE/extensions/" 
 # ---- 2. sanity: version and linked extensions ---------------------------------------------
 "$CACHE/bin/duckdb" -csv -noheader -c "SELECT version(), source_id FROM pragma_version()"
 ver="$("$CACHE/bin/duckdb" -csv -noheader -c "SELECT version()")"
-[[ "$ver" == v2.0.0* ]] || { echo "built CLI reports $ver, expected v2.0.0*" >&2; exit 1; }
+[[ "$ver" == "$ENGINE_VERSION" ]] || {
+  echo "built CLI reports $ver, expected $ENGINE_VERSION (duckdb-java's vendored version)" >&2; exit 1; }
 missing="$("$CACHE/bin/duckdb" -csv -noheader -c \
   "SELECT coalesce(string_agg(extension_name, ','), '') FROM duckdb_extensions()
    WHERE extension_name IN ('quack','ducklake','postgres_scanner','httpfs','json','parquet','tpch')
@@ -90,17 +108,7 @@ for e in quack ducklake postgres_scanner httpfs; do
   [[ -f "$CACHE/extensions/$e.duckdb_extension" ]] || { echo "missing loadable $e" >&2; exit 1; }
 done
 
-# ---- 3. duckdb-java at the same engine commit ----------------------------------------------
-if [[ ! -d "$WORK/duckdb-java/.git" ]]; then
-  git clone --filter=blob:none https://github.com/duckdb/duckdb-java.git "$WORK/duckdb-java"
-fi
-git -C "$WORK/duckdb-java" fetch origin "$DUCKDB_JAVA_REF"
-git -C "$WORK/duckdb-java" checkout --detach FETCH_HEAD
-vendored="$(grep -o 'DUCKDB_SOURCE_ID "[0-9a-f]*"' \
-  "$WORK/duckdb-java/src/duckdb/src/function/table/version/pragma_version.cpp" | head -1 | cut -d'"' -f2)"
-[[ "${DUCKDB_SHA:0:10}" == "$vendored" ]] || {
-  echo "duckdb-java $DUCKDB_JAVA_REF vendors $vendored, not ${DUCKDB_SHA:0:10}: pick a matching DUCKDB_JAVA_REF commit" >&2
-  exit 1; }
+# ---- 3. build and install duckdb-java ----------------------------------------------------
 ( cd "$WORK/duckdb-java" && GEN=ninja make release )
 M2="$HOME/.m2/repository/org/duckdb/duckdb_jdbc/$JDBC_VERSION"
 mkdir -p "$M2"
