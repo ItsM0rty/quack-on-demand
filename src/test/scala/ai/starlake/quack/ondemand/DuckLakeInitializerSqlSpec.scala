@@ -14,7 +14,8 @@ class DuckLakeInitializerSqlSpec extends AnyFlatSpec with Matchers:
 
   "attachSql" should "carry only DATA_PATH when encryption is off" in {
     val sql = DuckLakeInitializer.attachSql(connstr, "acme_lake", "/var/lake", encrypted = false)
-    sql should include("DATA_PATH '/var/lake'")
+    sql should include("DATA_PATH '/var/lake', AUTOMATIC_MIGRATION TRUE")
+    sql should endWith("(DATA_PATH '/var/lake', AUTOMATIC_MIGRATION TRUE)")
     sql should not include "ENCRYPTED"
   }
 
@@ -26,7 +27,7 @@ class DuckLakeInitializerSqlSpec extends AnyFlatSpec with Matchers:
     // comma-separated options, so a missing or wrong separator is a syntax error at the one ATTACH
     // that decides a catalog's encryption forever.
     sql should include("DATA_PATH '/var/lake', ENCRYPTED")
-    sql should endWith("(DATA_PATH '/var/lake', ENCRYPTED)")
+    sql should endWith("(DATA_PATH '/var/lake', ENCRYPTED, AUTOMATIC_MIGRATION TRUE)")
   }
 
   "encryptionMismatch" should "pass when the catalog has no recorded value yet" in {

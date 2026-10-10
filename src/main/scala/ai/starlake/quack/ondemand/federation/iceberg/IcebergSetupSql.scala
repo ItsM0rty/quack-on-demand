@@ -84,7 +84,7 @@ object IcebergSetupSql:
     val alias  = v.alias
     val secret = secretBlock(cfg, alias)
     val opts   = attachOptions(cfg, alias, needsSecret(cfg)) ++ Option.when(readOnly)("READ_ONLY")
-    "INSTALL iceberg; LOAD iceberg;\n" +
+    "INSTALL iceberg;\nLOAD iceberg;\n" +
       extensionPrelude(cfg) +
       secret +
       s"ATTACH ${lit(cfg.warehouse.trim)} AS ${ident(alias)} (\n  " +
@@ -114,8 +114,8 @@ object IcebergSetupSql:
   private def extensionPrelude(cfg: IcebergRestConfig): String =
     if !awsSecret(cfg) then ""
     else if cfg.awsCredentials.contains(AwsCredentials.CredentialChain) then
-      "INSTALL httpfs; LOAD httpfs;\nINSTALL aws; LOAD aws;\n"
-    else "INSTALL httpfs; LOAD httpfs;\n"
+      "INSTALL httpfs;\nLOAD httpfs;\nINSTALL aws;\nLOAD aws;\n"
+    else "INSTALL httpfs;\nLOAD httpfs;\n"
 
   /** `NAME '<trimmed value>'`, or `None` when `value` is unset or blank after trimming. Trimming
     * here - not just at the `isSet`/`filter` check upstream - matters because

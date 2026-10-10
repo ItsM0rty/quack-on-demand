@@ -19,7 +19,7 @@ class IcebergSetupSqlSpec extends AnyFlatSpec with Matchers:
 
   "render" should "install and load the extension first" in {
     IcebergSetupSql.render(v(oauth2, "sales_lake"), readOnly = false) should startWith(
-      "INSTALL iceberg; LOAD iceberg;"
+      "INSTALL iceberg;\nLOAD iceberg;"
     )
   }
 
@@ -215,7 +215,7 @@ class IcebergSetupSqlSpec extends AnyFlatSpec with Matchers:
 
   "render with AWS credentials" should "emit a scoped s3 secret and name it on the attach" in {
     val sql = IcebergSetupSql.render(v(glueWithKeys, "glue_lake"), readOnly = true)
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include("INSTALL httpfs;\nLOAD httpfs;")
     sql should include("""CREATE OR REPLACE SECRET "qod_ice_glue_lake"""")
     sql should include("TYPE s3")
     sql should include("""KEY_ID '{{secret.AWS_KEY_ID}}'""")
@@ -238,7 +238,7 @@ class IcebergSetupSqlSpec extends AnyFlatSpec with Matchers:
       awsSessionToken = None
     )
     val sql = IcebergSetupSql.render(v(cfg, "glue_lake"), readOnly = false)
-    sql should include("INSTALL aws; LOAD aws;")
+    sql should include("INSTALL aws;\nLOAD aws;")
     sql should include("PROVIDER credential_chain")
     sql should not include "KEY_ID"
     sql should include("""SECRET "qod_ice_glue_lake"""")

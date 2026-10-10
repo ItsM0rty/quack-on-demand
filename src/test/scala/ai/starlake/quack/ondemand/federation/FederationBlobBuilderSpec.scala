@@ -164,7 +164,7 @@ class FederationBlobBuilderSpec extends AnyFlatSpec with Matchers with OptionVal
   it should "render an iceberg_rest source and substitute its secrets" in {
     val s    = iceSrc()
     val blob = builderWith(List(s), iceSecrets(s)).build("td-1").unsafeRunSync().value
-    blob should include("INSTALL iceberg; LOAD iceberg;")
+    blob should include("INSTALL iceberg;\nLOAD iceberg;")
     blob should include("CLIENT_ID 'the-id'")
     blob should include("CLIENT_SECRET 'the-secret'")
     blob should not include "{{secret."

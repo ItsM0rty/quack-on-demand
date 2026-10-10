@@ -9,7 +9,10 @@ class DemoSeedSpec extends AnyFlatSpec with Matchers:
     val pg  = PgCoords("localhost", 54321, "postgres", "")
     val sql = DemoSeed.buildInitSql(pg, "acme_tpch", "tpch1", "/demo/ducklake", 0.1)
 
-    sql should include("INSTALL ducklake")
+    sql should include("INSTALL ducklake;\nLOAD ducklake;\n")
+    sql should include("INSTALL postgres;\nLOAD postgres;\n")
+    sql should include("INSTALL tpch;\nLOAD tpch;\n")
+    sql should include("(DATA_PATH '/demo/ducklake', AUTOMATIC_MIGRATION TRUE);")
     sql should include("INSTALL postgres")
     sql should include("INSTALL tpch")
     sql should include("host=localhost port=54321 dbname=acme_tpch user=postgres")

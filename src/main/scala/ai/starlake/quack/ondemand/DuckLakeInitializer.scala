@@ -314,9 +314,11 @@ object DuckLakeInitializer extends LazyLogging:
       dataPath: String,
       encrypted: Boolean
   ): String =
+    // DuckDB 2.0: latest DuckLake only; an older catalog migrates here, once, under the
+    // per-dbname advisory lock, before any node attaches it.
     val opts =
-      if encrypted then s"DATA_PATH ${duckdbLiteral(dataPath)}, ENCRYPTED"
-      else s"DATA_PATH ${duckdbLiteral(dataPath)}"
+      if encrypted then s"DATA_PATH ${duckdbLiteral(dataPath)}, ENCRYPTED, AUTOMATIC_MIGRATION TRUE"
+      else s"DATA_PATH ${duckdbLiteral(dataPath)}, AUTOMATIC_MIGRATION TRUE"
     s"ATTACH ${duckdbLiteral(connstr)} AS ${quoteIdent(dbName)} ($opts)"
 
   /** Compares the catalog's recorded `ducklake_metadata.encrypted` against what the tenant-db row
