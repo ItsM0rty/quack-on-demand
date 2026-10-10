@@ -55,6 +55,42 @@ object LockdownScreen:
     "secret_directory",
     "allowed_directories",
     "allowed_paths",
+    "allowed_configs",
+    // Where extensions come from and how they are trusted (extension_directories replaces the
+    // deprecated extension_directory in DuckDB 2.0).
+    "extension_directories",
+    "extension_repository_directory",
+    "custom_extension_repository",
+    "autoinstall_extension_repository",
+    "allow_extensions_metadata_mismatch",
+    // Parser and grammar: a dialect the edge lexer does not model desyncs every screen from the
+    // engine (spark compatibility mode reads backslash escapes inside '...' literals).
+    "active_grammar_extensions",
+    "allow_parser_override_extension",
+    "current_dialect",
+    "dialect_compatibility_mode",
+    // Secrets: where they persist and whether they print unredacted.
+    "allow_persistent_secrets",
+    "default_secret_storage",
+    "allow_unredacted_secrets",
+    // Local files read or written by path.
+    "home_directory",
+    "file_search_path",
+    "log_query_path",
+    "profile_output",
+    "profiling_output",
+    // Outbound connections: TLS trust, proxying, scheme routing, and SQL the node runs against the
+    // Postgres catalog with its own credentials.
+    "ca_cert_file",
+    "enable_server_cert_verification",
+    "enable_curl_server_cert_verification",
+    "http_proxy",
+    "s3_url_scheme_aliases",
+    "pg_staleness_query",
+    "pg_pool_health_check_query",
+    // The node's own quack server authentication and authorization callbacks.
+    "quack_authentication_function",
+    "quack_authorization_function",
     // Resource settings: not a data-exfiltration surface, but an unguarded resource-abuse vector.
     // A tenant raising memory_limit past the node's spawn-time default can OOM the node (K8s) or
     // pressure the whole host's RAM (local backend). Spawn-time defaults (dbInitSql, cgroup-derived

@@ -496,6 +496,60 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("RESET allow_extension_repositories") shouldBe true
   }
 
+  // Settings protected for DuckDB 2.0: extension sources and trust, parser dialects and grammars,
+  // secret storage, local file paths, outbound connections and the node's own quack auth.
+  private val Protected20 = List(
+    "allowed_configs"                      -> "['memory_limit']",
+    "extension_directories"                -> "['/tmp/ext']",
+    "extension_repository_directory"       -> "'/tmp/repos'",
+    "custom_extension_repository"          -> "'https://x/'",
+    "autoinstall_extension_repository"     -> "'https://x/'",
+    "allow_extensions_metadata_mismatch"   -> "true",
+    "active_grammar_extensions"            -> "['g']",
+    "allow_parser_override_extension"      -> "'DEFAULT'",
+    "current_dialect"                      -> "'spark'",
+    "dialect_compatibility_mode"           -> "'spark'",
+    "allow_persistent_secrets"             -> "true",
+    "default_secret_storage"               -> "'local_file'",
+    "allow_unredacted_secrets"             -> "true",
+    "home_directory"                       -> "'/tmp'",
+    "file_search_path"                     -> "'/etc'",
+    "log_query_path"                       -> "'/tmp/q.log'",
+    "profile_output"                       -> "'/tmp/p.json'",
+    "profiling_output"                     -> "'/tmp/p.json'",
+    "ca_cert_file"                         -> "'/tmp/ca.pem'",
+    "enable_server_cert_verification"      -> "false",
+    "enable_curl_server_cert_verification" -> "false",
+    "http_proxy"                           -> "'evil:3128'",
+    "s3_url_scheme_aliases"                -> "['oss']",
+    "pg_staleness_query"                   -> "'SELECT 1 ${SCHEMA}'",
+    "pg_pool_health_check_query"           -> "'SELECT 1'",
+    "quack_authentication_function"        -> "'f'",
+    "quack_authorization_function"         -> "'f'"
+  )
+
+  it should "protect the DuckDB 2.0 extension, parser, secret, file and network settings" in
+    Protected20.foreach { case (name, value) =>
+      val upper = name.toUpperCase(java.util.Locale.ROOT)
+      withClue(name) {
+        denied(s"SET $name = $value") shouldBe true
+        denied(s"set $upper = $value") shouldBe true
+        denied(s"SET GLOBAL $name = $value") shouldBe true
+        denied(s"SET \"$name\" = $value") shouldBe true
+        denied(s"RESET $name") shouldBe true
+        denied(s"PRAGMA $name = $value") shouldBe true
+        denied(s"SELECT 1; SET $name = $value") shouldBe true
+        // reading a protected setting stays admitted
+        denied(s"SELECT current_setting('$name')") shouldBe false
+      }
+    }
+
+  it should "keep the settings that only share a prefix with a protected one admitted" in {
+    denied("SET http_proxy_username = 'u'") shouldBe false
+    denied("SET http_proxy_password = 'p'") shouldBe false
+    denied("SET http_timeout = 300") shouldBe false
+  }
+
   "the statement splitter" should "not lose a statement behind a dollar-quoted or E-string literal" in {
     // DuckDB reads `$x$'$x$` as a dollar-quoted string holding one quote, and `E'\''` as an
     // escape string holding one quote. A splitter that knew only '...' opened a single-quoted
