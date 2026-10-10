@@ -122,6 +122,31 @@ class NodeSettingScreenSpec extends AnyFlatSpec with Matchers:
       Some(NodeSettingScreen.ImportRefusalMessage)
   }
 
+  it should "refuse PRAGMA import_database, the pragma form IMPORT DATABASE lowers to on 2.0" in {
+    // Verified on the 2.0 CLI: PRAGMA import_database('<dir>') with a SET GLOBAL in schema.sql
+    // applies the setting; only the pragma form exists (CALL / FROM import_database do not).
+    val msg = Some(NodeSettingScreen.ImportRefusalMessage)
+    NodeSettingScreen.screen("PRAGMA import_database('exp')") shouldBe msg
+    NodeSettingScreen.screen("PRAGMA\"import_database\"('exp')") shouldBe msg
+    NodeSettingScreen.screen("pragma IMPORT_DATABASE('exp')") shouldBe msg
+    NodeSettingScreen.screen("SELECT 1; PRAGMA import_database('exp')") shouldBe msg
+    NodeSettingScreen.screen("SELECT * FROM query('PRAGMA import_database(''exp'')')") shouldBe msg
+    refused("SELECT import_database FROM t") shouldBe false
+  }
+
+  it should "refuse postgres_execute / postgres_query, which run unscreened SQL on the node" in {
+    // Verified on the 2.0 CLI: postgres_execute against the DuckLake catalog Postgres runs DDL
+    // there with the node's credentials. quack_query (the front door's own primitive) stays allowed.
+    val msg = Some(NodeSettingScreen.ExecRefusalMessage)
+    NodeSettingScreen.screen("SELECT * FROM postgres_execute('c', 'SELECT 1')") shouldBe msg
+    NodeSettingScreen.screen("SELECT * FROM postgres_query('c', 'SELECT 1')") shouldBe msg
+    NodeSettingScreen.screen("CALL postgres_execute('c', 'DROP TABLE t')") shouldBe msg
+    NodeSettingScreen.screen("SELECT * FROM `postgres_query`('c', 'SELECT 1')") shouldBe msg
+    NodeSettingScreen.screen("EXPLAIN SELECT * FROM postgres_query('c', 'SELECT 1')") shouldBe msg
+    refused("SELECT * FROM quack_query('quack:h:9494', 'SELECT 1', token := 't')") shouldBe false
+    refused("SELECT postgres_query FROM t") shouldBe false
+  }
+
   it should "not read a setting name inside a literal or a comment as a SET" in {
     refused("SELECT 'SET dialect_compatibility_mode = 1' AS s") shouldBe false
     refused("SELECT $$SET GLOBAL show_behavior = 'table'$$") shouldBe false

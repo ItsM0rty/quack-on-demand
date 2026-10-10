@@ -19,13 +19,24 @@ package ai.starlake.quack.edge.sql
   * every session's traffic. `allow_unredacted_secrets` is startup-only on 2.0 and refused here so a
   * later runtime-settable version cannot reopen it.
   *
-  * `IMPORT DATABASE` is refused for the same reason: it replays the `schema.sql` / `load.sql` of a
-  * directory the edge never reads (verified on 2.0: a `SET dialect_compatibility_mode` in
-  * `schema.sql` takes effect), so it can carry any of these settings past this screen.
+  * Three ways of running SQL the edge never screens are refused for the same reason:
+  *   - `IMPORT DATABASE 'dir'` and its pragma form `PRAGMA import_database('dir')` (the lowering
+  *     DuckDB 2.0 itself uses) replay the `schema.sql` / `load.sql` of a directory or URL the edge
+  *     never reads. Verified on 2.0: a `SET GLOBAL dialect_compatibility_mode` in `schema.sql`
+  *     applies, from a local dir or an `http://` URL, so the import would carry any of these
+  *     settings past this screen.
+  *   - `postgres_execute('<catalog>', '<sql>')` and `postgres_query('<catalog>', '<sql>')` run an
+  *     arbitrary SQL string on an attached Postgres with the node's credentials. A DuckLake node
+  *     has its catalog Postgres attached (`__ducklake_metadata_<alias>`), which holds every
+  *     per-file key; verified on 2.0 that `postgres_execute` runs DDL there. The edge never parses
+  *     that string, so no ACL, catalog scoping or policy applies to it.
   *
-  * Token-based: each statement is split and lexed from the ORIGINAL text by DuckDB 2.0's own
-  * tokenizer and names are folded afterwards. Manager-internal SQL (DuckLake initializer, node
-  * bootstrap, demo seed) never goes through the router and sets none of these.
+  * Settings read from DuckDB 2.0's own tokens, the carried statement of an EXPLAIN / PREPARE
+  * wrapper included ([[StatementHead]]); the three SQL-running calls are found by [[FunctionCalls]]
+  * (any quoting, qualified, and inside `query()` literal bodies). Manager-internal SQL (DuckLake
+  * initializer, node bootstrap's own `postgres_query` advisory locks, demo seed) never goes through
+  * the router, and `quack_query` (the front door's own federation primitive, which reaches a remote
+  * quack endpoint that applies its own ACL) is deliberately NOT refused.
   */
 object NodeSettingScreen:
 
@@ -37,6 +48,9 @@ object NodeSettingScreen:
 
   val ImportRefusalMessage =
     "IMPORT DATABASE replays SQL the gateway cannot screen and is disabled"
+
+  val ExecRefusalMessage =
+    "postgres_execute / postgres_query run SQL the gateway cannot screen and are disabled"
 
   /** The DuckDB 2.0 settings that change lexing, parsing, identifier folding or name resolution. */
   val ParserSettings: Set[String] = Set(
@@ -57,11 +71,25 @@ object NodeSettingScreen:
 
   private val Scopes = Set("session", "global", "local")
 
-  /** The refusal for the first statement of `sql` that changes one of [[Settings]] or imports a
-    * database, if any.
+  /** Table functions / pragmas that run SQL the edge never screens, mapped to their refusal. */
+  private val DeniedCalls: Map[String, String] = Map(
+    "import_database"  -> ImportRefusalMessage,
+    "postgres_execute" -> ExecRefusalMessage,
+    "postgres_query"   -> ExecRefusalMessage
+  )
+
+  /** The refusal for the first statement of `sql` that changes one of [[Settings]], imports a
+    * database, or calls a SQL-running function, if any.
     */
   def screen(sql: String): Option[String] =
-    LockdownScreen.splitStatements(sql).iterator.flatMap(screenOne).nextOption()
+    LockdownScreen
+      .splitStatements(sql)
+      .iterator
+      .flatMap(screenOne)
+      .nextOption()
+      .orElse(
+        FunctionCalls.scan(sql).calls.iterator.flatMap(c => DeniedCalls.get(c.name)).nextOption()
+      )
 
   /** Read from DuckDB 2.0's own tokens, never from a regex over the text: the tokenizer needs no
     * whitespace between a keyword and a quoted name, so `SET"show_behavior"='setting'`,

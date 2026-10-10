@@ -30,13 +30,16 @@ private[sql] object StatementHead:
 
   /** The non-trivia tokens of `stmt` read from DuckDB 2.0's own tokenizer, over `view` (the
     * statement's engine view, which the token offsets index), and the index of the first token of
-    * the statement an EXPLAIN carries: past a leading run of EXPLAIN / ANALYZE / ANALYSE keywords
+    * the statement a wrapper carries: past a leading run of EXPLAIN / ANALYZE / ANALYSE keywords
     * and parenthesized option lists (balanced over paren TOKENS, so a paren inside a literal or a
-    * comment never counts). 0 when the statement is not an EXPLAIN; `toks.length` when nothing
-    * follows. `EXPLAIN ANALYZE <stmt>`, `EXPLAIN (ANALYZE) <stmt>` and `EXPLAIN ANALYZE (FORMAT
-    * json) <stmt>` all EXECUTE the statement on 2.0 (SET, PRAGMA, RESET, COPY and LOAD verified).
-    * The run is wider than the grammar (any order, repeated) so an unusual prefix only ever moves
-    * the head further in.
+    * comment never counts), and then past a `PREPARE <name> [(<types>)] AS` head. 0 when the
+    * statement wraps nothing; `toks.length` when nothing follows. `EXPLAIN ANALYZE <stmt>`,
+    * `EXPLAIN (ANALYZE) <stmt>` and `EXPLAIN ANALYZE (FORMAT json) <stmt>` all EXECUTE the
+    * statement on 2.0 (SET, PRAGMA, RESET, COPY and LOAD verified), and `PREPARE p AS <stmt>` +
+    * `EXECUTE p` executes `<stmt>` (only SELECT / INSERT / UPDATE / DELETE / COPY are preparable on
+    * 2.0, so `PREPARE p AS COPY (...) TO '<local>'` is the write carrier the lockdown first-token
+    * rules must see through). The EXPLAIN run is wider than the grammar (any order, repeated) so an
+    * unusual prefix only ever moves the head further in.
     */
   final case class Head(view: String, toks: Vector[SqlLexer.Token], start: Int):
 
@@ -54,17 +57,29 @@ private[sql] object StatementHead:
     def text: String = if start < toks.length then view.substring(toks(start).start) else ""
 
   def of(stmt: String): Head =
-    val view  = SqlLexer.engineView(Option(stmt).getOrElse(""))
-    val toks  = SqlLexer.tokens(view).filterNot(_.isTrivia)
-    val first = Head(view, toks, 0)
-    if !first.word(0).contains("explain") then first
+    val view         = SqlLexer.engineView(Option(stmt).getOrElse(""))
+    val toks         = SqlLexer.tokens(view).filterNot(_.isTrivia)
+    val h            = Head(view, toks, 0)
+    val afterExplain =
+      if !h.word(0).contains("explain") then 0
+      else
+        var i = 0
+        while i < toks.length && (h.word(i).exists(ExplainWords) || isPunct(view, toks(i), '(')) do
+          if isPunct(view, toks(i), '(') then i = closingParen(view, toks, i) + 1
+          else i += 1
+        i
+    Head(view, toks, math.min(skipPrepareHead(h, afterExplain), toks.length))
+
+  /** Past a `PREPARE <name> [(<types>)] AS` head at `from`, to the first token of the prepared
+    * statement; `from` unchanged when there is no such head or no `AS` is found.
+    */
+  private def skipPrepareHead(h: Head, from: Int): Int =
+    if !h.word(from).contains("prepare") || h.identifier(from + 1).isEmpty then from
     else
-      var i = 0
-      while i < toks.length && (first.word(i).exists(ExplainWords) || isPunct(view, toks(i), '('))
-      do
-        if isPunct(view, toks(i), '(') then i = closingParen(view, toks, i) + 1
-        else i += 1
-      Head(view, toks, math.min(i, toks.length))
+      var i = from + 2 // past PREPARE and the statement name
+      if i < h.toks.length && isPunct(h.view, h.toks(i), '(') then
+        i = closingParen(h.view, h.toks, i) + 1
+      if h.word(i).contains("as") then i + 1 else from
 
   private val ExplainWords = Set("explain", "analyze", "analyse")
 

@@ -536,7 +536,7 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     "quack_authorization_function"         -> "'f'"
   )
 
-  it should "protect the DuckDB 2.0 extension, parser, secret, file, network and logging settings" in
+  it should "protect the DuckDB 2.0 extension, parser, secret, file, network and log settings" in
     Protected20.foreach { case (name, value) =>
       val upper = name.toUpperCase(java.util.Locale.ROOT)
       withClue(name) {
@@ -597,6 +597,24 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("EXPLAIN ANALYZE COPY (SELECT 1) TO 's3://staging/x.csv'") shouldBe false
     denied("EXPLAIN ANALYZE SELECT * FROM t") shouldBe false
     denied("EXPLAIN UPDATE t SET threads = 1") shouldBe false
+  }
+
+  "a prepared statement" should "meet the first-token rules on the statement it prepares" in {
+    // Verified on 2.0: PREPARE p AS COPY (SELECT 1) TO '<local>'; EXECUTE p writes the file; only
+    // SELECT / INSERT / UPDATE / DELETE / COPY are preparable, so COPY ... TO is the write carrier.
+    denied("PREPARE p AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+    denied("PREPARE p (INTEGER) AS COPY (SELECT $1) TO '/tmp/x.csv'") shouldBe true
+    denied("EXPLAIN PREPARE p AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+    denied("PREPARE p AS COPY (SELECT 1) TO 's3://staging/x.csv'") shouldBe false
+    denied("PREPARE p AS SELECT * FROM t") shouldBe false
+  }
+
+  "the postgres control functions" should "be denied (ATTACH and pool-config bypasses)" in {
+    // postgres_attach is the function form of the denied ATTACH statement; postgres_configure_pool
+    // carries health_check_query, the lever of the protected setting pg_pool_health_check_query.
+    denied("SELECT * FROM postgres_attach('dbname=x host=h', source := 'pg')") shouldBe true
+    denied("CALL postgres_configure_pool(health_check_query := 'SELECT 1')") shouldBe true
+    denied("SELECT `postgres_attach`('dbname=x')") shouldBe true
   }
 
   "enable_logging" should "be denied in every call form, since file storage writes local files" in {

@@ -530,16 +530,17 @@ final class FlightSqlRouter(
             .map(_.id)
         TriggerScreen.mayManageTriggers(effectiveSet, poolTenantId)
       }
-    // Parser and credential-exposing settings (and IMPORT DATABASE, which can carry them) are
-    // refused for every caller, superusers included, whatever the ACL mode and the lockdown flag:
-    // one session switching how the node parses desyncs the ACL for every session on it, and one
-    // unredacting its HTTP logs exposes the node's credentials (NodeSettingScreen's scaladoc).
+    // Parser / credential settings, IMPORT DATABASE and the SQL-running calls (postgres_execute /
+    // postgres_query) are refused for every caller, superusers included, whatever the ACL mode and
+    // the lockdown flag: one session switching how the node parses desyncs the ACL for every
+    // session on it, one unredacting its HTTP logs exposes the node's credentials, and the SQL-
+    // running paths run text the edge never authorizes (NodeSettingScreen's scaladoc).
     val settingDenial                 = NodeSettingScreen.screen(sql)
     val preGateDenial: Option[String] =
       lockdownDenial
         .map(r => s"lockdown: $r")
         .orElse(triggerDenial.map(r => s"trigger: $r"))
-        .orElse(settingDenial.map(r => s"setting: $r"))
+        .orElse(settingDenial.map(r => s"node: $r"))
 
     val aclCheck: Either[RouterFailure, Unit] = preGateDenial match
       case Some(reason) =>

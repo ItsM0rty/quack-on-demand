@@ -4,6 +4,7 @@ import ai.starlake.quack.edge.adapter._
 import ai.starlake.quack.edge.sql.{
   Allowed,
   Denied,
+  NodeSettingScreen,
   StatementValidator,
   ValidationContext,
   ValidationResult
@@ -1934,7 +1935,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
     out.swap.toOption.get.reason shouldBe
-      s"access denied: setting: ${ai.starlake.quack.edge.sql.NodeSettingScreen.RefusalMessage}"
+      s"access denied: node: ${ai.starlake.quack.edge.sql.NodeSettingScreen.RefusalMessage}"
 
   it should "be refused for a superuser too, lockdown off" in:
     val (base, _, _) = setup()
@@ -2012,7 +2013,34 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       )
       .unsafeRunSync()
     out.swap.toOption.get.reason shouldBe
-      s"access denied: setting: ${ai.starlake.quack.edge.sql.NodeSettingScreen.SecretRefusalMessage}"
+      s"access denied: node: ${NodeSettingScreen.SecretRefusalMessage}"
+
+  it should "refuse PRAGMA import_database and postgres_execute for a superuser, lockdown off" in:
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val superuser = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser.copy(tenant = None, kind = "admin"),
+      Nil,
+      Nil,
+      Nil,
+      Nil
+    )
+    val imp = router
+      .execute("psr-6", "alice", poolKey, "PRAGMA import_database('/tmp/x')", Some(superuser))
+      .unsafeRunSync()
+    imp.swap.toOption.get.reason shouldBe
+      s"access denied: node: ${NodeSettingScreen.ImportRefusalMessage}"
+    val pe = router
+      .execute("psr-7", "alice", poolKey, "SELECT * FROM postgres_execute('c', 'SELECT 1')", None)
+      .unsafeRunSync()
+    pe.swap.toOption.get.reason shouldBe
+      s"access denied: node: ${NodeSettingScreen.ExecRefusalMessage}"
 
   // ---- node lockdown (QOD_NODE_LOCKDOWN) ----
 

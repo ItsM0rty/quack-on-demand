@@ -120,14 +120,22 @@ object LockdownScreen:
     "parquet_scan",
     "getenv",
     // Writes log files (CALL or FROM form) under storage_path or storage_config's path.
-    "enable_logging"
+    "enable_logging",
+    // postgres_attach is the function form of ATTACH (denied as a statement on this deployment);
+    // postgres_configure_pool carries health_check_query, the lever of the protected setting
+    // pg_pool_health_check_query. Neither takes a path, so neither exempts on a remote literal.
+    "postgres_attach",
+    "postgres_configure_pool"
   )
 
   // read-style functions whose string-literal args may be remote URLs. read_text / read_blob keep
   // the exemption too, matching the documented contract: a remote URL literal is admitted, a local
-  // path is denied. glob (directory listing), getenv (no path) and enable_logging (its path is a
-  // named argument or a struct field, never the first argument) never exempt.
-  private val UrlExempt = DeniedFunctions - "glob" - "getenv" - "enable_logging"
+  // path is denied. glob (directory listing), getenv (no path), enable_logging (its path is a named
+  // argument or a struct field, never the first argument) and the postgres_* control functions
+  // (no path argument) never exempt.
+  private val UrlExempt =
+    DeniedFunctions - "glob" - "getenv" - "enable_logging" - "postgres_attach" -
+      "postgres_configure_pool"
 
   private val RemoteSchemes = List("s3://", "gs://", "az://", "r2://", "http://", "https://")
 
@@ -231,12 +239,10 @@ object LockdownScreen:
     // The function-call rule and the quoted-identifier rule do not read `lower`: they lex
     // `stmt` itself (see `FunctionCalls`), so no quoting form DuckDB 2.0 accepts for a name can hide
     // one from a regex, and only a call's argument list is normalized and folded afterwards.
-    val lower =
-      SqlTrivia
-        .normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt)))
-        .toLowerCase(Locale.ROOT)
-    // The first-token rules judge the statement an EXPLAIN carries: EXPLAIN ANALYZE executes it
-    // (SET, PRAGMA, RESET, COPY ... TO and LOAD verified on 2.0), so `explain` itself says nothing.
+    val lower = StatementHead.normalize(stmt)
+    // The first-token rules judge the statement an EXPLAIN / PREPARE wrapper carries: EXPLAIN
+    // ANALYZE executes it (SET, PRAGMA, RESET, COPY ... TO and LOAD verified on 2.0) and a prepared
+    // COPY ... TO writes on EXECUTE, so the wrapper word itself says nothing.
     val head          = StatementHead.of(stmt)
     val headLower     = if head.start == 0 then lower else StatementHead.normalize(head.text)
     val first         = FirstToken.findFirstMatchIn(headLower).map(_.group(1))
