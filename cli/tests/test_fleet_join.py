@@ -567,6 +567,17 @@ def test_probe_duckdb_version_parses_the_cli_banner(tmp_path):
     assert probe_duckdb_version(tmp_path / "duckdb", run=run) == "1.5.6"
 
 
+def test_probe_duckdb_version_runs_with_agent_mode_off(tmp_path):
+    seen = {}
+
+    def run(*a, **kw):
+        seen.update(kw.get("env") or {})
+        return _Done("v2.0.0 (Cyanoptera) b15358c371\n")
+
+    assert probe_duckdb_version(tmp_path / "duckdb", run=run) == "2.0.0"
+    assert seen.get("DUCKDB_AGENT_MODE") == "0"
+
+
 def test_probe_duckdb_version_fails_soft(tmp_path):
     def boom(*a, **kw):
         raise subprocess.TimeoutExpired("duckdb", 5)

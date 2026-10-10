@@ -81,6 +81,9 @@ object DemoSeed extends LazyLogging:
     try
       Files.writeString(sqlFile, sql)
       val pb = new java.lang.ProcessBuilder(duckdb)
+      // DuckDB 2.0's CLI turns errors into JSON under an agent env var (AI_AGENT, CLAUDECODE)
+      // when stdout is not a terminal; keep the plain stderr this seeder reports.
+      pb.environment().put("DUCKDB_AGENT_MODE", "0")
       pb.redirectInput(sqlFile.toFile)
       pb.redirectOutput(java.lang.ProcessBuilder.Redirect.DISCARD)
       pb.redirectError(errFile.toFile)

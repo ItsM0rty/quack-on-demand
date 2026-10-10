@@ -73,6 +73,10 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+# (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal; pin the normal output format.
+$env:DUCKDB_AGENT_MODE = '0'
+
 $RepoDir    = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $DistribDir = Join-Path $RepoDir 'distrib'
 Set-Location $RepoDir

@@ -30,3 +30,16 @@ class DemoSeedSpec extends AnyFlatSpec with Matchers:
     do
       sql should include(s"CREATE TABLE acme_tpch.tpch1.$table AS SELECT * FROM memory.main.$table")
   }
+
+  "DemoSeed.run" should "start the duckdb CLI with DuckDB 2.0's agent mode off" in {
+    assume(!scala.util.Properties.isWin, "the fake duckdb is a POSIX shell script")
+    val dir  = java.nio.file.Files.createTempDirectory("qod-demo-seed-spec")
+    val fake = dir.resolve("duckdb")
+    java.nio.file.Files
+      .writeString(fake, "#!/bin/sh\necho \"agent=$DUCKDB_AGENT_MODE\" >&2\nexit 1\n")
+    fake.toFile.setExecutable(true)
+    val home = DemoHome(dir, dir.resolve("pg"), dir.resolve("ducklake"), dir.resolve("native"))
+    val pg   = PgCoords("localhost", 54321, "postgres", "")
+    val out  = DemoSeed.run(pg, "acme_tpch", "tpch1", home, 0.1, fake.toString, maxAttempts = 1)
+    out.left.toOption.getOrElse("") should include("agent=0")
+  }

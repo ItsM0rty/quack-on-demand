@@ -147,6 +147,8 @@ def probe_duckdb_version(binary: Path, run=subprocess.run) -> str | None:
         out = run(
             [str(binary), "--version"],
             capture_output=True,
+            # Normal output even under an agent env var (DuckDB 2.0 agent mode).
+            env={**os.environ, "DUCKDB_AGENT_MODE": "0"},
             text=True,
             errors="replace",
             timeout=5,

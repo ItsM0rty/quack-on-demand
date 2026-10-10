@@ -533,6 +533,10 @@ def runtime_env(
     # honours it too (Unix PATH inheritance already works, so this is belt-and-suspenders there).
     exe = "duckdb.exe" if os_name == "win32" else "duckdb"
     env["DUCKDB_BIN"] = str(duckdb_bin / exe)
+    # DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+    # (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal: pin the normal output for every
+    # node, loader and seeder the manager starts, even from inside an agent session.
+    env["DUCKDB_AGENT_MODE"] = "0"
     if libduckdb_lib is not None:
         # On Windows the DLL resolves through PATH, already prefixed above.
         var = {"darwin": "DYLD_LIBRARY_PATH", "linux": "LD_LIBRARY_PATH"}.get(os_name)

@@ -180,6 +180,8 @@ function Get-AttachSql($cfg) {
 function Invoke-DuckDb {
   param([Parameter(Mandatory)] [string]$Sql, [switch]$Quiet)
   $duck = Get-DuckDbExe
+  # The 2.0 CLI otherwise prints JSON errors under an agent env var (AI_AGENT, CLAUDECODE).
+  $env:DUCKDB_AGENT_MODE = '0'
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ("qod-load-" + [Guid]::NewGuid().ToString('N') + ".sql")
   [IO.File]::WriteAllText($tmp, $Sql, (New-Object System.Text.UTF8Encoding($false)))
   $argLine = '-c ".read ''{0}''"' -f ($tmp -replace '\\','/')

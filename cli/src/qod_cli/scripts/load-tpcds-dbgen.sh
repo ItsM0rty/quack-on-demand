@@ -53,6 +53,10 @@
 
 set -euo pipefail
 
+# DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+# (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal; pin the normal output format.
+export DUCKDB_AGENT_MODE=0
+
 # ---- Config / sanity / storage / idempotency (shared) ----
 # Dataset knobs consumed by scripts/_load-common.sh, which owns the full env
 # contract (PG_*, DB_NAME, SCHEMA_NAME, DATA_PATH, TEMP_DIR, MEMORY_LIMIT, SF)

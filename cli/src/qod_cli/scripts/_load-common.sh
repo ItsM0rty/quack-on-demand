@@ -249,7 +249,9 @@ load_exit_if_already_loaded() {
     echo ".headers off"
     echo "SELECT count(*) FROM $DB_NAME.$SCHEMA_NAME.$SENTINEL_TABLE;"
   } > "$probe_sql"
-  existing_rows="$(duckdb < "$probe_sql" 2>/dev/null | tr -d '\r\n ' || true)"
+  # DUCKDB_AGENT_MODE=0: the 2.0 CLI otherwise prints JSON errors under an agent env var
+  # (AI_AGENT, CLAUDECODE), which garbles the file-probe path extraction below.
+  existing_rows="$(DUCKDB_AGENT_MODE=0 duckdb < "$probe_sql" 2>/dev/null | tr -d '\r\n ' || true)"
   rm -f "$probe_sql"
   if [[ "$existing_rows" =~ ^[0-9]+$ ]] && (( existing_rows > 0 )); then
     # Catalog says there's data. Verify the parquet files are reachable -
@@ -262,7 +264,7 @@ load_exit_if_already_loaded() {
       echo ".headers off"
       echo "SELECT $SENTINEL_COLUMN FROM $DB_NAME.$SCHEMA_NAME.$SENTINEL_TABLE LIMIT 1;"
     } > "$file_probe_sql"
-    file_probe_err="$(duckdb < "$file_probe_sql" 2>&1 1>/dev/null || true)"
+    file_probe_err="$(DUCKDB_AGENT_MODE=0 duckdb < "$file_probe_sql" 2>&1 1>/dev/null || true)"
     rm -f "$file_probe_sql"
     if [[ -n "$file_probe_err" && "$file_probe_err" == *"Cannot open file"* ]]; then
       echo "ERROR: catalog claims $existing_rows rows in $DB_NAME.$SCHEMA_NAME.$SENTINEL_TABLE" >&2

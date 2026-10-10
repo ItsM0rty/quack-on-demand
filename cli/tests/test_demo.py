@@ -1,5 +1,6 @@
 import pathlib
 import hashlib
+import re
 import sys
 
 import httpx
@@ -484,6 +485,56 @@ def test_bundled_spawn_scripts_match_the_canonical_ones():
         )
 
 
+# A duckdb CLI launch on a code line: `duckdb <` / `duckdb -x` / `"$DUCKDB" <` / `.../duckdb" -x` in
+# bash, `Invoke-DuckDb` / `& $duck...` / `FileName = $duckdb...` in PowerShell (not the
+# `Get-Process duckdb -ErrorAction ...` teardown lookup).
+_DUCKDB_CALL = re.compile(
+    r'(?<!Process )\bduckdb"?\s+(<|-)|"\$DUCKDB"\s|Invoke-DuckDb\b|&\s*\$duck'
+    r"|FileName\s*=\s*\$duck"
+)
+_AGENT_MODE_OFF = re.compile(r"DUCKDB_AGENT_MODE\s*=\s*'?0'?|-no-agent\b")
+
+
+def test_scripts_running_the_duckdb_cli_pin_agent_mode_off():
+    # DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+    # (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal, e.g. a manager started from
+    # inside Claude Code. Every script that runs the CLI must pin DUCKDB_AGENT_MODE=0 (or -no-agent).
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    candidates = [
+        *(repo / "scripts").rglob("*.sh"),
+        *(repo / "scripts").rglob("*.ps1"),
+        *(repo / "cli" / "src" / "qod_cli" / "scripts").glob("*"),
+    ]
+    flagged = set()
+    for path in sorted(p for p in candidates if p.is_file()):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        code = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+        if _DUCKDB_CALL.search(code):
+            rel = path.relative_to(repo).as_posix()
+            flagged.add(rel)
+            assert _AGENT_MODE_OFF.search(code), f"{rel} runs the duckdb CLI without DUCKDB_AGENT_MODE=0"
+    # The detector must keep seeing the known launchers, or the loop above proves nothing.
+    known = {
+        f"{d}/{name}"
+        for d in ("scripts", "cli/src/qod_cli/scripts")
+        for name in (
+            "spawn-quack-node.sh",
+            "_load-common.sh",
+            "load-tpch-dbgen.sh",
+            "load-tpcds-dbgen.sh",
+            "load-ssb-dbgen.sh",
+        )
+    } | {
+        "scripts/spawn-quack-node.ps1",
+        "cli/src/qod_cli/scripts/spawn-quack-node.ps1",
+        "scripts/_load-common.ps1",
+        "scripts/load-tpch-dbgen.ps1",
+        "scripts/run-jar.sh",
+        "scripts/run-jar.ps1",
+    }
+    assert known <= flagged, sorted(known - flagged)
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="NTFS has no POSIX exec bit; materialize's chmod(0o755) is a no-op on Windows",
@@ -513,6 +564,8 @@ def test_demo_env_wires_spawn_script_duckdb_and_app_home(tmp_path):
     # actually runs under (duckdb.exe on Windows).
     exe = "duckdb.exe" if sys.platform == "win32" else "duckdb"
     assert env["DUCKDB_BIN"] == str(tmp_path / "duckdb" / "bin" / exe)
+    # Nodes, loaders and the seeder run the duckdb CLI with DuckDB 2.0's agent mode off.
+    assert env["DUCKDB_AGENT_MODE"] == "0"
 
 
 def test_runtime_env_pins_duckdb_bin_windows(tmp_path):
