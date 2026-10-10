@@ -9,6 +9,8 @@ import org.scalatest.matchers.should.Matchers
 import java.net.URI
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.duration.*
+import scala.jdk.CollectionConverters.*
 
 /** Pure tests for [[QuackProtocol]] driven by a fake [[QuackTransport]].
   *
@@ -99,6 +101,46 @@ class QuackProtocolSpec extends AnyFunSpec with Matchers:
         e.getCause.getMessage shouldBe "boom"
         transport.postCount.get() shouldBe 0
       finally allocator.close()
+    }
+
+    it("sends HEARTBEAT_REQUESTs every lease / 3 while open, and none after close") {
+      val heartbeatType = MessageType.HeartbeatRequest.wireOrdinal
+      final class BeatTransport extends QuackTransport:
+        val types = java.util.concurrent.ConcurrentLinkedQueue[Int]()
+        def post(uri: URI, body: Array[Byte]): IO[Array[Byte]] = IO {
+          types.add(QuackNativeBridge.parseMessageType(body))
+          QuackTestFixtures.serializeSampleConnectionResponse(connId)
+        }
+      val transport = BeatTransport()
+      val allocator = new RootAllocator()
+      try
+        val protocol = new QuackProtocol(transport, allocator, nodeLeaseSec = 3) // beat every 1s
+        val conn     = protocol.open(endpoint, token).unsafeRunSync()
+        Thread.sleep(2500)
+        val beats = transport.types.asScala.count(_ == heartbeatType)
+        beats should be >= 2
+        conn.close().unsafeRunSync()
+        val afterClose = transport.types.asScala.count(_ == heartbeatType)
+        Thread.sleep(1500)
+        transport.types.asScala.count(_ == heartbeatType) shouldBe afterClose
+      finally allocator.close()
+    }
+
+    it("rejects a lease below one second at construction") {
+      val allocator = new RootAllocator()
+      try
+        val e = intercept[IllegalArgumentException] {
+          new QuackProtocol(new FakeTransport(Iterator.empty), allocator, nodeLeaseSec = 0)
+        }
+        e.getMessage should include("nodeLeaseSec")
+      finally allocator.close()
+    }
+
+  describe("heartbeatEvery"):
+    it("is a third of the lease, at least one second") {
+      QuackProtocol.heartbeatEvery(30) shouldBe 10.seconds
+      QuackProtocol.heartbeatEvery(3) shouldBe 1.second
+      QuackProtocol.heartbeatEvery(1) shouldBe 1.second
     }
 
   describe("execute"):

@@ -58,6 +58,7 @@ open class QuackHttpClient(
     allocator: BufferAllocator,
     nativeClient: Boolean,
     nodeDisableSsl: Boolean,
+    nodeLeaseSec: Int = QuackProtocol.DefaultNodeLeaseSec,
     protocolFactory: Option[BufferAllocator => QuackProtocol] = None
 ) extends LazyLogging:
 
@@ -250,7 +251,8 @@ open class QuackHttpClient(
       case None          =>
         new QuackProtocol(
           new QuackProtocol.JdkHttpTransport(java.net.http.HttpClient.newHttpClient()),
-          allocator
+          allocator,
+          nodeLeaseSec
         )
 
   /** Build a fresh DuckDB instance with the quack extension loaded. Each gets its own clean

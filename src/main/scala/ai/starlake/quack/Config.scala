@@ -526,6 +526,13 @@ final case class ManagerConfig(
     )
     nodeDisableSsl: Boolean,
     @field @ConfigField(
+      envVar = "QOD_QUACK_NODE_LEASE_SEC",
+      description =
+        "Lease (seconds, >= 1) the manager asks a node for on each native connection. The manager " +
+          "heartbeats at a third of it; a node interrupts a statement whose lease lapses."
+    )
+    nodeLeaseSec: Int = 30,
+    @field @ConfigField(
       envVar = "QOD_SPAWN_SCRIPT",
       description = "Path to spawn-quack-node.sh invoked by LocalQuackBackend on Unix."
     )
@@ -597,7 +604,11 @@ final case class ManagerConfig(
     k8s: K8sConfig,
     federation: FederationConfig,
     auth: ManagerAuthConfig
-)
+):
+  require(
+    nodeLeaseSec >= 1,
+    s"nodeLeaseSec (QOD_QUACK_NODE_LEASE_SEC) must be >= 1, got $nodeLeaseSec"
+  )
 
 final case class RoutingConfig(
     @field @ConfigField(

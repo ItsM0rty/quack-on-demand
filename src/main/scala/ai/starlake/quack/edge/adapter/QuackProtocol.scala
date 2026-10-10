@@ -1,6 +1,6 @@
 package ai.starlake.quack.edge.adapter
 
-import cats.effect.IO
+import cats.effect.{FiberIO, IO}
 import cats.effect.unsafe.IORuntime
 import com.typesafe.scalalogging.LazyLogging
 import org.apache.arrow.memory.BufferAllocator
@@ -11,6 +11,7 @@ import org.apache.arrow.vector.ipc.ArrowReader
 import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import scala.concurrent.duration.*
 
 /** Connection lifecycle errors surfaced by [[QuackProtocol]]. Mirrors the [[QuackError.Transient]]
   * / [[QuackError.Permanent]] split in `QuackHttpClient.scala` so Task 7's adapter can map between
@@ -78,8 +79,10 @@ trait QuackTransport:
   */
 final class QuackProtocol(
     transport: QuackTransport,
-    allocator: BufferAllocator
+    allocator: BufferAllocator,
+    nodeLeaseSec: Int = QuackProtocol.DefaultNodeLeaseSec
 ) extends LazyLogging:
+  require(nodeLeaseSec >= 1, s"nodeLeaseSec must be >= 1, got $nodeLeaseSec")
 
   /** Opens a Quack connection: POST `CONNECTION_REQUEST(token)`, expect
     * `CONNECTION_RESPONSE(connId)`. Surfaces `ERROR_RESPONSE` as [[QuackWireError.Permanent]], any
@@ -102,25 +105,35 @@ final class QuackProtocol(
       guard()
       // Inside the IO too: a malformed endpoint fails the IO rather than throwing at call time.
       val url     = QuackProtocol.endpointToHttp(endpoint)
-      val reqBody = QuackNativeBridge.serializeConnectionRequest(token, 30L)
-      transport.post(url, reqBody).map { respBytes =>
-        val wireOrdinal = QuackNativeBridge.parseMessageType(respBytes)
-        MessageType.fromWireOrdinal(wireOrdinal) match
-          case Some(MessageType.ConnectionResponse) =>
-            val connId = QuackNativeBridge.extractConnectionId(respBytes)
-            new Connection(transport, url, connId, allocator)
-          case Some(MessageType.ErrorResponse) =>
-            val msg = QuackNativeBridge.extractErrorMessage(respBytes)
-            throw QuackWireError.Permanent(msg)
-          case other =>
-            val label = other.map(_.toString).getOrElse(wireOrdinal.toString)
-            throw QuackWireError.Permanent(
-              s"unexpected response type after CONNECTION_REQUEST: $label"
-            )
-      }
+      val reqBody = QuackNativeBridge.serializeConnectionRequest(token, nodeLeaseSec.toLong)
+      transport
+        .post(url, reqBody)
+        .map { respBytes =>
+          val wireOrdinal = QuackNativeBridge.parseMessageType(respBytes)
+          MessageType.fromWireOrdinal(wireOrdinal) match
+            case Some(MessageType.ConnectionResponse) =>
+              val connId = QuackNativeBridge.extractConnectionId(respBytes)
+              new Connection(transport, url, connId, allocator)
+            case Some(MessageType.ErrorResponse) =>
+              val msg = QuackNativeBridge.extractErrorMessage(respBytes)
+              throw QuackWireError.Permanent(msg)
+            case other =>
+              val label = other.map(_.toString).getOrElse(wireOrdinal.toString)
+              throw QuackWireError.Permanent(
+                s"unexpected response type after CONNECTION_REQUEST: $label"
+              )
+        }
+        .flatTap(_.startHeartbeats(QuackProtocol.heartbeatEvery(nodeLeaseSec)))
     }
 
 object QuackProtocol:
+
+  /** Default node lease (Quack v3 `heartbeat_timeout_seconds`), config `nodeLeaseSec`. */
+  val DefaultNodeLeaseSec: Int = 30
+
+  /** A third of the lease, so two heartbeats can be lost before the node interrupts the statement.
+    */
+  def heartbeatEvery(leaseSec: Int): FiniteDuration = math.max(1, leaseSec / 3).seconds
 
   /** "quack:host:port" -> "http://host:port/quack". The leading `quack:` scheme is what
     * `LocalQuackBackend` and `KubernetesQuackBackend` publish; we never see a `quack://` two-slash
@@ -173,6 +186,22 @@ final class Connection private[adapter] (
     val connectionId: String,
     allocator: BufferAllocator
 ) extends LazyLogging:
+
+  @volatile private var heartbeat: Option[FiberIO[Nothing]] = None
+
+  /** Renews the node lease until [[close]]. A failed beat is ignored: a dead node already fails the
+    * in-flight request, and the next beat retries.
+    */
+  private[adapter] def startHeartbeats(every: FiniteDuration): IO[Unit] =
+    val beat = transport
+      .post(url, QuackNativeBridge.serializeHeartbeat(connectionId))
+      .void
+      .handleError(e =>
+        logger.debug(s"HEARTBEAT for $connectionId failed (ignored): ${e.getMessage}")
+      )
+    (IO.sleep(every) *> beat).foreverM.start.map(f => heartbeat = Some(f))
+
+  private def stopHeartbeats: IO[Unit] = IO.defer(heartbeat.fold(IO.unit)(_.cancel))
 
   /** Posts a PREPARE_REQUEST for `sql` and returns a streaming [[ArrowReader]] that chains the
     * initial PREPARE_RESPONSE batches with subsequent FETCH_RESPONSE batches until the server
@@ -238,7 +267,7 @@ final class Connection private[adapter] (
     * swallow any transport exception. The server-side `connectionId` will be cleaned up by the
     * node's own connection reaper anyway.
     */
-  def close(): IO[Unit] = transport
+  def close(): IO[Unit] = stopHeartbeats *> transport
     .post(url, QuackNativeBridge.serializeDisconnect(connectionId))
     .void
     .handleError { e =>

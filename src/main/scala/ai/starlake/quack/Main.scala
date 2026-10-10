@@ -844,7 +844,8 @@ object Main extends IOApp with LazyLogging:
       // libquackwire native (Windows on ARM64) instead of crashing at JNI load.
       nativeClient = ai.starlake.quack.edge.adapter.QuackNativeSupport
         .effectiveNativeClient(mgrCfg.nativeClient),
-      nodeDisableSsl = mgrCfg.nodeDisableSsl
+      nodeDisableSsl = mgrCfg.nodeDisableSsl,
+      nodeLeaseSec = mgrCfg.nodeLeaseSec
     )
     val adapter = new QuackHttpAdapter(client, tracker)
     logger.info(
