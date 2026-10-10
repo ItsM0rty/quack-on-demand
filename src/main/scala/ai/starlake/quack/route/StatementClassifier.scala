@@ -118,12 +118,16 @@ final class StatementClassifier(
       // data-write audit record. Only special-cased while WITH sits in the select
       // bucket, so an operator who reassigns it keeps full control.
       case Some("WITH") if cfg.select.contains("WITH") =>
-        verbAfterWithClause(sql) match
-          case Some(tok) =>
-            kindOf(tok) match
-              case StatementKind.Other => StatementKind.Select // unknown verb: legacy bucket
-              case k                   => k
-          case None => StatementKind.Select
+        // DuckDB 2.0 allows DML inside a CTE body (WITH w AS (DELETE ... RETURNING *) SELECT ...),
+        // so the verb after the list alone would misroute it as a read.
+        if cteBodyStartsWithDml(sql) then StatementKind.Dml
+        else
+          verbAfterWithClause(sql) match
+            case Some(tok) =>
+              kindOf(tok) match
+                case StatementKind.Other => StatementKind.Select // unknown verb: legacy bucket
+                case k                   => k
+            case None => StatementKind.Select
       // DuckDB's EXPLAIN ANALYZE EXECUTES the inner statement; plain EXPLAIN only
       // plans it. Classify the executed statement, recursively so
       // EXPLAIN ANALYZE WITH ... INSERT resolves too.
@@ -220,6 +224,53 @@ final class StatementClassifier(
         i = w
       else i += 1
     None
+
+  /** True when any parenthesized group of the statement starts with a DML verb, i.e. a
+    * data-modifying CTE (`WITH w AS (DELETE ... RETURNING *) SELECT ...`, DuckDB 2.0). Literals,
+    * quoted identifiers and dollar-quoted strings are skipped, so a DML word inside them does not
+    * count. A false positive (a column literally named `copy` as a group's first word) only routes
+    * a read to a writer, which is safe.
+    */
+  private def cteBodyStartsWithDml(sql: String): Boolean =
+    val s                                   = sql.trim
+    val n                                   = s.length
+    def isWordChar(c: Char)                 = c.isLetterOrDigit || c == '_'
+    def skipQuoted(from: Int, q: Char): Int =
+      var p    = from + 1
+      var done = false
+      while p < n && !done do
+        if s(p) == q then
+          if p + 1 < n && s(p + 1) == q then p += 2
+          else
+            p += 1
+            done = true
+        else p += 1
+      p
+    def skipDollar(from: Int): Int =
+      var t = from + 1
+      while t < n && isWordChar(s(t)) do t += 1
+      if t >= n || s(t) != '$' then from + 1
+      else
+        val tag   = s.substring(from, t + 1)
+        val close = s.indexOf(tag, t + 1)
+        if close < 0 then n else close + tag.length
+    def firstWordAfter(open: Int): String =
+      var p = open + 1
+      while p < n && (s(p).isWhitespace || s(p) == '(') do p += 1
+      var w = p
+      while w < n && isWordChar(s(w)) do w += 1
+      s.substring(p, w).toUpperCase(Locale.ROOT)
+    var i     = 0
+    var found = false
+    while i < n && !found do
+      val c = s(i)
+      if c == '\'' || c == '"' then i = skipQuoted(i, c)
+      else if c == '$' then i = skipDollar(i)
+      else if c == '(' then
+        if cfg.dml.contains(firstWordAfter(i)) then found = true
+        i += 1
+      else i += 1
+    found
 
 object StatementClassifier:
 

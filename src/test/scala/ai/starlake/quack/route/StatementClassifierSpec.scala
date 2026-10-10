@@ -505,3 +505,25 @@ class StatementClassifierSpec extends AnyFlatSpec with Matchers:
       }
     finally src.close()
   }
+
+  it should "classify a CTE whose body is INSERT/UPDATE/DELETE/MERGE as DML (DuckDB 2.0)" in:
+    StatementClassifier.classify(
+      "WITH w AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH a AS (SELECT 1), w AS (DELETE FROM t RETURNING *) SELECT * FROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "with w as materialized ( update t set x = 1 returning * ) select * from w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "WITH w AS (/* c */ DELETE FROM t RETURNING *) SELECT 1"
+    ) shouldBe StatementKind.Dml
+
+  it should "not mistake DML words inside literals or nested reads for a DML CTE" in:
+    StatementClassifier.classify(
+      "WITH w AS (SELECT 'DELETE FROM t' AS s) SELECT * FROM w"
+    ) shouldBe StatementKind.Select
+    StatementClassifier.classify(
+      "WITH w AS (SELECT * FROM (SELECT update_ts FROM t) x) SELECT * FROM w"
+    ) shouldBe StatementKind.Select
