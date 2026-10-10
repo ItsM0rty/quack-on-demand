@@ -43,6 +43,17 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
       case GateOutcome.Refuse(_, false, _) => succeed
       case other                           => fail(other.toString)
 
+  it should "find a catalog-reaching call behind dollar-quote tags differing only in case" in:
+    // DuckDB 2.0 compares dollar tags case-sensitively: $A$ is not closed by $a$, so the call after
+    // the block-comment opener runs. Folding case before lexing read it as a comment.
+    CatalogReachingCalls.find(
+      "SELECT $A$x$a$ /* $A$, * FROM query_table('orders') -- */"
+    ) shouldBe Some("query_table")
+    // matching tags: the call sits in a comment for DuckDB too
+    CatalogReachingCalls.find(
+      "SELECT $a$x$a$ /* $a$, * FROM query_table('orders') -- */"
+    ) shouldBe None
+
   it should "refuse an ambiguous two-part name on an attached catalog as not wildcard-coverable" in:
     val attached = Config.forDuckDB(Some("tpch"), Some("main"), Set("tpch", "fedpg"))
     AccessGate.evaluate("SELECT * FROM fedpg.orders", attached, "tpch", false) match

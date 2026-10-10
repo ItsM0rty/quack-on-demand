@@ -106,11 +106,11 @@ final class StatementClassifier(
   // receives already-comment-stripped text and reuses it for more than just the first token (the
   // `WITH`/`EXPLAIN` arms slice into it directly).
   //
-  // `original` rides along untouched for the WITH arm, which lexes the WHOLE statement as DuckDB
-  // does instead of the comment-stripped, trivia-normalized copy: `SqlTrivia.normalize` turns a
-  // NBSP inside a dollar tag into a space (`$<NBSP>$` stops being a tag) and stripping a comment
-  // changes what DuckDB's unicode-space pre-pass keeps (see `SqlLexer`), so either copy can open a
-  // literal DuckDB does not and hide a DML verb behind it.
+  // `original` rides along untouched for the WITH and EXPLAIN arms, which lex the WHOLE statement
+  // as DuckDB does instead of the comment-stripped, trivia-normalized copy: `SqlTrivia.normalize`
+  // turns a NBSP inside a dollar tag into a space (`$<NBSP>$` stops being a tag) and stripping a
+  // comment changes what DuckDB's unicode-space pre-pass keeps (see `SqlLexer`), so either copy can
+  // open a literal DuckDB does not and hide a DML verb (or an EXPLAIN's ANALYZE) behind it.
   def classify(sql: String): StatementKind =
     classifyStripped(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(sql)), sql)
 
@@ -135,15 +135,13 @@ final class StatementClassifier(
                 case StatementKind.Other => StatementKind.Select // unknown verb: legacy bucket
                 case k                   => k
             case None => StatementKind.Select
-      // DuckDB's EXPLAIN ANALYZE EXECUTES the inner statement; plain EXPLAIN only
-      // plans it. Classify the executed statement, recursively so
-      // EXPLAIN ANALYZE WITH ... INSERT resolves too.
+      // An executing EXPLAIN (ANALYZE / ANALYSE, or an analyze option) RUNS the explained
+      // statement; any other EXPLAIN only plans it. Classify the executed statement,
+      // recursively so EXPLAIN ANALYZE WITH ... INSERT resolves too.
       case Some("EXPLAIN") if cfg.select.contains("EXPLAIN") =>
-        val rest = sql.trim.drop("EXPLAIN".length)
-        firstToken(rest).map(_.toUpperCase(Locale.ROOT)) match
-          case Some("ANALYZE") =>
-            classifyStripped(rest.trim.drop("ANALYZE".length), original)
-          case _ => StatementKind.Select
+        executedByExplain(original) match
+          case Some(stmt) => classify(stmt)
+          case None       => StatementKind.Select
       case Some(tok) => kindOf(tok)
       case None      => StatementKind.Other
 
@@ -167,6 +165,74 @@ final class StatementClassifier(
   private def firstToken(sql: String): Option[String] =
     val tok = SqlTrivia.firstToken(sql).takeWhile(_ != ';').dropWhile(_ == '(')
     Option.when(tok.nonEmpty)(tok)
+
+  /** The statement an EXPLAIN EXECUTES, or None when it only plans it. DuckDB 2.0's grammar is
+    * `'EXPLAIN' AnalyzeKeyword? ExplainOptionList? ExplainableStatements` with `AnalyzeKeyword <-
+    * 'ANALYZE' / 'ANALYSE'` and `ExplainOptionList <- Parens(List(ExplainOptionName Expression?))`,
+    * and its transformer turns the statement into EXPLAIN ANALYZE for the keyword and for an option
+    * NAMED analyze (any value, ignored; a quoted name is case-folded, so `("analyze")` executes
+    * too). Each of `EXPLAIN ANALYSE DELETE ...`, `EXPLAIN (ANALYZE) DELETE ...` and
+    * `EXPLAIN (FORMAT json, ANALYZE true) DELETE ...` deletes the rows on the 2.0 CLI, while
+    * `EXPLAIN DELETE ...` and `EXPLAIN (FORMAT json) DELETE ...` delete nothing.
+    *
+    * Read through `SqlLexer` over the ORIGINAL text, so an ANALYZE inside a literal or a comment is
+    * not one and a literal cannot hide one. A parenthesized group right after the keyword is an
+    * option list when its first token can name an option that runs (`ANALYZE`, `ANALYSE`, `FORMAT`,
+    * `SQL`, or a quoted identifier, which may fold to any of them); any other option name makes
+    * DuckDB refuse the statement, so every other group is the explained statement itself (`EXPLAIN
+    * ANALYZE (SELECT ...)`). Fail closed inside the list: any ANALYZE word, or quoted identifier
+    * folding to one, counts, even in a value position. The explained statement is cut from
+    * `SqlLexer.engineView`, which lexes alone exactly as it lexed in place. A statement whose first
+    * token, as DuckDB reads it, is not EXPLAIN (a leading U+00AD, a leading paren) is one DuckDB
+    * refuses, and is answered None.
+    */
+  private def executedByExplain(sql: String): Option[String] =
+    val view                                         = SqlLexer.engineView(sql)
+    val toks                                         = SqlLexer.tokens(view).filterNot(_.isTrivia)
+    def text(t: SqlLexer.Token): String              = view.substring(t.start, t.end)
+    def upper(t: SqlLexer.Token): String             = text(t).toUpperCase(Locale.ROOT)
+    def isPunct(t: SqlLexer.Token, c: Char): Boolean =
+      t.kind == SqlLexer.Kind.Punct && view.charAt(t.start) == c
+    def isWord(t: SqlLexer.Token, words: Set[String]): Boolean =
+      t.kind == SqlLexer.Kind.Word && words.contains(upper(t))
+    def isQuotedIdent(t: SqlLexer.Token): Boolean =
+      val q = view.charAt(t.start)
+      t.kind == SqlLexer.Kind.Literal && (q == '"' || q == '`')
+    def unquoted(t: SqlLexer.Token): String =
+      val q = view.charAt(t.start).toString
+      text(t).drop(1).stripSuffix(q).replace(q + q, q).toUpperCase(Locale.ROOT)
+    def isAnalyzeName(t: SqlLexer.Token): Boolean =
+      isWord(t, StatementClassifier.AnalyzeKeywords) ||
+        (isQuotedIdent(t) && StatementClassifier.AnalyzeKeywords.contains(unquoted(t)))
+    if toks.isEmpty || !isWord(toks.head, Set("EXPLAIN")) then None
+    else
+      val keyword      = toks.length > 1 && isWord(toks(1), StatementClassifier.AnalyzeKeywords)
+      val afterKeyword = if keyword then 2 else 1
+      val optionList   =
+        afterKeyword + 1 < toks.length && isPunct(toks(afterKeyword), '(') && {
+          val first = toks(afterKeyword + 1)
+          isWord(first, StatementClassifier.RunnableExplainOptions) || isQuotedIdent(first)
+        }
+      // index of the token closing the option list (or the end of input, unbalanced)
+      val close =
+        if !optionList then afterKeyword
+        else
+          var depth = 0
+          var k     = afterKeyword
+          var found = -1
+          while found < 0 && k < toks.length do
+            if isPunct(toks(k), '(') then depth += 1
+            else if isPunct(toks(k), ')') then
+              depth -= 1
+              if depth == 0 then found = k
+            k += 1
+          if found < 0 then toks.length else found
+      val analyzeOption =
+        optionList && toks.slice(afterKeyword + 1, close).exists(isAnalyzeName)
+      val stmtAt = if optionList then close + 1 else afterKeyword
+      Option.when(keyword || analyzeOption)(
+        if stmtAt < toks.length then view.substring(toks(stmtAt).start) else ""
+      )
 
   /** The first keyword token at the leading WITH's depth after its CTE list, uppercased: the
     * statement's real verb. Read through [[wordTokens]], so parens or verbs inside a CTE body's
@@ -243,6 +309,14 @@ object StatementClassifier:
     * non-blank character is `(`.
     */
   private final case class WordToken(upper: String, depth: Int, beforeParen: Boolean)
+
+  /** DuckDB 2.0's `AnalyzeKeyword <- 'ANALYZE' / 'ANALYSE'`. */
+  private val AnalyzeKeywords: Set[String] = Set("ANALYZE", "ANALYSE")
+
+  /** The EXPLAIN option names DuckDB 2.0's transformer accepts (`format`, `sql`, `analyze`, the
+    * last also spelled through `AnalyzeKeyword`); any other name refuses the statement.
+    */
+  private val RunnableExplainOptions: Set[String] = AnalyzeKeywords ++ Set("FORMAT", "SQL")
 
   /** Default classifier instance backed by [[StatementClassifierConfig.Defaults]]. Used by tests
     * and by call sites that haven't been threaded with a config-driven instance.

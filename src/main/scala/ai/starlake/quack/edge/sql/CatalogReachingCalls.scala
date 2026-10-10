@@ -19,8 +19,8 @@ import java.util.Locale
   *     a protected table through one of these returns unfiltered, unmasked rows.
   *
   * Lexical on purpose, not an AST walk: an unparseable statement reaches the wildcard-coverable
-  * parse-error arm with no AST at all. The text is lowercased, stripped of comments and
-  * trivia-normalized exactly as [[LockdownScreen]] does, then any call of a listed name (bare,
+  * parse-error arm with no AST at all. The text is stripped of comments, trivia-normalized and only
+  * then lowercased, exactly as [[LockdownScreen]] does, then any call of a listed name (bare,
   * qualified or double-quoted, whitespace or a comment before the paren) matches. String literals
   * are not blanked, so a literal like `'query('` over-denies: the safe direction.
   */
@@ -33,7 +33,9 @@ object CatalogReachingCalls:
 
   /** The first catalog-reaching function called by `sql`, lowercased, or None. */
   def find(sql: String): Option[String] =
-    val lower = SqlTrivia.normalize(SqlCommentStripper.stripComments(sql.toLowerCase(Locale.ROOT)))
+    // Lex the ORIGINAL text, fold case after: DuckDB compares dollar-quote tags case-sensitively,
+    // so lowercasing first could end a literal where DuckDB does not and hide a call in a comment.
+    val lower = SqlTrivia.normalize(SqlCommentStripper.stripComments(sql)).toLowerCase(Locale.ROOT)
     Call.findFirstMatchIn(lower).map(m => Option(m.group(1)).getOrElse(m.group(2)))
 
   def denyReason(fn: String): String =

@@ -184,19 +184,18 @@ object CatalogWriteScreen extends LazyLogging:
         // fragment into an empty string too, and that is already handled by the check itself, so
         // normalizing before it would only cost the distinction for no benefit.
         //
-        // Every other check normalizes the snippet ONCE, up front, through the same three passes
-        // the rest of the manager uses, in the same order -- `SqlTrivia.firstToken`'s scaladoc is
-        // the authoritative account of why that order and not another. The short version: only
-        // `stripLeading` DELETES a leading trivia character (`normalize` rewrites it in place to an
-        // ASCII space, which still sits at index 0), only `stripComments` removes an INTERIOR
-        // comment and only it knows DuckDB's quoting forms, and `normalize` runs last because
-        // `stripComments` can re-expose a trivia character that sat next to a comment body.
+        // `classify` gets the ORIGINAL snippet, never a normalized copy: the classifier strips
+        // comments and normalizes trivia itself, and its WITH arm lexes the text it is handed as
+        // DuckDB does. `SqlTrivia.normalize` rewrites characters DuckDB reads as identifier or
+        // dollar-tag characters (U+00AD, a kept NBSP) to spaces, so a normalized copy can open a
+        // dollar-quoted string DuckDB never opens and hide a DML CTE behind it: `WITH a<U+00AD>$q$
+        // AS (DELETE ...), b$q$ AS (...) SELECT ...` runs the DELETE on DuckDB 2.0 and classified
+        // Select once normalized.
         //
-        // Both consumers below re-derive the same three passes internally (`isPrepareOrExecute`
-        // through `SqlTrivia.firstToken`, and `classify` through `StatementClassifier.classify`),
-        // so passing the raw snippet would give identical verdicts today. `normalized` is kept
-        // anyway, as defence in depth against either consumer's internal composition changing
-        // under this screen, and because it keeps the two arms provably judging one same string.
+        // Only the PREPARE/EXECUTE head read takes the normalized copy (`stripLeading ->
+        // stripComments -> normalize`, the order `SqlTrivia.firstToken`'s scaladoc accounts for).
+        // It reads a single head word, which normalizing after lexing cannot move: it can only
+        // split a word DuckDB reads whole, and DuckDB rejects the statement that word starts.
         // What IS load-bearing here is the CHECKPOINT fragment-list fallback (this method's own
         // second call site below): `fragments.exists(isWriteShaped)` hands this method raw,
         // comment-intact split fragments with no jsqlparser re-rendering to fall back on, so a
@@ -210,7 +209,7 @@ object CatalogWriteScreen extends LazyLogging:
               SqlTrivia.normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(snippet)))
             if isPrepareOrExecute(normalized) then true
             else
-              classify(normalized) match
+              classify(snippet) match
                 case StatementKind.Dml | StatementKind.Ddl => true
                 case _                                     => false
 

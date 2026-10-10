@@ -510,6 +510,15 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
       List("SELECT $$a; b$$", " SELECT 2")
   }
 
+  it should "read dollar-quote tags case-sensitively, lexing before folding case" in {
+    // DuckDB 2.0 compares dollar tags case-sensitively: $A$ is not closed by $a$, so the literal
+    // runs to the second $A$ and the read_text call after it runs (verified on the 2.0 CLI).
+    // Folding case before lexing closed the literal at $a$ and read the call as a block comment.
+    denied("SELECT $A$x$a$ /* $A$, * FROM read_text('/etc/hosts') -- */") shouldBe true
+    // matching tags: the call sits in a comment for DuckDB too
+    denied("SELECT $a$x$a$ /* $a$, * FROM read_text('/etc/hosts') -- */") shouldBe false
+  }
+
   it should "split after an identifier ending in a dollar-tag shape, as DuckDB does" in {
     // DuckDB 2.0: `x$a$` is ONE identifier (identifiers continue through `$`), so the `;` after it
     // is a statement boundary and no dollar-quoted string opens there.

@@ -401,6 +401,35 @@ class StatementClassifierSpec extends AnyFlatSpec with Matchers:
       "EXPLAIN ANALYZE WITH s AS (SELECT 1) UPDATE m SET x = 1"
     ) shouldBe StatementKind.Dml
 
+  it should "classify every executing EXPLAIN form (ANALYSE, an analyze option) by its statement" in:
+    // DuckDB 2.0: 'EXPLAIN' AnalyzeKeyword? ExplainOptionList?, AnalyzeKeyword <- 'ANALYZE' /
+    // 'ANALYSE', and an option named analyze (any value, ignored; quoted names fold) executes
+    // too. Each of these deletes the row on the 2.0 CLI.
+    StatementClassifier.classify("EXPLAIN ANALYSE DELETE FROM t") shouldBe StatementKind.Dml
+    StatementClassifier.classify("EXPLAIN (ANALYZE) DELETE FROM t") shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "EXPLAIN (ANALYZE true, FORMAT json) DELETE FROM t"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "EXPLAIN (FORMAT json, ANALYZE) DELETE FROM t"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify("EXPLAIN (\"analyze\") DELETE FROM t") shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "EXPLAIN (ANALYZE) WITH w AS (DELETE FROM t RETURNING *) SELECT * FROM w"
+    ) shouldBe StatementKind.Dml
+    StatementClassifier.classify(
+      "EXPLAIN ANALYZE (WITH w AS (DELETE FROM t RETURNING *) SELECT * FROM w)"
+    ) shouldBe StatementKind.Dml
+
+  it should "keep a planning-only EXPLAIN option list as Select" in:
+    StatementClassifier.classify("EXPLAIN DELETE FROM t") shouldBe StatementKind.Select
+    StatementClassifier.classify("EXPLAIN (FORMAT json) DELETE FROM t") shouldBe
+      StatementKind.Select
+    // an analyze spelled inside a literal is no option name
+    StatementClassifier.classify("EXPLAIN (FORMAT 'analyze') DELETE FROM t") shouldBe
+      StatementKind.Select
+    StatementClassifier.classify("EXPLAIN ANALYZE (SELECT 1)") shouldBe StatementKind.Select
+
   it should "keep plain EXPLAIN (no ANALYZE) and EXPLAIN ANALYZE SELECT as Select" in:
     StatementClassifier.classify("EXPLAIN SELECT 1") shouldBe StatementKind.Select
     // without ANALYZE the inner statement is planned, never executed

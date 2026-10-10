@@ -52,9 +52,12 @@ object TriggerScreen:
       (e.user.kind == "admin" && poolTenantId.exists(id => e.user.tenant.contains(id)))
     }
 
+  /** Lexes the ORIGINAL statement and folds case only afterwards. DuckDB compares dollar-quote tags
+    * case-sensitively (`$A$` is not closed by `$a$`), so lowercasing first let the lexer end a
+    * literal where DuckDB does not and read the trigger DDL behind it as a comment.
+    */
   private def normalize(stmt: String): String =
     SqlTrivia
-      .normalize(
-        SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt.toLowerCase(Locale.ROOT)))
-      )
+      .normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt)))
+      .toLowerCase(Locale.ROOT)
       .trim

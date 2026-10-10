@@ -64,6 +64,16 @@ class TriggerScreenSpec extends AnyFlatSpec with Matchers:
     refused(s"SELECT E'\\''; $trg; SELECT E'\\''") shouldBe true
   }
 
+  it should "read dollar-quote tags case-sensitively, lexing before folding case" in {
+    // DuckDB 2.0 compares dollar tags case-sensitively: $A$ is not closed by $a$, so the literal
+    // runs to the second $A$ and the trigger DDL after it runs (verified on the 2.0 CLI). Folding
+    // case before lexing closed the literal at $a$ and read the DDL as part of a block comment.
+    val trg = "CREATE TRIGGER t AFTER INSERT ON a FOR EACH STATEMENT INSERT INTO b VALUES (1)"
+    refused(s"EXPLAIN (ANALYZE $$A$$x$$a$$ /* $$A$$) $trg -- */") shouldBe true
+    // matching tags: the literal closes at $a$ and the DDL sits in a comment for DuckDB too
+    refused(s"EXPLAIN (ANALYZE $$a$$x$$a$$ /* $$a$$) $trg -- */") shouldBe false
+  }
+
   it should "not read a trigger keyword inside a literal as trigger DDL" in {
     refused("SELECT $$CREATE TRIGGER t$$") shouldBe false
     refused("SELECT E'it''s \\' CREATE TRIGGER'") shouldBe false

@@ -449,6 +449,19 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     r.value should include("read-only")
   }
 
+  it should "judge a fragment by its original text, not a trivia-normalized copy (soft hyphen before a dollar tag)" in {
+    // DuckDB 2.0 reads U+00AD as an identifier character, so `a<U+00AD>$q$` and `b$q$` are CTE
+    // names and the DELETE CTE runs (verified on the 2.0 CLI). Normalizing first turned the soft
+    // hyphen into a space, opened a dollar-quoted string at `$q$` that closed inside `b$q$` and
+    // hid the DELETE from the classifier. CHECKPOINT forces the fragment-list fallback.
+    val batch =
+      "CHECKPOINT; WITH a\u00AD$q$ AS (DELETE FROM sales_lake.main.orders RETURNING 1), " +
+        "b$q$ AS (SELECT 1) SELECT * FROM b$q$"
+    LockdownScreen.splitStatements(batch).length shouldBe 2
+    SqlParser.extract(batch, cfg).statements.length shouldBe 1
+    screen(batch) should not be None
+  }
+
   it should "still admit a read with interior trivia against a read-only catalog, via the parsed path" in {
     // Over-denial guard: this must reach the parsed per-statement path (denialFor), not just the
     // cheap classify-only path at step 2 -- CHECKPOINT forces the fragment-list fallback, and

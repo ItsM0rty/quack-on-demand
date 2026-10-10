@@ -151,13 +151,17 @@ object LockdownScreen:
     //      matching what DuckDB's own parser front end does before tokenizing. It runs LAST
     //      because pass 2 can re-expose a trivia character that sat next to a comment body.
     //
+    // Case is folded LAST, after every lexing pass, never before: DuckDB compares dollar-quote tags
+    // case-sensitively (`$A$` is not closed by `$a$`), so lowercasing first let the lexer end a
+    // literal where DuckDB does not and read a denied call behind it as a comment.
+    //
     // `Locale.ROOT` on the lowercasing, not the default locale: under `-Duser.language=tr`,
     // `"INSTALL".toLowerCase` is a dotless-i `install` (U+0131), which matches no key in
     // `DeniedFirstTokens` and admits INSTALL on a locked-down deployment.
     val lower =
-      SqlTrivia.normalize(
-        SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt.toLowerCase(Locale.ROOT)))
-      )
+      SqlTrivia
+        .normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(stmt)))
+        .toLowerCase(Locale.ROOT)
     val first         = FirstToken.findFirstMatchIn(lower).map(_.group(1))
     val repositoryHit =
       ExtensionRepositoryDdl
