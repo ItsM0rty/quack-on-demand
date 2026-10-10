@@ -33,10 +33,11 @@ import java.time.Instant
 import scala.collection.concurrent.TrieMap
 import scala.sys.process.{Process, ProcessLogger}
 
-/** Epic 5, task 4: the real DuckDB CLI (and, when `uv` is present, the Python package) against the
-  * front door, which relays to a real `quack_serve` node laid out like a QoD node (attached
-  * catalog, non-default schema, USE'd on the init connection only). Cancelled when `duckdb` is not
-  * on PATH, like the other real-node specs.
+/** Epic 5, task 4: the real DuckDB 2.0 CLI (and, when `uv` is present, the Python package) against
+  * the front door, which relays to a real `quack_serve` node laid out like a QoD node (attached
+  * catalog, non-default schema, USE'd on the init connection only). The front door speaks Quack
+  * protocol 3 only, so the `duckdb` on PATH must be a 2.0 build: it runs both the node and the
+  * client. Cancelled when it is missing or older, like the other real-node specs.
   *
   * The front door runs the REAL ACL gate: `PostgresAclValidator` with the metadata filter mounted,
   * and alice holds narrow grants (RW on `customer`, RO on `ids`, nothing on `secret`) PLUS a column
@@ -46,14 +47,23 @@ import scala.sys.process.{Process, ProcessLogger}
   * every ordinary principal (issue #114), and a policy-free principal then hid that the CLS
   * rewriter denied the same sync for anyone holding a column policy (the issue's second report).
   *
-  * Result sizes stay inside the upstream client's working envelope (spec section 2.4): the
-  * generation 1 client fails on multi-column results larger than its inline batch, so the fetch
-  * loop is exercised on a single column.
+  * A 2.0 client sends `BEGIN TRANSACTION` when it first touches the attached catalog, and ships an
+  * INSERT as `INSERT ... SELECT * FROM scan_data_from_quack_client(...)` followed by SEND_DATA
+  * messages, so every attach case also runs those through the gate.
+  *
+  * The Python cases provision their DuckDB through `uv`: a 2.0 pre-release wheel whose bundled
+  * quack extension is the nodes' own commit ([[Python20]]), and a 1.5 release that the front door
+  * must refuse by version ([[Python15]]).
   */
 class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAfterAll:
 
-  private val duckdbPresent: Boolean = Process("which duckdb").!(ProcessLogger(_ => ())) == 0
-  private val uvPresent: Boolean     = Process("which uv").!(ProcessLogger(_ => ())) == 0
+  // -no-agent: under an AI agent (AI_AGENT / CLAUDECODE set) the 2.0 CLI switches its output format.
+  private val duckdbPresent: Boolean =
+    val out = new StringBuilder
+    val rc  = Process(Seq("duckdb", "-no-agent", "-version"))
+      .!(ProcessLogger(l => out.append(l), _ => ()))
+    rc == 0 && out.toString.trim.startsWith("v2.")
+  private val uvPresent: Boolean = Process("which uv").!(ProcessLogger(_ => ())) == 0
 
   private def freePort(): Int =
     val s = new ServerSocket(0)
@@ -223,7 +233,7 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
   private def cli(sql: String): (Int, String, String) =
     val out = new StringBuilder
     val err = new StringBuilder
-    val rc  = Process(Seq("duckdb", "-csv", "-noheader", "-c", sql))
+    val rc  = Process(Seq("duckdb", "-no-agent", "-csv", "-noheader", "-c", sql))
       .!(ProcessLogger(l => out.append(l).append('\n'), l => err.append(l).append('\n')))
     (rc, out.toString.trim, err.toString.trim)
 
@@ -231,7 +241,7 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
   private def attach   = s"ATTACH '$endpoint' AS q (TYPE quack, TOKEN '$Token');"
 
   "quack_query through the front door" should "route a granted statement and record it" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     val (rc, out, err) =
       cli(
         s"SELECT count(*) FROM quack_query('$endpoint', 'SELECT count(*) FROM customer', token := '$Token');"
@@ -247,7 +257,7 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
     rec.map(r => (r.status, r.user)) shouldBe Some(("ok", "alice"))
 
   it should "deny an ungranted table with the manager's own wording" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     val (rc, _, err) =
       cli(s"SELECT * FROM quack_query('$endpoint', 'SELECT * FROM secret', token := '$Token');")
     rc should not be 0
@@ -258,27 +268,27 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
       .exists(r => r.status == "denied" && r.sql.contains("secret")) shouldBe true
 
   it should "refuse a malformed token at connect time" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     val (rc, _, err) = cli(s"SELECT * FROM quack_query('$endpoint', 'SELECT 1', token := 'nope');")
     rc should not be 0
     err should include("Authentication failed")
 
   "ATTACH through the front door" should "bootstrap the catalog and push a filtered scan down" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     val (rc, out, err) =
       cli(s"$attach SELECT count(*) FROM q.tpch1.customer WHERE c_custkey > 100;")
     withClue(err)(rc shouldBe 0)
     out shouldBe "1899"
 
   it should "mask a column-policy column on a scan pushed through the attached catalog" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     val (rc, out, err) =
       cli(s"$attach SELECT c_custkey, c_name FROM q.tpch1.customer WHERE c_custkey = 7;")
     withClue(err)(rc shouldBe 0)
     out shouldBe "7,***"
 
   it should "sync only the tables the principal is granted (issue #114)" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     // The manager narrowed the attach-time sync to alice's grants, so `secret` was never
     // described to her session: the granted tables resolve on the client, the ungranted one is
     // a client-side catalog miss, not a manager denial. (The quack extension does not enumerate
@@ -300,13 +310,13 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
       .exists(r => r.status == "denied" && r.sql.contains("duckdb_tables()")) shouldBe false
 
   it should "stream a large single-column result through the fetch loop" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     val (rc, out, err) = cli(s"$attach SELECT count(*), max(id) FROM q.tpch1.ids;")
     withClue(err)(rc shouldBe 0)
     out shouldBe "60000,59999"
 
   it should "join the attached catalog with a local table" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     val (rc, out, err) = cli(
       s"$attach CREATE TABLE vip AS SELECT range AS c_custkey FROM range(5); " +
         "SELECT count(*) FROM q.tpch1.customer c JOIN vip USING (c_custkey);"
@@ -314,25 +324,44 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
     withClue(err)(rc shouldBe 0)
     out shouldBe "5"
 
-  it should "authorize an INSERT (shipped as an append) as a write on the named table" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+  it should "authorize a client-fed INSERT as a write on the named table" in:
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     val (rc, out, err) = cli(
       s"$attach CREATE TABLE local_x AS SELECT 100000 + range AS c_custkey, 'n' || range AS c_name FROM range(3); " +
         "INSERT INTO q.tpch1.customer SELECT * FROM local_x; SELECT count(*) FROM q.tpch1.customer;"
     )
     withClue(err)(rc shouldBe 0)
     out shouldBe "2003"
-    // `ids` is visible (RO) but not writable: the append reaches the manager and is denied there.
+    // the 2.0 client ships the INSERT as a scan of the rows it then sends on the same connection
+    router.history
+      .snapshot(50)
+      .exists(r =>
+        r.status == "ok" && r.sql.contains("scan_data_from_quack_client") &&
+          r.sql.contains("customer")
+      ) shouldBe true
+    // `ids` is visible (RO) but not writable: the INSERT reaches the manager and is denied there.
     // `secret` would fail earlier, on the client, since it was never synced (see the case above).
     val (rc2, _, err2) = cli(s"$attach INSERT INTO q.tpch1.ids SELECT 1;")
     rc2 should not be 0
     err2 should include("access denied")
     err2 should include("acme_db.tpch1.ids:Write")
 
-  "the Python client" should "connect through uv-provisioned DuckDB 1.5.4" in:
-    assume(duckdbPresent, "duckdb CLI not on PATH")
+  /** Run a Python script under a uv-provisioned `duckdb` package; returns (exit code, stdout,
+    * stderr).
+    */
+  private def python(duckdbVersion: String, script: String): (Int, String, String) =
+    val out = new StringBuilder
+    val err = new StringBuilder
+    val rc  = Process(
+      Seq("uv", "run", "--no-project", "--with", s"duckdb==$duckdbVersion", "python", "-c", script)
+    ).!(ProcessLogger(l => out.append(l).append('\n'), l => err.append(l).append('\n')))
+    (rc, out.toString.trim, err.toString.trim)
+
+  "the Python client" should "connect through a uv-provisioned DuckDB 2.0 pre-release" in:
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
     assume(uvPresent, "uv not on PATH")
-    val script =
+    val (rc, out, err) = python(
+      Python20,
       s"""import duckdb
          |c = duckdb.connect()
          |c.execute('INSTALL quack; LOAD quack')
@@ -340,10 +369,27 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
          |c.execute("ATTACH '$endpoint' AS q (TYPE quack, TOKEN '$Token')")
          |print(c.execute('SELECT count(*) FROM q.tpch1.ids').fetchall()[0][0])
          |""".stripMargin
-    val out = new StringBuilder
-    val err = new StringBuilder
-    val rc  =
-      Process(Seq("uv", "run", "--no-project", "--with", "duckdb==1.5.4", "python", "-c", script))
-        .!(ProcessLogger(l => out.append(l).append('\n'), l => err.append(l).append('\n')))
+    )
     withClue(err)(rc shouldBe 0)
-    out.toString.trim.split("\n").toList shouldBe List("2003", "60000")
+    out.split("\n").toList shouldBe List("2003", "60000")
+
+  it should "refuse a DuckDB 1.5 client by its protocol version" in:
+    assume(duckdbPresent, "DuckDB 2.0 CLI not on PATH")
+    assume(uvPresent, "uv not on PATH")
+    val (rc, _, err) = python(
+      Python15,
+      s"""import duckdb
+         |c = duckdb.connect()
+         |c.execute('INSTALL quack; LOAD quack')
+         |c.execute("SELECT * FROM quack_query('$endpoint', 'SELECT 1', token := '$Token')").fetchall()
+         |""".stripMargin
+    )
+    rc should not be 0
+    err should include("requires a DuckDB 2.0 client")
+
+/** The Python `duckdb` packages the spec provisions. PyPI publishes no 2.0 release yet: the
+  * pre-release's bundled quack extension (974927a394) is the commit the nodes run, so it speaks the
+  * same protocol 3. Bump it with the engine.
+  */
+private val Python20 = "2.0.0.dev2610011535"
+private val Python15 = "1.5.4"
