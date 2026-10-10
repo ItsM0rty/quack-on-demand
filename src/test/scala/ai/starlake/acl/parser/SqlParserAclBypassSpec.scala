@@ -327,3 +327,29 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
     for stmt <- List("SHOW DATABASES", "SHOW SCHEMAS", "show databases", "show schemas") do
       SqlParser.extract(stmt, config).statements.head shouldBe a[StatementResult.ControlFlow]
   }
+
+  test("a data-modifying CTE is unsupported, not a crash (DuckDB 2.0 DML inside WITH)") {
+    Seq(
+      "WITH w AS (INSERT INTO db.main.t VALUES (1) RETURNING *) SELECT * FROM w",
+      "WITH w AS (DELETE FROM db.main.t RETURNING *) SELECT * FROM w",
+      "WITH w AS (UPDATE db.main.t SET a = 1 RETURNING *) SELECT * FROM w"
+    ).foreach { sql =>
+      withClue(sql) {
+        extracted(sql).unsupported.exists(_.startsWith("data-modifying CTE")) shouldBe true
+      }
+    }
+  }
+
+  test("a data-modifying CTE inside a subquery is unsupported and its target is not a read") {
+    val e = extracted(
+      "SELECT * FROM (WITH w AS (DELETE FROM db.main.t RETURNING *) SELECT * FROM w) s"
+    )
+    e.unsupported.exists(_.startsWith("data-modifying CTE")) shouldBe true
+    e.accesses.map(_.table) should not contain TableRef("db", "main", "t")
+  }
+
+  test("an ordinary CTE still extracts its reads") {
+    val e = extracted("WITH w AS (SELECT * FROM db.main.t) SELECT * FROM w")
+    e.unsupported shouldBe empty
+    e.accesses.map(_.table) should contain(TableRef("db", "main", "t"))
+  }

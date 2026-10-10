@@ -193,10 +193,18 @@ private[parser] class TableExtractorVisitor:
         val aliasName = wi.getUnquotedAliasName
         if aliasName != null then cteNames += aliasName.toLowerCase(Locale.ROOT)
       }
-      withItems.asScala.foreach { wi =>
-        val cteSelect = wi.getSelect
-        if cteSelect != null then visitSelect(cteSelect)
-      }
+      withItems.asScala.foreach(visitCteBody)
+
+  /** Walks one CTE body. `WithItem.getSelect` casts unconditionally and throws on a data-modifying
+    * CTE (`WITH w AS (INSERT/UPDATE/DELETE ... RETURNING *) ...`, DuckDB 2.0). Its target is a
+    * write this read walk would drop or misread as a read, so it is reported unsupported and the
+    * gate fails closed (a wildcard ALL grant still covers it).
+    */
+  private def visitCteBody(wi: net.sf.jsqlparser.statement.select.WithItem[?]): Unit =
+    wi.getParenthesedStatement match
+      case null      => ()
+      case s: Select => visitSelect(s)
+      case other     => unsupported += s"data-modifying CTE (${other.getClass.getSimpleName})"
 
   private def visitSelect(select: Select): Unit =
     if select != null && visited.add(select) then
@@ -293,8 +301,7 @@ private[parser] class TableExtractorVisitor:
       withItems.asScala.foreach { wi =>
         val aliasName = wi.getUnquotedAliasName
         if aliasName != null then cteNames += aliasName.toLowerCase(Locale.ROOT)
-        val cteSelect = wi.getSelect
-        if cteSelect != null then visitSelect(cteSelect)
+        visitCteBody(wi)
       }
 
   private[parser] def visitFromItem(fromItem: FromItem): Unit =
@@ -491,6 +498,8 @@ private[parser] class TableExtractorVisitor:
       case si: SelectItem[?]         => Option(si.getExpression).foreach(visitExpression)
       case it: java.lang.Iterable[?] => it.asScala.foreach(routeChild(_, recordBareTable))
       case arr: Array[?]             => arr.foreach(routeChild(_, recordBareTable))
+      case wi: net.sf.jsqlparser.statement.select.WithItem[?] =>
+        if visited.add(wi) then visitCteBody(wi)
       case holder: AnyRef if isJsqlNode(holder) =>
         if visited.add(holder) then descendChildren(holder, recordBareTable)
       case _ => ()
