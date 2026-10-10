@@ -428,8 +428,9 @@ def test_demo_refuses_when_latest_release_predates_the_demo(runner, monkeypatch)
     assert "0.3.8" in result.output
 
 
-def test_duckdb_cli_url_platform_mapping():
-    base = "https://github.com/duckdb/duckdb/releases/download/v1.5.6"
+def test_duckdb_cli_url_platform_mapping(monkeypatch):
+    monkeypatch.delenv("DUCKDB_VERSION", raising=False)
+    base = f"https://github.com/duckdb/duckdb/releases/download/v{launcher.DUCKDB_CLI_VERSION}"
     assert launcher.duckdb_cli_url("darwin", "arm64") == f"{base}/duckdb_cli-osx-universal.zip"
     assert launcher.duckdb_cli_url("linux", "x86_64") == f"{base}/duckdb_cli-linux-amd64.zip"
     assert launcher.duckdb_cli_url("linux", "aarch64") == f"{base}/duckdb_cli-linux-arm64.zip"
@@ -587,8 +588,9 @@ def test_demo_rejects_non_release_version_with_hint(runner, monkeypatch):
     assert "--jar" in result.output
 
 
-def test_libduckdb_url_platform_mapping():
-    base = "https://github.com/duckdb/duckdb/releases/download/v1.5.6"
+def test_libduckdb_url_platform_mapping(monkeypatch):
+    monkeypatch.delenv("DUCKDB_VERSION", raising=False)
+    base = f"https://github.com/duckdb/duckdb/releases/download/v{launcher.DUCKDB_CLI_VERSION}"
     assert launcher.libduckdb_url("darwin", "arm64") == f"{base}/libduckdb-osx-universal.zip"
     assert launcher.libduckdb_url("linux", "x86_64") == f"{base}/libduckdb-linux-amd64.zip"
     assert launcher.libduckdb_url("win32", "ARM64") == f"{base}/libduckdb-windows-arm64.zip"
