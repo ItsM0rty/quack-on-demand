@@ -178,7 +178,7 @@ ensure_duckdb() {
     version="$(grep -E '^val libquackwireVersion' "$REPO_DIR/build.sbt" \
       | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
   fi
-  version="${version:-1.5.6}"
+  version="${version:-2.0.0}"
 
   local cache="$DUCKDB_CACHE_DIR/$version"
   local bin_dir="$cache/bin"

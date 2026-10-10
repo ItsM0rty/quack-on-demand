@@ -75,7 +75,7 @@ EOF
 # =========================================================================
 FROM eclipse-temurin:21-jre
 
-ARG DUCKDB_VERSION=1.5.6
+ARG DUCKDB_VERSION=2.0.0
 ARG TARGETARCH
 
 # Runtime deps:

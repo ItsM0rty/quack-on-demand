@@ -19,7 +19,7 @@ RUN pip wheel --no-deps --wheel-dir /wheels /src/cli
 FROM debian:bookworm-slim
 
 ARG TARGETARCH
-ARG DUCKDB_VERSION=1.5.6
+ARG DUCKDB_VERSION=2.0.0
 
 RUN <<EOF
 set -eu

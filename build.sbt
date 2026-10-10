@@ -92,10 +92,10 @@ def docsTarget(docs: File, relative: String): String = {
 // JNI shim native binaries.
 //
 // Version format:  <duckdb-abi>-<duckdb-quack-short-sha>-<rev>[-SNAPSHOT]
-// Example:         1.5.6-7e80f7ffcc98-1-SNAPSHOT
+// Example:         2.0.0-974927a394b1-1-SNAPSHOT
 //
 //   duckdb-abi              the DuckDB libduckdb release the C++ shim
-//                           links against (1.5.6)
+//                           links against (2.0.0)
 //   duckdb-quack-short-sha  the pinned `native/quackwire/thirdparty/
 //                           duckdb-quack` commit
 //   rev                     monotonic patch number; bumps each time we
@@ -115,7 +115,7 @@ def docsTarget(docs: File, relative: String): String = {
 // etc.) copied from the pinned DuckDB source. A DuckDB bump can change those
 // values or introduce new unresolved symbols on the Windows link. See that
 // file's header for how to re-derive them.
-val libquackwireVersion = "1.5.6-7e80f7ffcc98-1"
+val libquackwireVersion = "2.0.0-974927a394b1-1"
 
 lazy val root = (project in file("."))
   .settings(UiBuild.settings)
@@ -169,6 +169,8 @@ lazy val root = (project in file("."))
       "io.netty" % "netty-resolver"                     % Versions.netty,
       "io.netty" % "netty-resolver-dns"                 % Versions.netty
     ),
+    // DuckDB 2.0 pre-release JDBC lives in ~/.m2 until v2.0.0 is on Central (release day: remove).
+    resolvers += Resolver.mavenLocal,
     libraryDependencies ++= Seq(
       Dependencies.tapirCore,
       Dependencies.tapirHttp4sServer,
