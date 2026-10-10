@@ -82,7 +82,7 @@ find "$B/extension" -name '*.duckdb_extension' -exec cp {} "$CACHE/extensions/" 
 ver="$("$CACHE/bin/duckdb" -csv -noheader -c "SELECT version()")"
 [[ "$ver" == v2.0.0* ]] || { echo "built CLI reports $ver, expected v2.0.0*" >&2; exit 1; }
 missing="$("$CACHE/bin/duckdb" -csv -noheader -c \
-  "SELECT string_agg(extension_name, ',') FROM duckdb_extensions()
+  "SELECT coalesce(string_agg(extension_name, ','), '') FROM duckdb_extensions()
    WHERE extension_name IN ('quack','ducklake','postgres_scanner','httpfs','json','parquet','tpch')
      AND install_mode <> 'STATICALLY_LINKED'")"
 [[ -z "$missing" ]] || { echo "not statically linked: $missing" >&2; exit 1; }
