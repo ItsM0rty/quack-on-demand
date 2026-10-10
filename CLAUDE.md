@@ -30,11 +30,12 @@ On **Windows** the manager runs natively (no WSL/Docker) via PowerShell twins:
 alive by holding stdin open instead of a FIFO). Teardown uses `taskkill /T` so
 the `duckdb.exe` grandchild dies with its wrapper. The native `quackwire.dll` is
 bundled automatically whenever `libquackwire/binaries/windows-x86_64/quackwire.dll`
-exists in the checkout; without it (or on Windows ARM64, where the dll is
-x86_64-only) `QuackNativeSupport.effectiveNativeClient` probes the jar at boot
-and falls back to the embedded client with a WARN, so no env flag is needed --
-`QOD_NATIVE_CLIENT=false` only forces that path. On the DuckDB 2.0 pre-release the embedded client
-does not work (its JDBC disables Arrow export), so Windows ARM64 has no working path until 2.0.0.
+exists in the checkout. The native client is the manager's only client to its nodes (the embedded
+JDBC fallback, `QOD_NATIVE_CLIENT` and `QOD_NODE_DISABLE_SSL` were dropped with DuckDB 2.0, whose
+JDBC disables Arrow export): `QuackNativeSupport.bootCheck` loads it early in `Main.bootManager`
+and a platform with no bundled binary (Windows ARM64 until it gets a build) or a native that
+cannot load refuses to boot, naming `os.name`/`os.arch`, the expected
+`libquackwire/binaries/<platform>/` file and the `DUCKDB_CACHE_DIR` hint.
 
 **DuckDB 2.0 pre-release toolchain.** Until DuckDB v2.0.0 is released, the engine and JDBC are built from source with `scripts/dev/build-duckdb-prerelease.sh` (engine `b15358c371`, JDBC `2.0.0.0-pre-b15358c` installed into `~/.m2`). Run it once before `sbt compile` on a fresh machine.
 
@@ -63,7 +64,7 @@ front door on `:9494`, is described after the list):
 
 4. **Native Quack protocol front door** on `:9494` ([QuackFrontDoorServer.scala](src/main/scala/ai/starlake/quack/edge/quack/QuackFrontDoorServer.scala) → [QuackFrontDoor.scala](src/main/scala/ai/starlake/quack/edge/quack/QuackFrontDoor.scala)): what a DuckDB client `ATTACH 'quack:host:9494' AS qod (TYPE quack, TOKEN 'tenant=..&pool=..&user=..&password=..')`es to. The token is the FlightSQL JDBC query string; the handshake is the Flight edge's ([EdgeHandshake.scala](src/main/scala/ai/starlake/quack/edge/EdgeHandshake.scala)); each statement runs through `FlightSqlRouter.executeWith` (the pipeline generalized over the node call) and is relayed to one raw node connection per statement ([QuackNodeLink.scala](src/main/scala/ai/starlake/quack/edge/quack/QuackNodeLink.scala)), the node's result bytes going back to the client untouched. The manager never encodes DuckDB chunks; [QuackWire.scala](src/main/scala/ai/starlake/quack/edge/quack/QuackWire.scala) parses only headers and the small request messages and speaks Quack protocol 3 only (DuckDB 2.0 clients; a 1.x client gets `requires a DuckDB 2.0 client`). It admits a 2.0 client's `BEGIN TRANSACTION` and its INSERT data path (`scan_data_from_quack_client`, scoped to that client's own connection). Config block `quack-native` (`QOD_QUACK_*`), TLS off by default because the DuckDB client only speaks plain HTTP to loopback hosts. `QuackCompatibilitySpec` drives the real `duckdb` CLI and Python client end to end (cancelled without `duckdb` on PATH). Design: docs/superpowers/specs/2026-09-20-native-quack-front-door-design.md.
 
-   The manager-to-node native client (libquackwire, on by default) holds a heartbeat lease on each node connection: `QOD_QUACK_NODE_LEASE_SEC` (default 30, floor 1; a heartbeat goes out every third of it). Node connections are released on error and on cancel. The embedded JDBC fallback (`QOD_NATIVE_CLIENT=false`, and the automatic fallback on Windows ARM64) does not work on the DuckDB 2.0 pre-release, whose JDBC disables Arrow export.
+   The manager-to-node native client (libquackwire, on by default) holds a heartbeat lease on each node connection: `QOD_QUACK_NODE_LEASE_SEC` (default 30, floor 1; a heartbeat goes out every third of it). Node connections are released on error and on cancel. It is the only manager-to-node client: there is no embedded fallback.
 
 A FlightSQL request flows: `client → FlightProducerImpl → AuthenticationService → FlightSqlRouter.execute → StatementValidator (ACL) → StatementClassifier (READ/WRITE/DDL) → Router.pick(snapshot, kind) → QuackHttpAdapter → child node's /quack HTTP endpoint → Arrow stream back through Flight`. Tests for the routing core ([RouterSpec.scala](src/test/scala/ai/starlake/quack/route/RouterSpec.scala), [StatementClassifierSpec.scala](src/test/scala/ai/starlake/quack/route/StatementClassifierSpec.scala), [FlightSqlRouterSpec.scala](src/test/scala/ai/starlake/quack/edge/FlightSqlRouterSpec.scala)) exercise this without the Flight wire.
 

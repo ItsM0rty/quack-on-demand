@@ -744,7 +744,7 @@ final class FlightSqlRouter(
               val txPin  = s.pinnedNodeId.filter(_ => s.txOpen)
               val pinned =
                 txPin.orElse(preferredNode.filter(id => snap.nodes.exists(_.nodeId == id)))
-              // Each quack_query lands in a fresh remote DuckDB session, so unqualified
+              // Each statement lands in a fresh remote DuckDB session, so unqualified
               // refs need the USE prefix (see wrapWithDefaultSchema).
               val wrappedSql = wrapWithDefaultSchema(supervisor.get(poolKey), finalSql)
               // Probes never stamp: they must not open transactions on the node.

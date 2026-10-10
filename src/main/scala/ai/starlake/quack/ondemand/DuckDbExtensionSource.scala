@@ -2,9 +2,11 @@ package ai.starlake.quack.ondemand
 
 import java.util.Properties
 
-/** Where the manager's embedded (JDBC) DuckDB gets its extensions. Unset (the default) it INSTALLs
-  * them from DuckDB's signed repository, as always. Set to a directory of `.duckdb_extension` files
-  * it LOADs them by path and opens the connection with `allow_unsigned_extensions`: the DuckDB 2.0
+/** Where the manager's in-process JDBC DuckDB (the DuckLake catalog initializer, `ducklake`,
+  * `postgres_scanner` and the storage extensions; nothing else in the manager opens one since the
+  * embedded node client was dropped) gets its extensions. Unset (the default) it INSTALLs them from
+  * DuckDB's signed repository, as always. Set to a directory of `.duckdb_extension` files it LOADs
+  * them by path and opens the connection with `allow_unsigned_extensions`: the DuckDB 2.0
   * pre-release toolchain (scripts/dev/build-duckdb-prerelease.sh) and air-gapped installs, where no
   * repository serves the engine's version.
   */

@@ -52,7 +52,6 @@
                            (minimal = acme only, one pool, single dual node)
     DUCKDB_VERSION         pin a DuckDB release (default: derived from build.sbt)
     DUCKDB_CACHE_DIR       relocate the duckdb cache (default: <repo>\.duckdb)
-    QOD_NATIVE_CLIENT      false = embedded DuckDB-JDBC path (no quackwire.dll)
     JAVA_HOME              uses `java` on PATH if unset
     JAVA_OPTS              extra JVM flags (e.g. -Xmx2g)
 

@@ -19,8 +19,8 @@ class DuckDbExtensionSourceSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "escape a quote in the path" in {
-    DuckDbExtensionSource(Some("/o'x")).loadSql("quack") shouldBe
-      "LOAD '/o''x/quack.duckdb_extension';"
+    DuckDbExtensionSource(Some("/o'x")).loadSql("ducklake") shouldBe
+      "LOAD '/o''x/ducklake.duckdb_extension';"
   }
 
   it should "treat a blank value as unset" in {

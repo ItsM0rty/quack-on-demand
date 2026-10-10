@@ -25,10 +25,9 @@ import java.sql.DriverManager
   *
   * **Fix.** Call `DuckLakeInitializer.initBlocking(...)` once from `PoolSupervisor.createTenantDb`,
   * right after the per-tenant-db Postgres database is provisioned and before any node can spawn
-  * against it. The call opens a one-shot embedded DuckDB connection (via the same `duckdb_jdbc`
-  * driver `QuackHttpClient` already uses on the embedded path), runs
-  * `INSTALL/LOAD ducklake; ATTACH ...;` against that tenant-db's Postgres, then closes. After this
-  * the `ducklake_*` tables exist; every per-node `ATTACH` from `spawn-quack-node.sh` is then
+  * against it. The call opens a one-shot embedded DuckDB connection (via the `duckdb_jdbc` driver),
+  * runs `INSTALL/LOAD ducklake; ATTACH ...;` against that tenant-db's Postgres, then closes. After
+  * this the `ducklake_*` tables exist; every per-node `ATTACH` from `spawn-quack-node.sh` is then
   * read-only on the metadata and the pg_type race cannot fire.
   *
   * The control-plane database (`qod`) is never touched by this code - it holds `qodstate_*` only.

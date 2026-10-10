@@ -507,24 +507,12 @@ final case class ManagerConfig(
     )
     maxNodesTotal: Int,
     @field @ConfigField(
-      envVar = "QOD_NATIVE_CLIENT",
-      description =
-        "Use the JNI-backed native Quack wire client. False falls back to the embedded path."
-    )
-    nativeClient: Boolean,
-    @field @ConfigField(
       envVar = "QOD_STAMP_WRITES",
       description =
         "Stamp DuckLake snapshots created by FlightSQL DML/DDL with author and commit message " +
           "(native wire bracket; fail-open). Off = writes are never bracketed."
     )
     stampWrites: Boolean,
-    @field @ConfigField(
-      envVar = "QOD_NODE_DISABLE_SSL",
-      description =
-        "Disable TLS on the embedded path's quack_query() call. Ignored on the native path."
-    )
-    nodeDisableSsl: Boolean,
     @field @ConfigField(
       envVar = "QOD_QUACK_NODE_LEASE_SEC",
       description =

@@ -127,7 +127,7 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     val events                 = ArrayBuffer.empty[ManagerEvent]
     val sink: ManagerEventSink = e => events.synchronized(events += e)
     val client                 =
-      new QuackHttpClient(TestArrow.sharedAllocator, nativeClient = true, nodeDisableSsl = true)
+      new QuackHttpClient(TestArrow.sharedAllocator)
     val router = new FlightSqlRouter(
       sup,
       new SessionRegistry,

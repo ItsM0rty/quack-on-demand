@@ -53,11 +53,7 @@ class FlightProducerImplPrepareSpec extends AnyFlatSpec with Matchers:
     sup.createPool(poolKey, RoleDistribution(0, 0, 1)).unsafeRunSync()
 
     val sent = mutable.Buffer.empty[(String, String)] // (endpoint, sql)
-    val client = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient   = true,
-      nodeDisableSsl = true
-    ):
+    val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         sent += (endpoint -> sql)
         IO.pure(TestArrow.okResponse())

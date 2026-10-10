@@ -155,9 +155,9 @@ JAR_CACHE_DIR="${JAR_CACHE_DIR:-$HOME/.cache/quack-on-demand}"
 #          spawns via LocalQuackBackend
 #        - scripts/load-{tpch,tpcds}-dbgen.sh shell out to it for demo seeds
 #   2. libduckdb.{so,dylib} on the JVM's library path:
-#        - the JNI native client (QOD_NATIVE_CLIENT=true, default) dlopens
-#          libquackwire which itself links against libduckdb at the ABI
-#          pinned in build.sbt's libquackwireVersion
+#        - the JNI native client (the manager's only client to its nodes)
+#          dlopens libquackwire which itself links against libduckdb at the
+#          ABI pinned in build.sbt's libquackwireVersion
 #
 # Mandatory by design: even when the operator has a system duckdb on PATH,
 # an ABI mismatch against libquackwire's libduckdb crashes at first node
@@ -252,9 +252,9 @@ ensure_duckdb() {
   echo "  fetching libduckdb from $base/libduckdb-$plat.zip"
   if ! curl -fsSL -o "$tmp/lib.zip" "$base/libduckdb-$plat.zip"; then
     echo "ERROR: failed to download $base/libduckdb-$plat.zip" >&2
-    echo "       The JNI native client requires libduckdb at the same ABI as libquackwire." >&2
-    echo "       Pre-populate $lib_dir with libduckdb v$version, or set QOD_NATIVE_CLIENT=false" >&2
-    echo "       on the JVM side to fall back to the embedded (slower) path." >&2
+    echo "       The JNI native client requires libduckdb at the same ABI as libquackwire," >&2
+    echo "       and the manager refuses to boot without it." >&2
+    echo "       Air-gapped? Pre-populate $lib_dir with libduckdb v$version and re-run." >&2
     exit 1
   fi
   unzip -q -o "$tmp/lib.zip" -d "$lib_dir"

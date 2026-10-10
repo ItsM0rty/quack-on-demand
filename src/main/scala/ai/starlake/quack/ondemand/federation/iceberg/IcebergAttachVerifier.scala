@@ -233,9 +233,9 @@ final class IcebergAttachVerifier(
     *
     * The narrower half of that claim, stated because the broad version was wrong: this is NOT the
     * only place the raw error can reach the MANAGER LOG. `QuackHttpClient` logs the same string
-    * verbatim at DEBUG before `note` ever sees it (`native query failed: ...` and `quack_query
-    * failed: ...`), on both transports. That is generic adapter code outside this feature and off
-    * at the default level, but a manager running at DEBUG can still have a credential in its log.
+    * verbatim at DEBUG before `note` ever sees it (`native query failed: ...`). That is generic
+    * adapter code outside this feature and off at the default level, but a manager running at DEBUG
+    * can still have a credential in its log.
     *
     * See [[AttachErrorRedactor]] for the proven vector and for exactly what `scrub` guarantees.
     */

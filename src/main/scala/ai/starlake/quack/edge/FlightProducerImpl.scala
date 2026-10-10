@@ -17,7 +17,7 @@ import java.util.Collections
 import scala.jdk.CollectionConverters.*
 
 /** Minimal FlightSqlProducer that forwards SQL to the [[FlightSqlRouter]]. The router talks to the
-  * chosen Quack node through DuckDB's `quack_query` extension and hands us back an
+  * chosen Quack node through the native Quack wire client and hands us back an
   * [[org.apache.arrow.vector.ipc.ArrowReader]] that we stream batch-by-batch to the Flight client.
   */
 final class FlightProducerImpl(

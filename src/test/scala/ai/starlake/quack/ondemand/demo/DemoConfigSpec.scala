@@ -65,15 +65,19 @@ class DemoConfigSpec extends AnyFlatSpec with Matchers:
     out.manager.defaultMetastore.dbName shouldBe "qod"
     out.manager.defaultMetastore.dataPath shouldBe "/x/dl"
     out.manager.runtimeType shouldBe "local"
-    out.manager.apiKey shouldBe None        // REST open
-    out.manager.nativeClient shouldBe false // portable HTTP client fallback, not the JNI native lib
-    out.flight.tlsEnabled shouldBe true     // self-signed TLS, auto-generated at boot
+    out.manager.apiKey shouldBe None    // REST open
+    out.flight.tlsEnabled shouldBe true // self-signed TLS, auto-generated at boot
     // Cert material lives under the ephemeral demo home (wiped on exit), not the
     // cwd-relative default `certs/` -- `qod demo` must not litter the invoking directory.
     out.flight.tlsCertChain shouldBe home.root.resolve("certs/server-cert.pem").toString
     out.flight.tlsPrivateKey shouldBe home.root.resolve("certs/server-key.pem").toString
     out.flight.port shouldBe 31338
     out.acl.enabled shouldBe true // ACL kept on
+  }
+
+  it should "not pick a manager-to-node client: the native client is the only one" in {
+    val out = DemoConfig.overlay(baseManager, baseFlight, baseAcl, pg, home)
+    (out.manager.productElementNames.toList should contain).noneOf("nativeClient", "nodeDisableSsl")
   }
 
   it should "leave the base configs untouched (Guardrail 1: no in-place mutation)" in {

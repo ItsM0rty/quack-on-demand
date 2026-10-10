@@ -19,9 +19,6 @@ data:
   # QOD_K8S_NAMESPACE is injected via fieldRef in the Deployment so it
   # always tracks the manager pod's own namespace.
   QOD_K8S_IMAGE:           {{ .Values.quackNode.image | default (printf "starlakeai/quack-on-demand-node:%s" .Chart.AppVersion) | quote }}
-  # disable_ssl flag passed to quack_query in QuackHttpClient. Plain HTTP
-  # by default; true means TLS NOT used on the manager<->node wire.
-  QOD_NODE_DISABLE_SSL:    {{ not .Values.quackNode.tls.enabled | quote }}
   QOD_K8S_SERVICE_ACCOUNT: {{ include "qod.serviceAccountName" . | quote }}
 
   # ---- Admin bootstrap (idempotent) ----------------------------------------

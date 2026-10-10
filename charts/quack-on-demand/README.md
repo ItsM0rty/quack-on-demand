@@ -169,18 +169,13 @@ helm upgrade qod charts/quack-on-demand \
 
 ## Manager ↔ Quack node TLS
 
-The chart's default is **plain HTTP** on the manager↔node wire (`quackNode.tls.enabled: false`, which sets `QOD_NODE_DISABLE_SSL=true`). The auth token Quack ships on every request is still required and enforced; only the transport is unencrypted.
+The manager↔node wire is **plain HTTP**: the manager's native Quack client (libquackwire) always speaks `http://<node>/quack`, and the spawn-quack-node.sh script runs `quack_serve()` without TLS. The auth token Quack ships on every request is still required and enforced; only the transport is unencrypted.
 
-Why HTTP by default:
+Why that is acceptable:
 - Intra-namespace traffic. Anyone with pod-network access to your namespace has bigger problems than sniffing this.
 - The FlightSQL edge between clients and the manager *does* carry TLS by default (`flightsql.tls.enabled: true`) - that's the surface that crosses trust boundaries.
-- The spawn-quack-node.sh script doesn't yet plumb TLS certs into `quack_serve()`, so flipping the manager to TLS without first adding cert mounting would just break every health probe.
 
-When you should turn it on (`--set quackNode.tls.enabled=true`):
-- You run a service mesh (Istio / Linkerd) that injects mTLS between pods - the spawned nodes will be encrypted transparently. The manager already passes `disable_ssl=false` correctly in that case.
-- You need the wire encrypted for compliance (SOC2 / HIPAA / PCI) and accept the follow-up work of cert plumbing into the spawn script.
-
-Without one of those two, leave it off.
+When you need the wire encrypted (compliance such as SOC2 / HIPAA / PCI), run a service mesh (Istio / Linkerd) that injects mTLS between pods: the spawned nodes are then encrypted transparently, with no chart setting involved. The former `quackNode.tls.enabled` value (which set `QOD_NODE_DISABLE_SSL`) only applied to the embedded fallback client, removed with the DuckDB 2.0 bump.
 
 ## Operational notes
 

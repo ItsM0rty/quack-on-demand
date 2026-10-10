@@ -86,11 +86,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     // Use TestArrow.sharedAllocator (which never closes); each call gets a
     // fresh reader from `stub`. The stub function is used (not a single value)
     // because ArrowReader is single-use.
-    val client = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(stub())
     val adapter = new QuackHttpAdapter(client, tracker)
@@ -555,11 +551,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     sup.createPool(key, RoleDistribution(0, 0, 1)).unsafeRunSync()
     val capturer = new CapturingValidator
-    val client   = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client   = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(TestArrow.okResponse())
     val adapter = new QuackHttpAdapter(client, new NodeLoadTracker)
@@ -589,11 +581,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     sup.createPool(key, RoleDistribution(0, 0, 1)).unsafeRunSync()
     val capturer = new CapturingValidator
-    val client   = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client   = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(TestArrow.okResponse())
     val adapter = new QuackHttpAdapter(client, new NodeLoadTracker)
@@ -661,11 +649,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .createTenantDb(key.tenant, key.tenantDb, TenantDbKind.InMemory, Map.empty, "")
       .unsafeRunSync()
     sup.createPool(key, RoleDistribution(0, 0, replicas)).unsafeRunSync()
-    val client = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(TestArrow.okResponse())
     val adapter  = new QuackHttpAdapter(client, tracker)
@@ -759,11 +743,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       case Some(_) =>
         sup.createPool(key, RoleDistribution(0, 0, 1)).unsafeRunSync()
         val capturer = new CapturingValidator
-        val client   = new QuackHttpClient(
-          TestArrow.sharedAllocator,
-          nativeClient = true,
-          nodeDisableSsl = true
-        ):
+        val client   = new QuackHttpClient(TestArrow.sharedAllocator):
           override def query(
               endpoint: String,
               token: String,
@@ -863,11 +843,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
 
     val capturer    = new CapturingValidator
     var capturedSql = ""
-    val client      = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client      = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         capturedSql = sql
         IO.pure(TestArrow.okResponse())
@@ -990,11 +966,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     // Mutable cell that the override captures: holds the LAST SQL the backend saw,
     // so a retried statement overwrites the first attempt's text.
     var capturedSql: String = ""
-    val client              = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client              = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         capturedSql = sql
         IO.pure(stub())
@@ -1382,7 +1354,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     sup2.createPool(pk2, RoleDistribution(0, 0, 2)).unsafeRunSync()
 
     val client2 =
-      new QuackHttpClient(TestArrow.sharedAllocator, nativeClient = true, nodeDisableSsl = true):
+      new QuackHttpClient(TestArrow.sharedAllocator):
         override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
           IO.pure(stub())
     val adapter2  = new QuackHttpAdapter(client2, tkr)
@@ -1462,7 +1434,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
 
     val calls  = scala.collection.mutable.ListBuffer.empty[(Option[String], String)]
     val client =
-      new QuackHttpClient(TestArrow.sharedAllocator, nativeClient = true, nodeDisableSsl = true):
+      new QuackHttpClient(TestArrow.sharedAllocator):
         override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
           IO { calls += ((None, sql)); TestArrow.okResponse() }
         override def queryStamped(endpoint: String, token: String, prelude: String, sql: String) =
@@ -1616,7 +1588,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     sup.createPool(poolKey, RoleDistribution(0, 0, 2)).unsafeRunSync()
 
     val client =
-      new QuackHttpClient(TestArrow.sharedAllocator, nativeClient = true, nodeDisableSsl = true):
+      new QuackHttpClient(TestArrow.sharedAllocator):
         override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
           IO { calls += ((None, sql)); TestArrow.okResponse() }
         override def queryStamped(endpoint: String, token: String, prelude: String, sql: String) =
@@ -1754,11 +1726,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     sup.createPool(poolKey, RoleDistribution(0, 0, 1)).unsafeRunSync()
     if failResumeStarts then failStart.set(true)
 
-    val client = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(TestArrow.okResponse())
     val adapter = new QuackHttpAdapter(client, tracker)
@@ -2231,11 +2199,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     sup.createPool(poolKey, RoleDistribution(0, 0, 2)).unsafeRunSync()
 
-    val client = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(TestArrow.okResponse())
     val adapter = new QuackHttpAdapter(client, tracker)

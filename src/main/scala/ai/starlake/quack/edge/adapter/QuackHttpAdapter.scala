@@ -27,7 +27,7 @@ final class QuackHttpAdapter(client: QuackHttpClient, tracker: NodeLoadTracker) 
       recordLoad: Boolean = true,
       stampPrelude: Option[String] = None
   ): IO[QuackResponse] =
-    // Quack's URI scheme; DuckDB's `quack_query` parses it.
+    // Quack's URI scheme; QuackProtocol maps it to http://host:port/quack.
     val endpoint = s"quack:${node.host}:${node.port}"
     val call     = stampPrelude match
       case Some(p) => client.queryStamped(endpoint, node.token, p, sql)

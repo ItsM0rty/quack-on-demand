@@ -45,11 +45,7 @@ class StreamArrowCancelSpec extends AnyFlatSpec with Matchers:
       def cleanup()                      = IO(n.clear())
     val tracker = new NodeLoadTracker
     val sup     = new PoolSupervisor(backend, tracker, new InMemoryControlPlaneStore())
-    val client  = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client  = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(TestArrow.okResponse())
     val adapter = new QuackHttpAdapter(client, tracker)

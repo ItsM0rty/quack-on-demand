@@ -126,21 +126,19 @@ object QuackNativeBridge:
   // Referencing the module object forces its <clinit> (and therefore the
   // `loaded` init above, and the underlying System.load) to run right here,
   // instead of lazily at the first native call. Used by
-  // QuackNativeSupport.effectiveNativeClient to probe loadability at boot.
+  // QuackNativeSupport.requireLoaded, which QuackNativeSupport.bootCheck runs at boot.
   private[adapter] def forceInit(): Unit =
     val _ = QuackNativeBridge
     ()
 
-/** Classpath probe for the bundled libquackwire native. Deliberately separate from
-  * [[QuackNativeBridge]]: touching that object triggers the JNI load at init, which is exactly what
-  * must NOT happen on a platform with no bundled binary (Windows on ARM64 - quackwire.dll is built
-  * x86_64-only). Main consults [[effectiveNativeClient]] before constructing the client so such
-  * platforms degrade to the embedded HTTP path instead of crashing.
+/** Classpath probe and load gate for the bundled libquackwire native, the manager's only client to
+  * its nodes. Deliberately separate from [[QuackNativeBridge]]: touching that object triggers the
+  * JNI load at init, which must not happen on a platform with no bundled binary (Windows on ARM64,
+  * until it gets a build).
   *
-  * On a platform WITH a bundled binary, presence alone does not mean the native actually loads
-  * (e.g. Windows missing the MSVC runtime, or the ABI-pinned duckdb.dll not resolvable on PATH).
-  * [[effectiveNativeClient]] also attempts the real load once here, at boot, so a broken native
-  * degrades a single time with a warning instead of poisoning every query with a failed <clinit>.
+  * Main runs [[bootCheck]] early in boot, so a platform with no bundled binary, or one whose
+  * bundled native cannot load (an old glibc, a missing MSVC runtime, libduckdb not found), refuses
+  * to boot with an actionable message instead of failing every query. There is no fallback client.
   */
 object QuackNativeSupport extends com.typesafe.scalalogging.LazyLogging:
 
@@ -157,42 +155,58 @@ object QuackNativeSupport extends com.typesafe.scalalogging.LazyLogging:
   def availableForThisPlatform: Boolean =
     scala.util.Try(NativeLoader.platformDir()).toOption.exists(available(_))
 
-  /** The native-client setting Main should actually use: the configured value, forced to `false`
-    * (with a warning) when no native is bundled for this platform, or when a bundled native fails
-    * to actually load. `tryLoad` is injectable for tests; in production it triggers the real JNI
-    * load via [[QuackNativeBridge.forceInit]] exactly once, here at boot -- never lazily at the
-    * first query.
+  /** The boot gate: Right when the native client can run here, else a message naming the platform,
+    * the `libquackwire/binaries/<platform>` binary the jar should have bundled and the
+    * `DUCKDB_CACHE_DIR` hint. Main turns a Left into a boot failure.
+    *
+    * `load` runs only when a native is bundled (touching the bridge on a platform without one only
+    * adds a link error to the report); in production it is [[requireLoaded]], so the one real JNI
+    * load happens here, at boot. Every parameter is injectable for tests.
     */
-  def effectiveNativeClient(
-      configured: Boolean,
-      nativeBundled: Boolean = availableForThisPlatform,
-      tryLoad: () => Unit = () => requireLoaded()
-  ): Boolean =
-    if configured && !nativeBundled then
-      logger.warn(
-        "nativeClient=true but no libquackwire native is bundled for this platform " +
-          "(e.g. Windows on ARM64, where quackwire.dll is x86_64-only); " +
-          "falling back to the embedded HTTP client."
-      )
-      false
-    else if configured && nativeBundled then
-      // UnsatisfiedLinkError (and the ExceptionInInitializerError that wraps it when the
-      // failure surfaces via object init) is a java.lang.Error, not an Exception -- NonFatal
-      // (and therefore scala.util.Try) does not catch it. Catch Throwable explicitly.
-      try
-        tryLoad()
-        true
-      catch
-        case t: Throwable =>
-          val cause = if t.getCause != null then t.getCause else t
-          logger.warn(
-            "nativeClient=true and quackwire is bundled for this platform, but loading it " +
-              s"failed: ${cause.getMessage}. Falling back to the embedded HTTP client. On Windows " +
-              "this is commonly a missing Microsoft Visual C++ runtime or the ABI-pinned " +
-              "duckdb.dll not being resolvable on PATH."
-          )
-          false
-    else configured
+  def bootCheck(
+      bundled: Boolean = availableForThisPlatform,
+      load: () => Unit = () => requireLoaded(),
+      osName: String = sys.props.getOrElse("os.name", "unknown"),
+      osArch: String = sys.props.getOrElse("os.arch", "unknown")
+  ): Either[String, Unit] =
+    val platform =
+      s"os.name=$osName, os.arch=$osArch (libquackwire/binaries/${expectedBinary(osName, osArch)})"
+    val cause: Option[String] =
+      if !bundled then Some("no libquackwire native is bundled in this jar for the platform")
+      else
+        // A failed load can surface as a java.lang.Error (UnsatisfiedLinkError, or the
+        // ExceptionInInitializerError wrapping it), which NonFatal does not cover.
+        try
+          load()
+          None
+        catch
+          case t: Throwable =>
+            val root = initCause(t)
+            Some(Option(root.getMessage).getOrElse(root.toString))
+    cause match
+      case None         => Right(())
+      case Some(reason) =>
+        val cacheHint =
+          if reason.contains("DUCKDB_CACHE_DIR") then ""
+          else
+            " When the binary is present but cannot find libduckdb, provision " +
+              ".duckdb/<abi>/lib (scripts/run-jar.sh does) or point DUCKDB_CACHE_DIR at a cache " +
+              "holding it."
+        Left(
+          s"The native Quack client (libquackwire) cannot run on this host: $reason. " +
+            s"Platform: $platform. The manager has no fallback client to reach its nodes, so it " +
+            "refuses to boot. Use a jar built with the libquackwire binary for this platform." +
+            cacheHint
+        )
+
+  /** `<platform>/<library file>` under `libquackwire/binaries/`, derived from `os.name` / `os.arch`
+    * the way [[NativeLoader]] resolves it. A platform it does not know is reported as
+    * `<os.name>-<os.arch>`, since no build exists to name.
+    */
+  private def expectedBinary(osName: String, osArch: String): String =
+    scala.util.Try(NativeLoader.platformDir(osName, osArch)).toOption match
+      case Some(dir) => s"$dir/${NativeLoader.libraryFile(dir)}"
+      case None      => s"$osName-$osArch (no libquackwire build exists for it)"
 
   /** Attempts `load` and returns None when it succeeds, else a NON-fatal exception carrying the
     * original cause. A failed [[QuackNativeBridge]] init surfaces as `ExceptionInInitializerError`
@@ -228,9 +242,7 @@ object QuackNativeSupport extends com.typesafe.scalalogging.LazyLogging:
       initCause(t.getCause)
     case _ => t
 
-  /** The JNI load, attempted once per JVM and shared by [[effectiveNativeClient]] and
-    * [[requireLoaded]].
-    */
+  /** The JNI load, attempted once per JVM and shared by every [[requireLoaded]] caller. */
   private lazy val loadFailure: Option[IllegalStateException] =
     probe(() => QuackNativeBridge.forceInit())
 
@@ -242,9 +254,12 @@ object QuackNativeSupport extends com.typesafe.scalalogging.LazyLogging:
     loadFailure.foreach(e => throw new IllegalStateException(e.getMessage, e.getCause))
 
 private object NativeLoader:
-  def platformDir(): String =
-    val os    = sys.props("os.name").toLowerCase(Locale.ROOT)
-    val arch  = sys.props("os.arch").toLowerCase(Locale.ROOT)
+  def platformDir(
+      osName: String = sys.props("os.name"),
+      osArch: String = sys.props("os.arch")
+  ): String =
+    val os    = osName.toLowerCase(Locale.ROOT)
+    val arch  = osArch.toLowerCase(Locale.ROOT)
     val osTag =
       if os.contains("mac") then "osx"
       else if os.contains("linux") then "linux"
@@ -255,6 +270,14 @@ private object NativeLoader:
       case "aarch64" | "arm64" => "aarch64"
       case other               => sys.error(s"unsupported arch for libquackwire: $other")
     s"$osTag-$archTag"
+
+  /** The library file name the binaries for `platformDir` carry (`System.mapLibraryName` for that
+    * OS rather than the running one).
+    */
+  def libraryFile(platformDir: String): String =
+    if platformDir.startsWith("windows") then "quackwire.dll"
+    else if platformDir.startsWith("osx") then "libquackwire.dylib"
+    else "libquackwire.so"
 
   def loadFromResources(resourcePath: String): Unit =
     // Resolved before the preload: a platform with no bundled native (Windows on ARM64) has
@@ -288,8 +311,8 @@ private object NativeLoader:
   * rpath irrelevant.
   *
   * Best effort by design: finding nothing, or failing to load what it found, leaves resolution to
-  * the loader path exactly as before, and [[QuackNativeSupport.effectiveNativeClient]] still
-  * decides whether the native client is usable.
+  * the loader path exactly as before, and [[QuackNativeSupport.bootCheck]] still decides whether
+  * the manager can boot.
   */
 private[adapter] object LibDuckDbPreload extends com.typesafe.scalalogging.LazyLogging:
 

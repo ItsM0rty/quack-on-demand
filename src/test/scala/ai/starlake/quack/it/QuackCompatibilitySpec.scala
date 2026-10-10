@@ -167,7 +167,7 @@ class QuackCompatibilitySpec extends AnyFlatSpec with Matchers with BeforeAndAft
       tenantCatalogs = t => if t == "t-1" then Set("acme_db") else Set.empty,
       filteredMetadata = true
     )
-    val client = new QuackHttpClient(new org.apache.arrow.memory.RootAllocator(), true, true)
+    val client = new QuackHttpClient(new org.apache.arrow.memory.RootAllocator())
     // The column catalog the CLS resolver needs, mirroring the node's tables.
     val columns = new ColumnCatalog.MapCatalog(
       Map(

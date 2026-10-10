@@ -81,7 +81,7 @@ class StampedWriteIntegrationSpec extends AnyFunSpec with Matchers with BeforeAn
           )
 
   private def client() =
-    new QuackHttpClient(allocator, nativeClient = true, nodeDisableSsl = true)
+    new QuackHttpClient(allocator)
 
   private def rows(resp: QuackResponse): List[List[Any]] =
     val ok   = resp.asInstanceOf[QuackResponse.Ok]

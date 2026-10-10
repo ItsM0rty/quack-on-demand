@@ -17,9 +17,15 @@
   Node connections are released on error and on cancel. New `QOD_DUCKDB_EXTENSION_DIR` points the
   manager's DuckDB at a local extension directory and turns on unsigned extensions.
 
-- **Known limitation.** The DuckDB 2.0 pre-release JDBC disables Arrow export, so the embedded
-  fallback client (`QOD_NATIVE_CLIENT=false`, and the automatic fallback on Windows ARM64) does
-  not work on this pre-release. The native client (the default) is unaffected.
+- **The native client is the only manager-to-node client.** BREAKING: the embedded fallback client
+  (an in-process DuckDB running `quack_query` over JDBC, behind a JVM-wide mutex) is gone, since
+  the DuckDB 2.0 JDBC disables the Arrow export it needed. `QOD_NATIVE_CLIENT` and
+  `QOD_NODE_DISABLE_SSL` (which only the fallback read) are removed and ignored if still set, and
+  so is the Helm value `quackNode.tls.enabled`. A manager whose platform has no bundled
+  libquackwire (Windows on ARM64 for now), or whose native cannot load (for instance libduckdb not
+  found), refuses to boot with a message naming the platform, the expected
+  `libquackwire/binaries/<platform>/` binary and `DUCKDB_CACHE_DIR`, instead of falling back. The
+  demo no longer pins the fallback either.
 
 - **Security: DuckDB 2.0 hardening.**
   - Data-modifying CTEs classify as writes and fail closed in the ACL.
