@@ -109,13 +109,16 @@ object LockdownScreen:
     "read_ndjson",
     "read_ndjson_auto",
     "parquet_scan",
-    "getenv"
+    "getenv",
+    // Writes log files (CALL or FROM form) under storage_path or storage_config's path.
+    "enable_logging"
   )
 
   // read-style functions whose string-literal args may be remote URLs. read_text / read_blob keep
   // the exemption too, matching the documented contract: a remote URL literal is admitted, a local
-  // path is denied. Only glob (directory listing) and getenv (no path) never exempt.
-  private val UrlExempt = DeniedFunctions - "glob" - "getenv"
+  // path is denied. glob (directory listing), getenv (no path) and enable_logging (its path is a
+  // named argument or a struct field, never the first argument) never exempt.
+  private val UrlExempt = DeniedFunctions - "glob" - "getenv" - "enable_logging"
 
   private val RemoteSchemes = List("s3://", "gs://", "az://", "r2://", "http://", "https://")
 

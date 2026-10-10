@@ -550,6 +550,28 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SET http_timeout = 300") shouldBe false
   }
 
+  "enable_logging" should "be denied in every call form, since file storage writes local files" in {
+    // Verified on the 2.0 CLI: both forms write duckdb_log_entries.csv under the path, and the
+    // entries carry query text and write_log() payloads.
+    denied("CALL enable_logging(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("SELECT * FROM enable_logging(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("CALL enable_logging(storage='file', storage_config={'path': '/tmp/l'})") shouldBe true
+    denied("CALL ENABLE_LOGGING(storage_path='/tmp/logs', storage='file')") shouldBe true
+    denied("CALL main.enable_logging(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("CALL \"enable_logging\"(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("CALL `enable_logging`(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("CALL enable_logging/* c */(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("SELECT 1; CALL enable_logging(storage='file', storage_path='/tmp/logs')") shouldBe true
+    // fail closed even for a remote path: the path is a named argument, never the first one
+    denied("CALL enable_logging(storage='file', storage_path='s3://bucket/logs')") shouldBe true
+    denied("CALL enable_logging()") shouldBe true
+    // a call spelled inside a literal counts, like every denied function (query() runs one)
+    denied("SELECT * FROM query('CALL enable_logging(storage_path=''/tmp/l'')')") shouldBe true
+    // a column named like it is not a call
+    denied("SELECT enable_logging FROM t") shouldBe false
+    denied("CALL disable_logging()") shouldBe false
+  }
+
   "the statement splitter" should "not lose a statement behind a dollar-quoted or E-string literal" in {
     // DuckDB reads `$x$'$x$` as a dollar-quoted string holding one quote, and `E'\''` as an
     // escape string holding one quote. A splitter that knew only '...' opened a single-quoted
