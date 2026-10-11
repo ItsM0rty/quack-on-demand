@@ -112,8 +112,14 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
                     case Some(name) => Denied(s"unresolvable table $name")
                     case None       =>
                       try
+                        // The visitor masks the positions it models and leaves every other node
+                        // as it found it; a covered column still in the tree afterwards would
+                        // reach the node unmasked, so it denies (ResidualColumns).
+                        val suspects     = ResidualColumns.suspects(sel, policies, schema)
                         val (changed, _) = applyPolicies(sel, projectionOrigins, policies)
-                        if changed then Rewritten(sel.toString) else Passthrough
+                        ResidualColumns.unmasked(sel, suspects) match
+                          case Some(reason) => Denied(reason)
+                          case None => if changed then Rewritten(sel.toString) else Passthrough
                       catch case e: DenyException => Denied(e.reason)
                 case _ =>
                   Passthrough
@@ -637,3 +643,151 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
       (p.tableName == RoleColumnPolicy.Wildcard || p.tableName.equalsIgnoreCase(table)) &&
       p.columnName.equalsIgnoreCase(column)
     }
+
+/** The fail-closed backstop behind [[JsqltranspilerRewriter]]'s masking visitor, which models a
+  * fixed set of expression types (columns, functions, CASE, CAST, IN, ...) and returns any other
+  * node untouched. A covered column inside such a node (a MAP or list literal, a lambda, `->>`,
+  * TRIM, a JOIN condition, a struct_pack named argument, ...) was forwarded unmasked.
+  *
+  * Rather than enumerate those types, the check is structural: before the rewrite, every column
+  * reference a policy could cover is noted by node identity ([[suspects]]); the visitor replaces
+  * each one it masks with a new node, so any noted reference still reachable afterwards
+  * ([[unmasked]]) sits where masking did not reach, and the statement is denied. The walk follows
+  * the shared reflective child access ([[AstChildren]]), so a MAP literal's entries and a JSON
+  * pair's halves are seen; a child of a type it has no rule for denies too.
+  *
+  * Coverage mirrors the visitor's own match (policy table and column name, `*` for any table): a
+  * qualified reference resolves its qualifier through the statement's table aliases; an unqualified
+  * one is covered when its own select, or an enclosing one, reads a policy table directly and that
+  * table has the column (or its columns are unknown). The check can only add denials.
+  */
+private[cls] object ResidualColumns:
+  import scala.jdk.CollectionConverters._
+  import ai.starlake.acl.parser.AstChildren
+  import net.sf.jsqlparser.schema.{Column, Table}
+
+  final class Suspects private[ResidualColumns] (
+      val columns: java.util.Set[Column],
+      val unwalkable: Option[String]
+  )
+
+  /** Every column reference with the FROM scopes it sits in (innermost first, each the bare table
+    * names its select reads directly), every table node, and the first child of an unknown type.
+    */
+  private final case class Scan(
+      columns: List[(Column, List[Set[String]])],
+      tables: List[Table],
+      unknown: Option[String]
+  )
+
+  private def unquote(s: String): String = s.stripPrefix("\"").stripSuffix("\"")
+
+  private def lower(s: String): String = s.toLowerCase(java.util.Locale.ROOT)
+
+  /** The bare names of the tables a FROM item reads directly (a parenthesized join included). */
+  private def fromItemTables(item: Any): Set[String] =
+    item match
+      case t: Table =>
+        Option(t.getName).map(n => lower(unquote(n))).toSet
+      case pfi: net.sf.jsqlparser.statement.select.ParenthesedFromItem =>
+        fromItemTables(pfi.getFromItem) ++
+          Option(pfi.getJoins).toList.flatMap(_.asScala).flatMap(j => fromItemTables(j.getFromItem))
+      case _ => Set.empty
+
+  private def scopeOf(node: AnyRef): Option[Set[String]] =
+    node match
+      case ps: PlainSelect =>
+        Some(
+          fromItemTables(ps.getFromItem) ++
+            Option(ps.getJoins).toList
+              .flatMap(_.asScala)
+              .flatMap(j => fromItemTables(j.getFromItem))
+        )
+      case fq: net.sf.jsqlparser.statement.piped.FromQuery => Some(fromItemTables(fq.getFromItem))
+      case _                                               => None
+
+  private def scan(root: AnyRef): Scan =
+    val visited = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
+    )
+    val columns = scala.collection.mutable.ListBuffer.empty[(Column, List[Set[String]])]
+    val tables  = scala.collection.mutable.ListBuffer.empty[Table]
+    var unknown = Option.empty[String]
+    def walk(node: AnyRef, scopes: List[Set[String]]): Unit =
+      if visited.add(node) then
+        node match
+          case c: Column => columns += (c -> scopes)
+          case t: Table  => tables += t
+          case _         => ()
+        val inner = scopeOf(node).map(_ :: scopes).getOrElse(scopes)
+        AstChildren.accessors(node.getClass).foreach { m =>
+          AstChildren.read(m, node) match
+            // A column's qualifier is not a table the statement reads.
+            case _: Table if node.isInstanceOf[Column] => ()
+            case value                                 => route(value, inner)
+        }
+    def route(value: Any, scopes: List[Set[String]]): Unit =
+      value match
+        case null                         => ()
+        case it: java.lang.Iterable[?]    => it.forEach(route(_, scopes))
+        case arr: Array[?]                => arr.foreach(route(_, scopes))
+        case e: java.util.Map.Entry[?, ?] =>
+          route(e.getKey, scopes); route(e.getValue, scopes)
+        case m: java.util.Map[?, ?]                => m.entrySet.forEach(route(_, scopes))
+        case n: AnyRef if AstChildren.isAstNode(n) => walk(n, scopes)
+        case leaf if AstChildren.isLeaf(leaf)      => ()
+        case other => unknown = unknown.orElse(Some(other.getClass.getName))
+    walk(root, Nil)
+    Scan(columns.toList, tables.toList, unknown)
+
+  /** The column references in `sel` a policy could cover, noted before the rewrite. */
+  def suspects(
+      sel: AnyRef,
+      policies: List[RoleColumnPolicy],
+      schema: Map[String, List[String]]
+  ): Suspects =
+    val before  = scan(sel)
+    val aliases = before.tables.flatMap { t =>
+      Option(t.getAlias).map(a => lower(unquote(a.getName)) -> unquote(t.getName))
+    }.toMap
+    def columnsOf(table: String): Option[List[String]] =
+      schema.find(_._1.equalsIgnoreCase(table)).map(_._2).filter(_.nonEmpty)
+    def covered(col: Column, scopes: List[Set[String]]): Boolean =
+      val name   = unquote(Option(col.getColumnName).getOrElse(""))
+      val byName = policies.filter(_.columnName.equalsIgnoreCase(name))
+      Option(col.getTable).flatMap(t => Option(t.getName)).map(unquote) match
+        case Some(q) =>
+          val table = aliases.getOrElse(lower(q), q)
+          byName.exists(p =>
+            p.tableName == RoleColumnPolicy.Wildcard || p.tableName.equalsIgnoreCase(table)
+          )
+        case None =>
+          // Unqualified: a base read only when a select it sits in (its own, or an enclosing one
+          // for a correlated reference) reads the policy table directly and that table has the
+          // column. Through a CTE or a derived table it reads values already masked inside.
+          byName.exists(p =>
+            p.tableName == RoleColumnPolicy.Wildcard ||
+              (scopes.exists(_.contains(lower(p.tableName))) &&
+                columnsOf(p.tableName).forall(_.exists(_.equalsIgnoreCase(name))))
+          )
+    val noted = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[Column, java.lang.Boolean]()
+    )
+    before.columns.collect { case (c, scopes) if covered(c, scopes) => c }.foreach(noted.add(_))
+    new Suspects(noted, before.unknown)
+
+  /** Some(deny reason) when a noted reference is still in `sel` after the rewrite, or the statement
+    * holds a node the walk cannot follow.
+    */
+  def unmasked(sel: AnyRef, suspects: Suspects): Option[String] =
+    val after = scan(sel)
+    suspects.unwalkable.orElse(after.unknown) match
+      case Some(cls) => Some(s"column policy rewrite cannot walk a $cls node")
+      case None      =>
+        after.columns
+          .map(_._1)
+          .find(suspects.columns.contains)
+          .map(c =>
+            s"column ${c.getFullyQualifiedName} is in a position the column policy rewrite " +
+              "cannot mask; select it directly instead"
+          )

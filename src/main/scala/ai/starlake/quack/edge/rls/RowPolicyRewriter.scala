@@ -1,6 +1,6 @@
 package ai.starlake.quack.edge.rls
 
-import ai.starlake.acl.parser.TableExtractor
+import ai.starlake.acl.parser.{AstChildren, TableExtractor}
 import ai.starlake.quack.model.StatementKind
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.state.RoleRowPolicy
@@ -22,7 +22,6 @@ import net.sf.jsqlparser.statement.select.{
 
 import scala.jdk.CollectionConverters._
 import scala.util.Try
-import scala.util.control.NonFatal
 
 /** Schema/catalog defaults in scope when the statement runs, used to qualify bare table references
   * (`customer` -> catalog `acme_tpch`, schema `tpch1`) so they match policies keyed on
@@ -76,6 +75,9 @@ object RowPolicyRewriter:
   /** A shape the rewrite cannot filter, refused with a fixed reason (never the SQL). */
   private final class Refusal(val reason: String) extends RuntimeException(reason)
 
+  private val UnwalkedRefusal =
+    "the statement holds a syntax node the row policy rewrite cannot walk"
+
   private val StatementSourceRefusal =
     "a parenthesized statement in table position reads a row-policy table; select from it instead"
 
@@ -116,34 +118,6 @@ object RowPolicyRewriter:
         // replaceAllIn treats $ and \ in the replacement as group refs; quote them out.
         java.util.regex.Matcher.quoteReplacement(values.getOrElse(name, "NULL"))
     )
-
-  // ---- reflective descent plumbing (mirrors TableExtractorVisitor.childAccessors, which is
-  // private to the ACL parser package) ----
-
-  private val accessorCache =
-    new java.util.concurrent.ConcurrentHashMap[Class[?], Array[java.lang.reflect.Method]]()
-
-  /** The no-arg `get*` accessors of `cls` that can reach a child AST node: return type is a
-    * collection, an array, or any jsqlparser AST type outside the `net.sf.jsqlparser.parser`
-    * package (excluded so the walk never follows an upward parent link into a cycle).
-    */
-  private def childAccessors(cls: Class[?]): Array[java.lang.reflect.Method] =
-    accessorCache.computeIfAbsent(
-      cls,
-      c =>
-        c.getMethods.filter { m =>
-          val rt = m.getReturnType
-          m.getParameterCount == 0 &&
-          m.getName.startsWith("get") &&
-          (classOf[java.lang.Iterable[?]].isAssignableFrom(rt) || rt.isArray || isJsqlAstType(rt))
-        }
-    )
-
-  private def isJsqlAstType(rt: Class[?]): Boolean =
-    val n = rt.getName
-    n.startsWith("net.sf.jsqlparser.") && !n.startsWith("net.sf.jsqlparser.parser.")
-
-  private def isJsqlNode(value: AnyRef): Boolean = isJsqlAstType(value.getClass)
 
 class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
   import RowPolicyRewriter._
@@ -238,12 +212,7 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
         // Only the reflective call is guarded (some jsqlparser getters cast `this` and throw on
         // a sibling subtype): an exception from the walk itself, a refusal or a predicate that
         // fails to apply on a nested table, must reach rewrite's handler and deny.
-        childAccessors(node.getClass).foreach { m =>
-          route(
-            try m.invoke(node)
-            catch case NonFatal(_) => null
-          )
-        }
+        AstChildren.accessors(node.getClass).foreach(m => route(AstChildren.read(m, node)))
 
     /** Some(wrapper) when the slot holds a base table matching a policy, None otherwise. */
     private def wrapped(item: FromItem): Option[FromItem] =
@@ -256,13 +225,20 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
             Some(w)
         case _ => None
 
+    /** Children JSqlParser keeps outside its node types are followed too (a MAP literal's
+      * `Map.Entry` pairs, any `java.util.Map`); a value of a type with no rule here is refused,
+      * since a table it holds could not be filtered.
+      */
     private def route(value: Any): Unit =
       value match
-        case null                       => ()
-        case it: java.lang.Iterable[?]  => it.asScala.foreach(route)
-        case arr: Array[?]              => arr.foreach(route)
-        case n: AnyRef if isJsqlNode(n) => walk(n)
-        case _                          => ()
+        case null                                  => ()
+        case it: java.lang.Iterable[?]             => it.asScala.foreach(route)
+        case arr: Array[?]                         => arr.foreach(route)
+        case e: java.util.Map.Entry[?, ?]          => route(e.getKey); route(e.getValue)
+        case m: java.util.Map[?, ?]                => m.entrySet.asScala.foreach(route)
+        case n: AnyRef if AstChildren.isAstNode(n) => walk(n)
+        case leaf if AstChildren.isLeaf(leaf)      => ()
+        case _                                     => throw new Refusal(UnwalkedRefusal)
 
   /** The principal's row policies covering `t`, its bare parts qualified by the session defaults.
     */

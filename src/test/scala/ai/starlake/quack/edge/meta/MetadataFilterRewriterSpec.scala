@@ -726,3 +726,12 @@ class MetadataFilterRewriterSpec extends AnyFlatSpec with Matchers:
   it should "leave unparseable non-SHOW statements untouched" in {
     go("THIS IS NOT SQL", eff(tenantUser)) shouldBe Passthrough
   }
+
+  "a filterable reference inside a MAP literal" should "be refused, not forwarded" in {
+    go(
+      "SELECT map {'a': (SELECT count(*) FROM information_schema.tables)}",
+      eff(tenantUser, grant("acme_tpch", "tpch1", "customer"))
+    ) match
+      case Denied(_) => succeed
+      case other     => fail(s"expected Denied, got $other")
+  }

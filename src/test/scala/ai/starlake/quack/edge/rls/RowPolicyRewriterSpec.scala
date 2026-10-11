@@ -390,3 +390,17 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       eff(tenantUser, List(policy("c_region = 'EU'")))
     ) shouldBe Passthrough
   }
+
+  // ---- expression positions outside JSqlParser's node types --------------------------------
+
+  "a policy table read in a MAP literal or a json_object argument" should "be filtered" in {
+    val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
+    rewritten(go("SELECT map {'a': (SELECT count(*) FROM customer)}", effSet)) should include(
+      "c_region = 'eu'"
+    )
+    rewritten(go("SELECT MAP {(SELECT max(c_id) FROM customer): 1}", effSet)) should include(
+      "c_region = 'eu'"
+    )
+    rewritten(go("SELECT json_object('a', (SELECT count(*) FROM customer))", effSet)) should
+      include("c_region = 'eu'")
+  }

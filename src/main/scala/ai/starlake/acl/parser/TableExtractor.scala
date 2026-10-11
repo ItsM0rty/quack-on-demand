@@ -601,9 +601,10 @@ private[parser] class TableExtractorVisitor:
     * a column qualifier).
     */
   private def descendChildren(node: AnyRef, recordBareTable: Boolean): Unit =
-    TableExtractorVisitor.childAccessors(node.getClass).foreach { m =>
-      try routeChild(m.invoke(node), recordBareTable)
-      catch case _: Throwable => ()
+    // Only the reflective read is guarded (AstChildren.read): the walk of what it returns is not,
+    // so a failure there reaches SqlParser as a parse error instead of dropping the subtree.
+    AstChildren.accessors(node.getClass).foreach { m =>
+      routeChild(AstChildren.read(m, node), recordBareTable)
     }
 
   /** Route one reflectively-fetched child value to the right walk. `Expression` is tested before
@@ -612,56 +613,30 @@ private[parser] class TableExtractorVisitor:
     * expression it is a column qualifier and is skipped. Any other jsqlparser node is an
     * intermediate holder (GroupByElement, Distinct, WindowDefinition, Join, Top, Pivot, ...): guard
     * it and descend reflectively, so no holder type needs to be enumerated by hand.
+    *
+    * Children JSqlParser keeps outside its node types are followed too: a MAP literal's entries
+    * (`Map.Entry`, both key and value) and any `java.util.Map`. A value of a type with no rule here
+    * is recorded as unsupported, so a child the walk cannot see into denies rather than vanishes.
     */
   private def routeChild(value: Any, recordBareTable: Boolean): Unit =
     value match
-      case null                      => ()
-      case e: Expression             => visitExpression(e)
-      case t: Table                  => if recordBareTable then visitFromItem(t)
-      case s: Select                 => visitSelect(s)
-      case fi: FromItem              => visitFromItem(fi)
-      case oe: OrderByElement        => Option(oe.getExpression).foreach(visitExpression)
-      case si: SelectItem[?]         => Option(si.getExpression).foreach(visitExpression)
-      case it: java.lang.Iterable[?] => it.asScala.foreach(routeChild(_, recordBareTable))
-      case arr: Array[?]             => arr.foreach(routeChild(_, recordBareTable))
+      case null                         => ()
+      case e: Expression                => visitExpression(e)
+      case t: Table                     => if recordBareTable then visitFromItem(t)
+      case s: Select                    => visitSelect(s)
+      case fi: FromItem                 => visitFromItem(fi)
+      case oe: OrderByElement           => Option(oe.getExpression).foreach(visitExpression)
+      case si: SelectItem[?]            => Option(si.getExpression).foreach(visitExpression)
+      case it: java.lang.Iterable[?]    => it.asScala.foreach(routeChild(_, recordBareTable))
+      case arr: Array[?]                => arr.foreach(routeChild(_, recordBareTable))
+      case e: java.util.Map.Entry[?, ?] =>
+        routeChild(e.getKey, recordBareTable)
+        routeChild(e.getValue, recordBareTable)
+      case m: java.util.Map[?, ?] => m.entrySet.asScala.foreach(routeChild(_, recordBareTable))
       case wi: net.sf.jsqlparser.statement.select.WithItem[?] =>
         if visited.add(wi) then visitCteBody(wi)
-      case holder: AnyRef if isJsqlNode(holder) =>
+      case holder: AnyRef if AstChildren.isAstNode(holder) =>
         if visited.add(holder) then descendChildren(holder, recordBareTable)
-      case _ => ()
-
-  private def isJsqlNode(value: AnyRef): Boolean =
-    val n = value.getClass.getName
-    n.startsWith("net.sf.jsqlparser.") && !n.startsWith("net.sf.jsqlparser.parser.")
-
-private[parser] object TableExtractorVisitor:
-  import java.lang.reflect.Method
-
-  private val accessorCache =
-    new java.util.concurrent.ConcurrentHashMap[Class[?], Array[Method]]()
-
-  /** The no-arg `get*` accessors of `cls` that can reach a child AST node: return type is a
-    * collection (`Iterable`, so a raw `List<OrderByElement>` / `List<Join>` / `List<SelectItem>` is
-    * reached), an array, or any jsqlparser AST type OUTSIDE the `net.sf.jsqlparser.parser` package.
-    * The parser package (SimpleNode and friends) is excluded so the walk never follows an upward
-    * parent link into a cycle; primitives, String, and other library types are excluded so leaves
-    * (Column, literals) cost only the memoized lookup. routeChild filters values further by runtime
-    * type, so admitting the whole AST-node space here is safe and makes the walk complete.
-    */
-  def childAccessors(cls: Class[?]): Array[Method] =
-    accessorCache.computeIfAbsent(
-      cls,
-      c =>
-        c.getMethods.filter { m =>
-          val rt = m.getReturnType
-          m.getParameterCount == 0 &&
-          m.getName.startsWith("get") &&
-          (classOf[java.lang.Iterable[?]].isAssignableFrom(rt) ||
-            rt.isArray ||
-            isJsqlAstType(rt))
-        }
-    )
-
-  private def isJsqlAstType(rt: Class[?]): Boolean =
-    val n = rt.getName
-    n.startsWith("net.sf.jsqlparser.") && !n.startsWith("net.sf.jsqlparser.parser.")
+      case leaf if AstChildren.isLeaf(leaf) => ()
+      case other                            =>
+        unsupported += s"unwalked syntax node ${other.getClass.getName}"

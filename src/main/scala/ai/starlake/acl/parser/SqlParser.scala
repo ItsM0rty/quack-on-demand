@@ -119,7 +119,7 @@ object SqlParser:
             try stmts.asScala.toList
             catch case _: NullPointerException => Nil
           val results = statements.zipWithIndex.map { case (stmt, idx) =>
-            processStatement(stmt, idx, config)
+            analysed(stmt, idx, config)
           }
 
           ExtractionResult.fromStatements(results)
@@ -150,12 +150,26 @@ object SqlParser:
       else
         ParserInput.render(sql) match
           case Left(reason) => StatementResult.ParseError(0, truncateSnippet(sql), reason)
-          case Right(input) => processStatement(CCJSqlParserUtil.parse(input.text), 0, config)
+          case Right(input) => analysed(CCJSqlParserUtil.parse(input.text), 0, config)
     catch
       case e: JSQLParserException =>
         val snippet = truncateSnippet(sql)
         val message = Option(e.getMessage).getOrElse("Unknown parse error")
         StatementResult.ParseError(0, snippet, message)
+
+  /** [[processStatement]], with a failure of the analysis itself (a walk meeting a shape it cannot
+    * follow) turned into a parse error, which the validators deny, rather than an exception that
+    * escapes the gate.
+    */
+  private def analysed(stmt: Statement, index: Int, config: Config): StatementResult =
+    try processStatement(stmt, index, config)
+    catch
+      case scala.util.control.NonFatal(e) =>
+        StatementResult.ParseError(
+          index,
+          truncateSnippet(String.valueOf(stmt)),
+          s"statement could not be analysed (${e.getClass.getSimpleName}); denied (fail-closed)"
+        )
 
   /** Shared tail of every write/DDL arm: qualify the read sources and the single target table,
     * grant `targetVerb` on the target plus Read on every source, and carry the qualification errors

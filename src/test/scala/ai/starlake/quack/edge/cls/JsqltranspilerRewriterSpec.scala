@@ -335,3 +335,39 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
       case RewriteOutcome.Denied(reason) => fail(s"LENIENT must not deny: $reason")
       case _                             => succeed
   }
+
+  // ---- positions the masking visitor does not model ----------------------------------------
+  //
+  // A covered column the visitor leaves in place reaches the node unmasked. Each of these used to
+  // pass through; the residual check refuses them instead.
+
+  private def notForwardedUnmasked(sql: String): Unit =
+    val withOrders = schema + ("orders" -> List("o_id", "o_total"))
+    rw.rewrite(sql, withOrders, List(maskEmail), Some("acme_tpch"), Some("tpch1")) match
+      case RewriteOutcome.Denied(_)      => succeed
+      case RewriteOutcome.Rewritten(out) =>
+        out.toLowerCase should not include "c_email"
+      case other => fail(s"expected Denied or a masked rewrite, got $other for: $sql")
+
+  "a covered column outside a modeled expression" should "never be forwarded unmasked" in {
+    notForwardedUnmasked("SELECT map {'a': c_email} FROM customer")
+    notForwardedUnmasked("SELECT [c_email] FROM customer")
+    notForwardedUnmasked("SELECT map {'a': (SELECT c_email FROM customer)}")
+    notForwardedUnmasked("SELECT list_transform([1], x -> c_email) FROM customer")
+    notForwardedUnmasked("SELECT c_email->>'$' FROM customer")
+    notForwardedUnmasked("SELECT struct_pack(a := c_email) FROM customer")
+    notForwardedUnmasked("SELECT trim(c_email) FROM customer")
+    notForwardedUnmasked("SELECT c_id FROM customer WHERE map {'a': c_email}['a'] = 'x'")
+    notForwardedUnmasked("SELECT c.c_id FROM customer c JOIN orders o ON c.c_email = o.o_id")
+  }
+
+  it should "leave a same-named column of a table without a policy alone" in {
+    val out = rw.rewrite(
+      "SELECT [o.c_email] FROM orders o",
+      schema + ("orders" -> List("o_id", "c_email")),
+      List(maskEmail),
+      Some("acme_tpch"),
+      Some("tpch1")
+    )
+    out shouldBe RewriteOutcome.Passthrough
+  }
