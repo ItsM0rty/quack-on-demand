@@ -12,8 +12,12 @@ import ai.starlake.sql.SqlLexer
   * backtick + ` 2; SET search_path = 'x'; SELECT 3 ` + backtick + ` 4` runs three statements and a
   * call between the pair runs too (both checked on the 1.5.6 CLI), while the lexer reads one quoted
   * identifier and every screen built on it (statement split, SessionScopeScreen,
-  * CatalogReachingCalls, LockdownScreen) sees neither the separators nor the call. Refusing the
-  * backtick closes that for the callers the screens protect; identifiers take double quotes.
+  * CatalogReachingCalls, LockdownScreen, CatalogWriteScreen, and StatementClassifier, whose kind
+  * feeds OPA's statement class and the protected-write guard) sees neither the separators nor the
+  * call. Refusing the backtick closes that for the callers the screens protect; identifiers take
+  * double quotes. It runs first in AccessGate (QoD and OPA validators), LockdownScreen,
+  * ProtectedWriteGuard and CatalogWriteScreen, so the classifier's reading of a backtick statement
+  * never decides anything on those paths.
   *
   * Up to the first backtick token the 1.5 and 2.0 lexers agree, so a statement this screen admits
   * holds no backtick token on either engine. Inert once the pin is DuckDB 2 or later, where the
@@ -27,7 +31,10 @@ object BacktickScreen:
   def activeFor(duckdbVersion: String): Boolean =
     duckdbVersion.trim.takeWhile(_.isDigit).toIntOption.forall(_ < 2)
 
-  /** Whether the screen applies to this build's pinned engine. */
+  /** Whether the screen applies to this build's pinned engine. Fixed at object init from a
+    * compile-time constant, so specs cannot flip it: refusal specs `assume(active)` and cancel on a
+    * 2.x pin.
+    */
   val active: Boolean = activeFor(BuildVersions.duckdb)
 
   /** Some(reason) when `sql` must be refused on this build's engine. */

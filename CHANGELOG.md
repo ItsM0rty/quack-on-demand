@@ -13,11 +13,13 @@
   default schema, even when it opens with `BEGIN` or `SET`; one opening with `ROLLBACK` / `COMMIT`
   switches to it right after that statement, so a rollback out of a failed transaction still runs.
 
-- **Security: a backtick outside a string or comment is refused for ACL-checked users and on
-  lockdown pools.** On DuckDB 1.5 a backtick is an operator, not an identifier quote, so with a
-  macro named after it the text between two backticks runs: statement separators and function
-  calls there were hidden from the access checks. Quote identifiers with double quotes. Superusers,
-  and users on pools without lockdown while the ACL is off, are unaffected.
+- **Security: a backtick outside a string or comment is refused for ACL-checked users, users with
+  column or row policies, on lockdown pools and on pools with a read-only catalog.** On DuckDB 1.5
+  a backtick is an operator, not an identifier quote, so with a macro named after it the text
+  between two backticks runs: statement separators and function calls there were hidden from the
+  access checks. Quote identifiers with double quotes. Superusers (except on a pool with a
+  read-only catalog, whose write screen applies to everyone), and users without policies on pools
+  without lockdown while the ACL is off, are unaffected.
 
 - **Security: `SET VARIABLE` can no longer read a table without a grant.** Its value is a query,
   so `SET VARIABLE x = (SELECT ... FROM any_table); SELECT getvariable('x')` returned rows from any

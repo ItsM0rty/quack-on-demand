@@ -60,3 +60,24 @@ class BacktickScreenSpec extends AnyFlatSpec with Matchers:
     LockdownScreen
       .screen(s"SELECT 1 $B 2 AS a, * FROM read_csv('/tmp/x.csv') WHERE 3 $B 4 = 7", Set.empty)
       .getOrElse("") should include("backtick")
+
+  "CatalogWriteScreen" should "refuse a backtick pair only while a catalog is read-only" in:
+    assume(BacktickScreen.active, "backtick screen is inert on this DuckDB pin")
+    val cfg = ai.starlake.acl.model.Config.forDuckDB(
+      Some("acme_db"),
+      Some("main"),
+      Set("acme_db", "sales_lake")
+    )
+    def screen(sql: String, ro: Set[String]) =
+      CatalogWriteScreen.screen(
+        sql,
+        ai.starlake.quack.route.StatementClassifier.default.classify,
+        ro,
+        cfg
+      )
+    val hidden = s"SELECT 1 $B 2; INSERT INTO sales_lake.main.orders VALUES (1); SELECT 3 $B 4"
+    screen(hidden, Set("sales_lake")).getOrElse("") should include("backtick")
+    // No read-only catalog: the screen does not apply, as before.
+    screen(hidden, Set.empty) shouldBe None
+    // A backtick inside a string literal is not refused.
+    screen(s"SELECT '$B' FROM sales_lake.main.orders", Set("sales_lake")) shouldBe None

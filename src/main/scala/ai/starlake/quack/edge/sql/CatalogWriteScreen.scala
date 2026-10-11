@@ -142,6 +142,9 @@ object CatalogWriteScreen extends LazyLogging:
       config: Config
   ): Option[String] =
     if readOnlyCatalogs.isEmpty then None
+    // On a DuckDB 1.x engine a backtick pair can hide a write from every check below; the second
+    // lexing only happens on the refusal path.
+    else if BacktickScreen.find(sql).isDefined then BacktickScreen.find(sql)
     else
       val fragments = LockdownScreen.splitStatements(sql)
       if fragments.forall(f => ReadSideKinds.contains(classify(f))) then
