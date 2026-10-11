@@ -585,6 +585,9 @@ duckdb::ClientProperties& shared_client_properties() {
     duckdb::DBConfig config;
     config.SetOptionByName("threads", duckdb::Value::BIGINT(1));
     config.SetOptionByName("async_threads", duckdb::Value::BIGINT(1));
+    // Never load the OS user's persistent secrets (~/.duckdb/stored_secrets) into this helper
+    // instance, matching InProcessDuckDb.Settings on the JVM side.
+    config.SetOptionByName("allow_persistent_secrets", duckdb::Value::BOOLEAN(false));
     db = std::make_unique<duckdb::DuckDB>(nullptr, &config);
     conn = std::make_unique<duckdb::Connection>(*db);
     props = std::make_unique<duckdb::ClientProperties>(conn->context->GetClientProperties());
