@@ -1,7 +1,6 @@
 package ai.starlake.quack.edge.sql
 
-import ai.starlake.acl.model.Config
-import ai.starlake.acl.parser.{ExtractionResult, SqlParser, StatementResult, TableExtractor}
+import ai.starlake.acl.parser.ExtractionResult
 import ai.starlake.sql.SqlLexer
 
 /** Direct file access, refused to every tenant-scoped principal whenever the ACL validates (QoD
@@ -168,8 +167,7 @@ object FileAccessScreen:
       NodeSettingScreen.SecretCalls(name)
 
   /** Some(reason) when `sql` reads or writes a file directly. */
-  def find(sql: String): Option[String] =
-    find(sql, SqlParser.extract(sql, Config.forDuckDB(None, None, Set.empty)))
+  def find(sql: String): Option[String] = find(sql, FileReferences.extraction(sql))
 
   /** [[find]] over the access check's own `extraction` of `sql`, evaluated only when the lexical
     * checks find nothing (file references do not depend on the qualification config).
@@ -188,80 +186,33 @@ object FileAccessScreen:
         .orElse(LockdownScreen.splitStatements(sql).iterator.flatMap(statementVerb).nextOption())
         .orElse(tablePositionFile(sql, extraction))
 
-  /** A file in table position: from the walk when it is complete, else the lexical scan. */
+  /** A file in table position: from the walk when it is complete, else the lexical scan
+    * ([[FileReferences]]).
+    */
   private def tablePositionFile(sql: String, extraction: ExtractionResult): Option[String] =
-    if incomplete(extraction) then
+    if FileReferences.incomplete(extraction) then
       LockdownScreen.splitStatements(sql).iterator.flatMap(lexicalTableFile).nextOption()
     else
-      extraction.statements
-        .collect { case StatementResult.Extracted(_, _, _, _, unsupported) => unsupported }
-        .flatten
-        .find(_.startsWith(TableExtractor.FileReferencePrefix))
-        .map(m =>
-          reason(
-            s"${m.stripPrefix(TableExtractor.FileReferencePrefix)} in a table " +
-              "position reads a file"
-          )
-        )
-
-  /** The walk did not read the whole statement: a parse error, or a node it could not follow. */
-  private def incomplete(extraction: ExtractionResult): Boolean =
-    extraction.statements.exists {
-      case _: StatementResult.ParseError                  => true
-      case StatementResult.Extracted(_, _, _, _, markers) => markers.exists(IncompleteMarkers)
-      case _                                              => false
-    }
-
-  private def IncompleteMarkers(marker: String): Boolean =
-    List("unrecognized ", "unwalked ", "unreadable ", "data-modifying ").exists(marker.startsWith)
-
-  // The words after which DuckDB 2.0 reads a table name: FROM, JOIN, USING, TABLE and the statement
-  // keywords that take one (LockdownScreen.TableKeywords' set).
-  private val TableWords = Set(
-    "from",
-    "join",
-    "using",
-    "table",
-    "summarize",
-    "describe",
-    "desc",
-    "show",
-    "pivot",
-    "pivot_wider",
-    "pivot_longer",
-    "unpivot"
-  )
+      FileReferences
+        .fromWalk(extraction)
+        .headOption
+        .map(name => reason(s"$name in a table position reads a file"))
 
   /** The conservative scan of a statement the walk could not read: a string literal right after a
-    * table word, a comma, or a `(` itself in such a position; or a quoted identifier chain shaped
-    * like a URL, a glob or a local path.
+    * table word, a comma, or a `(` itself in such a position
+    * ([[LockdownScreen.conservativeLiterals]]); or a quoted identifier chain shaped like a URL, a
+    * glob or a local path.
     */
   private def lexicalTableFile(stmt: String): Option[String] =
-    val view                       = SqlLexer.engineView(stmt)
-    val toks                       = SqlLexer.tokens(view).filterNot(_.isTrivia)
-    def text(i: Int)               = view.substring(toks(i).start, toks(i).end)
-    def isWord(i: Int)             = toks(i).kind == SqlLexer.Kind.Word
-    def isPunct(i: Int, c: String) = toks(i).kind == SqlLexer.Kind.Punct && text(i) == c
-    def isString(i: Int)           =
-      toks(i).kind == SqlLexer.Kind.Literal && view.charAt(toks(i).start) != '"' &&
-        view.charAt(toks(i).start) != '`'
-    // opens(i): token i puts the next token in a table position
-    val opens = Array.fill(toks.length)(false)
-    var hit   = false
-    var i     = 0
-    while i < toks.length && !hit do
-      val after = i > 0 && opens(i - 1)
-      if isString(i) && after then hit = true
-      else
-        opens(i) = (isWord(i) && TableWords(text(i).toLowerCase(java.util.Locale.ROOT))) ||
-          isPunct(i, ",") || (isPunct(i, "(") && after)
-      i += 1
-    if hit then Some(reason("a file path in a table position reads the file"))
+    if LockdownScreen.conservativeLiterals(stmt).nonEmpty then
+      Some(reason("a file path in a table position reads the file"))
     else
       LockdownScreen.quotedPathFrom(
         stmt,
         name =>
-          Option.when(pathShaped(name))(reason("a quoted path, URL or glob as a table reads files"))
+          Option.when(FileReferences.pathShaped(name))(
+            reason("a quoted path, URL or glob as a table reads files")
+          )
       )
 
   /** The statement verbs that read or write files, judged on the statement an EXPLAIN / PREPARE
@@ -289,16 +240,6 @@ object FileAccessScreen:
     }
 
   private val loadReason = reason("LOAD / INSTALL from a file, a URL or a repository loads code")
-
-  /** A joined quoted-identifier chain DuckDB would read as a file: a URL, a glob (a bare part
-    * cannot hold a glob character, so a quoted one does: `"*".csv` reads every CSV of the working
-    * directory, whatever the position or extension), or a local path.
-    */
-  private def pathShaped(name: String): Boolean =
-    name.contains("://") || GlobChars.exists(name.contains) ||
-      LockdownScreen.looksLikePath("'" + name + "'")
-
-  private val GlobChars = List("*", "?", "[", "{")
 
   private def reason(what: String): String =
     s"$what; direct file access is not available to tenant-scoped principals (deny, " +

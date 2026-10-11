@@ -910,7 +910,9 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT * FROM 'd/t.db'") shouldBe true
     denied("SELECT * FROM 'd/t.xlsx'") shouldBe true
     denied("SELECT * FROM 'd/t.csv?v=1'") shouldBe true
-    denied("SELECT * FROM 'a/b'") shouldBe false
+    // judged from the parse, a literal in a table position is a file whatever its shape: only a
+    // remote URL is exempt
+    denied("SELECT * FROM 'a/b'") shouldBe true
   }
 
   // ---- run-time-SQL table functions (2026-10-11 ruling: these gaps ship fixed with 2.0) ------
@@ -1056,4 +1058,31 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     // never runs (run through the 1.5.6 CLI against a missing file, which it did not open).
     denied("SELECT 1 AS\u00ad$$ -- $$, * FROM read_csv('/tmp/x.csv')") shouldBe false
     denied("SELECT 1 AS\u00a0$$ -- $$, * FROM read_csv('/tmp/x.csv')") shouldBe true
+  }
+
+  // The FROM-list tracking ended the list at a keyword used as a name, so a file after the next
+  // comma went unjudged (each read the CSV on the 2.0 CLI). The file decision now follows the
+  // tenant screen's two tiers: the parse when the statement parses, a conservative lexical scan
+  // when it does not; the remote exemption and the bucket deny-set are unchanged.
+  "a file in table position" should "be judged from the parse, a keyword alias hiding nothing" in {
+    List(
+      "SELECT * FROM range(1) AS values, '/etc/x.csv'",
+      "SELECT * FROM range(1) AS set, '/etc/x.csv'",
+      "SELECT * FROM range(1) set, '/etc/x.csv'",
+      "SELECT * FROM range(1) AS values, ('/etc/x.csv')",
+      "SELECT * FROM (SELECT 1 AS \"order\") r JOIN (SELECT 1 AS \"order\") s " +
+        "ON r.order = s.order, '/etc/x.csv'",
+      // a relative path and a quoted glob read the working directory
+      "SELECT * FROM 'x.csv'",
+      "SELECT * FROM \"*\".csv",
+      "SELECT * FROM \"data_*\".parquet"
+    ).foreach(sql => withClue(sql)(denied(sql) shouldBe true))
+    List(
+      "SELECT * FROM range(1) AS values, 's3://staging/x.csv'",
+      "SELECT * FROM \"s3://staging/x.parquet\"",
+      "SELECT * FROM orders WHERE o_comment IS DISTINCT FROM '/etc/x.csv'",
+      "SELECT * FROM orders ORDER BY o_id, '/etc/x.csv'"
+    ).foreach(sql => withClue(sql)(denied(sql) shouldBe false))
+    deniedB("SELECT * FROM range(1) AS values, 's3://lakebucket/x.csv'") shouldBe true
+    deniedB("SELECT * FROM \"s3://lakebucket/x.parquet\"") shouldBe true
   }

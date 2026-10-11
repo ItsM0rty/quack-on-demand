@@ -3698,3 +3698,41 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         Some(withRows)
       )
       .unsafeRunSync() shouldBe a[Right[?, ?]]
+
+  "a lockdown pool with the ACL off" should "refuse a file after a keyword-named alias, both edges" in:
+    val (router, captured, _) = setupWithRewriter(lockdownFor = _ => true)
+    List(
+      "SELECT * FROM range(1) AS values, '/etc/x.csv'",
+      "SELECT * FROM range(1) set, '/etc/x.csv'",
+      "SELECT * FROM \"*\".csv"
+    ).foreach { sql =>
+      withClue(sql) {
+        router
+          .execute("lock-1", "alice", poolKey, sql, Some(wildcardAllSet))
+          .unsafeRunSync()
+          .swap
+          .toOption
+          .get shouldBe a[RouterFailure.AccessDenied]
+        router
+          .executeWith(
+            "lock-2",
+            "alice",
+            poolKey,
+            sql,
+            Some(wildcardAllSet),
+            okSend,
+            source = "quack"
+          )
+          .unsafeRunSync() shouldBe a[Left[?, ?]]
+        captured() shouldBe ""
+      }
+    }
+    router
+      .execute(
+        "lock-3",
+        "alice",
+        poolKey,
+        "SELECT * FROM range(1) AS values, 's3://staging/x.csv'",
+        Some(wildcardAllSet)
+      )
+      .unsafeRunSync() shouldBe a[Right[?, ?]]
