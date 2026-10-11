@@ -2,7 +2,7 @@ package ai.starlake.quack.edge.policy
 
 import ai.starlake.acl.model.{Config, TableRef}
 import ai.starlake.acl.parser.{SqlParser, StatementResult, Verb}
-import ai.starlake.quack.edge.sql.CatalogReachingCalls
+import ai.starlake.quack.edge.sql.{BacktickScreen, CatalogReachingCalls}
 import ai.starlake.quack.edge.cls.{
   ColumnCatalog,
   ColumnPolicyRewriter,
@@ -58,9 +58,12 @@ final class ProtectedWriteGuard(
     else if colPolicies.isEmpty && rowPolicies.isEmpty then Allow
     else
       // Every kind, a plain SELECT included: a table named in a string is invisible to the
-      // rewriters, so the read would come back unfiltered and unmasked.
-      CatalogReachingCalls.find(sql) match
-        case Some(fn) => Deny(s"access denied: ${CatalogReachingCalls.denyReason(fn)}")
+      // rewriters, so the read would come back unfiltered and unmasked. The backtick screen goes
+      // first: on a DuckDB 1.x engine a backtick pair hides a call from CatalogReachingCalls.
+      BacktickScreen
+        .find(sql)
+        .orElse(CatalogReachingCalls.find(sql).map(CatalogReachingCalls.denyReason)) match
+        case Some(reason)                         => Deny(s"access denied: $reason")
         case None if kind == StatementKind.Select => Allow
         case None => checkWrite(sql, eff, ctx, colPolicies, rowPolicies)
 

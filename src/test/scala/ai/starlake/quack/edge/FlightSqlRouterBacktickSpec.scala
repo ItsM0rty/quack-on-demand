@@ -1,6 +1,8 @@
 package ai.starlake.quack.edge
 
 import ai.starlake.quack.edge.adapter.*
+import ai.starlake.quack.edge.cls.ColumnCatalog
+import ai.starlake.quack.edge.policy.ProtectedWriteGuard
 import ai.starlake.quack.edge.sql.{BacktickScreen, PostgresAclValidator, StatementValidator}
 import ai.starlake.quack.model.{
   NodeSpec,
@@ -13,7 +15,12 @@ import ai.starlake.quack.model.{
 import ai.starlake.quack.ondemand.PoolSupervisor
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.runtime.QuackBackend
-import ai.starlake.quack.ondemand.state.{InMemoryControlPlaneStore, RbacUser, RolePermission}
+import ai.starlake.quack.ondemand.state.{
+  InMemoryControlPlaneStore,
+  RbacUser,
+  RolePermission,
+  RoleRowPolicy
+}
 import cats.effect.IO
 import cats.effect.unsafe.implicits.global
 import org.scalatest.flatspec.AnyFlatSpec
@@ -33,7 +40,7 @@ class FlightSqlRouterBacktickSpec extends AnyFlatSpec with Matchers:
 
   private val poolKey = PoolKey("acme", "acme_db", "sales")
 
-  private def setup(aclOn: Boolean, lockdown: Boolean) =
+  private def setup(aclOn: Boolean, lockdown: Boolean, policies: Boolean) =
     val backend = new QuackBackend:
       private val n          = TrieMap.empty[String, RunningNode]
       def start(s: NodeSpec) = IO {
@@ -93,7 +100,9 @@ class FlightSqlRouterBacktickSpec extends AnyFlatSpec with Matchers:
       tracker,
       new QuackHttpAdapter(client, tracker),
       validator = validator,
-      lockdownFor = _ => lockdown
+      lockdownFor = _ => lockdown,
+      protectedWriteGuard =
+        new ProtectedWriteGuard(new ColumnCatalog.MapCatalog(Map.empty), rlsEnabled = policies)
     )
     (router, sent)
 
@@ -118,9 +127,10 @@ class FlightSqlRouterBacktickSpec extends AnyFlatSpec with Matchers:
       sql: String,
       eff: EffectiveSet,
       aclOn: Boolean = true,
-      lockdown: Boolean = false
+      lockdown: Boolean = false,
+      policies: Boolean = false
   ) =
-    val (router, sent) = setup(aclOn, lockdown)
+    val (router, sent) = setup(aclOn, lockdown, policies)
     val out            = router
       .execute("c-1", eff.user.username, poolKey, sql, Some(eff))
       .unsafeRunSync()
@@ -172,6 +182,22 @@ class FlightSqlRouterBacktickSpec extends AnyFlatSpec with Matchers:
     out shouldBe a[Right[?, ?]]
     sent should have size 1
     sent.head should endWith(hidesSeparator)
+
+  // A row policy on acme_db.tpch1.t: the protected-write guard runs even with the ACL and
+  // lockdown off, and its CatalogReachingCalls check must not be blinded by a backtick pair.
+  private val rowPolicy = RoleRowPolicy("rp-r", "r-1", "*", "tpch1", "t", "v = 1")
+
+  it should "be refused for a principal with a row policy, ACL and lockdown off" in:
+    assume(BacktickScreen.active, "backtick screen is inert on this DuckDB pin")
+    val eff = alice.copy(rowPolicies = List(rowPolicy))
+    refused(run(hidesQueryTable, eff, aclOn = false, policies = true))
+
+  it should "run for a superuser with a row policy, ACL and lockdown off" in:
+    val su          = root.copy(rowPolicies = List(rowPolicy))
+    val (out, sent) = run(hidesQueryTable, su, aclOn = false, policies = true)
+    out shouldBe a[Right[?, ?]]
+    sent should have size 1
+    sent.head should endWith(hidesQueryTable)
 
   "a backtick inside a string literal or a comment" should "be admitted" in:
     val sql = s"SELECT '$B;$B' AS a, " + "\"x" + B + "y\"" + s" FROM t /* $B */ -- $B"

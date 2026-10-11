@@ -350,6 +350,31 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
     ) shouldBe Allow
   }
 
+  // On DuckDB 1.5.6 a backtick is an operator, so the call between the pair runs (see
+  // BacktickScreen); the shared lexer reads the pair as one identifier and would hide it.
+  it should "deny a backtick pair hiding query_table while the backtick screen is active" in {
+    assume(
+      ai.starlake.quack.edge.sql.BacktickScreen.active,
+      "backtick screen is inert on this DuckDB pin"
+    )
+    val b   = "`"
+    val sql = s"SELECT 1 $b 2 AS a, * FROM query_table('tpch1.customer') WHERE 3 $b 4 = 7"
+    guardWithCls().check(
+      sql,
+      StatementKind.Select,
+      eff(tenantUser, rows = List(rowPolicy)),
+      ctx
+    ) match
+      case Deny(reason) => reason should include("backtick")
+      case other        => fail(s"expected Deny, got $other")
+    guardWithCls().check(
+      sql,
+      StatementKind.Select,
+      eff(superuser, rows = List(rowPolicy)),
+      ctx
+    ) shouldBe Allow
+  }
+
   it should "leave an ordinary SELECT to the rewriters" in {
     guardWithCls().check(
       "SELECT * FROM tpch1.customer",
