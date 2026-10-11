@@ -181,10 +181,10 @@
     (a database link) and `"a""b"` as `a""b`, so a grant on schema `a` reached `main."a.b"` and a
     grant on `secret` read, wrote and dropped `secret@x`. The rule is lexical, so it also refuses
     such a quoted COLUMN or struct-field name (`"price.usd"`, `s."a.b"`, common in CSV- or
-    JSON-derived tables), in any position but directly after `AS`. An alias (`AS "t.x"`) and a
-    remote URL starting with a scheme (`"s3://b/x.parquet"`) are still accepted (a `://` anywhere
-    else, `"other.x://"`, no longer is); rename such tables and columns (an `AS` alias only
-    renames an output label).
+    JSON-derived tables), in any position but directly after `AS`. An alias (`AS "t.x"`) is still
+    accepted, and a remote URL starting with a scheme (`"s3://b/x.parquet"`) passes this screen to
+    be refused as the file read it is (see below; a `://` anywhere else, `"other.x://"`, is
+    refused here); rename such tables and columns (an `AS` alias only renames an output label).
   - `quack_active_connections()` (every session's running query text and connection id) and
     `quack_server_list()` join the node-control calls reserved to superusers and refused to every
     caller on a lockdown pool.
@@ -230,6 +230,36 @@
     dates of birth) with its row.
   - A FROM-first statement (`FROM t`) of a principal with a column policy is refused cleanly
     instead of failing with an internal error.
+  - A method call on a masked table's binding (`c.to_json()`, `customer.to_json()`,
+    `c.list()`, `c.struct_extract('c_email')`, in any clause) is refused like `to_json(c)`: DuckDB
+    hands the function the whole row, every masked column raw.
+  - BREAKING for principals with a column policy: an alias column list on a table with a column
+    policy (`customer AS c(a, b, e)`, with or without `AS`, in a join or a NATURAL join) is
+    refused. It renamed a masked column positionally (`SELECT e` read `c_email` raw) under the
+    default lenient resolver. Alias each column in the select list instead; a column list on a
+    derived table or a CTE stays accepted, its values masked inside it.
+  - BREAKING: a table name DuckDB reads as a file is refused like the string literal it stands
+    for (`FROM 's3://b/x.parquet'`): only a wildcard ALL grant (`*.*.* ALL`) covers it, in every
+    position (FROM, DESCRIBE / SUMMARIZE, write and DDL targets). DuckDB 2.0 replacement-scans a
+    name it cannot resolve, its parts joined with dots, so a quoted URL (`"s3://b/*.parquet"`,
+    `` `file:///d/x.csv` ``), a quoted path (`"/d/x"."csv"`) and even a bare relative file
+    (`x.parquet`, `sub.x.json`) read the object or file with the node's credentials, while the
+    access check saw a table a wildcard read grant (`*.*.* RO`, `<db>.*.* RO`) admits: a raw read
+    of the pool's DuckLake data files, past any row policy. Refused now: a name with a part
+    holding `/`, `\`, `*`, `?`, `[` or `{` (a URL's `://` included), and a qualified name whose
+    last part is a replacement-scan extension (`parquet`, `csv`, `json`, `duckdb`, ..., a trailing
+    `gz` / `zst` dropped first). A real table named like one (`raw.json`, `"data_*"`) is reachable
+    only under a wildcard ALL grant; rename it.
+  - BREAKING for quoted names JSqlParser misreads: the quoted-identifier screen no longer lists
+    characters but reads each quoted name back through the access check's parser and refuses it
+    unless that reading is the name DuckDB reads. Newly refused: square brackets (`"[secret]"`,
+    `"secret]"` were checked as `secret` while DuckDB reads the table `[secret]`) and a quote of
+    the other style at a name's edge. A re-validated rewrite is screened only for the quoted names
+    the caller wrote, so a star expansion over a column named `a@b` is no longer refused; a star
+    over a column whose name holds a dot is refused under column policies (the rewrite could only
+    print it as another column).
+  - The dbt shape `WITH customer AS (SELECT * FROM customer) SELECT c_email FROM customer` is
+    masked instead of refused for a principal with a column policy.
 
 - **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
   open transaction's node connection too, so a statement after an idle pause longer than the
