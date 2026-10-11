@@ -333,6 +333,9 @@ $encryptionKey = Secret-Or 'encryptionKey' ''
 # Build init SQL piecemeal based on $kind so memory / duckdb-file skip the
 # DuckLake-specific setup entirely. Mirrors spawn-quack-node.sh.
 $sb = [System.Text.StringBuilder]::new()
+# The CLI exits on the first error of an -init file by default; a node has always carried on past
+# a failing statement (an unreachable federated source, an offline INSTALL), so keep doing that.
+[void]$sb.AppendLine('.bail off')
 if (-not [string]::IsNullOrEmpty($proxySql))  { [void]$sb.AppendLine($proxySql) }
 # Before dbInitSql, so an operator's own SET temp_directory still wins.
 [void]$sb.AppendLine("SET temp_directory = '$($spillDir.Replace("'", "''"))';")
@@ -425,8 +428,18 @@ if ($dryRun) {
 # Start duckdb with a redirected stdin we keep OPEN (the Windows analogue of
 # the bash FIFO). stdout/stderr are inherited so node logs flow to the
 # manager's console (LocalQuackBackend uses inheritIO()).
+#
+# The init SQL goes through `-init <file>`, never stdin: the 2.0 CLI records every statement it
+# reads from stdin in shell_history(), which any session of the node can query, and the init SQL
+# carries the node token and the catalog / object-store / federation credentials. The file sits in
+# the private node directory and is deleted once the node listens (quack_serve, its last statement,
+# has run) or exits. `-init` also stops the CLI from running the user's ~/.duckdbrc. Nothing is
+# written to stdin. Mirrors spawn-quack-node.sh, which uses a FIFO instead of a file.
+$initFile = Join-Path $nodeDir 'init.sql'
+[System.IO.File]::WriteAllText($initFile, $initSql)
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName               = $duckdbBin
+$psi.Arguments              = '-init "' + $initFile + '"'
 $psi.RedirectStandardInput  = $true
 $psi.RedirectStandardOutput = $false
 $psi.RedirectStandardError  = $false
@@ -435,11 +448,21 @@ $psi.WorkingDirectory       = $workDir
 
 try {
   $proc = [System.Diagnostics.Process]::Start($psi)
-  $proc.StandardInput.Write($initSql)
-  $proc.StandardInput.Flush()
   # Do NOT close StandardInput: duckdb's main thread blocks reading it, which
   # keeps the process (and the background quack_serve thread) alive until the
   # manager terminates the tree.
+  $deadline = [DateTime]::UtcNow.AddMinutes(10)
+  while (-not $proc.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+      if ($client.ConnectAsync('127.0.0.1', $Port).Wait(200)) { break }
+    } catch {
+    } finally {
+      $client.Dispose()
+    }
+    Start-Sleep -Milliseconds 300
+  }
+  Remove-Item -LiteralPath $initFile -Force -ErrorAction SilentlyContinue
   $proc.WaitForExit()
   $exitCode = $proc.ExitCode
 } finally {

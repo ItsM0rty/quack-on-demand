@@ -113,7 +113,9 @@ class SpawnScriptWorkDirSpec extends AnyFlatSpec with Matchers with SpawnScriptT
     )
   }
 
-  /** A stand-in duckdb that records where it runs, then holds its stdin like the real one. */
+  /** A stand-in duckdb that records where it runs and its init SQL (`-init <fifo>`), then holds its
+    * stdin like the real one.
+    */
   private def fakeDuckdb(at: Path, probe: Path): Path =
     Files.createDirectories(at.getParent)
     Files.writeString(
@@ -123,7 +125,8 @@ class SpawnScriptWorkDirSpec extends AnyFlatSpec with Matchers with SpawnScriptT
          |ls -A | wc -l | tr -d ' ' > '$probe/entries'
          |(stat -f %Lp . 2>/dev/null || stat -c %a .) > '$probe/mode'
          |mv '$probe/cwd.part' '$probe/cwd'
-         |exec cat > '$probe/stdin'
+         |cat "$$2" > '$probe/init'
+         |exec cat > /dev/null
          |""".stripMargin
     )
     Files.setPosixFilePermissions(at, PosixFilePermissions.fromString("rwx------"))
@@ -157,8 +160,8 @@ class SpawnScriptWorkDirSpec extends AnyFlatSpec with Matchers with SpawnScriptT
       cwd should not be start.toRealPath()
       Files.readString(probe.resolve("entries")).trim shouldBe "0"
       Files.readString(probe.resolve("mode")).trim shouldBe "700"
-      awaitFile(probe.resolve("stdin"))
-      val sql   = awaitContains(probe.resolve("stdin"), "quack_serve")
+      awaitFile(probe.resolve("init"))
+      val sql   = awaitContains(probe.resolve("init"), "quack_serve")
       val spill = TempDirRe.findFirstMatchIn(sql).map(_.group(1)).getOrElse(fail(sql))
       Files.isDirectory(Paths.get(spill)) shouldBe true
       stop(p)

@@ -23,6 +23,18 @@
   Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
   unhealthy, draining, quarantined or at its `maxConcurrent` cap.
 
+- **Security: node init SQL no longer lands in `shell_history()`.** On DuckDB 2.0 the CLI records
+  every statement it reads from stdin, and the spawn scripts fed the node's whole init SQL that way,
+  so `SELECT * FROM shell_history()` on a node returned it: the node token, the catalog Postgres
+  password, and the object-store and federation credentials. The init SQL now reaches duckdb through
+  `-init` (a FIFO on Linux and macOS, a file in the private node directory on Windows, deleted once
+  the node serves), which the CLI does not record; nothing is written to stdin. A failing init
+  statement still does not stop the node. `-init` also means a node no longer runs the OS user's
+  `~/.duckdbrc`. The CLI only keeps this history in memory when stdin is not a terminal (nothing was
+  written to `~/.duckdb_history`), and 1.x CLIs have no `shell_history()`. If you ran DuckDB 2.0
+  nodes before this release, rotate what they could read: the catalog Postgres passwords, the
+  object-store keys and the federated-source credentials.
+
 - **Nodes run in an empty private working directory.** DuckDB 2.0 reads a file named by an
   unquoted dotted table name when no such schema exists (`SELECT * FROM x.csv` read `./x.csv` from
   the manager's own working directory). Every node, on every runtime (local, Windows, fleet,

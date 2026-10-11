@@ -32,6 +32,12 @@
 # by this shell, so the background quack thread keeps serving until the
 # process is terminated (SIGTERM from `LocalQuackBackend.stop`).
 #
+# The init SQL reaches duckdb through `-init` on a second FIFO, never through stdin: the 2.0 CLI
+# records every statement it reads from stdin in shell_history(), which any session of the node can
+# query, and the init SQL carries the node token and the catalog / object-store / federation
+# credentials. An -init file is not recorded, and a FIFO never puts it on disk. `-init` also stops
+# the CLI from running the OS user's ~/.duckdbrc. Nothing is written to stdin.
+#
 # duckdb runs in an empty, private (0700) directory of its own, created here and removed when the
 # node stops: DuckDB 2.0 replacement-scans an unquoted dotted name as a file (`SELECT * FROM x.csv`
 # reads ./x.csv), and an unquoted name cannot hold a path separator, so the working directory is
@@ -210,7 +216,11 @@ fi
 NODE_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/quack-node.XXXXXX)"
 SPILL_DIR=""
 DUCK_PID=""
+INIT_WRITER=""
 cleanup() {
+  if [[ -n "$INIT_WRITER" ]]; then
+    kill -TERM "$INIT_WRITER" 2>/dev/null || true
+  fi
   if [[ -n "$DUCK_PID" ]]; then
     kill -TERM "$DUCK_PID" 2>/dev/null || true
     wait "$DUCK_PID" 2>/dev/null || true
@@ -271,14 +281,15 @@ fi
 # duckdb process. Skip the FIFO and the duckdb launch entirely rather than starting one and
 # killing it - SpawnScriptEncryptionSpec drives this script many times per run.
 if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
-  # A named pipe keeps duckdb's stdin live without blocking after we feed the
-  # init SQL. fd 9 holds the writer side open until this shell exits.
+  # A named pipe keeps duckdb's stdin live without blocking: nothing is ever written to it, and
+  # fd 9 holds the writer side open until this shell exits. The init SQL goes through INIT_FIFO.
   FIFO="$NODE_DIR/in"
-  mkfifo "$FIFO"
+  INIT_FIFO="$NODE_DIR/init"
+  mkfifo "$FIFO" "$INIT_FIFO"
 
   # Start duckdb first - open() on FIFO blocks until the writer side appears. It runs in WORK_DIR
   # (the subshell execs it, so $! is duckdb's own pid); this script stays where it started.
-  (cd "$WORK_DIR" && exec "$DUCKDB") < "$FIFO" &
+  (cd "$WORK_DIR" && exec "$DUCKDB" -init "$INIT_FIFO") < "$FIFO" &
   DUCK_PID=$!
 
   # Open the writer end; this unblocks duckdb's open().
@@ -367,6 +378,9 @@ fi
 # Build init SQL piecemeal based on $kind so kind=memory and
 # kind=duckdb-file skip DuckLake-specific setup entirely.
 INIT_SQL=""
+# The CLI exits on the first error of an -init file by default; a node has always carried on past
+# a failing statement (an unreachable federated source, an offline INSTALL), so keep doing that.
+INIT_SQL+=$'.bail off\n'
 INIT_SQL+="$PROXY_SQL"$'\n'
 # Cgroup-derived memory_limit / temp_directory / threads (see above) run
 # right after the proxy settings and before dbInitSql, so an operator's
@@ -474,7 +488,10 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" == "1" ]]; then
   exit 0
 fi
 
-printf '%s' "$INIT_SQL" >&9
+# duckdb reads -init before stdin. The writer's open blocks until it does, so it runs in the
+# background: a duckdb that exits first must still end this script (cleanup stops the writer).
+printf '%s' "$INIT_SQL" > "$INIT_FIFO" &
+INIT_WRITER=$!
 
 # Block until duckdb is killed (typically SIGTERM from the manager).
 wait "$DUCK_PID"
