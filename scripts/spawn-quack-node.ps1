@@ -4,7 +4,9 @@
 
 .DESCRIPTION
   PowerShell mirror of scripts/spawn-quack-node.sh. LocalQuackBackend wraps
-  this as `powershell.exe -File spawn-quack-node.ps1 <port>`.
+  this as `powershell.exe -File spawn-quack-node.ps1 <port> <manager-marker>`. The marker
+  (LocalQuackBackend.managerMarker: REST port plus a per-boot id) names the node directory
+  `quack-node.<marker>.<id>`, so stop-jar.ps1 stops only its own manager's nodes.
 
   The non-sensitive metastore connection details arrive as environment
   variables that LocalQuackBackend.start() sets from CreatePoolRequest.metastore.
@@ -51,7 +53,8 @@
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true, Position = 0)] [int]    $Port
+  [Parameter(Mandatory = $true, Position = 0)] [int]    $Port,
+  [Parameter(Mandatory = $false, Position = 1)] [string] $Marker = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -313,7 +316,13 @@ Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'quack-node.*' -ErrorAct
     }
   }
 $nodeId  = [Guid]::NewGuid().ToString('N').Substring(0, 12)
-$nodeDir = Join-Path $tempRoot "quack-node.$nodeId"
+if (-not [string]::IsNullOrEmpty($Marker) -and $Marker -notmatch '^[0-9]+-[0-9a-f]+$') {
+  [Console]::Error.WriteLine("ERROR: invalid manager marker '$Marker' (expected <rest-port>-<hex boot id>)")
+  exit 1
+}
+$markerPart = ''
+if (-not [string]::IsNullOrEmpty($Marker)) { $markerPart = "$Marker." }
+$nodeDir = Join-Path $tempRoot "quack-node.$markerPart$nodeId"
 New-PrivateDirectory $nodeDir
 $workDir = Join-Path $nodeDir 'cwd'
 New-PrivateDirectory $workDir

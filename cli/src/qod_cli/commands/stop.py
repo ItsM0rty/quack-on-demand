@@ -258,15 +258,21 @@ def _stop_manager_and_nodes():
     edge_port = int(os.environ.get("PROXY_PORT", "31338"))
     force_after = int(os.environ.get("FORCE_AFTER", "10"))
 
+    # Only this manager's nodes: each wrapper's argv and node directory carry the manager's marker
+    # `<rest-port>-<boot id>` (LocalQuackBackend.managerMarker), so another manager on this host
+    # (an isolated test stack) keeps its nodes.
+    spawn_re = rf"spawn-quack-node\.sh [0-9]+ {mgr_port}-[0-9a-f]+"
+    duck_re = rf"duckdb .*-init .*quack-node\.{mgr_port}-[0-9a-f]+\."
+
     def discover() -> set[int]:
-        pids = {_listening_pid(mgr_port), _listening_pid(edge_port), *_pgrep("spawn-quack-node")}
+        pids = {_listening_pid(mgr_port), _listening_pid(edge_port), *_pgrep(spawn_re)}
         return {int(p) for p in pids if p}
 
     pids = discover()
     if not pids:
         typer.echo(
             f"nothing running on ports {mgr_port} / {edge_port} "
-            "and no spawn-quack-node processes."
+            "and no spawn-quack-node processes of that manager."
         )
         return
 
@@ -282,9 +288,9 @@ def _stop_manager_and_nodes():
     typer.echo(f"still running after {force_after}s; sending SIGKILL.", err=True)
     # Re-discover: the spawn scripts trap TERM, but their duckdb children can
     # survive a killed wrapper; sweep both. A node runs as
-    # `<abs path>/duckdb -init <tmp>/quack-node.XXX/init`, so match that argv (a bare `^duckdb`
-    # never matches the absolute path the spawn script now uses), and only this project's nodes.
-    leftovers = pids | discover() | {int(p) for p in _pgrep(r"duckdb .*-init .*quack-node\.") if p}
+    # `<abs path>/duckdb -init <tmp>/quack-node.<marker>.XXX/init`, so match that argv with this
+    # manager's marker (a bare `^duckdb` never matches the absolute path the spawn script uses).
+    leftovers = pids | discover() | {int(p) for p in _pgrep(duck_re) if p}
     _kill_all(leftovers, signal.SIGKILL)
     time.sleep(2)
     if discover():

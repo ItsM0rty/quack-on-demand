@@ -36,8 +36,11 @@ object BootFactories extends LazyLogging:
         new LocalQuackBackend(
           mgrCfg.minPort,
           mgrCfg.maxPort,
-          commandFor =
-            LocalQuackBackend.defaultCommand(mgrCfg.spawnScript, mgrCfg.spawnScriptWindows)
+          commandFor = LocalQuackBackend.defaultCommand(
+            mgrCfg.spawnScript,
+            mgrCfg.spawnScriptWindows,
+            LocalQuackBackend.managerMarker(mgrCfg.port)
+          )
         )
       case "kubernetes" | "k8s" =>
         val k8s = new io.fabric8.kubernetes.client.KubernetesClientBuilder().build()
@@ -87,7 +90,11 @@ object BootFactories extends LazyLogging:
       new LocalQuackBackend(
         mgrCfg.minPort,
         mgrCfg.maxPort,
-        commandFor = LocalQuackBackend.defaultCommand(mgrCfg.spawnScript, mgrCfg.spawnScriptWindows)
+        commandFor = LocalQuackBackend.defaultCommand(
+          mgrCfg.spawnScript,
+          mgrCfg.spawnScriptWindows,
+          LocalQuackBackend.managerMarker(mgrCfg.port)
+        )
       )
     else main
 

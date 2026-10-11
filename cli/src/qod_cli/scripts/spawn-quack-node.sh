@@ -3,7 +3,12 @@
 # Spawn one Quack node - invoked by LocalQuackBackend.
 #
 # Usage:
-#   spawn-quack-node.sh <port>
+#   spawn-quack-node.sh <port> [<manager-marker>]
+#
+# <manager-marker> (LocalQuackBackend.managerMarker: the manager's REST port and a per-boot id, e.g.
+# `20900-3fa9c1e2`) names the node directory `quack-node.<marker>.XXXXXX`, so stop-jar.sh,
+# kill-quack-nodes.sh and `qod stop` can stop one manager's nodes without touching another's. Fleet
+# servers and Kubernetes pods pass none.
 #
 # The non-sensitive metastore connection details come from environment variables that
 # LocalQuackBackend.start() sets from CreatePoolRequest.metastore. The
@@ -53,6 +58,11 @@ set -euo pipefail
 export DUCKDB_AGENT_MODE=0
 
 PORT="${1:?port required}"
+MARKER="${2:-}"
+if [[ -n "$MARKER" && ! "$MARKER" =~ ^[0-9]+-[0-9a-f]+$ ]]; then
+  echo "ERROR: invalid manager marker '$MARKER' (expected <rest-port>-<hex boot id>)" >&2
+  exit 1
+fi
 
 # The directory relative paths resolve against (the manager's or join process's working directory,
 # where duckdb itself used to run). Physical, so it matches the manager JVM's own resolution. A
@@ -221,9 +231,10 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
 fi
 
 # Sweep node directories left by an earlier spawn whose script died on SIGKILL (which skips the
-# trap below): the init FIFO carries no secrets to disk, but a spill directory can be large. A
-# directory whose recorded pid is gone is ours to remove; one still being created has no pid file
-# yet and is left alone.
+# trap below): the init FIFO carries no secrets to disk, but a spill directory can be large. Only a
+# directory whose recorded owner pid is provably gone is removed, whichever manager made it; a live
+# owner's directory (this manager's or another's) and one still being created (no pid file yet)
+# are left alone.
 for d in "${TMPDIR:-/tmp}"/quack-node.*; do
   [[ -d "$d" ]] || continue
   op="$d/owner.pid"
@@ -241,7 +252,7 @@ done
 # holds the init FIFO, the psql passfile while it is needed, owner.pid / spill.path for the stale
 # sweep above, and WORK_DIR, the empty directory duckdb runs in. Created in dry-run mode too, so the
 # SQL below names the same spill directory a real spawn would.
-NODE_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/quack-node.XXXXXX)"
+NODE_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/quack-node.${MARKER:+$MARKER.}XXXXXX)"
 SPILL_DIR=""
 DUCK_PID=""
 INIT_WRITER=""

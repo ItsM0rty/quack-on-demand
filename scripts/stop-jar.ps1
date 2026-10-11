@@ -1,13 +1,16 @@
 <#
 .SYNOPSIS
-  Stop the quack-on-demand manager and all child Quack nodes on Windows.
+  Stop the quack-on-demand manager and its child Quack nodes on Windows.
 
 .DESCRIPTION
   PowerShell mirror of scripts/stop-jar.sh. Locates the manager JVM by its REST
-  / FlightSQL listen ports and the child Quack nodes by their spawn-quack-node.ps1
-  wrapper (plus any stray duckdb.exe), then terminates each process tree with
-  `taskkill /T` (graceful) escalating to `/T /F` (force) after FORCE_AFTER
-  seconds.
+  / FlightSQL listen ports and ITS child Quack nodes by their spawn-quack-node.ps1
+  wrapper, whose command line carries the manager's marker
+  `<rest-port>-<boot id>` (LocalQuackBackend.managerMarker), plus any orphaned
+  duckdb.exe of that manager. Another manager's nodes (a different REST port) and
+  unmarked nodes from an older manager are left alone. Terminates each process
+  tree with `taskkill /T` (graceful) escalating to `/T /F` (force) after
+  FORCE_AFTER seconds.
 
   Env overrides:
     QOD_ON_DEMAND_PORT   (default 20900 - manager REST + UI)
@@ -28,9 +31,12 @@ function Get-ListenerPid([int]$port) {
     Select-Object -First 1 -ExpandProperty OwningProcess)
 }
 
+# This manager's wrappers: `... spawn-quack-node.ps1 <node-port> <rest-port>-<boot id>` (the script
+# path may be quoted).
+$SpawnRe = "spawn-quack-node\.ps1`"?\s+\d+\s+$MgrPort-[0-9a-f]+"
 function Get-SpawnPids {
   Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like '*spawn-quack-node*' } |
+    Where-Object { $_.CommandLine -match $SpawnRe } |
     Select-Object -ExpandProperty ProcessId
 }
 
@@ -66,10 +72,11 @@ for ($i = 0; $i -lt $ForceAfter; $i++) {
 # ---- Force: taskkill /T /F ----
 Write-Host "still running after ${ForceAfter}s; force-killing."
 foreach ($p in $pids) { & taskkill /PID $p /T /F *> $null }
-# Sweep any orphaned node duckdb.exe left behind. Match this script's nodes only (their command
-# line runs `duckdb ... -init <...>\quack-node.XXX\init`), not an unrelated duckdb.exe.
+# Sweep any orphaned node duckdb.exe of THIS manager left behind (its command line runs
+# `duckdb ... -init <...>\quack-node.<rest-port>-<boot id>.<id>\init`), not an unrelated duckdb.exe
+# nor another manager's node.
 Get-CimInstance Win32_Process -Filter "Name='duckdb.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -match 'quack-node\.' } |
+  Where-Object { $_.CommandLine -match "quack-node\.$MgrPort-[0-9a-f]+\." } |
   ForEach-Object { & taskkill /PID $_.ProcessId /T /F *> $null }
 
 Start-Sleep -Seconds 2
