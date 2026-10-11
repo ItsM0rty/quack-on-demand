@@ -2,7 +2,14 @@ package ai.starlake.quack.edge.sql
 
 import java.util.Locale
 import ai.starlake.acl.model.{Config, DenyReason}
-import ai.starlake.acl.parser.{SqlParser, StatementResult, TableAccess, TableExtractor, Verb}
+import ai.starlake.acl.parser.{
+  ExtractionResult,
+  SqlParser,
+  StatementResult,
+  TableAccess,
+  TableExtractor,
+  Verb
+}
 
 /** What a statement needs authorized, independent of WHO decides (QoD grants or OPA).
   *   - `Refuse`: the statement cannot be authorized table by table. `wildcardCoverable` says
@@ -50,6 +57,8 @@ object AccessGate:
       clientDataScans: Boolean,
       rewriteOf: Option[String] = None
   ): GateOutcome =
+    // Parsed once, by the file screen (when its lexical checks find nothing) or the gate below.
+    lazy val extraction = SqlParser.extract(statement, config)
     // Ahead of every other arm, and never wildcard-coverable: the target of these calls is
     // a string the parser cannot see, so the wildcard's tenant-catalog scoping cannot apply.
     // The same holds for a batch that moves the schema or search path: every bare name after
@@ -66,14 +75,14 @@ object AccessGate:
       .find(statement)
       .orElse(DottedIdentifierScreen.find(statement, rewriteOf))
       .orElse(CatalogReachingCalls.find(statement).map(CatalogReachingCalls.denyReason))
-      .orElse(FileAccessScreen.find(statement))
+      .orElse(FileAccessScreen.find(statement, extraction))
       .orElse(
         CatalogReachingCalls.sqlValuedSetting(statement).map(CatalogReachingCalls.settingDenyReason)
       )
       .orElse(SessionScopeScreen.find(statement)) match
       case Some(reason) => GateOutcome.Refuse(reason, false, "")
       case None         =>
-        evaluateParsed(statement, config, sessionCatalog, filteredMetadata, clientDataScans)
+        evaluateParsed(extraction, config, sessionCatalog, filteredMetadata, clientDataScans)
 
   /** Some(reason) when `rewritten`, a statement an edge rewriter (column policies, row policies,
     * metadata filter) printed from `original`, needs a grant on a table, or a verb, the original
@@ -117,13 +126,12 @@ object AccessGate:
     }
 
   private def evaluateParsed(
-      statement: String,
+      extraction: ExtractionResult,
       config: Config,
       sessionCatalog: String,
       filteredMetadata: Boolean,
       clientDataScans: Boolean
   ): GateOutcome =
-    val extraction = SqlParser.extract(statement, config)
 
     // Parse errors short-circuit to Denied unless the principal holds an
     // unrestricted ALL grant (preserves prior behavior).

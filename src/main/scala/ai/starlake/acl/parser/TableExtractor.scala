@@ -26,6 +26,11 @@ final case class TableExtraction(tables: List[Table], unsupported: List[String])
   */
 object TableExtractor:
 
+  /** The prefix of the `unsupported` marker of a table DuckDB reads as a file (a string literal, or
+    * a name with a path separator or glob character); the tenant file screen keys off it.
+    */
+  val FileReferencePrefix: String = "file reference "
+
   /** DuckDB's catalog-introspection table functions the edge metadata filter narrows to the session
     * catalog and the principal's grants (issue #114). The single list both the walk below and
     * `ai.starlake.quack.edge.meta.MetadataFilterRewriter` key off, so the admit and the filter

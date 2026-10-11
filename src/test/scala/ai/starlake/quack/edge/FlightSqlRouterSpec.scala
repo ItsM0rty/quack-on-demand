@@ -3535,7 +3535,12 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
   private val fileReads = List(
     "SELECT * FROM read_parquet('s3://bucket/main/customer/x.parquet')",
     "SELECT * FROM 's3://bucket/main/customer/x.parquet'",
-    "COPY (SELECT 1) TO '/tmp/x.csv'"
+    "COPY (SELECT 1) TO '/tmp/x.csv'",
+    // parseable: a keyword-named alias before a comma join; unparseable: the bare `set` alias
+    "SELECT * FROM range(1) AS values, '/etc/x.csv'",
+    "SELECT * FROM range(1) set, '/etc/x.csv'",
+    "SELECT * FROM (SELECT 1 AS \"order\") r JOIN (SELECT 1 AS \"order\") s " +
+      "ON r.order = s.order, '/etc/x.csv'"
   )
 
   "a direct file read or write" should "be refused to a *.*.* ALL tenant principal, QoD and OPA" in:

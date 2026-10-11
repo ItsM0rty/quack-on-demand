@@ -14,8 +14,8 @@ import org.scalatest.matchers.should.Matchers
   * a raw read of any object the node's secrets reach, the pool's DuckLake data files included. A
   * name holding a URL scheme, a glob character or a path separator is now the file reference the
   * literal form is: an unsupported construct only a wildcard ALL grant covers, in every table
-  * position. Since a direct file read is reserved to superusers ([[FileAccessScreen]]), a URL or
-  * path name is refused under that grant too.
+  * position. Since a direct file read is reserved to superusers ([[FileAccessScreen]]), a URL, path
+  * or glob name is refused under that grant too.
   */
 class QuotedFileReferenceSpec extends AnyFlatSpec with Matchers:
 
@@ -128,23 +128,13 @@ class QuotedFileReferenceSpec extends AnyFlatSpec with Matchers:
     do withClue(sql)(validate(sql, e) shouldBe a[Denied])
   }
 
-  // A glob character alone is no file DuckDB reads (`"data_*"` is an ordinary table name there),
-  // so only the wildcard ALL grant reaches it; a URL or a path is a file read, refused to every
-  // tenant principal whatever the grants (FileAccessScreen).
-  private val globOnly = Set(
-    "SELECT * FROM \"data_*\"",
-    "SELECT * FROM \"data_?\"",
-    "SELECT * FROM \"data_{a,b}\"",
-    s"DROP TABLE ${B}data_*$B"
-  )
-
-  it should "admit a glob-only name under the wildcard ALL grant, and no URL or path" in
-    (fileReads ++ fileWrites).foreach { sql =>
-      withClue(sql) {
-        val outcome = validate(sql, eff(perm("*", "*", "*", "ALL")))
-        if globOnly.contains(sql) then outcome shouldBe Allowed else outcome shouldBe a[Denied]
+  // A direct file read is reserved to superusers (FileAccessScreen): every URL, path and glob
+  // name is refused under the wildcard ALL grant too.
+  it should "refuse every URL, path and glob form under the wildcard ALL grant" in
+    (fileReads ++ fileWrites)
+      .foreach { sql =>
+        withClue(sql)(validate(sql, eff(perm("*", "*", "*", "ALL"))) shouldBe a[Denied])
       }
-    }
 
   "LockdownScreen" should "judge a quoted URL name exactly as the string literal" in {
     for (quoted, literal) <- List(

@@ -114,4 +114,4 @@ private[parser] object DuckDBDialectMapper extends DialectMapper:
 
   /** The `unsupported` marker of a file reference ([[isFileReference]]). */
   def fileReferenceMarker(table: Table): String =
-    s"file reference ${table.getFullyQualifiedName}"
+    TableExtractor.FileReferencePrefix + table.getFullyQualifiedName
