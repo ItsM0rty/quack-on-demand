@@ -100,9 +100,17 @@ object SqlCommentStripper:
     * and `USE x; -- done` are both one statement.
     */
   def splitStatements(sql: String): List[String] =
+    statementSpans(sql).map((from, until) => sql.substring(from, until))
+
+  /** The `[from, until)` offsets in `sql` of each fragment [[splitStatements]] returns, in order.
+    * `until` stops before the separating `;`, so `sql.substring(from, until)` is the fragment, and
+    * a caller can splice text into the ORIGINAL submission at a statement boundary instead of
+    * rebuilding it from the fragments.
+    */
+  def statementSpans(sql: String): List[(Int, Int)] =
     if sql == null || sql.isEmpty then Nil
     else
-      val out    = List.newBuilder[String]
+      val out    = List.newBuilder[(Int, Int)]
       val length = sql.length
       var start  = 0
       var i      = 0
@@ -115,15 +123,16 @@ object SqlCommentStripper:
         else if c == '\'' then i = singleQuotedEnd(sql, i, isEscapeStringOpener(sql, i))
         else if c == '"' then i = doubleQuotedEnd(sql, i)
         else if c == ';' then
-          out += sql.substring(start, i)
+          out += ((start, i))
           i += 1
           start = i
         else if c == '$' then i = dollarQuotedEnd(sql, i).getOrElse(i + 1)
         else i += 1
-      out += sql.substring(start)
-      out
-        .result()
-        .filter(f => SqlTrivia.normalize(stripComments(SqlTrivia.stripLeading(f))).trim.nonEmpty)
+      out += ((start, length))
+      out.result().filter { (from, until) =>
+        val f = sql.substring(from, until)
+        SqlTrivia.normalize(stripComments(SqlTrivia.stripLeading(f))).trim.nonEmpty
+      }
 
   /** Index just past the marker closing the block comment that opens at `from`, tracking nesting
     * depth the way DuckDB's lexer does. An unterminated comment consumes the rest of the input --
@@ -154,14 +163,13 @@ object SqlCommentStripper:
 
   /** True when the `'` at `at` opens an escape string (`e'...'` / `E'...'`) rather than a plain
     * one. The `e` must be a token of its own and must touch the quote: DuckDB reads `ze'a\'b'` as
-    * the identifier `ze` followed by a PLAIN string, and `e 'a\'b'` as the same, so a preceding
-    * letter, digit or underscore disqualifies it and so does any gap.
+    * the identifier `ze` followed by a PLAIN string, and `e 'a\'b'` as the same, so any character
+    * that continues a token (`continuesToken`, the rule the dollar-quote opener follows too:
+    * `x$e'..'` is the identifier `x$e` and a plain string) disqualifies it, and so does any gap.
     */
   private def isEscapeStringOpener(sql: String, at: Int): Boolean =
     at > 0 && (sql.charAt(at - 1) == 'e' || sql.charAt(at - 1) == 'E') &&
-      (at == 1 || !isIdentChar(sql.charAt(at - 2)))
-
-  private def isIdentChar(c: Char): Boolean = c.isLetterOrDigit || c == '_'
+      (at == 1 || !continuesToken(sql.charAt(at - 2)))
 
   /** Index just past the quote closing the single-quoted literal that opens at `from`. `''` is an
     * embedded quote in both forms. In an escape string a backslash additionally escapes whatever
@@ -207,12 +215,12 @@ object SqlCommentStripper:
     *
     * A `$` glued to the character before it opens nothing when that character continues a token:
     * DuckDB's lexer continues an identifier through ASCII letters, digits, `_`, `$` and every
-    * non-ASCII character, so `x$$`, `x$a$` and an accented letter followed by `$$` are identifiers
-    * and the `$$` in them is not an opener (all verified on DuckDB 1.5.6 and 2.0). A `$` right
-    * after a digit is not one either: `0x1$$` lexes as `0` and the identifier `x1$$`, and `1$$` /
-    * `1.5$$` are syntax errors, so reading no opener there only ever exposes more separators.
-    * Reading an opener where DuckDB has an identifier would hide every separator up to the next
-    * matching tag, which can sit in a trailing comment.
+    * non-ASCII character but its Unicode spaces (see `continuesToken`), so `x$$`, `x$a$` and an
+    * accented letter followed by `$$` are identifiers and the `$$` in them is not an opener (all
+    * verified on DuckDB 1.5.6 and 2.0). A `$` right after a digit is not one either: `0x1$$` lexes
+    * as `0` and the identifier `x1$$`, and `1$$` / `1.5$$` are syntax errors, so reading no opener
+    * there only ever exposes more separators. Reading an opener where DuckDB has an identifier
+    * would hide every separator up to the next matching tag, which can sit in a trailing comment.
     *
     * Tag characters follow DuckDB too: ASCII letters, `_` and every non-ASCII character, plus
     * digits after the first.
@@ -232,9 +240,16 @@ object SqlCommentStripper:
 
   private def isAsciiDigit(c: Char): Boolean = c >= '0' && c <= '9'
 
-  /** A character that continues an identifier or number token in DuckDB's lexer. */
+  /** A character that continues an identifier or number token in DuckDB's lexer. DuckDB turns its
+    * Unicode space set into ASCII spaces before lexing, so those characters end a token rather than
+    * continue it (a dollar quote right after a no-break or ideographic space opens, verified on
+    * 1.5.6 and 2.0). `SqlTrivia.isTriviaSpace` is a superset of that set, which only moves the
+    * answer toward "a quote opens here": for `stripComments` that keeps the quoted body (and any
+    * comment marker in it) intact, the same reading it had before this rule existed.
+    */
   private def continuesToken(c: Char): Boolean =
-    isAsciiLetter(c) || isAsciiDigit(c) || c == '_' || c == '$' || c >= 0x80
+    isAsciiLetter(c) || isAsciiDigit(c) || c == '_' || c == '$' ||
+      (c >= 0x80 && !SqlTrivia.isTriviaSpace(c))
 
   private def isTagChar(c: Char, first: Boolean): Boolean =
     isAsciiLetter(c) || c == '_' || c >= 0x80 || (!first && isAsciiDigit(c))

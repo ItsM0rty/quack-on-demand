@@ -910,12 +910,13 @@ final class FlightSqlRouter(
     * such a batch: whatever its own statements select still runs after the prelude.
     *
     * One exception to "prepend": a submission opening with statements that END a transaction
-    * (ROLLBACK / ABORT / COMMIT / END) gets the prelude right after that leading run instead.
-    * Inside an aborted transaction DuckDB refuses every statement but ROLLBACK, the prelude's `USE`
-    * included, so `USE ...; ROLLBACK; ...` failed and left the session aborted. Those statements
-    * read no table and cannot move name resolution (a search path is not transactional on DuckDB:
-    * it survives the ROLLBACK), so every statement that can read still runs after the prelude. With
-    * nothing after the run there is nothing to resolve and the text goes as is.
+    * (ROLLBACK / ABORT / COMMIT / END) gets the prelude right after that leading run instead,
+    * spliced into the original text. Inside an aborted transaction DuckDB refuses every statement
+    * but ROLLBACK, the prelude's `USE` included, so `USE ...; ROLLBACK; ...` failed and left the
+    * session aborted. Those statements read no table and cannot move name resolution (a search path
+    * is not transactional on DuckDB: it survives the ROLLBACK), so every statement that can read
+    * still runs after the prelude. With nothing after the run there is nothing to resolve and the
+    * text goes as is.
     */
   private def wrapWithDefaultSchema(
       state: Option[ai.starlake.quack.ondemand.PoolState],
@@ -949,9 +950,16 @@ final class FlightSqlRouter(
               .getOrElse("main")
             val use = s"USE $db.$schema;"
             if endsTxFirst then
-              val (lead, rest) = fragments.span(FlightSqlRouter.endsTransaction)
-              if rest.isEmpty then sql
-              else s"${lead.mkString(";")}; $use${rest.mkString(";")}"
+              // Splice into the ORIGINAL text at the start of the first statement that does not
+              // end a transaction (just past its separating `;`), so what reaches the node is
+              // byte for byte what the validator checked, plus the USE.
+              SqlCommentStripper
+                .statementSpans(sql)
+                .find((from, until) =>
+                  !FlightSqlRouter.endsTransaction(sql.substring(from, until))
+                ) match
+                case None            => sql
+                case Some((from, _)) => s"${sql.substring(0, from)} $use${sql.substring(from)}"
             else s"$use $sql"
           case None => sql
       case Some(st) if trimmed.startsWith("USE ") =>

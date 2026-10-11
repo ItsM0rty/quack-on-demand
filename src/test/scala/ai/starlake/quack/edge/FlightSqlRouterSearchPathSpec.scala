@@ -192,6 +192,11 @@ class FlightSqlRouterSearchPathSpec extends AnyFlatSpec with Matchers:
         sent shouldBe List(expected)
       }
     }
+    // The text the validator checked goes out byte for byte, with only the USE inserted: comment
+    // fragments, spacing and the trailing semicolon are kept.
+    val kept = "ROLLBACK; /* keep */ ;  SELECT * FROM t; -- tail"
+    run(kept, eff = tenantAdmin)._2 shouldBe
+      List("ROLLBACK; /* keep */ ; USE acme_db.tpch1;  SELECT * FROM t; -- tail")
     // Nothing after the transaction end: nothing to resolve, sent as is.
     run("ROLLBACK; COMMIT", eff = root)._2 shouldBe List("ROLLBACK; COMMIT")
 

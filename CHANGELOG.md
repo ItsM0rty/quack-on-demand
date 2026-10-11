@@ -22,7 +22,8 @@
 - **Security: a subquery passed straight to a function is access-checked.** DuckDB's
   `ARRAY(SELECT ... FROM t)` hands its subquery to the function without parentheses of its own, and
   the access check skipped such a subquery entirely, so the statement needed no grant on `t` at all.
-  Every subquery is now checked wherever it appears.
+  A subquery passed as a function argument is now access-checked like any other read; one inside
+  a table function's argument is refused as an unsupported construct.
 
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left
