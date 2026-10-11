@@ -264,13 +264,32 @@
     principal, `*.*.* ALL` included, is refused file-reading table functions (`read_parquet`,
     `read_csv`, `read_json`, `glob`, `read_text`, `parquet_metadata`, `iceberg_scan`, ...), a
     path or URL in a table position (`FROM 'x.parquet'`, `JOIN 's3://..'`, `FROM "s3://.."`),
-    `COPY` to or from a path, `EXPORT` / `IMPORT DATABASE`, `ATTACH`, and `LOAD` / `INSTALL` from
-    a path, a URL or a repository. These were "unsupported constructs" a `*.*.* ALL` grant
-    covered, so a tenant admin could read anything the node's process and secrets reach (another
-    tenant's DuckLake data files, the node's disk), write files with COPY and load code from a
-    file. Superusers, an ACL turned off, the native front door's client data
-    (`scan_data_from_quack_client`), federated and Iceberg catalogs read by table name are
-    unchanged.
+    `COPY` to or from a path, `EXPORT` / `IMPORT DATABASE`, `ATTACH`, and `sql_auto_complete`
+    (it lists node directories). These were "unsupported constructs" a `*.*.* ALL` grant
+    covered, so a tenant user (the built-in `qod_all_tables` role is `*.*.* ALL`) could read
+    anything the node's process and secrets reach (another tenant's DuckLake data files, the
+    node's disk) and write files with COPY. A statement that parses is judged from the parse (a
+    keyword used as an alias, `FROM range(1) AS values, '/etc/x.csv'`, no longer hides the file
+    after it; `x IS DISTINCT FROM 'y'` is a value, not a file); one that does not parse is judged
+    lexically and conservatively (any string literal after FROM, JOIN, USING, TABLE, a comma or
+    such an opening parenthesis is refused). A quoted name part holding a glob character
+    (`"*".csv`, `"data_*"`) is a file read whatever its position or extension. Superusers, an
+    ACL turned off, the native front door's client data (`scan_data_from_quack_client`),
+    federated and Iceberg catalogs read by table name are unchanged.
+  - BREAKING: tenant users can no longer install extensions or set path-resolution settings, ACL
+    on or off. `INSTALL` (any form), `FORCE INSTALL`, `UPDATE EXTENSIONS` and `LOAD` from a path
+    or URL are reserved to superusers (install at node start; `LOAD httpfs` by its bare name still
+    works), and so are `file_search_path` (`SET file_search_path = '/etc'; SELECT * FROM x.csv`
+    read /etc/x.csv), `home_directory`, `allow_asterisks_in_http_paths`, `ca_cert_file` and the
+    server certificate verification settings, all GLOBAL on DuckDB 2.0. tpch's `dbgen` (creates
+    and fills tables in any catalog at any scale) is reserved to superusers too.
+  - `shell_history()` is refused to every caller, superusers included: a node's init SQL reaches
+    its DuckDB CLI through stdin, so the history held the object-store secret keys, the catalog
+    password and the node token, readable by any tenant user with `*.*.* ALL`, and by everyone
+    with the ACL off.
+  - An alias column list on a parenthesized FROM item holding a table with a column policy
+    (`(customer) AS c(a, b, e)`, `(customer JOIN orders ..) AS j(..)`) is refused like one on
+    the table itself: it renamed a masked column out of the policy's reach.
 
 - **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
   open transaction's node connection too, so a statement after an idle pause longer than the
