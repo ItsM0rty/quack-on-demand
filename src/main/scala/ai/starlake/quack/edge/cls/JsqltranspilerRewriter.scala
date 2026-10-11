@@ -856,12 +856,14 @@ private[cls] object ResidualColumns:
               if ai.starlake.acl.parser.TableExtractor.tableStatementSources(f).isDefined =>
             tableStatements += f.toString
           case _ => ()
-        // A WITH clause: its names are in scope for the whole select (and, for a recursive CTE,
-        // its own body), and each body is walked with the scopes ENCLOSING this select.
+        // A WITH clause: its names are in scope for the whole select. Each body is walked with the
+        // scopes ENCLOSING this select and sees only what DuckDB lets it see: the CTEs declared
+        // before it, never its own name or a later one (both bind to the real table), except its
+        // own name in the recursive term of a WITH RECURSIVE union (TableExtractor.recursiveSplit).
         val withItems = node match
           case sel: Select => Option(sel.getWithItemsList).toList.flatMap(_.asScala)
           case _           => Nil
-        val inCtes = ctes ++ withItems.flatMap { wi =>
+        val declared = withItems.map { wi =>
           Option(wi.getUnquotedAliasName).map(n =>
             lower(n) -> (Option(wi.getWithItemList)
               .filter(!_.isEmpty)
@@ -869,8 +871,22 @@ private[cls] object ResidualColumns:
               .orElse(outputsOf(wi.getParenthesedStatement)))
           )
         }
-        withItems.foreach(wi => walk(wi, scopes, inCtes))
-        val inner = fromItemsOf(node) match
+        val recursive = withItems.exists(_.isRecursive)
+        withItems.zipWithIndex.foreach { (wi, i) =>
+          val visible = ctes ++ declared.take(i).flatten
+          val split   = Option
+            .when(recursive)(wi.getParenthesedStatement)
+            .collect { case body: Select => body }
+            .flatMap(ai.starlake.acl.parser.TableExtractor.recursiveSplit)
+          (split, declared(i)) match
+            case (Some((anchor, term)), Some(own)) =>
+              anchor.foreach(walk(_, scopes, visible))
+              term.foreach(walk(_, scopes, visible + own))
+            case _ => ()
+          walk(wi, scopes, visible)
+        }
+        val inCtes = ctes ++ declared.flatten
+        val inner  = fromItemsOf(node) match
           case Nil   => scopes
           case items => items.filter(_ != null).flatMap(sourcesOf(_, inCtes)) :: scopes
         AstChildren.accessors(node.getClass).foreach { m =>

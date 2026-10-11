@@ -453,3 +453,22 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
       "SELECT c_id FROM customer WHERE 'a@x' = ANY (TABLE customer)",
       "SELECT ARRAY(TABLE v_customer)"
     ).foreach(sql => withClue(sql)(outcome(sql) shouldBe a[RewriteOutcome.Denied]))
+
+  // ---- CTE visibility in the residual check -----------------------------------------------------
+  //
+  // A CTE body does not see its own name nor a later sibling's (DuckDB 2.0 binds both to the real
+  // table), so a covered column read there is a base read, not a read of the CTE's output.
+
+  "the residual check" should "bind a CTE body's own or later-sibling name to the real table" in {
+    notForwardedUnmasked(
+      "WITH customer AS (SELECT [c_email] AS l FROM customer) SELECT l FROM customer"
+    )
+    notForwardedUnmasked(
+      "WITH a AS (SELECT [c_email] AS l FROM customer), customer AS (SELECT 'x' AS c_email) " +
+        "SELECT l FROM a"
+    )
+    notForwardedUnmasked(
+      "WITH RECURSIVE customer AS (SELECT [c_email] AS l FROM customer UNION ALL " +
+        "SELECT l FROM customer WHERE false) SELECT l FROM customer"
+    )
+  }
