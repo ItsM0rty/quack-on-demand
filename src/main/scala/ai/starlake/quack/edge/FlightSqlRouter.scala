@@ -21,7 +21,7 @@ import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.telemetry.{AuditActions, AuditEvent, EventJournal, StatementEvent}
 import ai.starlake.quack.route.{PoolSnapshot, Router, RoutingDecision, StatementClassifier}
 import ai.starlake.quack.spi.{ManagerEvent, ManagerEventSink}
-import ai.starlake.sql.SqlTrivia
+import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
 
 import ai.starlake.quack.observability.metrics.StatementInstruments
 import cats.effect.IO
@@ -965,18 +965,36 @@ final class FlightSqlRouter(
     * session, where `schema` is the tenant-db's `defaultSchema` when set and its metastore
     * `schemaName` otherwise. It MUST differ from the catalog name (same-named catalog+schema is
     * ambiguous in DuckDB). The schema itself is pre-created by HealthProbe's first successful probe
-    * per node. Skipped for USE / SET / txn control / ATTACH / DETACH so the operator can escape the
-    * default.
+    * per node. Skipped for a LONE USE / SET / txn control / ATTACH / DETACH so the operator can
+    * escape the default.
+    *
+    * Never skipped for a multi-statement submission, whatever its first statement: the validator
+    * qualified every bare name in it against that schema, and a node connection the session keeps
+    * (a client transaction on the native front door, the embedded client's cached session) may
+    * still carry an earlier lone `USE` or `SET search_path`. `BEGIN; SELECT * FROM t` used to run
+    * there with no prelude and read whichever `t` that left current. Prepending is harmless for
+    * such a batch: whatever its own statements select still runs after the prelude.
+    *
+    * One exception to "prepend": a submission opening with statements that END a transaction
+    * (ROLLBACK / ABORT / COMMIT / END) gets the prelude right after that leading run instead,
+    * spliced into the original text. Inside an aborted transaction DuckDB refuses every statement
+    * but ROLLBACK, the prelude's `USE` included, so `USE ...; ROLLBACK; ...` failed and left the
+    * session aborted. Those statements read no table and cannot move name resolution (a search path
+    * is not transactional on DuckDB: it survives the ROLLBACK), so every statement that can read
+    * still runs after the prelude. With nothing after the run there is nothing to resolve and the
+    * text goes as is.
     */
   private def wrapWithDefaultSchema(
       state: Option[ai.starlake.quack.ondemand.PoolState],
       sql: String
   ): String =
-    val trimmed = sql.trim.toUpperCase(Locale.ROOT)
-    val skip    = trimmed.startsWith("USE ") || trimmed.startsWith("SET ") ||
+    val trimmed        = sql.trim.toUpperCase(Locale.ROOT)
+    lazy val fragments = SqlCommentStripper.splitStatements(sql)
+    val endsTxFirst    = FlightSqlRouter.endsTransaction(sql)
+    val skip           = (trimmed.startsWith("USE ") || trimmed.startsWith("SET ") ||
       trimmed.startsWith("BEGIN") || trimmed.startsWith("COMMIT") ||
       trimmed.startsWith("ROLLBACK") || trimmed.startsWith("ATTACH") ||
-      trimmed.startsWith("DETACH")
+      trimmed.startsWith("DETACH")) && fragments.lengthCompare(2) < 0
     // The alias is `catalogAlias` when set (branch catalogs attach under their parent's alias),
     // else `dbName`: see TenantDb.catalogAlias.
     state match
@@ -996,7 +1014,19 @@ final class FlightSqlRouter(
               .filter(_.nonEmpty)
               .orElse(st.metastore.get("schemaName").filter(_.nonEmpty))
               .getOrElse("main")
-            s"USE $db.$schema; $sql"
+            val use = s"USE $db.$schema;"
+            if endsTxFirst then
+              // Splice into the ORIGINAL text at the start of the first statement that does not
+              // end a transaction (just past its separating `;`), so what reaches the node is
+              // byte for byte what the validator checked, plus the USE.
+              SqlCommentStripper
+                .statementSpans(sql)
+                .find((from, until) =>
+                  !FlightSqlRouter.endsTransaction(sql.substring(from, until))
+                ) match
+                case None            => sql
+                case Some((from, _)) => s"${sql.substring(0, from)} $use${sql.substring(from)}"
+            else s"$use $sql"
           case None => sql
       case Some(st) if trimmed.startsWith("USE ") =>
         FlightSqlRouter
@@ -1112,6 +1142,16 @@ object FlightSqlRouter:
     (ai.starlake.quack.model.RunningNode, String, Option[String], Boolean) => IO[
       ai.starlake.quack.edge.adapter.NodeOutcome[A]
     ]
+
+  private val TransactionEnds = Set("ROLLBACK", "ABORT", "COMMIT", "END")
+
+  /** True when the first statement of `sql` ends a transaction (its verb as the engine reads it,
+    * past leading comments and trivia).
+    */
+  private[edge] def endsTransaction(sql: String): Boolean =
+    TransactionEnds.contains(
+      SqlTrivia.firstToken(sql).takeWhile(_.isLetter).toUpperCase(Locale.ROOT)
+    )
 
   // A bare one-part USE target: an unquoted identifier or one quoted identifier
   // (quoted may contain anything but a quote, including dots). Two-part

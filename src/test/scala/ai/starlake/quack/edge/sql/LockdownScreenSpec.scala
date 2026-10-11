@@ -1040,3 +1040,18 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
       false
     denied("SELECT * FROM t ORDER BY a DESC, 2") shouldBe false
   }
+
+  "a dollar quote after a Unicode space" should "not hide a denied call later on the line" in {
+    // DuckDB opens the dollar quote after the space character, so the `--` sits inside the string
+    // and the call after it runs: the screen must see that call.
+    denied("SELECT\u00a0$$--$$, * FROM read_csv('/tmp/x.csv')") shouldBe true
+    denied("SELECT\u3000$$--$$, * FROM read_csv('/tmp/x.csv')") shouldBe true
+    deniedB("SELECT\u200b$$--$$, * FROM read_parquet('s3://lakebucket/x.parquet')") shouldBe true
+  }
+
+  "a dollar sign after a soft hyphen" should "continue the identifier, as DuckDB 1.5.6 does" in {
+    // DuckDB names the column `AS<U+00AD>$$` and reads the rest of the line as a comment: the call
+    // never runs (run through the 1.5.6 CLI against a missing file, which it did not open).
+    denied("SELECT 1 AS\u00ad$$ -- $$, * FROM read_csv('/tmp/x.csv')") shouldBe false
+    denied("SELECT 1 AS\u00a0$$ -- $$, * FROM read_csv('/tmp/x.csv')") shouldBe true
+  }

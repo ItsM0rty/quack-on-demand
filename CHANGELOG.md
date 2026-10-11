@@ -172,6 +172,37 @@
   open transaction's node connection too, so a statement after an idle pause longer than the
   node lease no longer fails with "Connection heartbeat lease expired".
 
+- **Security: a batched `USE` or `SET search_path` no longer reaches tables outside a user's
+  grants.** The access check resolves a bare table name against the pool's default schema, but a
+  `USE`, `SET search_path`, `SET schema` (any spelling, including `SET SESSION`, `TO`, `PRAGMA
+  search_path` and `RESET`) in the same request moved the node elsewhere first, so
+  `SET search_path='db.other'; SELECT * FROM t` read `db.other.t` with a grant on the default
+  schema's `t` only, over FlightSQL and the native front door alike. For ACL-checked users such a
+  batch is now refused: send `USE` / `SET search_path` as its own statement, which works as
+  before. Superusers are unaffected. Every multi-statement request now also starts from the pool's
+  default schema, even when it opens with `BEGIN` or `SET`; one opening with `ROLLBACK` / `COMMIT`
+  switches to it right after that statement, so a rollback out of a failed transaction still runs.
+
+- **Security (DuckDB 1.x builds only): a backtick outside a string or comment is refused for
+  ACL-checked users, users with column or row policies, on lockdown pools and on pools with a
+  read-only catalog.** On DuckDB 1.5 a backtick is an operator, not an identifier quote, so with a
+  macro named after it the text between two backticks runs: statement separators and function
+  calls there were hidden from the access checks. The screen is keyed on the DuckDB version the
+  build pins and is inert on DuckDB 2.0, where a backtick quotes an identifier and the edge's lexer
+  reads it as one.
+
+- **Security: `SET VARIABLE` can no longer read a table without a grant.** Its value is a query,
+  so `SET VARIABLE x = (SELECT ... FROM any_table); SELECT getvariable('x')` returned rows from any
+  table the node could reach, with no grant at all: the `SET` passed as table-free control flow.
+  A `SET` whose value reads a table is now denied unless the user holds the unrestricted `ALL`
+  grant; `SET VARIABLE x = 42` still works.
+
+- **Security: a subquery passed straight to a function is access-checked.** DuckDB's
+  `ARRAY(SELECT ... FROM t)` hands its subquery to the function without parentheses of its own, and
+  the access check skipped such a subquery entirely, so the statement needed no grant on `t` at all.
+  A subquery passed as a function argument is now access-checked like any other read; one inside
+  a table function's argument is refused as an unsupported construct.
+
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left
   by an earlier `qod serve` captured the default: on a machine running `qod start` against its own

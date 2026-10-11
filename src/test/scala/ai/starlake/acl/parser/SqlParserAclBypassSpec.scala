@@ -278,6 +278,45 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
     SqlParser.extract("USE db1", config).statements.head shouldBe a[StatementResult.ControlFlow]
   }
 
+  // --- SET VARIABLE evaluates its value as a query: DuckDB (1.5.6 and 2.0) runs
+  // `SET VARIABLE x = (SELECT v FROM db.other.t)` and `getvariable('x')` hands the row back, so a
+  // SET whose value reads a table is a read, not table-free control flow ---
+
+  test("SET VARIABLE whose value reads a table is not admitted as control flow") {
+    List(
+      "SET VARIABLE x = (SELECT v FROM db.other.t)",
+      "SET VARIABLE x = (SELECT v FROM t)",
+      "SET VARIABLE x = (SELECT string_agg(v, ',') FROM t WHERE v IN (SELECT v FROM db.other.u))",
+      "SET VARIABLE x = (SELECT content FROM read_text('/etc/passwd'))",
+      "EXPLAIN SET VARIABLE x = (SELECT v FROM db.other.t)"
+    ).foreach { sql =>
+      withClue(sql) {
+        SqlParser.extract(sql, config).statements.head shouldBe a[StatementResult.ParseError]
+      }
+    }
+  }
+
+  test("a bare select passed as a function argument is walked (DuckDB ARRAY(SELECT ...))") {
+    extracted("SELECT ARRAY(SELECT v FROM db.other.t)").accesses shouldBe Set(
+      TableAccess(TableRef("db", "other", "t"), Verb.Read)
+    )
+    extracted("SELECT ARRAY(SELECT v FROM t)").accesses shouldBe Set(
+      TableAccess(TableRef("db", "main", "t"), Verb.Read)
+    )
+    SqlParser
+      .extract("SET VARIABLE x = ARRAY(SELECT v FROM db.other.t)", config)
+      .statements
+      .head shouldBe a[StatementResult.ParseError]
+  }
+
+  test("SET / SET VARIABLE with a table-free value stays control flow") {
+    List("SET VARIABLE x = 42", "SET VARIABLE x = [1, 2, 3]", "SET threads = 4").foreach { sql =>
+      withClue(sql) {
+        SqlParser.extract(sql, config).statements.head shouldBe a[StatementResult.ControlFlow]
+      }
+    }
+  }
+
   // --- metadata enumeration: DESCRIBE / SHOW <table> reveal a table's shape, so they
   // are Read accesses on that table rather than unconditionally admitted control flow ---
 

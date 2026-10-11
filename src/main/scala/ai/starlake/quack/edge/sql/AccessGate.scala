@@ -51,15 +51,22 @@ object AccessGate:
   ): GateOutcome =
     // Ahead of every other arm, and never wildcard-coverable: the target of these calls is
     // a string the parser cannot see, so the wildcard's tenant-catalog scoping cannot apply.
-    CatalogReachingCalls.find(statement) match
-      case Some(fn) => GateOutcome.Refuse(CatalogReachingCalls.denyReason(fn), false, "")
-      case None     =>
-        // A SET of a SQL-valued setting is control flow to the parser, but its value runs later on
-        // the catalog Postgres or as the node's auth callback, outside every grant.
-        CatalogReachingCalls.sqlValuedSetting(statement) match
-          case Some(s) => GateOutcome.Refuse(CatalogReachingCalls.settingDenyReason(s), false, "")
-          case None    =>
-            evaluateParsed(statement, config, sessionCatalog, filteredMetadata, clientDataScans)
+    // The same holds for a batch that moves the schema or search path: every bare name after
+    // it resolves somewhere `config` does not describe, possibly in a catalog outside the
+    // tenant's (see SessionScopeScreen). The backtick screen goes first: on a DuckDB 1.x engine a
+    // backtick pair can hide separators and calls from both screens after it (see BacktickScreen).
+    // A SET of a SQL-valued setting is control flow to the parser, but its value runs later on the
+    // catalog Postgres or as the node's auth callback, outside every grant.
+    BacktickScreen
+      .find(statement)
+      .orElse(CatalogReachingCalls.find(statement).map(CatalogReachingCalls.denyReason))
+      .orElse(
+        CatalogReachingCalls.sqlValuedSetting(statement).map(CatalogReachingCalls.settingDenyReason)
+      )
+      .orElse(SessionScopeScreen.find(statement)) match
+      case Some(reason) => GateOutcome.Refuse(reason, false, "")
+      case None         =>
+        evaluateParsed(statement, config, sessionCatalog, filteredMetadata, clientDataScans)
 
   private def evaluateParsed(
       statement: String,

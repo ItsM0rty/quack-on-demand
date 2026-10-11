@@ -32,3 +32,81 @@ class AccessGateExpressionPositionsSpec extends AnyFlatSpec with Matchers:
 
   "a subquery in a json_object argument" should "be gated" in:
     gated("SELECT json_object('a', (SELECT v FROM secret))") shouldBe Set("lake.main.secret")
+
+  // DuckDB's `ARRAY(<query>)` hands its query to the function as a BARE select (no parentheses
+  // of its own). The walker used to mark it visited as an expression before walking it as a
+  // select, so every form below came back NothingGated, an unconditional allow, while the 2.0 CLI
+  // returned the rows (review-final-fixes-2 C1).
+  "a query passed bare to ARRAY()" should "gate every table it reads" in:
+    gated("SELECT ARRAY(SELECT v FROM secret)") shouldBe Set("lake.main.secret")
+    gated("SELECT array(SELECT v FROM lake.main.secret)") shouldBe Set("lake.main.secret")
+    gated("SELECT ARRAY(SELECT v FROM secret)[1]") shouldBe Set("lake.main.secret")
+    gated("SELECT unnest(ARRAY(SELECT v FROM secret))") shouldBe Set("lake.main.secret")
+    gated("SELECT ARRAY(SELECT v FROM secret UNION ALL SELECT w FROM other)") shouldBe
+      Set("lake.main.secret", "lake.main.other")
+    gated("SELECT ARRAY(SELECT v FROM secret JOIN other ON true)") shouldBe
+      Set("lake.main.secret", "lake.main.other")
+    gated("SELECT ARRAY(SELECT v FROM secret s, other o WHERE s.id = o.id)") shouldBe
+      Set("lake.main.secret", "lake.main.other")
+    gated("SELECT ARRAY(SELECT v FROM secret WHERE v IN (SELECT w FROM other))") shouldBe
+      Set("lake.main.secret", "lake.main.other")
+    gated("SELECT ARRAY(WITH c AS (SELECT v FROM secret) SELECT v FROM c)") shouldBe
+      Set("lake.main.secret")
+    gated("SELECT ARRAY(SELECT ARRAY(SELECT v FROM secret))") shouldBe Set("lake.main.secret")
+
+  it should "gate the read inside a write's source" in:
+    gated("INSERT INTO t SELECT ARRAY(SELECT v FROM secret)") should contain("lake.main.secret")
+    gated("INSERT INTO t VALUES (ARRAY(SELECT v FROM secret))") should contain("lake.main.secret")
+    gated("UPDATE t SET a = ARRAY(SELECT v FROM secret)") should contain("lake.main.secret")
+    gated("CREATE TABLE t2 AS SELECT ARRAY(SELECT v FROM secret) AS a") should contain(
+      "lake.main.secret"
+    )
+
+  it should "refuse it in a table function's argument" in:
+    AccessGate.evaluate(
+      "SELECT * FROM unnest(ARRAY(SELECT v FROM secret))",
+      cfg,
+      "lake",
+      filteredMetadata = true,
+      clientDataScans = false
+    ) match
+      case GateOutcome.Refuse(_, _, _) => succeed
+      case GateOutcome.Gated(g, _) => g.map(_.table.canonical) should contain("lake.main.secret")
+      case other                   => fail(s"admitted ungated: $other")
+
+  // `SET VARIABLE x = (<query>)` runs the query: alone (its error message carries the value, as
+  // `Could not convert string '<value>' to INT32`) or batched with `getvariable` (review C2). It
+  // is no longer table-free control flow.
+  "a SET VARIABLE whose value reads a table" should "never be admitted ungated" in:
+    List(
+      "SET VARIABLE x = (SELECT v FROM secret)",
+      "SET VARIABLE x = (SELECT v::INT FROM secret)",
+      "SET VARIABLE x = map {'a': (SELECT v FROM secret)}",
+      "SET VARIABLE x = ARRAY(SELECT v FROM secret)",
+      "SET VARIABLE x = [(SELECT v FROM secret)]",
+      "SET VARIABLE x = (SELECT v FROM secret); SELECT getvariable('x')",
+      "SELECT 1; SET VARIABLE x = (SELECT v FROM secret)",
+      "SET VARIABLE x = (SELECT content FROM read_text('/etc/hosts'))"
+    ).foreach { sql =>
+      withClue(sql) {
+        AccessGate.evaluate(
+          sql,
+          cfg,
+          "lake",
+          filteredMetadata = true,
+          clientDataScans = false
+        ) match
+          case GateOutcome.Refuse(_, _, _) => succeed
+          case GateOutcome.Gated(g, _)     =>
+            g.map(_.table.canonical) should contain("lake.main.secret")
+          case other => fail(s"admitted ungated: $other")
+      }
+    }
+
+  it should "stay control flow with a table-free value" in:
+    List("SET VARIABLE x = 42", "SET VARIABLE x = [1, 2]", "SET VARIABLE x = (SELECT 1)")
+      .foreach { sql =>
+        withClue(sql) {
+          AccessGate.evaluate(sql, cfg, "lake", true, false) shouldBe a[GateOutcome.NothingGated]
+        }
+      }

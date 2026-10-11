@@ -310,7 +310,7 @@ private[parser] class TableExtractorVisitor:
         val aliasName = wi.getUnquotedAliasName
         if aliasName != null then cteNames += aliasName.toLowerCase(Locale.ROOT)
       }
-      withItems.asScala.foreach(visitCteBody)
+      withItems.asScala.foreach(wi => if visited.add(wi) then visitCteBody(wi))
 
   /** Walks one CTE body. `WithItem.getSelect` casts unconditionally and throws on a data-modifying
     * CTE (`WITH w AS (INSERT/UPDATE/DELETE ... RETURNING *) ...`, DuckDB 2.0). Its target is a
@@ -325,12 +325,43 @@ private[parser] class TableExtractorVisitor:
 
   private def visitSelect(select: Select): Unit =
     if select != null && visited.add(select) then
-      matchSelect(select)
-      // Symmetric completeness: descend reflectively into every child of the SELECT node too, so a
-      // subquery in a clause the hand-walk omits (GROUP BY, DISTINCT ON, QUALIFY, named WINDOW,
-      // GROUPING SETS, ...) cannot be dropped. recordBareTable = true because a bare Table reached
-      // directly from a SELECT/holder is a real FROM/JOIN read, not a column qualifier.
-      descendChildren(select, recordBareTable = true)
+      // A ParenthesedSelect scopes its own WITH clause (visitParenthesedSelect).
+      val withItems = select match
+        case _: ParenthesedSelect => null
+        case _                    => select.getWithItemsList
+      withScopedCtes(withItems) {
+        matchSelect(select)
+        // Symmetric completeness: descend reflectively into every child of the SELECT node too,
+        // so a subquery in a clause the hand-walk omits (GROUP BY, DISTINCT ON, QUALIFY, named
+        // WINDOW, GROUPING SETS, ...) cannot be dropped. recordBareTable = true because a bare
+        // Table reached directly from a SELECT/holder is a real FROM/JOIN read, not a column
+        // qualifier.
+        descendChildren(select, recordBareTable = true)
+      }
+
+  /** Walk `body` with the CTE names of `withItems` in scope, then take them out of scope again: a
+    * CTE shadows a bare name only inside the query that declares it, so a CTE named after a table
+    * in a nested query (`ARRAY(WITH c AS (..) SELECT .. FROM c)`, a derived table) must neither be
+    * gated as a table there nor hide a read of the real table elsewhere in the statement. Names
+    * already in scope (an enclosing CTE of the same name) stay in scope. The CTE bodies are walked
+    * for their own reads, with every name of the clause in scope.
+    */
+  private def withScopedCtes(
+      withItems: java.util.List[net.sf.jsqlparser.statement.select.WithItem[?]]
+  )(body: => Unit): Unit =
+    if withItems == null || withItems.isEmpty then body
+    else
+      val added = withItems.asScala
+        .flatMap(wi => Option(wi.getUnquotedAliasName))
+        .map(_.toLowerCase(Locale.ROOT))
+        .filterNot(cteNames.contains)
+        .toSet
+      cteNames ++= added
+      withItems.asScala.foreach { wi =>
+        if visited.add(wi) then visitCteBody(wi)
+      }
+      body
+      cteNames --= added
 
   private def matchSelect(select: Select): Unit =
     select match
@@ -409,17 +440,11 @@ private[parser] class TableExtractorVisitor:
     if selects != null then selects.asScala.foreach(visitSelect)
 
   private def visitParenthesedSelect(psel: ParenthesedSelect): Unit =
-    // ParenthesedSelect wraps another Select
-    val inner = psel.getSelect
-    if inner != null then visitSelect(inner)
-    // Also check if it has its own WITH items
-    val withItems = psel.getWithItemsList
-    if withItems != null then
-      withItems.asScala.foreach { wi =>
-        val aliasName = wi.getUnquotedAliasName
-        if aliasName != null then cteNames += aliasName.toLowerCase(Locale.ROOT)
-        visitCteBody(wi)
-      }
+    // ParenthesedSelect wraps another Select, possibly under a WITH clause of its own.
+    withScopedCtes(psel.getWithItemsList) {
+      val inner = psel.getSelect
+      if inner != null then visitSelect(inner)
+    }
 
   private[parser] def visitFromItem(fromItem: FromItem): Unit =
     if fromItem != null && visited.add(fromItem) then
@@ -507,6 +532,17 @@ private[parser] class TableExtractorVisitor:
         unsupported += s"unrecognized FROM item ${other.getClass.getSimpleName}"
 
   private[parser] def visitExpression(expr: Expression): Unit =
+    expr match
+      // A select reached in expression position (a scalar subquery, or DuckDB's
+      // `ARRAY(SELECT ...)`, which parses as a function whose argument is a BARE select) is walked
+      // as a select, exactly once. It used to be marked visited here first, so the select arm
+      // below found it already visited and skipped it, and the reflective pass reached its FROM
+      // table only as a column qualifier: the read vanished and the statement was admitted with
+      // no gated access at all.
+      case sel: Select => visitSelect(sel)
+      case _           => visitNonSelectExpression(expr)
+
+  private def visitNonSelectExpression(expr: Expression): Unit =
     if expr != null && visited.add(expr) then
       matchExpression(expr)
       // Completeness backstop: after the explicit arms, unconditionally descend into every
@@ -518,11 +554,9 @@ private[parser] class TableExtractorVisitor:
       descendChildren(expr, recordBareTable = false)
 
   private def matchExpression(expr: Expression): Unit =
+    // Selects never reach here: visitExpression hands every Select (ParenthesedSelect included)
+    // to visitSelect.
     expr match
-      case psel: ParenthesedSelect =>
-        visitParenthesedSelect(psel)
-      case sel: Select =>
-        visitSelect(sel)
       case bin: BinaryExpression =>
         val left = bin.getLeftExpression
         if left != null then visitExpression(left)
@@ -607,8 +641,10 @@ private[parser] class TableExtractorVisitor:
       routeChild(AstChildren.read(m, node), recordBareTable)
     }
 
-  /** Route one reflectively-fetched child value to the right walk. `Expression` is tested before
-    * `Select` so a `ParenthesedSelect` (both) takes the visited-guarded expression path. A bare
+  /** Route one reflectively-fetched child value to the right walk. A `Select` (also an
+    * `Expression`) is tested first and always walked as a select, guarded by `visitSelect`'s own
+    * visited check: DuckDB's `ARRAY(SELECT ...)` hands a BARE select to a function as its argument,
+    * and walking it as an expression marked it visited before `visitSelect` could walk it. A bare
     * `Table` records only when it was reached from a select / from-item / holder; reached from an
     * expression it is a column qualifier and is skipped. Any other jsqlparser node is an
     * intermediate holder (GroupByElement, Distinct, WindowDefinition, Join, Top, Pivot, ...): guard
@@ -621,9 +657,9 @@ private[parser] class TableExtractorVisitor:
   private def routeChild(value: Any, recordBareTable: Boolean): Unit =
     value match
       case null                         => ()
+      case s: Select                    => visitSelect(s)
       case e: Expression                => visitExpression(e)
       case t: Table                     => if recordBareTable then visitFromItem(t)
-      case s: Select                    => visitSelect(s)
       case fi: FromItem                 => visitFromItem(fi)
       case oe: OrderByElement           => Option(oe.getExpression).foreach(visitExpression)
       case si: SelectItem[?]            => Option(si.getExpression).foreach(visitExpression)

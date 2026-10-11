@@ -268,3 +268,19 @@ class SqlCommentStripperSpec extends AnyFlatSpec with Matchers:
     SqlCommentStripper.stripComments(
       "SELECT 1 /* ' */ AS a\u00A0$q$ /* x */, 2 AS b\u00A0$q$ /* ' */"
     ) should not include "/* x */"
+
+  // DuckDB turns its Unicode space set into ASCII spaces before lexing, so a dollar quote right
+  // after one of them opens (verified on 1.5.6 and 2.0 for U+00A0, U+200B, U+2003, U+202F, U+205F,
+  // U+3000, U+FEFF). Reading the `$` as the tail of an identifier there would turn a `--` inside
+  // the quoted body into a comment that hides the rest of the line from every screen.
+  "stripComments" should "open a dollar quote right after a Unicode space character" in
+    List("\u00a0", "\u200b", "\u2003", "\u202f", "\u205f", "\u3000", "\ufeff").foreach { sp =>
+      val out = SqlCommentStripper.stripComments("SELECT" + sp + "$$--$$, f(1)")
+      withClue(f"U+${sp.head.toInt}%04X")(out should include("$$--$$, f(1)"))
+    }
+
+  it should "read an escape string only at the start of a token" in {
+    // `x$e'a\'` is the identifier `x$e` followed by the plain string `'a\'`: the quote after the
+    // backslash closes it, so the comment after it is a real comment and is stripped.
+    SqlCommentStripper.stripComments("SELECT x$e'a\\' /* c */ FROM t") should not include "/*"
+  }
