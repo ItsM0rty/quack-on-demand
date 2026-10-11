@@ -84,7 +84,7 @@ object NodeSecretFiles extends LazyLogging:
     * an operator may rely on DuckDB's credential chain reading them.
     */
   def isInheritedSecret(name: String): Boolean =
-    !SdkPrefixes.exists(p => name.toUpperCase.startsWith(p)) &&
+    !SdkPrefixes.exists(p => name.toUpperCase(java.util.Locale.ROOT).startsWith(p)) &&
       SecretNamePattern.matches(name)
 
   /** The values to deliver by file, keyed by canonical name. A metastore entry wins over an
@@ -139,15 +139,17 @@ object NodeSecretFiles extends LazyLogging:
           PosixFilePermissions.fromString(if directory then "rwx------" else "rw-------")
         )
       case None =>
-        Option(Files.getFileAttributeView(p, classOf[AclFileAttributeView])).foreach { acl =>
-          val entry = AclEntry
-            .newBuilder()
-            .setType(AclEntryType.ALLOW)
-            .setPrincipal(acl.getOwner)
-            .setPermissions(AclEntryPermission.values().toSet.asJava)
-            .build()
-          acl.setAcl(java.util.List.of(entry))
-        }
+        // Neither view: fail closed rather than write secrets with the default permissions.
+        val acl = Option(Files.getFileAttributeView(p, classOf[AclFileAttributeView])).getOrElse(
+          throw new java.io.IOException(s"cannot restrict $p to its owner: no POSIX or ACL view")
+        )
+        val entry = AclEntry
+          .newBuilder()
+          .setType(AclEntryType.ALLOW)
+          .setPrincipal(acl.getOwner)
+          .setPermissions(AclEntryPermission.values().toSet.asJava)
+          .build()
+        acl.setAcl(java.util.List.of(entry))
 
   /** Recursively delete `dir`, ignoring every failure (the script may already have removed it). */
   def deleteQuietly(dir: Path): Unit =

@@ -72,16 +72,16 @@
     `ducklake_commit`) are refused to every caller who is not a superuser, whatever the ACL mode
     (QoD grants, OPA, ACL off) and the grants (the built-in `qod_all_tables` `*.*.* ALL` no longer
     reaches them), and to every caller on a pool under lockdown. Any quoting, `USE`,
-    `SET search_path`, string arguments and `query()` bodies are covered; a run-time-computed
-    target (`query_table('__duck' || 'lake...')`, a `search_path` / `schema` set to an expression
-    in any `SET` / `PRAGMA` form, the
-    `postgres_query` / `query` family with a non-constant argument) is refused for the same
-    callers. The string-named table carriers (`query_table('<name>')`, `query('<sql>')`,
-    `duckdb_table_sample('<table>')`) have their literal screened for the metadata catalog and are
-    refused with any non-literal argument. `json_execute_serialized_sql` (table function and
-    pragma) is refused outright to the same callers: a serialized plan names its catalogs in JSON
-    strings DuckDB decodes after the screen reads them. The data tables themselves and the other
-    DuckLake functions are unchanged.
+    `SET search_path`, string arguments and `query()` bodies are covered, and any string literal
+    or comment that mentions the name is refused too (an over-deny, the safe direction); a
+    run-time-computed target (`query_table('__duck' || 'lake...')`, a `search_path` / `schema`
+    set to an expression in any `SET` / `PRAGMA` form, the `postgres_query` / `query` family with a
+    non-constant argument) is refused for the same callers. The string-named table carriers
+    (`query_table('<name>')`, `query('<sql>')`, `duckdb_table_sample('<table>')`) have their
+    literal screened for the metadata catalog and are refused with any non-literal argument.
+    `json_execute_serialized_sql` (table function and pragma) is refused outright to the same
+    callers: a serialized plan names its catalogs in JSON strings DuckDB decodes after the screen
+    reads them. The data tables themselves and the other DuckLake functions are unchanged.
   - `duckdb_table_sample` (new in 2.0; reads the table its string names) and the Iceberg catalog
     functions that act on a table or schema named by a string outside every table grant
     (`iceberg_rewrite_data_files`, `iceberg_rollback_to_snapshot`, `iceberg_to_ducklake`,

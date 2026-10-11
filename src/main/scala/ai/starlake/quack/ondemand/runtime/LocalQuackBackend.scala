@@ -81,7 +81,12 @@ final class LocalQuackBackend(
     // after extraSetupSql, right before quack_serve, so the value
     // restrictions are in effect before the node serves any tenant statement.
     if spec.lockdownSql.nonEmpty then env.put("lockdownSql", spec.lockdownSql)
-    val secretsDir = NodeSecretFiles.writePrivateDir(secrets)
+    val secretsDir =
+      try NodeSecretFiles.writePrivateDir(secrets)
+      catch
+        case e: Throwable =>
+          ports.release(port)
+          throw e
     env.put(NodeSecretFiles.DirEnv, secretsDir.toString)
     env.put(NodeSecretFiles.EphemeralEnv, "1")
     val proc =

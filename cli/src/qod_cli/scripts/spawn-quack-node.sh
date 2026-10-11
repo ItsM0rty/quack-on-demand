@@ -188,6 +188,8 @@ if [[ "$kind" == "ducklake" && "${QOD_SPAWN_DRY_RUN:-}" != "1" ]] && command -v 
   # The password reaches psql through a private passfile, never PGPASSWORD: psql's own
   # environment is as readable as duckdb's while it runs.
   PGPASS_DIR="$(mktemp -d -t qod-pgpass.XXXXXX)"
+  # Removed on any exit (a kill during psql included), not only on the normal path below.
+  trap 'rm -rf -- "$PGPASS_DIR"' EXIT
   pgpass_escaped="${pgPassword//\\/\\\\}"
   pgpass_escaped="${pgpass_escaped//:/\\:}"
   (umask 077 && printf '*:*:*:*:%s\n' "$pgpass_escaped" > "$PGPASS_DIR/pgpass")
@@ -201,6 +203,7 @@ if [[ "$kind" == "ducklake" && "${QOD_SPAWN_DRY_RUN:-}" != "1" ]] && command -v 
       }
   fi
   rm -rf -- "$PGPASS_DIR"
+  trap - EXIT
 fi
 
 # Early guard: in dry-run mode we only want the assembled INIT_SQL (below), never a live
