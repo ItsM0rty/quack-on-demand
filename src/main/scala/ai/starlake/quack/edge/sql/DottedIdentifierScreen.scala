@@ -1,11 +1,15 @@
 package ai.starlake.quack.edge.sql
 
 import ai.starlake.sql.SqlLexer
+import net.sf.jsqlparser.parser.CCJSqlParserUtil
+import net.sf.jsqlparser.schema.Table
+import net.sf.jsqlparser.statement.select.PlainSelect
 
 import java.util.Locale
 
 /** Refuses a quoted identifier JSqlParser does not read as the one name DuckDB reads, outside an
-  * alias: a name holding a dot, an `@` or an escaped quote.
+  * alias: a name holding a dot, an `@`, a bracket, an escaped quote, a quote of the other style at
+  * an edge, or anything else JSqlParser splits or strips.
   *
   * DuckDB reads `"a.b"` (or `` `a.b` ``) as ONE identifier: `SELECT * FROM "a.b"` reads the table
   * literally named `a.b` in the default schema. JSqlParser splits the quoted name on its dots
@@ -16,13 +20,16 @@ import java.util.Locale
   * schema (checked on the DuckDB 2.0 CLI with both `a.b` and `main."a.b"` present). It splits
   * `"secret@x"` the same way at the `@` (an Oracle database link: the check sees table `secret`
   * while DuckDB reads `secret@x`), and keeps an escaped quote doubled (`"a""b"` is checked as
-  * `a""b`, DuckDB reads `a"b`). Every other printable ASCII and unicode character was probed in
-  * both quoting styles and reaches the check as the name DuckDB 2.0 reads (unicode spaces inside a
-  * backtick name become ASCII spaces on both sides, DuckDB's pre-pass knowing no backtick).
-  * Tracking which positions JSqlParser splits would mean modelling its grammar, so the rule is
-  * lexical and covers every position: a double-quoted or backtick-quoted identifier token holding a
-  * `.`, an `@` or its own doubled delimiter is refused, read from [[SqlLexer]] tokens so a string
-  * literal or a comment never counts.
+  * `a""b`, DuckDB reads `a"b`). It strips SQL Server brackets and a quote of the other style at a
+  * name's edges (`"[secret]"`, `"secret]"`, `` "`secret`" `` are all checked as `secret`, while
+  * DuckDB 2.0 reads the table literally named `[secret]`). Tracking which positions JSqlParser
+  * splits would mean modelling its grammar, so the rule is lexical and covers every position: each
+  * double-quoted or backtick-quoted identifier token, read from [[SqlLexer]] tokens so a string
+  * literal or a comment never counts, is read back through JSqlParser as a table name and refused
+  * unless that reading is the one name DuckDB reads (the token's body, its doubled delimiters
+  * undone; a doubled delimiter is always refused, JSqlParser keeping it doubled). No character list
+  * to keep current: a name of plain ASCII letters, digits and `_` skips the read-back.
+  * DottedIdentifierScreenSpec probes every printable ASCII character in both quoting styles.
   *
   * Two exceptions. A name directly after the keyword `AS` is an alias (`SELECT x AS "t.x"`, `FROM t
   * AS "a.b"`), the shape BI tools generate for column labels; in DuckDB's grammar `AS` is never
@@ -42,35 +49,58 @@ import java.util.Locale
 object DottedIdentifierScreen:
 
   val Reason: String =
-    "a quoted identifier containing a dot, an @ or an escaped quote is not supported: DuckDB " +
-      "reads \"a.b\" as one name, which the access check cannot tell from a qualified a.b; " +
-      "rename the object or use an alias without one"
+    "a quoted identifier containing a dot, an @, a bracket, an escaped quote or another character " +
+      "the access check reads differently is not supported: DuckDB reads \"a.b\" as one name, " +
+      "which the access check cannot tell from a qualified a.b; rename the object or use an " +
+      "alias without one"
 
   // A scheme with no dot, so JSqlParser's first split part always holds the `://`.
   private val UrlScheme = "^[A-Za-z][A-Za-z0-9+-]*://.*".r
 
   /** Some(reason) when `sql` holds such a quoted identifier outside an alias. */
   def find(sql: String): Option[String] =
-    if sql == null || !(sql.indexOf('.') >= 0 || sql.indexOf('@') >= 0 ||
-        sql.contains("\"\"") || sql.contains("``"))
-    then None
+    if sql == null || (sql.indexOf('"') < 0 && sql.indexOf('`') < 0) then None
     else
       val view = SqlLexer.engineView(sql)
+      // The text the access check parses (ParserInput): the view with each kept unicode space
+      // restored, position for position.
+      val text = SqlLexer.keptSpacesRestored(view)
       val toks = SqlLexer.tokens(view).filterNot(_.isTrivia)
       val hit  = toks.indices.exists { i =>
         val t = toks(i)
         t.kind == SqlLexer.Kind.Literal && isQuotedIdentifier(view, t) &&
-        misread(view.substring(t.start, t.end)) && !(i > 0 && isAs(view, toks(i - 1)))
+        misread(text.substring(t.start, t.end)) && !(i > 0 && isAs(view, toks(i - 1)))
       }
       Option.when(hit)(Reason)
 
-  /** Whether JSqlParser reads the quoted identifier `text` (delimiters included) as another name.
+  // A name JSqlParser cannot read differently: no separator, quote or bracket to act on.
+  private val PlainName = "[A-Za-z0-9_]+".r
+
+  /** Whether JSqlParser reads the quoted identifier `text` (delimiters included) as another name
+    * than DuckDB does. Rather than list the characters it acts on, the name is read back through
+    * JSqlParser as a table name (the reading the access check uses) and compared with the name
+    * DuckDB reads; anything it splits, strips or cannot parse is a misread. An escaped quote is one
+    * even in a URL: JSqlParser keeps it doubled.
     */
   private def misread(text: String): Boolean =
     val quote = text.charAt(0)
     val body  = text.drop(1).dropRight(1)
-    val split = (body.indexOf('.') >= 0 || body.indexOf('@') >= 0) && !UrlScheme.matches(body)
-    split || body.contains(s"$quote$quote")
+    if body.contains(s"$quote$quote") then true
+    else if PlainName.matches(body) || UrlScheme.matches(body) then false
+    else !readAsTable(text).contains(body)
+
+  /** The one name JSqlParser reads `quoted` as in table position, None when it reads several parts
+    * or none.
+    */
+  private def readAsTable(quoted: String): Option[String] =
+    try
+      CCJSqlParserUtil.parse(s"SELECT * FROM $quoted") match
+        case ps: PlainSelect =>
+          ps.getFromItem match
+            case t: Table if t.getNameParts.size == 1 => Option(t.getUnquotedName)
+            case _                                    => None
+        case _ => None
+    catch case scala.util.control.NonFatal(_) => None
 
   private def isQuotedIdentifier(view: String, t: SqlLexer.Token): Boolean =
     val c = view.charAt(t.start)

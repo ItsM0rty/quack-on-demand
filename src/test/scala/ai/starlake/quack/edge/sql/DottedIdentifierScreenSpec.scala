@@ -134,3 +134,63 @@ class DottedIdentifierScreenSpec extends AnyFlatSpec with Matchers:
 
   it should "admit them as aliases, literals and URL paths, and the other separators" in:
     admittedSeparators.foreach(sql => withClue(sql)(DottedIdentifierScreen.find(sql) shouldBe None))
+
+  // JSqlParser also strips SQL Server bracket quoting and a stray quote of the other style at a
+  // quoted name's edges: `"[secret]"`, `"secret]"`, `` "`secret`" `` and `` `"secret"` `` were all
+  // gated as table `secret`, while DuckDB 2.0 reads the table literally named `[secret]` (a
+  // `BRACKETED` row beside a `secret` table). The screen now compares JSqlParser's reading of every
+  // quoted name with the name itself.
+  private val refusedMisreads = List(
+    "SELECT * FROM \"[secret]\"",
+    s"SELECT * FROM ${B}[secret]$B",
+    "SELECT * FROM \"secret]\"",
+    "SELECT * FROM \"[secret\"",
+    "SELECT * FROM main.\"[secret]\"",
+    "SELECT * FROM \"[main]\".\"[secret]\"",
+    "INSERT INTO \"[secret]\" VALUES (1)",
+    "DROP TABLE \"[secret]\"",
+    "CREATE TABLE \"[secret]\" (a INT)",
+    s"SELECT * FROM \"${B}secret$B\"",
+    s"SELECT * FROM $B\"secret\"$B",
+    s"SELECT * FROM \"${B}secret\"",
+    s"SELECT * FROM $B\"secret$B"
+  )
+
+  "DottedIdentifierScreen" should "refuse a quoted name JSqlParser strips brackets or quotes from" in
+    refusedMisreads.foreach { sql =>
+      withClue(sql) {
+        DottedIdentifierScreen.find(sql) shouldBe Some(DottedIdentifierScreen.Reason)
+        AccessGate.evaluate(sql, cfg, "lake", false, clientDataScans = false) shouldBe a[
+          GateOutcome.Refuse
+        ]
+        LockdownScreen.screen(sql, Set.empty) shouldBe defined
+      }
+    }
+
+  // Every printable ASCII character, in both quoting styles, inside, before, after and around a
+  // name: the access check either refuses the statement or gates exactly the name DuckDB reads.
+  it should "never let a quoted name be gated as another name" in {
+    for
+      q     <- List('"', '`')
+      c     <- (32 to 126).map(_.toChar)
+      shape <- List(s"se${c}cret", s"${c}secret", s"secret$c", s"${c}secret$c")
+    do
+      val body = if c == q then shape.replace(s"$c", s"$c$c") else shape
+      val sql  = s"SELECT * FROM $q$body$q"
+      withClue(sql) {
+        AccessGate.evaluate(sql, cfg, "lake", true, clientDataScans = false) match
+          case GateOutcome.Gated(g, _) =>
+            g.map(_.table.canonical) shouldBe Set("lake.main." + shape.toLowerCase)
+          case GateOutcome.Refuse(_, _, _) => succeed
+          case other                       => fail(s"expected Gated or Refuse, got $other")
+      }
+  }
+
+  it should "admit ordinary quoted names, unicode included" in
+    List(
+      "SELECT * FROM \"orders\"",
+      "SELECT * FROM \"Order Items\"",
+      "SELECT * FROM \"émile\"",
+      "SELECT \"c-1\", \"a b\" FROM \"t#1\"",
+      s"SELECT * FROM ${B}order items$B"
+    ).foreach(sql => withClue(sql)(DottedIdentifierScreen.find(sql) shouldBe None))
