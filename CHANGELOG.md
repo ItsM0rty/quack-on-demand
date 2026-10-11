@@ -9,9 +9,9 @@
   `SET search_path='db.other'; SELECT * FROM t` read `db.other.t` with a grant on the default
   schema's `t` only, over FlightSQL and the native front door alike. For ACL-checked users such a
   batch is now refused: send `USE` / `SET search_path` as its own statement, which works as
-  before. Superusers are unaffected, except on a pool with a read-only catalog, where such a batch
-  cannot write. Every multi-statement request now also starts from the pool's default schema, even
-  when it opens with `BEGIN` or `SET`.
+  before. Superusers are unaffected. Every multi-statement request now also starts from the pool's
+  default schema, even when it opens with `BEGIN` or `SET`; one opening with `ROLLBACK` / `COMMIT`
+  switches to it right after that statement, so a rollback out of a failed transaction still runs.
 
 - **Security: `SET VARIABLE` can no longer read a table without a grant.** Its value is a query,
   so `SET VARIABLE x = (SELECT ... FROM any_table); SELECT getvariable('x')` returned rows from any

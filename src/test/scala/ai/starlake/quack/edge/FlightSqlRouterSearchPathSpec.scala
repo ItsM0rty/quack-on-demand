@@ -162,7 +162,6 @@ class FlightSqlRouterSearchPathSpec extends AnyFlatSpec with Matchers:
     // `t` here would resolve to acme_db.other.t while the ACL checked acme_db.tpch1.t.
     List(
       "BEGIN; SELECT * FROM t",
-      "COMMIT; SELECT * FROM t",
       "SET threads=2; SELECT * FROM t",
       "SET VARIABLE x = 1; SELECT * FROM t"
     ).foreach { sql =>
@@ -172,6 +171,29 @@ class FlightSqlRouterSearchPathSpec extends AnyFlatSpec with Matchers:
         sent shouldBe List(Prelude + sql)
       }
     }
+
+  it should "place the prelude after leading statements that end a transaction" in:
+    // Inside an aborted transaction DuckDB refuses everything but ROLLBACK, the USE prelude
+    // included, so `USE ...; ROLLBACK; ...` would fail and leave the session aborted. The prelude
+    // goes after the leading run of ROLLBACK / ABORT / COMMIT / END instead: those statements cannot
+    // move name resolution (a search path is not transactional on DuckDB), and every later
+    // statement still runs under the default schema the ACL checked.
+    List(
+      "ROLLBACK; SELECT * FROM t"         -> "ROLLBACK; USE acme_db.tpch1; SELECT * FROM t",
+      "abort ; SELECT * FROM t"           -> "abort ; USE acme_db.tpch1; SELECT * FROM t",
+      "COMMIT; SELECT * FROM t"           -> "COMMIT; USE acme_db.tpch1; SELECT * FROM t",
+      "ROLLBACK; COMMIT; SELECT * FROM t" -> "ROLLBACK; COMMIT; USE acme_db.tpch1; SELECT * FROM t",
+      "/* c */ END; SELECT * FROM t"      -> "/* c */ END; USE acme_db.tpch1; SELECT * FROM t",
+      "SELECT 1; ROLLBACK; SELECT * FROM t" -> (Prelude + "SELECT 1; ROLLBACK; SELECT * FROM t")
+    ).foreach { case (sql, expected) =>
+      withClue(sql) {
+        val (out, sent) = run(sql, eff = tenantAdmin)
+        out shouldBe a[Right[?, ?]]
+        sent shouldBe List(expected)
+      }
+    }
+    // Nothing after the transaction end: nothing to resolve, sent as is.
+    run("ROLLBACK; COMMIT", eff = root)._2 shouldBe List("ROLLBACK; COMMIT")
 
   it should "leave a lone transaction-control or SET statement unprefixed" in:
     run("BEGIN", eff = root)._2 shouldBe List("BEGIN")

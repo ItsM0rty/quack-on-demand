@@ -908,17 +908,26 @@ final class FlightSqlRouter(
     * still carry an earlier lone `USE` or `SET search_path`. `BEGIN; SELECT * FROM t` used to run
     * there with no prelude and read whichever `t` that left current. Prepending is harmless for
     * such a batch: whatever its own statements select still runs after the prelude.
+    *
+    * One exception to "prepend": a submission opening with statements that END a transaction
+    * (ROLLBACK / ABORT / COMMIT / END) gets the prelude right after that leading run instead.
+    * Inside an aborted transaction DuckDB refuses every statement but ROLLBACK, the prelude's `USE`
+    * included, so `USE ...; ROLLBACK; ...` failed and left the session aborted. Those statements
+    * read no table and cannot move name resolution (a search path is not transactional on DuckDB:
+    * it survives the ROLLBACK), so every statement that can read still runs after the prelude. With
+    * nothing after the run there is nothing to resolve and the text goes as is.
     */
   private def wrapWithDefaultSchema(
       state: Option[ai.starlake.quack.ondemand.PoolState],
       sql: String
   ): String =
-    val trimmed = sql.trim.toUpperCase(Locale.ROOT)
-    val skip    = (trimmed.startsWith("USE ") || trimmed.startsWith("SET ") ||
+    val trimmed        = sql.trim.toUpperCase(Locale.ROOT)
+    lazy val fragments = SqlCommentStripper.splitStatements(sql)
+    val endsTxFirst    = FlightSqlRouter.endsTransaction(sql)
+    val skip           = (trimmed.startsWith("USE ") || trimmed.startsWith("SET ") ||
       trimmed.startsWith("BEGIN") || trimmed.startsWith("COMMIT") ||
       trimmed.startsWith("ROLLBACK") || trimmed.startsWith("ATTACH") ||
-      trimmed.startsWith("DETACH")) &&
-      SqlCommentStripper.splitStatements(sql).lengthCompare(2) < 0
+      trimmed.startsWith("DETACH")) && fragments.lengthCompare(2) < 0
     // The alias is `catalogAlias` when set (branch catalogs attach under their parent's alias),
     // else `dbName`: see TenantDb.catalogAlias.
     state match
@@ -938,7 +947,12 @@ final class FlightSqlRouter(
               .filter(_.nonEmpty)
               .orElse(st.metastore.get("schemaName").filter(_.nonEmpty))
               .getOrElse("main")
-            s"USE $db.$schema; $sql"
+            val use = s"USE $db.$schema;"
+            if endsTxFirst then
+              val (lead, rest) = fragments.span(FlightSqlRouter.endsTransaction)
+              if rest.isEmpty then sql
+              else s"${lead.mkString(";")}; $use${rest.mkString(";")}"
+            else s"$use $sql"
           case None => sql
       case Some(st) if trimmed.startsWith("USE ") =>
         FlightSqlRouter
@@ -1054,6 +1068,16 @@ object FlightSqlRouter:
     (ai.starlake.quack.model.RunningNode, String, Option[String], Boolean) => IO[
       ai.starlake.quack.edge.adapter.NodeOutcome[A]
     ]
+
+  private val TransactionEnds = Set("ROLLBACK", "ABORT", "COMMIT", "END")
+
+  /** True when the first statement of `sql` ends a transaction (its verb as the engine reads it,
+    * past leading comments and trivia).
+    */
+  private[edge] def endsTransaction(sql: String): Boolean =
+    TransactionEnds.contains(
+      SqlTrivia.firstToken(sql).takeWhile(_.isLetter).toUpperCase(Locale.ROOT)
+    )
 
   // A bare one-part USE target: an unquoted identifier or one quoted identifier
   // (quoted may contain anything but a quote, including dots). Two-part

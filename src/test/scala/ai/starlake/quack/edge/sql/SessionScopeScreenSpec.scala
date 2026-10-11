@@ -49,13 +49,18 @@ class SessionScopeScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // hidden from a first-token check by leading trivia
     "/* c */ SET search_path='db.other'; SELECT * FROM t",
     "-- c\nUSE db.other; SELECT * FROM t",
-    " ​SET search_path='db.other'; SELECT * FROM t",
+    "\u00a0\u200bSET search_path='db.other'; SELECT * FROM t",
     "SET/**/search_path='db.other'; SELECT * FROM t",
-    "SET search_path='db.other'; SELECT * FROM t",
+    "SET\u00a0search_path='db.other'; SELECT * FROM t",
     // the separator a naive quote tracker would swallow
     "SELECT $$'$$; USE db.other; SELECT * FROM t",
     "SELECT e'\\''; USE db.other; SELECT * FROM t",
-    "SELECT 1 /* a /* b */ ; c */; USE db.other; SELECT * FROM t"
+    "SELECT 1 /* a /* b */ ; c */; USE db.other; SELECT * FROM t",
+    // a `$` that continues an identifier opens no dollar quote, so the trailing `$$` hides nothing
+    "SELECT 1 AS x$$; SET search_path='db.other'; SELECT * FROM t; -- $$",
+    "SELECT 1 AS x$$; SET schema='other'; SELECT * FROM t; -- $$",
+    "SELECT 1 AS x$a$; USE other; SELECT * FROM t; -- $a$",
+    "SELECT 1 AS x$$; SET search_path='db.other'; DELETE FROM t; -- $$"
   )
 
   "SessionScopeScreen" should "refuse every batch that moves the schema or search path" in:
@@ -165,13 +170,17 @@ class SessionScopeScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     val su = EffectiveSet(RbacUser("u-su", None, "admin", "admin"), Nil, Nil, Nil, Nil)
     validator.validate(ctx("SET search_path='db.other'; SELECT * FROM t", su)) shouldBe Allowed
 
-  // ---- the read-only catalog screen, which qualifies bare names the same way ---------------------
+  // ---- the read-only catalog screen ------------------------------------------------------------
 
-  "CatalogWriteScreen" should "refuse a scope-changing batch on a pool with a read-only catalog" in:
+  // The screen binds callers the ACL does not check (superusers, acl.enabled=false), for whom a
+  // scope-changing batch is legitimate; ACL-checked callers are refused by the validator before the
+  // screen runs, and the node attaches a read-only catalog READ_ONLY. So the screen keeps its
+  // previous behavior and does not refuse a batch merely for moving the schema.
+  "CatalogWriteScreen" should "not refuse a read-only scope-changing batch" in:
     val roCfg = Config.forDuckDB(Some("db"), Some("def"), Set("db", "ro"))
     CatalogWriteScreen.screen(
-      "USE ro.main; INSERT INTO t VALUES (1)",
+      "USE ro.main; SELECT * FROM t",
       StatementClassifier.default.classify,
       Set("ro"),
       roCfg
-    ) shouldBe defined
+    ) shouldBe None

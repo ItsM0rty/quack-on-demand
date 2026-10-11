@@ -74,8 +74,9 @@ object SqlCommentStripper:
           result.append(sql.substring(i, end))
           i = end
         else
-          // `$` opens a dollar-quoted string only when a well-formed tag and its matching close
-          // are both there; otherwise it is an ordinary character (a positional parameter, say).
+          // `$` opens a dollar-quoted string only at the start of a token, with a well-formed tag
+          // and its matching close; otherwise it is an ordinary character (a positional
+          // parameter, or the tail of an identifier such as `x$$`). See `dollarQuotedEnd`.
           val dollar = if c == '$' then dollarQuotedEnd(sql, i) else None
           dollar match
             case Some(end) =>
@@ -203,18 +204,40 @@ object SqlCommentStripper:
     * parameter `$1` followed by an unterminated `$x$` string, not as `$1$...$1$`. An opener with no
     * matching close is rejected too rather than swallowing the remainder -- DuckDB rejects that
     * statement outright, and leaving the text visible is the safe direction for a screening caller.
+    *
+    * A `$` glued to the character before it opens nothing when that character continues a token:
+    * DuckDB's lexer continues an identifier through ASCII letters, digits, `_`, `$` and every
+    * non-ASCII character, so `x$$`, `x$a$` and an accented letter followed by `$$` are identifiers
+    * and the `$$` in them is not an opener (all verified on DuckDB 1.5.6 and 2.0). A `$` right
+    * after a digit is not one either: `0x1$$` lexes as `0` and the identifier `x1$$`, and `1$$` /
+    * `1.5$$` are syntax errors, so reading no opener there only ever exposes more separators.
+    * Reading an opener where DuckDB has an identifier would hide every separator up to the next
+    * matching tag, which can sit in a trailing comment.
+    *
+    * Tag characters follow DuckDB too: ASCII letters, `_` and every non-ASCII character, plus
+    * digits after the first.
     */
   private def dollarQuotedEnd(sql: String, from: Int): Option[Int] =
-    var t = from + 1
-    while t < sql.length && isTagChar(sql.charAt(t), t == from + 1) do t += 1
-    if t >= sql.length || sql.charAt(t) != '$' then None
+    if from > 0 && continuesToken(sql.charAt(from - 1)) then None
     else
-      val tag   = sql.substring(from, t + 1)
-      val close = sql.indexOf(tag, t + 1)
-      if close < 0 then None else Some(close + tag.length)
+      var t = from + 1
+      while t < sql.length && isTagChar(sql.charAt(t), t == from + 1) do t += 1
+      if t >= sql.length || sql.charAt(t) != '$' then None
+      else
+        val tag   = sql.substring(from, t + 1)
+        val close = sql.indexOf(tag, t + 1)
+        if close < 0 then None else Some(close + tag.length)
+
+  private def isAsciiLetter(c: Char): Boolean = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+
+  private def isAsciiDigit(c: Char): Boolean = c >= '0' && c <= '9'
+
+  /** A character that continues an identifier or number token in DuckDB's lexer. */
+  private def continuesToken(c: Char): Boolean =
+    isAsciiLetter(c) || isAsciiDigit(c) || c == '_' || c == '$' || c >= 0x80
 
   private def isTagChar(c: Char, first: Boolean): Boolean =
-    if first then c.isLetter || c == '_' else c.isLetterOrDigit || c == '_'
+    isAsciiLetter(c) || c == '_' || c >= 0x80 || (!first && isAsciiDigit(c))
 
   def removeEmptyLines(input: String): String =
     val res = input.linesIterator.filter(_.trim.nonEmpty).mkString("\n")
