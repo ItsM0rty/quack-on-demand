@@ -28,15 +28,17 @@
 # deletes it as soon as the values are read. On Kubernetes it is a read-only Secret volume. A key
 # still present in the environment is ignored (with a warning) rather than used.
 #
-# DuckDB is kept alive after `quack_serve` returns via a FIFO held open
-# by this shell, so the background quack thread keeps serving until the
-# process is terminated (SIGTERM from `LocalQuackBackend.stop`).
+# The init SQL reaches duckdb through `-init` on a FIFO, never through stdin: the 2.0 CLI records
+# every statement it reads from stdin in shell_history(), which any session of the node can query,
+# and the init SQL carries the node token and the catalog / object-store / federation credentials.
+# An -init file is not recorded, and a FIFO never puts it on disk. `-init` also stops the CLI from
+# running the OS user's ~/.duckdbrc. The FIFO name is unlinked as soon as duckdb has opened it.
 #
-# The init SQL reaches duckdb through `-init` on a second FIFO, never through stdin: the 2.0 CLI
-# records every statement it reads from stdin in shell_history(), which any session of the node can
-# query, and the init SQL carries the node token and the catalog / object-store / federation
-# credentials. An -init file is not recorded, and a FIFO never puts it on disk. `-init` also stops
-# the CLI from running the OS user's ~/.duckdbrc. Nothing is written to stdin.
+# duckdb's stdin is /dev/null: nothing is ever fed to it, so no statement or dot-command can be
+# injected on the node's own connection (COPY ... TO '/proc/self/fd/0' then lands on /dev/null),
+# and there is no reopenable FIFO in the working directory's parent. The node is instead kept alive
+# by a last init statement that blocks forever (quack_serve has already started its background
+# thread); SIGTERM from LocalQuackBackend.stop ends it.
 #
 # duckdb runs in an empty, private (0700) directory of its own, created here and removed when the
 # node stops: DuckDB 2.0 replacement-scans an unquoted dotted name as a file (`SELECT * FROM x.csv`
@@ -53,8 +55,10 @@ export DUCKDB_AGENT_MODE=0
 PORT="${1:?port required}"
 
 # The directory relative paths resolve against (the manager's or join process's working directory,
-# where duckdb itself used to run). Physical, so it matches the manager JVM's own resolution.
+# where duckdb itself used to run). Physical, so it matches the manager JVM's own resolution. A
+# trailing slash is stripped so a start dir of `/` yields `/ducklake/...`, not `//ducklake/...`.
 START_DIR="$(pwd -P)"
+START_DIR="${START_DIR%/}"
 
 # Keep in sync with NodeSecretFiles.Keys (Scala), SECRET_KEYS in spawn-quack-node.ps1 and
 # _SECRET_KEYS in cli/src/qod_cli/fleet_join.py; NodeSecretFilesSpec pins all four.
@@ -209,10 +213,27 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
   [[ "$DUCKDB" == /* ]] || DUCKDB="$START_DIR/$DUCKDB"
 fi
 
+# Sweep node directories left by an earlier spawn whose script died on SIGKILL (which skips the
+# trap below): the init FIFO carries no secrets to disk, but a spill directory can be large. A
+# directory whose recorded pid is gone is ours to remove; one still being created has no pid file
+# yet and is left alone.
+for d in "${TMPDIR:-/tmp}"/quack-node.*; do
+  [[ -d "$d" ]] || continue
+  op="$d/owner.pid"
+  if [[ -f "$op" ]]; then
+    owner="$(cat "$op" 2>/dev/null || true)"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      sp="$(cat "$d/spill.path" 2>/dev/null || true)"
+      [[ -n "$sp" ]] && rm -rf -- "$sp"
+      rm -rf -- "$d"
+    fi
+  fi
+done
+
 # Per-node private state, all removed by cleanup() when the node stops: NODE_DIR (0700, from mktemp)
-# holds the FIFO, the psql passfile while it is needed, and WORK_DIR, the empty directory duckdb
-# runs in. Created in dry-run mode too, so the SQL below names the same spill directory a real
-# spawn would.
+# holds the init FIFO, the psql passfile while it is needed, owner.pid / spill.path for the stale
+# sweep above, and WORK_DIR, the empty directory duckdb runs in. Created in dry-run mode too, so the
+# SQL below names the same spill directory a real spawn would.
 NODE_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/quack-node.XXXXXX)"
 SPILL_DIR=""
 DUCK_PID=""
@@ -225,10 +246,10 @@ cleanup() {
     kill -TERM "$DUCK_PID" 2>/dev/null || true
     wait "$DUCK_PID" 2>/dev/null || true
   fi
-  exec 9>&- 2>/dev/null || true
   rm -rf -- "$NODE_DIR" ${SPILL_DIR:+"$SPILL_DIR"}
 }
 trap cleanup TERM INT EXIT
+printf '%s' "$$" > "$NODE_DIR/owner.pid"
 WORK_DIR="$NODE_DIR/cwd"
 mkdir -m 700 "$WORK_DIR"
 # DuckDB's spill directory defaults to `.tmp` under its working directory, which no longer persists
@@ -247,6 +268,8 @@ if [[ -z "$SPILL_DIR" ]]; then
   SPILL_DIR="$NODE_DIR/tmp"
   mkdir -m 700 "$SPILL_DIR"
 fi
+# Recorded so the stale sweep of a later spawn can remove this spill dir if our script is SIGKILLed.
+printf '%s' "$SPILL_DIR" > "$NODE_DIR/spill.path"
 
 # Ensure the Postgres database $dbName exists. Connects to PG_ADMIN_DB (default
 # `postgres`) as admin and runs CREATE DATABASE if missing. Skipped when psql
@@ -281,19 +304,15 @@ fi
 # duckdb process. Skip the FIFO and the duckdb launch entirely rather than starting one and
 # killing it - SpawnScriptEncryptionSpec drives this script many times per run.
 if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
-  # A named pipe keeps duckdb's stdin live without blocking: nothing is ever written to it, and
-  # fd 9 holds the writer side open until this shell exits. The init SQL goes through INIT_FIFO.
-  FIFO="$NODE_DIR/in"
+  # The init SQL is handed to duckdb through -init on a FIFO (never on disk, never recorded in
+  # shell_history()). stdin is /dev/null, so no statement can be injected on the node's own
+  # connection; the node is kept alive by a blocking last init statement instead (appended below).
   INIT_FIFO="$NODE_DIR/init"
-  mkfifo "$FIFO" "$INIT_FIFO"
+  mkfifo "$INIT_FIFO"
 
-  # Start duckdb first - open() on FIFO blocks until the writer side appears. It runs in WORK_DIR
-  # (the subshell execs it, so $! is duckdb's own pid); this script stays where it started.
-  (cd "$WORK_DIR" && exec "$DUCKDB" -init "$INIT_FIFO") < "$FIFO" &
+  # Runs in WORK_DIR (the subshell execs it, so $! is duckdb's own pid); this script stays put.
+  (cd "$WORK_DIR" && exec "$DUCKDB" -init "$INIT_FIFO" < /dev/null) &
   DUCK_PID=$!
-
-  # Open the writer end; this unblocks duckdb's open().
-  exec 9> "$FIFO"
 fi
 
 # DuckDB does NOT honour the HTTP_PROXY / HTTPS_PROXY env vars for
@@ -484,7 +503,14 @@ fi
 # management NIC by accident.
 NODE_BIND="${QOD_NODE_BIND:-0.0.0.0}"
 # DuckDB 2.0 serves HTTPS by default off localhost; the manager speaks plain HTTP (node TLS: #27).
-INIT_SQL+="CALL quack_serve('quack:${NODE_BIND}:$PORT', token := '$TOKEN', allow_other_hostname := true, disable_ssl := true);"$'\n'
+# SELECT only listen_url (not the CALL's row), so the node token never reaches the inherited stdout
+# (the manager console locally, `kubectl logs` on K8s).
+INIT_SQL+="SELECT listen_url FROM quack_serve('quack:${NODE_BIND}:$PORT', token := '$TOKEN', allow_other_hostname := true, disable_ssl := true);"$'\n'
+# Keep-alive: with stdin on /dev/null the CLI would reach EOF and exit once the init is read, so the
+# last init statement blocks forever. quack_serve has already started its serving thread; this runs
+# on the main connection, holds no lock the served sessions need, and ends on SIGTERM. A single
+# huge sleep_ms overflows on 1.x, so sleep in bounded steps over an effectively endless range.
+INIT_SQL+=$'SELECT sum(sleep_ms(3600000)) FROM range(1000000000);\n'
 
 # Test seam: print the assembled init SQL and exit without launching duckdb.
 # Used by SpawnScriptEncryptionSpec to assert the emitted SQL, which is the only
@@ -494,9 +520,10 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" == "1" ]]; then
   exit 0
 fi
 
-# duckdb reads -init before stdin. The writer's open blocks until it does, so it runs in the
-# background: a duckdb that exits first must still end this script (cleanup stops the writer).
-printf '%s' "$INIT_SQL" > "$INIT_FIFO" &
+# Write the init SQL into the FIFO, then unlink the FIFO name so no `../init` path lingers in the
+# working directory's parent (the fd stays valid). Backgrounded: duckdb reads -init at startup, and
+# a duckdb that exits first must still let this script end (cleanup stops the writer).
+{ printf '%s' "$INIT_SQL" > "$INIT_FIFO"; rm -f -- "$INIT_FIFO"; } &
 INIT_WRITER=$!
 
 # Block until duckdb is killed (typically SIGTERM from the manager).

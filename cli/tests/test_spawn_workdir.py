@@ -60,7 +60,7 @@ def test_duckdb_runs_in_an_empty_private_directory_removed_on_stop(tmp_path):
         f"ls -A | wc -l | tr -d ' ' > '{probe}/entries'\n"
         f"mv '{probe}/cwd.part' '{probe}/cwd'\n"
         f"cat \"$2\" > '{probe}/init'\n"
-        "exec cat > /dev/null\n"
+        "while :; do sleep 1; done\n"
     )
     fake.chmod(0o700)
     env, tmpdir = _env(tmp_path, DUCKDB_BIN=str(fake))

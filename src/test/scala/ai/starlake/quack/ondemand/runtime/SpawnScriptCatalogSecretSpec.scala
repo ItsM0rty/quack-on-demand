@@ -66,7 +66,7 @@ private trait SpawnScriptCatalogSecretCases extends Matchers with SpawnScriptTem
       create should be < first
       lake should be < drop
       drop should be < lines.indexOf("SELECT 'federation';")
-      drop should be < lines.indexWhere(_.startsWith("CALL quack_serve"))
+      drop should be < lines.indexWhere(_.contains("quack_serve("))
     }
 
     it should "double an apostrophe in the password" in {

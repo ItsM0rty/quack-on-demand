@@ -274,19 +274,30 @@ function Remove-NodeDirectory([string]$dir) {
   Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Per-node private state: $nodeDir holds owner.pid, spill.path and $workDir, the empty directory
-# duckdb runs in. Node directories of earlier spawns whose owning script is gone (taskkill /T /F
-# skipped their cleanup) are removed first; one still being created has no owner.pid yet and is
-# left alone.
+# Per-node private state: $nodeDir holds owner.pid (the owning script's PID and its start ticks),
+# spill.path and $workDir, the empty directory duckdb runs in. Node directories of earlier spawns
+# whose owning script is gone (taskkill /T /F skipped their cleanup) are removed first. The owner is
+# alive only when a process of that PID exists AND started at the recorded time: Windows recycles
+# PIDs, so the start time keeps the sweep from sparing (or killing) an unrelated process's dir. A
+# dir with no owner.pid yet (still being created) or an unparseable one is left alone.
 $tempRoot = [System.IO.Path]::GetTempPath()
 Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'quack-node.*' -ErrorAction SilentlyContinue |
   ForEach-Object {
     $ownerFile = Join-Path $_.FullName 'owner.pid'
     if (Test-Path -LiteralPath $ownerFile -PathType Leaf) {
+      $parts = (([System.IO.File]::ReadAllText($ownerFile)).Trim() -split '\s+')
       $owner = 0
-      [void][int]::TryParse(([System.IO.File]::ReadAllText($ownerFile)).Trim(), [ref]$owner)
-      if ($null -eq (Get-Process -Id $owner -ErrorAction SilentlyContinue)) {
-        Remove-NodeDirectory $_.FullName
+      if ($parts.Count -ge 1 -and [int]::TryParse($parts[0], [ref]$owner)) {
+        $proc  = Get-Process -Id $owner -ErrorAction SilentlyContinue
+        $alive = $false
+        if ($null -ne $proc) {
+          if ($parts.Count -ge 2) {
+            try { $alive = ($proc.StartTime.Ticks.ToString() -eq $parts[1]) } catch { $alive = $true }
+          } else {
+            $alive = $true
+          }
+        }
+        if (-not $alive) { Remove-NodeDirectory $_.FullName }
       }
     }
   }
@@ -307,7 +318,9 @@ try {
   New-PrivateDirectory $spillDir
 }
 [System.IO.File]::WriteAllText((Join-Path $nodeDir 'spill.path'), $spillDir)
-[System.IO.File]::WriteAllText((Join-Path $nodeDir 'owner.pid'), [string]$PID)
+$ownerTicks = ''
+try { $ownerTicks = (Get-Process -Id $PID).StartTime.Ticks.ToString() } catch {}
+[System.IO.File]::WriteAllText((Join-Path $nodeDir 'owner.pid'), "$PID $ownerTicks")
 
 # DuckDB does NOT honour HTTP_PROXY/HTTPS_PROXY for `INSTALL <extension>`
 # downloads - those go through libcurl via the SQL `SET http_proxy=...`
@@ -418,7 +431,13 @@ if (-not [string]::IsNullOrEmpty($extraSetupSql)) { [void]$sb.AppendLine($extraS
 # node serves any tenant statement.
 if (-not [string]::IsNullOrEmpty($lockdownSql)) { [void]$sb.AppendLine($lockdownSql) }
 
-[void]$sb.AppendLine("CALL quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
+# SELECT only listen_url (not the CALL's row) so the node token never reaches the inherited stdout.
+[void]$sb.AppendLine("SELECT listen_url FROM quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
+# Keep-alive: stdin is the null device, so the CLI would reach EOF and exit once -init is read; a
+# blocking last statement holds it instead (quack_serve's thread is already serving). A single huge
+# sleep_ms overflows on 1.x, so sleep in bounded steps over an effectively endless range. Mirrors
+# spawn-quack-node.sh.
+[void]$sb.AppendLine("SELECT sum(sleep_ms(3600000)) FROM range(1000000000);")
 
 $initSql = $sb.ToString()
 
@@ -431,18 +450,33 @@ if ($dryRun) {
   exit 0
 }
 
-# Start duckdb with a redirected stdin we keep OPEN (the Windows analogue of
-# the bash FIFO). stdout/stderr are inherited so node logs flow to the
-# manager's console (LocalQuackBackend uses inheritIO()).
+# stdout/stderr are inherited so node logs flow to the manager's console (LocalQuackBackend uses
+# inheritIO()). stdin is the null device: nothing is fed to the CLI, so no statement can be injected
+# on the node's own connection, and the 2.0 CLI records nothing in shell_history(). The node is kept
+# alive by a blocking last init statement (appended to $initSql above), the same as the bash twin.
 #
-# The init SQL goes through `-init <file>`, never stdin: the 2.0 CLI records every statement it
-# reads from stdin in shell_history(), which any session of the node can query, and the init SQL
-# carries the node token and the catalog / object-store / federation credentials. The file sits in
-# the private node directory and is deleted once the node listens (quack_serve, its last statement,
-# has run) or exits. `-init` also stops the CLI from running the user's ~/.duckdbrc. Nothing is
-# written to stdin. Mirrors spawn-quack-node.sh, which uses a FIFO instead of a file.
+# The init SQL goes through `-init <file>`: the 2.0 CLI records every statement it reads from stdin
+# in shell_history(), and the init SQL carries the node token and the catalog / object-store /
+# federation credentials. Windows has no FIFO that -init accepts, so the file is the one carrier
+# that leaves disk; it sits in the private node directory (its ACL is current-user-only, set
+# explicitly below and inherited from the directory), and is deleted as soon as DuckDB has read it
+# (a retry loop that succeeds once the CLI closes the file, independent of the port probe, which
+# could see a stranger's listener). A node whose init file cannot be removed is killed rather than
+# left serving with its secrets on disk. A SIGKILL-equivalent (taskkill /F) that skips the cleanup
+# below still loses the file to the stale sweep of a later spawn. `-init` also stops the CLI from
+# running the user's ~/.duckdbrc.
 $initFile = Join-Path $nodeDir 'init.sql'
 [System.IO.File]::WriteAllText($initFile, $initSql)
+if ($onWindows) {
+  $acl = New-Object System.Security.AccessControl.FileSecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+  $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $me, 'FullControl', 'Allow')))
+  Set-Acl -LiteralPath $initFile -AclObject $acl
+} else {
+  & chmod 600 $initFile
+}
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName               = $duckdbBin
 $psi.Arguments              = '-init "' + $initFile + '"'
@@ -454,21 +488,41 @@ $psi.WorkingDirectory       = $workDir
 
 try {
   $proc = [System.Diagnostics.Process]::Start($psi)
-  # Do NOT close StandardInput: duckdb's main thread blocks reading it, which
-  # keeps the process (and the background quack_serve thread) alive until the
-  # manager terminates the tree.
-  $deadline = [DateTime]::UtcNow.AddMinutes(10)
-  while (-not $proc.HasExited -and [DateTime]::UtcNow -lt $deadline) {
-    $client = [System.Net.Sockets.TcpClient]::new()
-    try {
-      if ($client.ConnectAsync('127.0.0.1', $Port).Wait(200)) { break }
-    } catch {
-    } finally {
-      $client.Dispose()
+  # stdin carries nothing; closing it is harmless because the blocking init statement, not stdin,
+  # keeps the process alive. duckdb reads -init at startup and closes the file; a delete then
+  # succeeds (on Windows it fails with a sharing violation until that close, so the retry waits for
+  # exactly the read, not the port). If it never succeeds the init file would linger with its
+  # secrets, so the node is killed.
+  $proc.StandardInput.Close()
+  if ($onWindows) {
+    # Windows refuses to delete a file another process holds open (no FILE_SHARE_DELETE), so the
+    # loop deletes the moment DuckDB closes it after reading -init: that is the "has read it"
+    # signal, independent of the port (which a stray listener could answer). A file that can never
+    # be removed would keep the node's secrets on disk, so the node is killed. (POSIX unlink would
+    # instead succeed before DuckDB had opened it and break -init, so the eager delete is Windows
+    # only; off Windows the ps1 is not a production path and the file goes with the node dir in the
+    # finally below.)
+    $deleted  = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    while (-not $deleted -and [DateTime]::UtcNow -lt $deadline) {
+      try {
+        Remove-Item -LiteralPath $initFile -Force -ErrorAction Stop
+        $deleted = $true
+      } catch {
+        if (-not (Test-Path -LiteralPath $initFile)) { $deleted = $true }
+        else { Start-Sleep -Milliseconds 200 }
+      }
+      if (-not $deleted -and $proc.HasExited) {
+        Remove-Item -LiteralPath $initFile -Force -ErrorAction SilentlyContinue
+        $deleted = -not (Test-Path -LiteralPath $initFile)
+        break
+      }
     }
-    Start-Sleep -Milliseconds 300
+    if (-not $deleted) {
+      [Console]::Error.WriteLine("ERROR: could not delete the init file $initFile; killing the node so its secrets do not linger on disk")
+      try { $proc.Kill() } catch {}
+    }
   }
-  Remove-Item -LiteralPath $initFile -Force -ErrorAction SilentlyContinue
   $proc.WaitForExit()
   $exitCode = $proc.ExitCode
 } finally {

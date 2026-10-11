@@ -55,12 +55,16 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
     pb.environment()
       .putAll(
         (Seq(
-          "kind"                       -> "memory",
-          "schemaName"                 -> "main",
-          "dbName"                     -> "acme_mem",
-          "DUCKDB_BIN"                 -> pinnedDuckdb.get.toString,
-          "QOD_NODE_BIND"              -> "127.0.0.1",
-          NodeSecretFiles.DirEnv       -> secrets.toString,
+          "kind"          -> "memory",
+          "schemaName"    -> "main",
+          "dbName"        -> "acme_mem",
+          "DUCKDB_BIN"    -> pinnedDuckdb.get.toString,
+          "QOD_NODE_BIND" -> "127.0.0.1",
+          // A throwaway HOME, so the node never reads the developer's own ~/.duckdb (extensions
+          // resolve the same; before the persistent-secrets fix a real HOME also leaked stored
+          // secrets into the node).
+          "HOME"                 -> Files.createDirectories(tempDir.resolve("node-home")).toString,
+          NodeSecretFiles.DirEnv -> secrets.toString,
           NodeSecretFiles.EphemeralEnv -> "1"
         ) ++ env).toMap.asJava
       )

@@ -36,9 +36,14 @@
   every statement it reads from stdin, and the spawn scripts fed the node's whole init SQL that way,
   so `SELECT * FROM shell_history()` on a node returned it: the node token, the catalog Postgres
   password, and the object-store and federation credentials. The init SQL now reaches duckdb through
-  `-init` (a FIFO on Linux and macOS, a file in the private node directory on Windows, deleted once
-  the node serves), which the CLI does not record; nothing is written to stdin. A failing init
-  statement still does not stop the node. `-init` also means a node no longer runs the OS user's
+  `-init` (a FIFO on Linux and macOS, a current-user-only file in the private node directory on
+  Windows, deleted as soon as DuckDB has read it), which the CLI does not record. The node's stdin
+  is now the null device, so no statement or dot-command can be injected on the node's own
+  connection and there is no reopenable keep-alive pipe in the working directory; the node is kept
+  alive by a blocking final init statement instead. On Windows the init file briefly holds the
+  secrets on disk (user-only, removed once read, and a node whose init file cannot be removed is
+  killed); a later spawn sweeps any file a forced kill left behind. A failing init statement still
+  does not stop the node. `-init` also means a node no longer runs the OS user's
   `~/.duckdbrc`. The CLI only keeps this history in memory when stdin is not a terminal (nothing was
   written to `~/.duckdb_history`), and 1.x CLIs have no `shell_history()`. If you ran DuckDB 2.0
   nodes before this release, rotate what they could read: the catalog Postgres passwords, the
@@ -55,9 +60,14 @@
   Kubernetes, under `.tmp` of the starting directory elsewhere) instead of a `.tmp` shared by every
   node of the host. An operator's `SET temp_directory` in the database or pool init SQL still wins.
   Branches of a database with a relative dataPath now record the parent's files by absolute path,
-  and the merge node attaches the branch by its absolute path. Upgrading: a branch cloned before
-  this release from such a database cannot read the parent's files any more; discard and recreate
-  it.
+  and the merge node attaches the branch by its absolute path. BREAKING: a relative path in an
+  operator's database or pool `initSql` or federation SQL (for example `CREATE VIEW ... FROM
+  'data/x.parquet'` or `ATTACH 'x.duckdb'`) no longer resolves against the manager's directory,
+  because the node no longer runs there; use an absolute path or an object-store URL. Every spawn
+  also creates the per-node spill directory under `.tmp/` in the manager's (or `qod start` user's)
+  working directory up front, where duckdb previously created `.tmp` only on first spill.
+  Upgrading: a branch cloned before this release from a relative-dataPath database cannot read the
+  parent's files any more; discard and recreate it.
 
 - **Native client lease.** The manager-to-node native client heartbeats each node connection
   under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).

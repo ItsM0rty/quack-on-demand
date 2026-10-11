@@ -113,8 +113,8 @@ class SpawnScriptWorkDirSpec extends AnyFlatSpec with Matchers with SpawnScriptT
     )
   }
 
-  /** A stand-in duckdb that records where it runs and its init SQL (`-init <fifo>`), then holds its
-    * stdin like the real one.
+  /** A stand-in duckdb that records where it runs and its init SQL (`-init <fifo>`, argv position 2),
+    * then blocks until SIGTERM like the real node (whose stdin is /dev/null).
     */
   private def fakeDuckdb(at: Path, probe: Path): Path =
     Files.createDirectories(at.getParent)
@@ -126,7 +126,7 @@ class SpawnScriptWorkDirSpec extends AnyFlatSpec with Matchers with SpawnScriptT
          |(stat -f %Lp . 2>/dev/null || stat -c %a .) > '$probe/mode'
          |mv '$probe/cwd.part' '$probe/cwd'
          |cat "$$2" > '$probe/init'
-         |exec cat > /dev/null
+         |while :; do sleep 1; done
          |""".stripMargin
     )
     Files.setPosixFilePermissions(at, PosixFilePermissions.fromString("rwx------"))
