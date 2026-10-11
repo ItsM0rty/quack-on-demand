@@ -129,9 +129,11 @@ class QuotedFileReferenceSpec extends AnyFlatSpec with Matchers:
   }
 
   // A direct file read is reserved to superusers (FileAccessScreen): every URL, path and glob
-  // name is refused under the wildcard ALL grant too.
+  // name is refused under the wildcard ALL grant too. A quoted part holding a glob character is a
+  // file whatever its position or extension (`"*".csv` read every CSV of the working directory on
+  // the 2.0 CLI).
   it should "refuse every URL, path and glob form under the wildcard ALL grant" in
-    (fileReads ++ fileWrites)
+    (fileReads ++ fileWrites ++ List("SELECT * FROM \"data_*\".csv", "SELECT * FROM \"*\".csv"))
       .foreach { sql =>
         withClue(sql)(validate(sql, eff(perm("*", "*", "*", "ALL"))) shouldBe a[Denied])
       }

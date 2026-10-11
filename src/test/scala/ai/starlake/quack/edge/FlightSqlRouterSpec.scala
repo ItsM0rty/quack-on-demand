@@ -3540,7 +3540,9 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     "SELECT * FROM range(1) AS values, '/etc/x.csv'",
     "SELECT * FROM range(1) set, '/etc/x.csv'",
     "SELECT * FROM (SELECT 1 AS \"order\") r JOIN (SELECT 1 AS \"order\") s " +
-      "ON r.order = s.order, '/etc/x.csv'"
+      "ON r.order = s.order, '/etc/x.csv'",
+    // a quoted glob name: every matching file
+    "SELECT * FROM \"*\".csv"
   )
 
   "a direct file read or write" should "be refused to a *.*.* ALL tenant principal, QoD and OPA" in:

@@ -191,9 +191,15 @@ object FileAccessScreen:
 
   private val loadReason = reason("LOAD / INSTALL from a file, a URL or a repository loads code")
 
-  /** A joined quoted-identifier chain DuckDB would read as a file: a URL, or a local path. */
+  /** A joined quoted-identifier chain DuckDB would read as a file: a URL, a glob (a bare part
+    * cannot hold a glob character, so a quoted one does: `"*".csv` reads every CSV of the working
+    * directory, whatever the position or extension), or a local path.
+    */
   private def pathShaped(name: String): Boolean =
-    name.contains("://") || LockdownScreen.looksLikePath("'" + name + "'")
+    name.contains("://") || GlobChars.exists(name.contains) ||
+      LockdownScreen.looksLikePath("'" + name + "'")
+
+  private val GlobChars = List("*", "?", "[", "{")
 
   private def reason(what: String): String =
     s"$what; direct file access is not available to tenant-scoped principals (deny, " +

@@ -73,7 +73,15 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
     "SELECT * FROM range(1) set, '/etc/x.csv'",
     "SELECT * FROM range(1) AS values, ('/etc/x.csv')",
     "SELECT * FROM (SELECT 1 AS \"order\") r JOIN (SELECT 1 AS \"order\") s " +
-      "ON r.order = s.order, '/etc/x.csv'"
+      "ON r.order = s.order, '/etc/x.csv'",
+    // a quoted name holding a glob character reads every matching file (2.0 CLI); `csv` is a
+    // JSqlParser keyword, so `"*".csv` does not parse
+    "SELECT * FROM \"*\".csv",
+    s"SELECT * FROM $B*$B.csv",
+    "SELECT * FROM \"data_*\".csv",
+    "SELECT * FROM \"data_*\".parquet",
+    "SELECT * FROM \"data_*\"",
+    "SET file_search_path = '/etc'; SELECT * FROM \"*\".csv"
   )
 
   private val admitted = List(
