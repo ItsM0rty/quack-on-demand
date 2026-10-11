@@ -215,59 +215,49 @@ class NodeStateJudgmentSpec extends AnyFlatSpec with Matchers:
   * functions or compute values).
   */
 class MacroJudgmentSpec extends AnyFlatSpec with Matchers:
-
-  private def callsOf(body: String): Set[String] =
-    "[A-Za-z_][A-Za-z0-9_]*\\(".r
-      .findAllIn(Option(body).getOrElse(""))
-      .map(_.dropRight(1).toLowerCase(java.util.Locale.ROOT))
-      .toSet
-
-  private val pinned: Map[(String, String), Set[String]] =
-    val src = Source.fromResource("lockdown/duckdb-2.0-macros.csv")
-    try
-      src
-        .getLines()
-        .filterNot(l => l.startsWith("#") || l.isBlank)
-        .map { line =>
-          val cols = line.split(',')
-          (cols(0), cols(1)) -> (if cols(2) == "-" then Set.empty[String]
-                                 else cols(2).split('|').toSet)
-        }
-        .toMap
-    finally src.close()
-
-  /** A name the tenant screens refuse outright, whatever its position. */
-  private def refusedByName(n: String): Boolean =
-    FileAccessScreen.FileFunctions(n) || CatalogReachingCalls.LockdownNames(n) ||
-      n.startsWith("ducklake_") || NodeSettingScreen.NodeWideCalls(n) ||
-      NodeSettingScreen.SecretCalls(n) || NodeStateScreen.Refused.contains(n) ||
-      n == "current_setting"
-
-  private def reachesRefused(name: String, seen: Set[String] = Set.empty): Boolean =
-    pinned.get(("table_macro", name)).orElse(pinned.get(("macro", name))) match
-      case None        => false
-      case Some(calls) =>
-        calls.exists { c =>
-          (c != name && refusedByName(c)) ||
-          (!seen(c) && c != name && pinned.contains(("table_macro", c)) &&
-            reachesRefused(c, seen + name))
-        }
+  import PinnedMacros.{callsOf, pinned, reachable, refusedByScreens}
 
   "every 2.0 table macro" should "be refused when its body reaches a refused function" in {
     val tableMacros = pinned.keySet.collect { case ("table_macro", n) => n }
     tableMacros should contain allOf ("histogram", "histogram_values", "whoami")
     tableMacros.foreach { m =>
       withClue(m) {
-        val refused = refusedByName(m) || FileReferences.ReadingTableMacros.contains(m)
-        refused shouldBe reachesRefused(m)
+        refusedByScreens(m) shouldBe reachable(m).exists(c => c != m && refusedByScreens(c))
       }
     }
   }
 
-  "every 2.0 scalar macro" should "reach no refused function" in
-    pinned.collect { case (("macro", n), calls) => n -> calls }.foreach { (n, calls) =>
-      withClue(n)(calls.filter(refusedByName) shouldBe empty)
+  // Through every pinned macro, scalar and table: a scalar macro calling `histogram_values` in a
+  // subquery, or `pg_get_viewdef`, reaches a refused function and must be refused itself.
+  "every 2.0 scalar macro" should "be refused when its body reaches a refused function" in
+    pinned.keySet.collect { case ("macro", n) => n }.foreach { n =>
+      withClue(n) {
+        val reached = reachable(n).filter(c => c != n && refusedByScreens(c))
+        if reached.nonEmpty then refusedByScreens(n) shouldBe true
+      }
     }
+
+  "the refused-name derivation" should "read the screens' own verdicts" in {
+    List(
+      "query_table",
+      "read_csv",
+      "histogram",
+      "histogram_values",
+      "pg_get_viewdef",
+      "pg_get_constraintdef",
+      "duckdb_settings",
+      "current_setting",
+      "shell_history",
+      "dbgen",
+      "ducklake_table_insertions"
+    ).foreach(n => withClue(n)(refusedByScreens(n) shouldBe true))
+    List("range", "unnest", "format_type", "lower", "duckdb_tables", "when")
+      .foreach(n => withClue(n)(refusedByScreens(n) shouldBe false))
+  }
+
+  it should "read a quoted call and a space before the paren" in {
+    callsOf("SELECT \"nullif\"(a, '') FROM query_table (x)") shouldBe Set("nullif", "query_table")
+  }
 
   "the bundled 2.0 DuckDB's macros" should "all be pinned, bodies unchanged" in {
     Class.forName("org.duckdb.DuckDBDriver")
@@ -292,3 +282,54 @@ class MacroJudgmentSpec extends AnyFlatSpec with Matchers:
       }
     finally conn.close()
   }
+
+/** The pinned 2.0 macro bodies (`lockdown/duckdb-2.0-macros.csv`) and the screens' verdict on a
+  * function name, shared by the macro judgments.
+  */
+private[sql] object PinnedMacros:
+
+  /** The functions a macro body calls, read by [[FunctionCalls]], the lexer the screens use: a
+    * quoted name (`"nullif"(`) and a space before the paren count.
+    */
+  def callsOf(body: String): Set[String] =
+    FunctionCalls.scan(Option(body).getOrElse("")).calls.map(_.name).toSet
+
+  val pinned: Map[(String, String), Set[String]] =
+    val src = Source.fromResource("lockdown/duckdb-2.0-macros.csv")
+    try
+      src
+        .getLines()
+        .filterNot(l => l.startsWith("#") || l.isBlank)
+        .map { line =>
+          val cols = line.split(',')
+          (cols(0), cols(1)) -> (if cols(2) == "-" then Set.empty[String]
+                                 else cols(2).split('|').toSet)
+        }
+        .toMap
+    finally src.close()
+
+  private val bodies: Map[String, Set[String]] =
+    pinned.toList.groupMapReduce(_._1._2)(_._2)(_ ++ _)
+
+  /** Every function reachable from `name`'s body, through every pinned macro, scalar or table. */
+  def reachable(name: String): Set[String] =
+    @annotation.tailrec
+    def loop(todo: List[String], seen: Set[String]): Set[String] =
+      todo match
+        case Nil       => seen
+        case n :: rest =>
+          val next = bodies.getOrElse(n, Set.empty) -- seen
+          loop(next.toList ::: rest, seen ++ next)
+    loop(List(name), Set.empty)
+
+  /** Whether the tenant screens refuse a call of `n`, in a table position or a select list: read
+    * off the screens themselves, so a name they add is refused here too.
+    */
+  def refusedByScreens(n: String): Boolean =
+    val forms = List(s"SELECT * FROM $n()", s"SELECT $n()")
+    forms.exists { sql =>
+      FileAccessScreen.find(sql).isDefined || CatalogReachingCalls.find(sql).isDefined ||
+      NodeStateScreen.find(sql).isDefined || NodeSettingScreen.screen(sql).isDefined ||
+      NodeSettingScreen.screenNodeWide(sql).isDefined ||
+      CatalogDefinitionCalls.markers(sql).nonEmpty
+    }

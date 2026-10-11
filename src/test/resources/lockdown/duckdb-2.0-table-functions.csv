@@ -1,6 +1,9 @@
 # Table functions of the DuckDB 2.0 CLI (duckdb_functions(), function_type table / table_macro)
 # with every extension a node image installs loaded: the bundled 2.0 extension directory plus
 # avro and iceberg (INSTALL ... FROM core). Columns: name, first-parameter types, names.
+# On a DuckDB or extension bump, regenerate it (and duckdb-2.0-macros.csv) with every node extension
+# loaded, iceberg and avro included: LockdownTableFunctionsSpec and FileAccessFunctionsSpec judge
+# every row, and only the bundled DuckDB's core functions are checked live.
 arrow_scan,-,-
 arrow_scan_dumb,-,-
 avro_metadata,VARCHAR,path

@@ -5,8 +5,6 @@ import ai.starlake.quack.ondemand.state.{RbacUser, RolePermission}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import scala.io.Source
-
 /** `pg_get_viewdef(oid)` and `pg_get_constraintdef(oid)` are DuckDB 2.0 scalar macros over
   * `duckdb_views()` / `duckdb_constraints()`, outside the metadata filter: on the 2.0 CLI, `SELECT
   * pg_get_viewdef(o) FROM range(100000) ..` printed the SQL of every view of the node, and
@@ -60,11 +58,11 @@ class CatalogDefinitionCallsSpec extends AnyFlatSpec with Matchers:
       "SELECT o_id FROM orders"
     ).foreach(sql => withClue(sql)(validate(sql, narrow) shouldBe Allowed))
 
-  // Derived from the pinned 2.0 macro bodies: a scalar macro whose body reads a catalog-object
-  // listing (tables, views, columns, constraints, indexes, sequences, schemas, triggers,
-  // dependencies) returns another object's definition outside the metadata filter, so it must be
-  // gated here; a new or changed one fails until judged.
-  "every 2.0 scalar macro reading a catalog-object listing" should "be gated" in {
+  // Derived from the pinned 2.0 macro bodies, through every macro (scalar and table): a scalar macro
+  // reaching a catalog-object listing (tables, views, columns, constraints, indexes, sequences,
+  // schemas, triggers, dependencies), directly or through another macro, returns another object's
+  // definition outside the metadata filter, so it must be gated here; a new or changed one fails.
+  "every 2.0 scalar macro reaching a catalog-object listing" should "be gated" in {
     val listings = Set(
       "duckdb_tables",
       "duckdb_views",
@@ -76,18 +74,9 @@ class CatalogDefinitionCallsSpec extends AnyFlatSpec with Matchers:
       "duckdb_triggers",
       "duckdb_dependencies"
     )
-    val src     = Source.fromResource("lockdown/duckdb-2.0-macros.csv")
-    val readers =
-      try
-        src
-          .getLines()
-          .filterNot(l => l.startsWith("#") || l.isBlank)
-          .map(_.split(','))
-          .collect {
-            case cols if cols(0) == "macro" && cols(2).split('|').exists(listings) => cols(1)
-          }
-          .toSet
-      finally src.close()
+    val readers = PinnedMacros.pinned.keySet
+      .collect { case ("macro", n) => n }
+      .filter(n => PinnedMacros.reachable(n).exists(listings))
     readers shouldBe Set("pg_get_viewdef", "pg_get_constraintdef")
     readers.foreach(r => withClue(r)(CatalogDefinitionCalls.Names should contain(r)))
   }
