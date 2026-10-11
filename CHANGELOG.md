@@ -79,6 +79,22 @@
     table positions), and covers the avro and iceberg readers (`read_avro`, `avro_metadata`,
     `iceberg_scan` and the other `iceberg_*` path readers), the iceberg table-maintenance
     functions and `quack_serve` / `quack_stop`.
+  - The ACL gates the table `SUMMARIZE <table>` reads (it was admitted as table-free while
+    returning per-column statistics), the query of `DESCRIBE <query>`, and the table named by a
+    parenthesized statement in table position (`(SUMMARIZE t)`, `(TABLE t)`, `(DESCRIBE t)`,
+    `(SHOW t)`), which used to gate the keyword instead. A string literal in those positions is a
+    file reference. The row-policy rewrite refuses a parenthesized statement reading a policy
+    table, and the protected-write guard denies `SUMMARIZE` of one.
+  - A subquery inside a MAP literal or a `json_object` argument is gated and row-filtered (it was
+    invisible to the ACL walk). The ACL and row-policy walks refuse an AST child of a type they
+    have no rule for instead of skipping it, and the column-policy rewrite denies a statement in
+    which a covered column sits where it cannot be masked (a MAP or list literal, a lambda, `->>`,
+    `TRIM`, a JOIN condition, ...) instead of forwarding it unmasked.
+  - Lockdown judges file literals after `SUMMARIZE`, `DESCRIBE`, `TABLE`, the `PIVOT` / `UNPIVOT`
+    statements and `USING` (`MERGE INTO .. USING`, `DELETE .. USING`), and protects the iceberg
+    `unsafe_enable_version_guessing` setting.
+  - A column- or row-policy rewrite refused for holding `//` says so instead of "could not parse
+    statement".
 
 - **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
   open transaction's node connection too, so a statement after an idle pause longer than the
