@@ -105,22 +105,26 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
     resolveAttempt match
       case Left(failure)       => failure
       case Right(resolvedText) =>
-        val rsMeta                                          = resolver.getResultSetMetaData(sql)
-        val projectionOrigins: IndexedSeq[(String, String)] =
-          (1 to rsMeta.getColumnCount).toIndexedSeq.map { i =>
+        // None for a shape the resolver builds no result set for (the FROM-first `FROM t`): it
+        // cannot be masked, so it fails closed below.
+        val rsMeta = Option(resolver.getResultSetMetaData(sql))
+        val projectionOrigins: IndexedSeq[(String, String)] = rsMeta.toIndexedSeq.flatMap { m =>
+          (1 to m.getColumnCount).map { i =>
             (
-              Option(rsMeta.getTableName(i)).getOrElse(""),
-              Option(rsMeta.getColumnName(i)).getOrElse("")
+              Option(m.getTableName(i)).getOrElse(""),
+              Option(m.getColumnName(i)).getOrElse("")
             )
           }
+        }
 
         val parseAttempt: Either[RewriteOutcome, net.sf.jsqlparser.statement.Statement] =
           try Right(CCJSqlParserUtil.parse(resolvedText))
           catch case _: Throwable => Left(ParseFailed)
 
         parseAttempt match
-          case Left(failure) => failure
-          case Right(parsed) =>
+          case Left(failure)              => failure
+          case Right(_) if rsMeta.isEmpty => ParseFailed
+          case Right(parsed)              =>
             parsed match
               case sel: Select =>
                 // The resolver's STRICT mode only enforces table existence at the

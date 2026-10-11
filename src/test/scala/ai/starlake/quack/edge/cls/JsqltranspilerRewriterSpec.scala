@@ -674,3 +674,7 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
       "SELECT c_name FROM customer NATURAL JOIN (SELECT 1 AS c_id) k"
     ) shouldBe RewriteOutcome.Passthrough
   }
+
+  "a FROM-first statement" should "fail closed instead of throwing" in {
+    outcome("FROM customer") shouldBe RewriteOutcome.ParseFailed
+  }
