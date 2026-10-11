@@ -465,11 +465,14 @@ $payloadSql = $sb.ToString()
 #   - the outer init file holds NO secrets: it `.read`s the secrets file, has DuckDB itself delete
 #     it once read, then blocks on the keep-alive (a dot-command waiting for this wrapper to exit,
 #     not a query, so it pins no DuckDB transaction).
-# Every dot-command argument is SINGLE-quoted: both CLIs resolve backslash escapes inside a
-# double-quoted argument (`.read "C:\Users\bob\..."` opens `C:Users<BS>ob...`), while a single-quoted
-# one is taken literally. A single-quoted argument cannot hold a quote, so a node directory whose
-# path has one is refused below. `.read` gets forward slashes on Windows (DuckDB opens them there
-# too); `del` keeps backslashes, inside double quotes for spaces.
+# Every path handed to the CLI (-init, .read, the delete) is RELATIVE to duckdb's working directory
+# ($workDir = <nodeDir>\cwd) and pure ASCII. The CLI converts its argv to UTF-8, then opens -init
+# and .read files with plain fopen() and runs .shell through system(), both of which the CRT reads
+# in the ANSI code page: an absolute path under a non-ASCII %TEMP% (C:\Users\Hélène\...) would
+# never open, and the node would fail to start in a respawn loop. `..` is the node directory, which
+# holds init.sql and secrets.sql. Every dot-command argument is also SINGLE-quoted, which both CLIs
+# take literally (they resolve backslash escapes inside a double-quoted one). The spill directory
+# and dataPath go through DuckDB's own UTF-8 file system, not these calls, so they are unaffected.
 # Rendering target: this host, or (dry run only) QOD_SPAWN_TARGET_OS=windows|unix, so a dry run on
 # any OS can show the exact Windows outer init.
 $targetWindows = $onWindows
@@ -479,28 +482,23 @@ if ($dryRun -and $targetOs -eq 'unix') { $targetWindows = $false }
 
 $secretsFile = Join-Path $nodeDir 'secrets.sql'
 $initFile    = Join-Path $nodeDir 'init.sql'
-if ($nodeDir.Contains("'")) {
-  [Console]::Error.WriteLine("ERROR: the node directory '$nodeDir' contains a single quote, which the duckdb CLI cannot pass to a dot-command; point TEMP/TMP at a directory without one")
-  Remove-NodeDirectory $nodeDir
-  exit 2
-}
+$initArg     = '../init.sql'
 if ($targetWindows) {
-  $readPath = $secretsFile.Replace('\', '/')
-  $delPath  = $secretsFile.Replace('/', '\')
-  $delCmd   = "cmd /c del /f /q `"$delPath`""
-  $waitCmd  = "powershell -NoProfile -Command `"Wait-Process -Id $PID -ErrorAction SilentlyContinue`""
+  $delCmd  = 'cmd /c del /f /q ..\secrets.sql'
+  $waitCmd = "powershell -NoProfile -Command `"Wait-Process -Id $PID -ErrorAction SilentlyContinue`""
 } else {
-  $readPath = $secretsFile
-  $delCmd   = "rm -f `"$secretsFile`""
-  $waitCmd  = "tail --pid=$PID -f /dev/null 2>/dev/null || while kill -0 $PID 2>/dev/null; do sleep 1; done"
+  $delCmd  = 'rm -f ../secrets.sql'
+  $waitCmd = "tail --pid=$PID -f /dev/null 2>/dev/null || while kill -0 $PID 2>/dev/null; do sleep 1; done"
 }
-$outer = ".bail off`n.read '$readPath'`n.shell '$delCmd'`n.shell '$waitCmd'`n.exit`n"
+$outer = ".bail off`n.read '../secrets.sql'`n.shell '$delCmd'`n.shell '$waitCmd'`n.exit`n"
 
 # Test seam, mirror of QOD_SPAWN_DRY_RUN in spawn-quack-node.sh: print the payload and the outer
 # init exactly as the node would get them, and exit without launching duckdb. Used by
 # SpawnScriptEncryptionWindowsSpec (payload) and SpawnScriptWindowsInitSpec (outer init quoting).
 if ($dryRun) {
   [Console]::Out.Write($payloadSql)
+  # The -init argument, as an SQL comment so the output stays runnable.
+  [Console]::Out.Write("-- init: $initArg`n")
   [Console]::Out.Write($outer)
   Remove-NodeDirectory $nodeDir
   exit 0
@@ -529,7 +527,7 @@ Restrict-ToCurrentUser $secretsFile
 Restrict-ToCurrentUser $initFile
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName               = $duckdbBin
-$psi.Arguments              = '-init "' + $initFile + '"'
+$psi.Arguments              = '-init ' + $initArg
 $psi.RedirectStandardInput  = $true
 $psi.RedirectStandardOutput = $false
 $psi.RedirectStandardError  = $false

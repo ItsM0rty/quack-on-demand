@@ -45,8 +45,8 @@
   node) and on 2.0 could spin a CPU core for the node's life. The wait also means a node no longer
   outlives a forced kill of its wrapper. A crash before the Windows secrets file is read leaves it
   only until a later spawn's sweep, and the wrapper stops a node that fails to delete it. On Windows
-  a node refuses to start when its temp directory path contains a single quote (`'`), which the
-  duckdb CLI cannot pass to a dot-command; point `TEMP`/`TMP` elsewhere. A failing init statement still does not stop the node. `-init`
+  the CLI is only ever handed paths relative to the node's working directory, in ASCII, so a temp
+  directory under a profile with an accented or other non-ASCII name (or a quote) works. A failing init statement still does not stop the node. `-init`
   also means a node no longer runs the OS user's
   `~/.duckdbrc`. The CLI only keeps this history in memory when stdin is not a terminal (nothing was
   written to `~/.duckdb_history`), and 1.x CLIs have no `shell_history()`. If you ran DuckDB 2.0

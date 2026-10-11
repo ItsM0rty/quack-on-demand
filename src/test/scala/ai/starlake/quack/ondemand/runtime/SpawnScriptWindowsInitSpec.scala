@@ -60,36 +60,51 @@ class SpawnScriptWindowsInitSpec extends AnyFlatSpec with Matchers with SpawnScr
   private def dotLines(out: String): Vector[String] =
     out.linesIterator.filter(_.startsWith(".")).toVector
 
-  "the Windows outer init" should "single-quote every dot-command argument, with forward slashes for .read" in {
+  "the Windows outer init" should "hand the CLI only relative, single-quoted paths" in {
     val tmp            = Files.createDirectories(tempDir.resolve("my temp"))
     val (rc, out, err) = dryRun(tmp, "windows")
     withClue(err)(rc shouldBe 0)
-    val dots = dotLines(out)
-    dots.head shouldBe ".bail off"
-    val read = dots.find(_.startsWith(".read ")).getOrElse(fail(out))
-    read should fullyMatch regex """\.read '[^'\\]*my temp[^'\\]*/secrets\.sql'"""
-    val del = dots.find(_.contains(" del ")).getOrElse(fail(out))
-    del should fullyMatch regex """\.shell 'cmd /c del /f /q "[^'"]*my temp[^'"]*\\secrets\.sql"'"""
-    val keep = dots.find(_.contains("Wait-Process")).getOrElse(fail(out))
-    keep should fullyMatch regex """\.shell 'powershell -NoProfile -Command "Wait-Process -Id \d+ -ErrorAction SilentlyContinue"'"""
-    dots.last shouldBe ".exit"
-    // No dot-command argument is double-quoted: that is what mangled the Windows paths.
-    dots.foreach(l => withClue(l)(l should not startWith ".read \""))
-    dots.filter(_.startsWith(".shell")).foreach(l => withClue(l)(l should startWith(".shell '")))
+    // The outer init's five lines come last (the payload, printed first, opens with its own
+    // `.bail off`).
+    val dots = dotLines(out).takeRight(5)
+    dots shouldBe Vector(
+      ".bail off",
+      ".read '../secrets.sql'",
+      ".shell 'cmd /c del /f /q ..\\secrets.sql'",
+      dots(3),
+      ".exit"
+    )
+    dots(3) should fullyMatch regex
+      """\.shell 'powershell -NoProfile -Command "Wait-Process -Id \d+ -ErrorAction SilentlyContinue"'"""
+    out should include("-- init: ../init.sql")
+  }
+
+  // The CLI opens -init / .read with fopen() and runs .shell through system(), which read paths in
+  // the ANSI code page on Windows: an absolute path under a non-ASCII %TEMP% would never open. So no
+  // absolute and no non-ASCII path may reach it, whatever the temp directory is called (a quote, a
+  // space, an accent).
+  it should "pass no absolute or non-ASCII path to the CLI, whatever the temp directory" in {
+    val tmp            = Files.createDirectories(tempDir.resolve("Hélène o'brien t€mp"))
+    val (rc, out, err) = dryRun(tmp, "windows")
+    withClue(err)(rc shouldBe 0)
+    val cliLines = dotLines(out) ++ out.linesIterator.filter(_.startsWith("-- init:")).toVector
+    cliLines.foreach { l =>
+      withClue(l) {
+        l.forall(_ < 128) shouldBe true
+        l should not include tmp.toString
+        l should not include "Hélène"
+        l should not include ":/"
+        l should not include ":\\"
+      }
+    }
+    cliLines should contain(".read '../secrets.sql'")
+    cliLines should contain("-- init: ../init.sql")
   }
 
   it should "keep the credentials out of the outer init" in {
     val (rc, out, _) = dryRun(Files.createDirectories(tempDir.resolve("t")), "windows")
     rc shouldBe 0
     dotLines(out).foreach(l => withClue(l)(l should not include "tok"))
-  }
-
-  it should "refuse a node directory whose path holds a single quote" in {
-    val tmp            = Files.createDirectories(tempDir.resolve("o'brien"))
-    val (rc, out, err) = dryRun(tmp, "windows")
-    rc should not be 0
-    err should include("single quote")
-    out should not include ".read"
   }
 
   // The rule the rendering relies on, against the real CLI: a single-quoted argument is literal (a
