@@ -1474,6 +1474,26 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       captured() shouldBe ""
     }
 
+  it should "refuse a metadata-catalog name split across a newline to every non-superuser" in:
+    val split = Seq(
+      "SELECT encryption_key FROM query_table('__duck'\n'lake_metadata_lake.ducklake_data_file')",
+      "SET search_path = '__duck'\n'lake_metadata_lake'; " +
+        "SELECT encryption_key FROM ducklake_data_file"
+    )
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      split.foreach { sql =>
+        withClue(sql)(
+          catalogDenied(
+            router
+              .execute("dlm-16", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+              .unsafeRunSync(),
+            captured
+          )
+        )
+      }
+    }
+
   "the Iceberg catalog functions" should "be refused to *.*.* ALL under QoD and OPA, not su" in:
     val calls = Seq(
       "SELECT * FROM duckdb_table_sample('memory.main.t')",

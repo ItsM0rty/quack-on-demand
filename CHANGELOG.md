@@ -88,6 +88,13 @@
     `json_execute_serialized_sql` (table function and pragma) is refused outright to the same
     callers: a serialized plan names its catalogs in JSON strings DuckDB decodes after the screen
     reads them. The data tables themselves and the other DuckLake functions are unchanged.
+    String literals are read as DuckDB reads them: a literal continued on the next line
+    (`'__duck'` newline `'lake_metadata_x'`, which DuckDB folds into one value) is judged folded,
+    in every carrier, `query()` body and `SET` / `PRAGMA` form.
+  - Lockdown judges a `COPY` path as DuckDB reads it: a path continued on the next line, an
+    escape string or a dollar-quoted string is folded and decoded before the remote and
+    denied-bucket checks (a continued path could name a denied bucket, and the other two forms
+    were not judged by the COPY rule).
   - `duckdb_table_sample` (new in 2.0; reads the table its string names) and the Iceberg catalog
     functions that act on a table or schema named by a string outside every table grant
     (`iceberg_rewrite_data_files`, `iceberg_rollback_to_snapshot`, `iceberg_to_ducklake`,

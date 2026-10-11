@@ -41,6 +41,37 @@ class CatalogInternalsScreenSpec extends AnyFlatSpec with Matchers:
       "SELECT * FROM query('SELECT * FROM ducklake_list_files(''lake'', ''t'')')"
     ).foreach(sql => withClue(sql)(refused(sql) shouldBe true))
 
+  it should "refuse a metadata-catalog name split across newline-continued literals" in {
+    // DuckDB folds a plain literal that follows another across a newline (no block comment in
+    // between) into one value: '__duck'<LF>'lake_metadata_lake' IS '__ducklake_metadata_lake'.
+    val name = "'__duck'\n'lake_metadata_lake"
+    Seq(
+      s"SELECT * FROM query_table($name.ducklake_data_file')",
+      s"SELECT * FROM duckdb_table_sample($name.ducklake_data_file')",
+      s"SELECT * FROM postgres_query($name', 'SELECT 1')",
+      "SELECT * FROM query('SELECT * FROM query_table(''__duck''\n''lake_metadata_lake.t'')')",
+      "SELECT * FROM query('SELECT encryption_key FROM __duck'\n" +
+        "'lake_metadata_lake.ducklake_data_file')",
+      s"SET search_path = $name'",
+      s"SET SESSION schema TO $name'",
+      s"PRAGMA search_path = $name'",
+      s"PRAGMA schema = $name'",
+      s"EXPLAIN ANALYZE SET search_path = $name'",
+      "SET search_path = e'__duck'\n'lake_metadata_lake'",
+      "SET search_path = '__du'\n'ckl'\n'ake_metadata_lake'",
+      "SET search_path = '__duck'\r\n'lake_metadata_lake'",
+      "SET search_path = '__duck' -- split\n'lake_metadata_lake'",
+      s"USE lake.main; SET search_path = $name'; SELECT encryption_key FROM ducklake_data_file"
+    ).foreach { sql =>
+      withClue(sql)(
+        CatalogInternalsScreen.screen(sql) shouldBe Some(CatalogInternalsScreen.MetadataRefusal)
+      )
+    }
+    // Continued literals that spell nothing internal stay admitted.
+    refused("SELECT 'a'\n'b'") shouldBe false
+    refused("SELECT * FROM query_table('lake.main.'\n'customer')") shouldBe false
+  }
+
   it should "refuse json_execute_serialized_sql outright, whatever plan it carries" in {
     // A serialized plan names its catalogs inside JSON strings, which DuckDB decodes (`\u005f`
     // escapes included) after the screen has read them: no lexical read of the literal is sound.

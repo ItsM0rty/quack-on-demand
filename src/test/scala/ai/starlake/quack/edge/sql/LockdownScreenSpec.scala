@@ -923,6 +923,15 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
       true
   }
 
+  "a COPY path" should "be judged as DuckDB reads it: continued and escaped literals folded" in {
+    deniedB("COPY t TO 's3://lakebu'\n'cket/x.csv'") shouldBe true
+    deniedB("COPY t FROM 's3://lakebu'\n'cket/x.csv'") shouldBe true
+    denied("COPY t TO e'/tmp/x.csv'") shouldBe true
+    denied("COPY t TO $$/tmp/x.csv$$") shouldBe true
+    deniedB("COPY t TO 's3://staging/x.csv'") shouldBe false
+    deniedB("COPY t TO 's3://stag'\n'ing/x.csv'") shouldBe false
+  }
+
   "duckdb_table_sample" should "be denied under lockdown (it reads the table its string names)" in {
     denied("SELECT * FROM duckdb_table_sample('memory.main.t')") shouldBe true
     LockdownScreen.judged("duckdb_table_sample") shouldBe true

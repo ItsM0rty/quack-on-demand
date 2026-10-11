@@ -35,6 +35,14 @@ import scala.collection.mutable
   * is safe, since a string computed at run time (`'read' || '_text(...)'`) carries a call no
   * lexical scan sees. Nesting is followed [[MaxDepth]] levels deep, which bounds the work at
   * `MaxDepth` passes over the input; past it the scan reports `truncated`.
+  *
+  * DuckDB folds a plain `'...'` literal that follows another literal across a newline (no block
+  * comment in between) into ONE value: `'__duck'<LF>'lake_metadata_x'` is
+  * `'__ducklake_metadata_x'`. A text holding such a continuation is therefore also scanned in its
+  * [[ai.starlake.sql.ParserInput]] rendering (the 2.0 lexer's reading, every continuation folded,
+  * every literal one plain literal of its value), so the folded values reach `texts`, their calls
+  * reach `calls` and their bodies are scanned too. The parts stay scanned on their own as before;
+  * every consumer only refuses on what it finds, so the extra reading only adds refusals.
   */
 private[quack] object FunctionCalls:
 
@@ -59,25 +67,59 @@ private[quack] object FunctionCalls:
     val calls     = Vector.newBuilder[Call]
     val texts     = Vector.newBuilder[String]
     val pending   = mutable.Queue((Option(sql).getOrElse(""), 0))
+    val seen      = mutable.HashSet.empty[String]
     var truncated = false
     while pending.nonEmpty do
       val (text, depth) = pending.dequeue()
-      val view          = SqlLexer.engineView(text)
-      texts += view
-      // literal values are read from the characters DuckDB's pre-pass kept, not the stand-ins
-      val values = SqlLexer.keptSpacesRestored(view)
-      val toks   = SqlLexer.tokens(view).filterNot(_.isTrivia)
-      var i      = 0
-      while i < toks.length do
-        val t = toks(i)
-        if i + 1 < toks.length && isOpenParen(view, toks(i + 1)) then
-          identifier(view, t).foreach(name => calls += Call(name, view, toks(i + 1).end))
-        stringBody(values, t).foreach { body =>
-          if depth < MaxDepth then pending.enqueue((body, depth + 1))
-          else truncated = true
-        }
-        i += 1
+      if seen.add(text) then
+        val view = SqlLexer.engineView(text)
+        texts += view
+        // literal values are read from the characters DuckDB's pre-pass kept, not the stand-ins
+        val values = SqlLexer.keptSpacesRestored(view)
+        val all    = SqlLexer.tokens(view)
+        val toks   = all.filterNot(_.isTrivia)
+        var i      = 0
+        while i < toks.length do
+          val t = toks(i)
+          if i + 1 < toks.length && isOpenParen(view, toks(i + 1)) then
+            identifier(view, t).foreach(name => calls += Call(name, view, toks(i + 1).end))
+          stringBody(values, t).foreach { body =>
+            if depth < MaxDepth then pending.enqueue((body, depth + 1))
+            else truncated = true
+          }
+          i += 1
+        // The folded reading, at the same depth (a rendering never holds a continuation itself).
+        if hasContinuation(view, all) then
+          ai.starlake.sql.ParserInput.render(text).foreach(r => pending.enqueue((r.text, depth)))
     Scan(calls.result(), truncated, texts.result())
+
+  /** True when some string literal in `all` (the statement's tokens, trivia included) is followed,
+    * past trivia holding a newline and no block comment, by a plain `'...'` literal: DuckDB's
+    * `IsStringLiteralContinuation`, the rule [[ai.starlake.sql.ParserInput]] folds by. A
+    * dollar-quoted literal is never continued.
+    */
+  private[sql] def hasContinuation(view: String, all: Vector[SqlLexer.Token]): Boolean =
+    def isString(t: SqlLexer.Token) =
+      t.kind == SqlLexer.Kind.Literal && {
+        val c = view.charAt(t.start)
+        c != '"' && c != '`' && c != '$'
+      }
+    all.indices.exists { i =>
+      isString(all(i)) && {
+        var k       = i + 1
+        var newline = false
+        var block   = false
+        while k < all.length && all(k).isTrivia do
+          if all(k).kind == SqlLexer.Kind.BlockComment then block = true
+          else if all(k).kind == SqlLexer.Kind.Space then
+            newline = newline || view.substring(all(k).start, all(k).end).exists { c =>
+              c == '\n' || c == '\r'
+            }
+          k += 1
+        newline && !block && k < all.length && all(k).kind == SqlLexer.Kind.Literal &&
+        view.charAt(all(k).start) == '\''
+      }
+    }
 
   /** The unquoted, lowercased name of an identifier token (bare word, double-quoted or
     * backtick-quoted), or None for any other token.

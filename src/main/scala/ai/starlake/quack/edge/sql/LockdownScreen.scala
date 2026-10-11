@@ -1,7 +1,7 @@
 package ai.starlake.quack.edge.sql
 
 import ai.starlake.quack.model.BucketKeys
-import ai.starlake.sql.{SqlCommentStripper, SqlLexer, SqlTrivia}
+import ai.starlake.sql.{ParserInput, SqlCommentStripper, SqlLexer, SqlTrivia}
 
 import java.util.Locale
 
@@ -347,9 +347,19 @@ object LockdownScreen:
               .map(s => s"setting '$s' is protected on this deployment")
           case _ => None
         // A COPY statement reads/writes local files through its FROM/TO path literal; deny it
-        // unless every string literal it carries is a remote object-store literal.
+        // unless every string literal it carries is a remote object-store literal. The path is
+        // judged as written and as DuckDB reads it (ParserInput: continued literals folded,
+        // escape and dollar-quoted strings decoded to plain ones): `TO 's3://lakebu'<LF>'cket/x'`
+        // writes to lakebucket, and `TO e'/tmp/x'` to a local file.
         val copyHit =
-          if first.contains("copy") then copyLocalPath(lower, deniedBuckets) else None
+          if !first.contains("copy") then None
+          else
+            copyLocalPath(lower, deniedBuckets).orElse(
+              ParserInput
+                .render(stmt)
+                .toOption
+                .flatMap(r => copyLocalPath(StatementHead.normalize(r.text), deniedBuckets))
+            )
         // Settings statements still get the function scan: a denied function inside a
         // SET value must not slip through. The replacement-scan check catches literals
         // (SELECT * FROM '/etc/passwd.parquet') that carry no read-function call.
