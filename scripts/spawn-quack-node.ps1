@@ -438,48 +438,60 @@ if (-not [string]::IsNullOrEmpty($lockdownSql)) { [void]$sb.AppendLine($lockdown
 [void]$sb.AppendLine("SELECT listen_url FROM quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
 
 $payloadSql = $sb.ToString()
-# What the dry-run seam prints: the SQL the node runs, plus the keep-alive tail, for parity with
-# spawn-quack-node.sh's dry run. The live launch below delivers it split (secrets file + outer
-# init) so the credentials never persist, which a content dry run does not need to show.
-$keepAlive = ".shell `"while kill -0 $PID 2>/dev/null; do sleep 1; done`"`n.exit`n"
-$initSql = $payloadSql + $keepAlive
 
-# Test seam, mirror of QOD_SPAWN_DRY_RUN in spawn-quack-node.sh: print the assembled init SQL
-# and exit without launching duckdb. Used by SpawnScriptEncryptionWindowsSpec to assert the
-# emitted SQL, which is the only testable surface of a script the manager shells out to.
+# The init SQL goes through `-init <file>` (the CLI records stdin in shell_history(), not -init).
+# Windows has no FIFO that -init accepts, so to keep the credentials off disk the init is SPLIT:
+#   - a secrets file holds the payload (token, catalog password, object-store / federation SQL);
+#   - the outer init file holds NO secrets: it `.read`s the secrets file, has DuckDB itself delete
+#     it once read, then blocks on the keep-alive (a dot-command waiting for this wrapper to exit,
+#     not a query, so it pins no DuckDB transaction).
+# Every dot-command argument is SINGLE-quoted: both CLIs resolve backslash escapes inside a
+# double-quoted argument (`.read "C:\Users\bob\..."` opens `C:Users<BS>ob...`), while a single-quoted
+# one is taken literally. A single-quoted argument cannot hold a quote, so a node directory whose
+# path has one is refused below. `.read` gets forward slashes on Windows (DuckDB opens them there
+# too); `del` keeps backslashes, inside double quotes for spaces.
+# Rendering target: this host, or (dry run only) QOD_SPAWN_TARGET_OS=windows|unix, so a dry run on
+# any OS can show the exact Windows outer init.
+$targetWindows = $onWindows
+$targetOs = [Environment]::GetEnvironmentVariable('QOD_SPAWN_TARGET_OS')
+if ($dryRun -and $targetOs -eq 'windows') { $targetWindows = $true }
+if ($dryRun -and $targetOs -eq 'unix') { $targetWindows = $false }
+
+$secretsFile = Join-Path $nodeDir 'secrets.sql'
+$initFile    = Join-Path $nodeDir 'init.sql'
+if ($nodeDir.Contains("'")) {
+  [Console]::Error.WriteLine("ERROR: the node directory '$nodeDir' contains a single quote, which the duckdb CLI cannot pass to a dot-command; point TEMP/TMP at a directory without one")
+  Remove-NodeDirectory $nodeDir
+  exit 2
+}
+if ($targetWindows) {
+  $readPath = $secretsFile.Replace('\', '/')
+  $delPath  = $secretsFile.Replace('/', '\')
+  $delCmd   = "cmd /c del /f /q `"$delPath`""
+  $waitCmd  = "powershell -NoProfile -Command `"Wait-Process -Id $PID -ErrorAction SilentlyContinue`""
+} else {
+  $readPath = $secretsFile
+  $delCmd   = "rm -f `"$secretsFile`""
+  $waitCmd  = "while kill -0 $PID 2>/dev/null; do sleep 1; done"
+}
+$outer = ".bail off`n.read '$readPath'`n.shell '$delCmd'`n.shell '$waitCmd'`n.exit`n"
+
+# Test seam, mirror of QOD_SPAWN_DRY_RUN in spawn-quack-node.sh: print the payload and the outer
+# init exactly as the node would get them, and exit without launching duckdb. Used by
+# SpawnScriptEncryptionWindowsSpec (payload) and SpawnScriptWindowsInitSpec (outer init quoting).
 if ($dryRun) {
-  [Console]::Out.Write($initSql)
+  [Console]::Out.Write($payloadSql)
+  [Console]::Out.Write($outer)
   Remove-NodeDirectory $nodeDir
   exit 0
 }
 
 # stdout/stderr are inherited so node logs flow to the manager's console (LocalQuackBackend uses
 # inheritIO()). stdin is closed right after start: nothing is fed to the CLI, so no statement can be
-# injected on the node's own connection, and the 2.0 CLI records nothing in shell_history(). The
-# node is kept alive by the keep-alive dot-command at the end of the outer init file.
-#
-# The init SQL goes through `-init <file>` (the CLI records stdin in shell_history(), not -init).
-# Windows has no FIFO that -init accepts, so to keep the credentials off disk the init is SPLIT:
-#   - a secrets file holds the payload (token, catalog password, object-store / federation SQL);
-#   - the outer init file holds NO secrets - it `.read`s the secrets file, then has DuckDB itself
-#     delete it, then blocks on the keep-alive. DuckDB deletes the file the instant it has finished
-#     reading it (the `.read` returns after quack_serve), so there is no external delete race and no
-#     window after startup where the secrets sit on disk. A crash before `.read` leaves the secrets
-#     file for the stale sweep of a later spawn, no longer than that.
+# injected on the node's own connection. `-init` also stops the CLI from running ~/.duckdbrc.
 # Both files are current-user-only (explicit ACL on Windows, 0600 elsewhere) inside the private node
-# directory. `-init` also stops the CLI from running the user's ~/.duckdbrc.
-$secretsFile = Join-Path $nodeDir 'secrets.sql'
-$initFile    = Join-Path $nodeDir 'init.sql'
+# directory; a crash before `.read` leaves the secrets file to the stale sweep of a later spawn.
 [System.IO.File]::WriteAllText($secretsFile, $payloadSql)
-if ($onWindows) {
-  $delCmd  = "cmd /c del /f /q `"$secretsFile`""
-  $waitCmd = "powershell -NoProfile -Command `"Wait-Process -Id $PID -ErrorAction SilentlyContinue`""
-} else {
-  $delCmd  = "rm -f '$secretsFile'"
-  $waitCmd = "while kill -0 $PID 2>/dev/null; do sleep 1; done"
-}
-# The outer init: read the secrets, delete them (DuckDB itself), keep alive, exit.
-$outer = ".bail off`n.read `"$secretsFile`"`n.shell `"$delCmd`"`n.shell `"$waitCmd`"`n.exit`n"
 [System.IO.File]::WriteAllText($initFile, $outer)
 function Restrict-ToCurrentUser([string]$file) {
   if ($onWindows) {
@@ -508,6 +520,20 @@ try {
   $proc = [System.Diagnostics.Process]::Start($psi)
   # stdin carries nothing; the keep-alive dot-command, not stdin, holds the process open.
   $proc.StandardInput.Close()
+  # Check that DuckDB really deleted the secrets file after reading it. The node may take minutes to
+  # get there (extension INSTALL behind a proxy, a slow catalog), so the bound is generous; a file
+  # still present then, with the node alive, means the delete line failed: kill the node rather
+  # than leave its credentials on disk, and say so.
+  $deadline = [DateTime]::UtcNow.AddMinutes(15)
+  while ((Test-Path -LiteralPath $secretsFile) -and -not $proc.HasExited -and
+         [DateTime]::UtcNow -lt $deadline) {
+    Start-Sleep -Milliseconds 500
+  }
+  if ((Test-Path -LiteralPath $secretsFile) -and -not $proc.HasExited) {
+    [Console]::Error.WriteLine("ERROR: the node did not delete its secrets file $secretsFile after reading it; stopping the node")
+    try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+  }
+  Remove-Item -LiteralPath $secretsFile -Force -ErrorAction SilentlyContinue
   $proc.WaitForExit()
   $exitCode = $proc.ExitCode
 } finally {
