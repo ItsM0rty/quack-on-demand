@@ -538,17 +538,31 @@ try {
   $proc = [System.Diagnostics.Process]::Start($psi)
   # stdin carries nothing; the keep-alive dot-command, not stdin, holds the process open.
   $proc.StandardInput.Close()
-  # Check that DuckDB really deleted the secrets file after reading it. The node may take minutes to
-  # get there (extension INSTALL behind a proxy, a slow catalog), so the bound is generous; a file
-  # still present then, with the node alive, means the delete line failed: kill the node rather
-  # than leave its credentials on disk, and say so.
-  $deadline = [DateTime]::UtcNow.AddMinutes(15)
-  while ((Test-Path -LiteralPath $secretsFile) -and -not $proc.HasExited -and
-         [DateTime]::UtcNow -lt $deadline) {
+  # Check that DuckDB really deleted the secrets file after reading it. The delete runs right after
+  # the `.read` returns, i.e. right after quack_serve: once the node answers on its port the file
+  # must be gone within a short grace, or the delete failed and the serving node's own users could
+  # read it (`read_text('../secrets.sql')`), so the node is stopped. A stranger holding the port
+  # cannot cause a false stop: quack_serve then fails, but `.read` still returns and the delete
+  # still runs. Only a node that never listens gets the long bound (a slow INSTALL or catalog).
+  $graceSec   = 20
+  $neverAfter = [DateTime]::UtcNow.AddMinutes(15)
+  $listenedAt = $null
+  while ((Test-Path -LiteralPath $secretsFile) -and -not $proc.HasExited) {
+    if ($null -eq $listenedAt) {
+      $client = [System.Net.Sockets.TcpClient]::new()
+      try { if ($client.ConnectAsync('127.0.0.1', $Port).Wait(200)) { $listenedAt = [DateTime]::UtcNow } }
+      catch {} finally { $client.Dispose() }
+    }
+    if ($null -ne $listenedAt -and ([DateTime]::UtcNow - $listenedAt).TotalSeconds -gt $graceSec) { break }
+    if ($null -eq $listenedAt -and [DateTime]::UtcNow -gt $neverAfter) { break }
     Start-Sleep -Milliseconds 500
   }
   if ((Test-Path -LiteralPath $secretsFile) -and -not $proc.HasExited) {
-    [Console]::Error.WriteLine("ERROR: the node did not delete its secrets file $secretsFile after reading it; stopping the node")
+    if ($null -ne $listenedAt) {
+      [Console]::Error.WriteLine("ERROR: the node serves on port $Port but did not delete its secrets file within ${graceSec}s; stopping the node")
+    } else {
+      [Console]::Error.WriteLine("ERROR: the node neither listened on port $Port nor deleted its secrets file within 15 minutes; stopping the node")
+    }
     try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
   }
   Remove-Item -LiteralPath $secretsFile -Force -ErrorAction SilentlyContinue
