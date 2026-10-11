@@ -106,7 +106,9 @@ object LockdownScreen:
     "max_temp_directory_size"
   ) ++ NodeSettingScreen.Settings // also refused for every caller by NodeSettingScreen
 
-  private val DeniedFunctions = Set(
+  // Read-style functions that take a path or URL as their FIRST argument. A remote URL literal is
+  // admitted (UrlExempt), a local path denied; glob (directory listing) never exempts.
+  private val FileReadFunctions = Set(
     "read_text",
     "read_blob",
     "glob",
@@ -117,25 +119,26 @@ object LockdownScreen:
     "read_json_auto",
     "read_ndjson",
     "read_ndjson_auto",
-    "parquet_scan",
-    "getenv",
-    // Writes log files (CALL or FROM form) under storage_path or storage_config's path.
-    "enable_logging",
-    // postgres_attach is the function form of ATTACH (denied as a statement on this deployment);
-    // postgres_configure_pool carries health_check_query, the lever of the protected setting
-    // pg_pool_health_check_query. Neither takes a path, so neither exempts on a remote literal.
-    "postgres_attach",
-    "postgres_configure_pool"
+    "parquet_scan"
   )
 
-  // read-style functions whose string-literal args may be remote URLs. read_text / read_blob keep
-  // the exemption too, matching the documented contract: a remote URL literal is admitted, a local
-  // path is denied. glob (directory listing), getenv (no path), enable_logging (its path is a named
-  // argument or a struct field, never the first argument) and the postgres_* control functions
-  // (no path argument) never exempt.
-  private val UrlExempt =
-    DeniedFunctions - "glob" - "getenv" - "enable_logging" - "postgres_attach" -
-      "postgres_configure_pool"
+  // Functions that run raw SQL elsewhere, open a connection to a caller-chosen target, or read the
+  // node's environment. Refused for every caller under lockdown here, and for tenant-scoped
+  // principals when the ACL validates by CatalogReachingCalls, which owns the single list (postgres
+  // / mysql / sqlite connection functions + getenv) so the two paths never drift.
+  private val NodeEscapingFunctions = CatalogReachingCalls.LockdownNames
+
+  // Other lockdown-only denials that take no path: enable_logging writes a log file under a named
+  // storage_path argument; postgres_configure_pool carries health_check_query, the lever of the
+  // protected setting pg_pool_health_check_query.
+  private val NoPathFunctions = Set("enable_logging", "postgres_configure_pool")
+
+  private val DeniedFunctions = FileReadFunctions ++ NodeEscapingFunctions ++ NoPathFunctions
+
+  // Only the file-read functions may exempt on a remote URL literal, and glob never does. Every
+  // other denied function takes no path (or a DSN, not a path), so a remote literal must not admit
+  // it.
+  private val UrlExempt = FileReadFunctions - "glob"
 
   private val RemoteSchemes = List("s3://", "gs://", "az://", "r2://", "http://", "https://")
 
@@ -341,8 +344,7 @@ object LockdownScreen:
         .flatMap { fn =>
           val occurrences = scan.calls.filter(_.name == fn)
           if occurrences.isEmpty then None
-          else if !UrlExempt.contains(fn) then
-            Some(s"$fn over local paths is disabled on this deployment")
+          else if !UrlExempt.contains(fn) then Some(deniedCallMessage(fn))
           else
             val verdicts = occurrences
               .map(c => argsVerdict(screened(c.text.substring(c.argsFrom)), deniedBuckets))
@@ -350,9 +352,17 @@ object LockdownScreen:
             else
               verdicts
                 .collectFirst { case LitVerdict.Bucket(b) => bucketMessage(b) }
-                .orElse(Some(s"$fn over local paths is disabled on this deployment"))
+                .orElse(Some(deniedCallMessage(fn)))
         }
         .nextOption()
+
+  /** The refusal for a denied call. A file-read function (in [[UrlExempt]]) is denied only for a
+    * local path; everything else here takes no path (a connection string, a named storage path, or
+    * nothing), so its message does not mention paths.
+    */
+  private def deniedCallMessage(fn: String): String =
+    if UrlExempt.contains(fn) then s"$fn over local paths is disabled on this deployment"
+    else s"$fn is disabled on this deployment"
 
   /** An argument list as the regex rules below read it: comments stripped, trivia normalized, case
     * folded, in that order (see `screenOne`). A suffix starting just past a `(` token lexes as it

@@ -603,10 +603,28 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     // Verified on 2.0: PREPARE p AS COPY (SELECT 1) TO '<local>'; EXECUTE p writes the file; only
     // SELECT / INSERT / UPDATE / DELETE / COPY are preparable, so COPY ... TO is the write carrier.
     denied("PREPARE p AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
-    denied("PREPARE p (INTEGER) AS COPY (SELECT $1) TO '/tmp/x.csv'") shouldBe true
+    denied("PREPARE \"p\"AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
     denied("EXPLAIN PREPARE p AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
     denied("PREPARE p AS COPY (SELECT 1) TO 's3://staging/x.csv'") shouldBe false
     denied("PREPARE p AS SELECT * FROM t") shouldBe false
+  }
+
+  "the node-escaping functions" should "be denied: raw SQL, arbitrary connection, node env" in {
+    // postgres_scan / postgres_scan_pushdown connect to any caller-chosen DSN (an ATTACH bypass);
+    // postgres_query / postgres_execute run raw SQL on it; getenv reads the node's env. Verified on
+    // the 2.0 CLI; mysql_* / sqlite_* classified by name. No "over local paths" wording (no path).
+    denied(
+      "SELECT * FROM postgres_scan('host=h dbname=qod user=postgres', 'public', 't')"
+    ) shouldBe true
+    denied("SELECT * FROM postgres_scan_pushdown('host=h', 'public', 't')") shouldBe true
+    denied("SELECT * FROM postgres_query('c', 'SELECT 1')") shouldBe true
+    denied("CALL postgres_execute('c', 'DROP TABLE t')") shouldBe true
+    denied("SELECT * FROM mysql_query('c', 'SELECT 1')") shouldBe true
+    denied("SELECT * FROM sqlite_scan('/x.db', 't')") shouldBe true
+    denied("SELECT getenv('pgPassword')") shouldBe true
+    LockdownScreen.screen("SELECT * FROM postgres_query('c', 'x')", Set.empty) match
+      case Some(m) => m should not include "over local paths"
+      case None    => fail("expected a refusal")
   }
 
   "the postgres control functions" should "be denied (ATTACH and pool-config bypasses)" in {
@@ -615,6 +633,12 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT * FROM postgres_attach('dbname=x host=h', source := 'pg')") shouldBe true
     denied("CALL postgres_configure_pool(health_check_query := 'SELECT 1')") shouldBe true
     denied("SELECT `postgres_attach`('dbname=x')") shouldBe true
+    LockdownScreen.screen(
+      "CALL postgres_configure_pool(health_check_query := 'x')",
+      Set.empty
+    ) match
+      case Some(m) => m should not include "over local paths"
+      case None    => fail("expected a refusal")
   }
 
   "enable_logging" should "be denied in every call form, since file storage writes local files" in {

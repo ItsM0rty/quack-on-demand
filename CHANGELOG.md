@@ -41,16 +41,24 @@
     extension, secret or file locations, or redirect the node's outbound connections, and judges
     path-shaped quoted identifiers. It also denies the `enable_logging()` call and protects the
     logging settings (`enable_logging`, `logging_level`, `logging_storage`, `logging_mode`,
-    `enabled_log_types`, `disabled_log_types`, `pg_debug_show_queries`), and judges the statement
-    an `EXPLAIN ANALYZE` carries, which DuckDB 2.0 executes.
+    `enabled_log_types`, `disabled_log_types`, `pg_debug_show_queries`), denies the functions that
+    run raw SQL on or open a connection to another database (`postgres_query` / `postgres_execute`,
+    `postgres_scan` / `postgres_scan_pushdown` / `postgres_attach` / `postgres_configure_pool`, the
+    `mysql_*` and `sqlite_*` equivalents) and `getenv` (reads the node's environment, including the
+    catalog password), and judges the statement an `EXPLAIN ANALYZE` or a `PREPARE ... AS ...; EXECUTE`
+    carries, which DuckDB 2.0 executes.
   - BREAKING: settings that change how a node parses SQL (`dialect_compatibility_mode`,
     `current_dialect`, `active_grammar_extensions`, `allow_parser_override_extension`,
     `preserve_identifier_case`, `show_behavior`, `table_function_identifier_conversion`) and
     `redact_http_logs` / `allow_unredacted_secrets` are refused for every caller, superusers
     included, whatever the ACL mode and the lockdown flag: most are GLOBAL, so one session would
     change how every session on the node is parsed, or expose the node's credentials in its logs.
-  - BREAKING: `IMPORT DATABASE` is refused for every caller, superusers included: it replays SQL
-    files the gateway never reads.
+  - BREAKING: `IMPORT DATABASE` (and its `PRAGMA import_database(...)` form) is refused for every
+    caller, superusers included: it replays SQL files the gateway never reads.
+  - `postgres_query` / `postgres_execute` and the other raw-SQL / arbitrary-connection functions
+    and `getenv` are denied to tenant-scoped principals whenever the ACL validates (QoD-grant and
+    OPA modes), the same class as `query()` / `query_table()`. A superuser keeps the raw federation
+    passthrough; with the ACL off and lockdown off nothing is blocked, like any other statement.
   - Trigger DDL is reserved to superusers and own-tenant admins ("CREATE TRIGGER is restricted to
     tenant administrators").
   - The edge's comment stripper, statement splitter and classifier share one lexer ported from

@@ -134,17 +134,24 @@ class NodeSettingScreenSpec extends AnyFlatSpec with Matchers:
     refused("SELECT import_database FROM t") shouldBe false
   }
 
-  it should "refuse postgres_execute / postgres_query, which run unscreened SQL on the node" in {
-    // Verified on the 2.0 CLI: postgres_execute against the DuckLake catalog Postgres runs DDL
-    // there with the node's credentials. quack_query (the front door's own primitive) stays allowed.
-    val msg = Some(NodeSettingScreen.ExecRefusalMessage)
-    NodeSettingScreen.screen("SELECT * FROM postgres_execute('c', 'SELECT 1')") shouldBe msg
-    NodeSettingScreen.screen("SELECT * FROM postgres_query('c', 'SELECT 1')") shouldBe msg
-    NodeSettingScreen.screen("CALL postgres_execute('c', 'DROP TABLE t')") shouldBe msg
-    NodeSettingScreen.screen("SELECT * FROM `postgres_query`('c', 'SELECT 1')") shouldBe msg
-    NodeSettingScreen.screen("EXPLAIN SELECT * FROM postgres_query('c', 'SELECT 1')") shouldBe msg
+  it should "refuse a statement nesting literals past the scan depth, fail-closed" in {
+    // Each level is a plain string literal (quotes doubled), so the scan recurses into the body;
+    // past FunctionCalls.MaxDepth it truncates, and a call hidden there could be an import_database.
+    def nest(n: Int): String =
+      if n == 0 then "SELECT 1" else "SELECT '" + nest(n - 1).replace("'", "''") + "'"
+    NodeSettingScreen.screen(nest(9)) shouldBe Some(NodeSettingScreen.NestingRefusalMessage)
+    NodeSettingScreen.screen(nest(2)) shouldBe None
+  }
+
+  it should "NOT refuse postgres_query / postgres_execute (tenant+ACL and lockdown own those)" in {
+    // Owner ruling 2026-10-11: superusers keep the federation passthrough, so NodeSettingScreen
+    // (every-caller) leaves these alone; CatalogReachingCalls denies them for tenant-scoped
+    // principals and LockdownScreen for every caller under lockdown.
+    refused("SELECT * FROM postgres_execute('c', 'SELECT 1')") shouldBe false
+    refused("SELECT * FROM postgres_query('c', 'SELECT 1')") shouldBe false
+    refused("CALL postgres_execute('c', 'DROP TABLE t')") shouldBe false
+    refused("SELECT getenv('pgPassword')") shouldBe false
     refused("SELECT * FROM quack_query('quack:h:9494', 'SELECT 1', token := 't')") shouldBe false
-    refused("SELECT postgres_query FROM t") shouldBe false
   }
 
   it should "not read a setting name inside a literal or a comment as a SET" in {

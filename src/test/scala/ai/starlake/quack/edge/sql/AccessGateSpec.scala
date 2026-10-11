@@ -79,6 +79,45 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
     CatalogReachingCalls.find("SELECT `query_table`, `query` FROM t") shouldBe None
     CatalogReachingCalls.find("SELECT \"query\" FROM t") shouldBe None
 
+  it should "find the node-escaping calls (raw SQL, arbitrary connection, node env)" in:
+    // postgres_* and getenv verified on the 2.0 CLI; mysql_* / sqlite_* classified by name (the
+    // extensions are not in the toolchain). Each must deny for a tenant-scoped principal.
+    for name <- List(
+        "postgres_query",
+        "postgres_execute",
+        "postgres_scan",
+        "postgres_scan_pushdown",
+        "postgres_attach",
+        "mysql_query",
+        "mysql_execute",
+        "mysql_scan",
+        "mysql_attach",
+        "sqlite_scan",
+        "sqlite_attach",
+        "getenv"
+      )
+    do
+      withClue(name) {
+        CatalogReachingCalls.find(s"SELECT * FROM $name('c', 'x')") shouldBe Some(name)
+        CatalogReachingCalls.find(s"SELECT * FROM `$name`('c', 'x')") shouldBe Some(name)
+        CatalogReachingCalls.denyReason(name) should include("cannot authorize")
+      }
+    CatalogReachingCalls.find("SELECT postgres_query, getenv FROM t") shouldBe None
+
+  it should "fail closed when string literals nest past the scan depth" in:
+    // A reaching call reachable only past FunctionCalls.MaxDepth: each level is a plain string
+    // literal (not itself a reaching call), so nothing shallower denies and the scan truncates.
+    def nest(n: Int): String =
+      if n == 0 then "postgres_query('c', 'x')"
+      else "SELECT '" + nest(n - 1).replace("'", "''") + "'"
+    val deep = nest(9)
+    CatalogReachingCalls.find(deep) shouldBe defined
+    CatalogReachingCalls.denyReason(CatalogReachingCalls.find(deep).get) should
+      include("too deeply")
+    eval(deep) match
+      case GateOutcome.Refuse(_, false, _) => succeed
+      case other                           => fail(other.toString)
+
   it should "refuse an ambiguous two-part name on an attached catalog as not wildcard-coverable" in:
     val attached = Config.forDuckDB(Some("tpch"), Some("main"), Set("tpch", "fedpg"))
     AccessGate.evaluate("SELECT * FROM fedpg.orders", attached, "tpch", false, false) match

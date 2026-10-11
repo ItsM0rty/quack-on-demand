@@ -2015,7 +2015,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out.swap.toOption.get.reason shouldBe
       s"access denied: node: ${NodeSettingScreen.SecretRefusalMessage}"
 
-  it should "refuse PRAGMA import_database and postgres_execute for a superuser, lockdown off" in:
+  it should "refuse PRAGMA import_database for a superuser, lockdown off" in:
     val (base, _, _) = setup()
     val router       = new FlightSqlRouter(
       base.supervisor,
@@ -2036,11 +2036,36 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     imp.swap.toOption.get.reason shouldBe
       s"access denied: node: ${NodeSettingScreen.ImportRefusalMessage}"
-    val pe = router
-      .execute("psr-7", "alice", poolKey, "SELECT * FROM postgres_execute('c', 'SELECT 1')", None)
+
+  it should "admit postgres_execute with the ACL off and lockdown off (owner ruling)" in:
+    // The raw federation passthrough is blocked only for tenant-scoped principals when the ACL
+    // validates (CatalogReachingCalls, unit-tested in AccessGateSpec / PostgresAclValidatorSpec)
+    // and for every caller under lockdown (below). The default validator here is allowAll.
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      stmtInstruments = si
+    )
+    val superuser = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser.copy(tenant = None, kind = "admin"),
+      Nil,
+      Nil,
+      Nil,
+      Nil
+    )
+    val out = router
+      .execute(
+        "psr-7",
+        "alice",
+        poolKey,
+        "SELECT * FROM postgres_query('c', 'SELECT 1')",
+        Some(superuser)
+      )
       .unsafeRunSync()
-    pe.swap.toOption.get.reason shouldBe
-      s"access denied: node: ${NodeSettingScreen.ExecRefusalMessage}"
+    out.isRight shouldBe true
 
   // ---- node lockdown (QOD_NODE_LOCKDOWN) ----
 

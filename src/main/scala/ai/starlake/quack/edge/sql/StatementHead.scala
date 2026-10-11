@@ -32,8 +32,8 @@ private[sql] object StatementHead:
     * statement's engine view, which the token offsets index), and the index of the first token of
     * the statement a wrapper carries: past a leading run of EXPLAIN / ANALYZE / ANALYSE keywords
     * and parenthesized option lists (balanced over paren TOKENS, so a paren inside a literal or a
-    * comment never counts), and then past a `PREPARE <name> [(<types>)] AS` head. 0 when the
-    * statement wraps nothing; `toks.length` when nothing follows. `EXPLAIN ANALYZE <stmt>`,
+    * comment never counts), and then past a `PREPARE <name> AS` head. 0 when the statement wraps
+    * nothing; `toks.length` when nothing follows. `EXPLAIN ANALYZE <stmt>`,
     * `EXPLAIN (ANALYZE) <stmt>` and `EXPLAIN ANALYZE (FORMAT json) <stmt>` all EXECUTE the
     * statement on 2.0 (SET, PRAGMA, RESET, COPY and LOAD verified), and `PREPARE p AS <stmt>` +
     * `EXECUTE p` executes `<stmt>` (only SELECT / INSERT / UPDATE / DELETE / COPY are preparable on
@@ -70,16 +70,16 @@ private[sql] object StatementHead:
         i
     Head(view, toks, math.min(skipPrepareHead(h, afterExplain), toks.length))
 
-  /** Past a `PREPARE <name> [(<types>)] AS` head at `from`, to the first token of the prepared
-    * statement; `from` unchanged when there is no such head or no `AS` is found.
+  /** Past a `PREPARE <name> AS` head at `from`, to the first token of the prepared statement;
+    * `from` unchanged when there is no such head or no `AS` follows the name. DuckDB 2.0 has no
+    * parameter-type list form (`PREPARE p(INT) AS ...` is "TypeList ... not implemented"), so only
+    * the bare `PREPARE <name> AS` shape is skipped.
     */
   private def skipPrepareHead(h: Head, from: Int): Int =
-    if !h.word(from).contains("prepare") || h.identifier(from + 1).isEmpty then from
-    else
-      var i = from + 2 // past PREPARE and the statement name
-      if i < h.toks.length && isPunct(h.view, h.toks(i), '(') then
-        i = closingParen(h.view, h.toks, i) + 1
-      if h.word(i).contains("as") then i + 1 else from
+    if h.word(from).contains("prepare") && h.identifier(from + 1).isDefined &&
+      h.word(from + 2).contains("as")
+    then from + 3
+    else from
 
   private val ExplainWords = Set("explain", "analyze", "analyse")
 

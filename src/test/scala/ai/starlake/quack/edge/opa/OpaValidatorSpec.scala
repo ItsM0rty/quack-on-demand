@@ -119,6 +119,18 @@ class OpaValidatorSpec extends AnyFlatSpec with Matchers:
     ) shouldBe a[Denied]
     calls.toString shouldBe ""
 
+  it should "deny a node-escaping call (postgres_query / getenv) before asking OPA" in:
+    for sql <- List(
+        "SELECT * FROM postgres_query('c', 'SELECT 1')",
+        "SELECT getenv('pgPassword')"
+      )
+    do
+      val calls = StringBuilder()
+      validator(Right((200, """{"result":{"allow":true}}""")), calls).validate(
+        ctx(sql, Some(eff(true)))
+      ) shouldBe a[Denied]
+      withClue(sql)(calls.toString shouldBe "")
+
   it should "deny an unknown tenant without calling OPA" in:
     val calls = StringBuilder()
     val other = ctx("SELECT * FROM orders", Some(eff(true)))
