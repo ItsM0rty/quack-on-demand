@@ -153,24 +153,12 @@ object DuckLakeInitializer extends LazyLogging:
         stmt.execute(ext.loadSql("ducklake"))
         stmt.execute(ext.loadSql("postgres_scanner"))
         storageSqlFor(dataPath, ext).foreach(stmt.execute)
-        // Two-layer escape: libpq parses the post-`ducklake:postgres:`
-        // payload as a keyword=value connstring, which is itself wrapped
-        // in a DuckDB string literal. Naive single-quote doubling alone
-        // breaks for an apostrophe in pgPassword: `foo'bar` ->
-        // `password=foo''bar` -> DuckDB un-escapes to `password=foo'bar`
-        // -> libpq parses `password=foo` and chokes on the orphan
-        // `'bar`. [[libpqValue]] wraps + escapes per libpq's rules,
-        // [[duckdbLiteral]] then wraps the whole thing in a DuckDB
-        // literal and doubles any `'` that appears (including the ones
-        // [[libpqValue]] introduced).
-        val connstr =
-          s"ducklake:postgres:" +
-            s"host=${libpqValue(pgHost)} " +
-            s"port=${libpqValue(pgPort)} " +
-            s"dbname=${libpqValue(dbName)} " +
-            s"user=${libpqValue(pgUser)} " +
-            s"password=${libpqValue(pgPassword)}"
-        val attach = attachSql(connstr, dbName, dataPath, encrypted)
+        // The password never rides the ATTACH string (DuckDB keeps an attach path verbatim and
+        // prints it in errors): it goes into a temporary secret the ATTACH names, dropped right
+        // after the ATTACH ([[CatalogPgSecret]]). The path's values are libpq-quoted
+        // ([[CatalogPgSecret.libpqValue]]) inside a DuckDB literal ([[duckdbLiteral]]).
+        val connstr = CatalogPgSecret.connstr(pgHost, pgPort, dbName, pgUser)
+        val attach  = attachSql(connstr, dbName, dataPath, encrypted)
 
         // Side-channel Postgres connection that holds the per-dbname
         // advisory lock only for the duration of the DuckLake ATTACH.
@@ -203,7 +191,9 @@ object DuckLakeInitializer extends LazyLogging:
             try lockStmt.close()
             catch case _: Throwable => ()
 
-          stmt.execute(attach)
+          stmt.execute(CatalogPgSecret.createSql(CatalogPgSecret.Name, pgPassword))
+          try stmt.execute(attach)
+          finally stmt.execute(CatalogPgSecret.dropSql(CatalogPgSecret.Name))
           stmt.execute(s"USE ${quoteIdent(dbName)}")
           stmt.execute(s"CREATE SCHEMA IF NOT EXISTS ${quoteIdent(schemaName)}")
           logger.info(s"DuckLake pre-init OK: $dbName.$schemaName ready at $dataPath")
@@ -290,15 +280,11 @@ object DuckLakeInitializer extends LazyLogging:
   private[ondemand] def duckdbLiteral(v: String): String =
     ai.starlake.quack.model.SqlLiterals.duckdbLiteral(v)
 
+  /** libpq keyword-value value ([[CatalogPgSecret.libpqValue]]). */
+  private[ondemand] def libpqValue(v: String): String = CatalogPgSecret.libpqValue(v)
+
   /** Identifier quote: wrap in `"`, double any embedded `"`. */
   private def quoteIdent(v: String): String = "\"" + v.replace("\"", "\"\"") + "\""
-
-  /** libpq keyword-value value: always wrap in `'...'`, escape `'` as `\'` and `\` as `\\`. Order
-    * matters -- the backslash escape must run before the apostrophe escape, otherwise the backslash
-    * we add to `\'` gets doubled.
-    */
-  private[ondemand] def libpqValue(v: String): String =
-    "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
   /** The DuckLake ATTACH, extracted so its option list is assertable without a live Postgres.
     * `ENCRYPTED` is passed on every attach, not only the one that creates the catalog: the DuckLake
@@ -320,7 +306,8 @@ object DuckLakeInitializer extends LazyLogging:
     val opts =
       if encrypted then s"DATA_PATH ${duckdbLiteral(dataPath)}, ENCRYPTED, AUTOMATIC_MIGRATION TRUE"
       else s"DATA_PATH ${duckdbLiteral(dataPath)}, AUTOMATIC_MIGRATION TRUE"
-    s"ATTACH ${duckdbLiteral(connstr)} AS ${quoteIdent(dbName)} ($opts)"
+    val secret = CatalogPgSecret.metadataParameters(CatalogPgSecret.Name)
+    s"ATTACH ${duckdbLiteral(connstr)} AS ${quoteIdent(dbName)} ($opts, $secret)"
 
   /** Compares the catalog's recorded `ducklake_metadata.encrypted` against what the tenant-db row
     * asks for. `None` recorded means a fresh catalog, which the ATTACH is about to stamp. Same role

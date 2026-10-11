@@ -51,6 +51,9 @@ private trait SpawnScriptTempDir extends BeforeAndAfterEach:
       ))*
     ).!!
 
+/** The DuckLake ATTACH option naming the catalog password's temporary secret. */
+private val CatalogSecretParam = "METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'}"
+
 class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScriptTempDir:
 
   private val script = "scripts/spawn-quack-node.sh"
@@ -76,7 +79,7 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath');")
+    sql should include(s"(DATA_PATH '$dataPath', $CatalogSecretParam);")
     sql should not include "ENCRYPTED"
   }
 
@@ -91,7 +94,7 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED);")
+    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED, $CatalogSecretParam);")
     sql should include("INSTALL httpfs;")
     sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTED")
@@ -150,7 +153,7 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath');")
+    sql should include(s"(DATA_PATH '$dataPath', $CatalogSecretParam);")
     sql should not include "ENCRYPTED"
   }
 
@@ -166,7 +169,7 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED);")
+    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED, $CatalogSecretParam);")
     sql should include("INSTALL httpfs;")
     sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTED")

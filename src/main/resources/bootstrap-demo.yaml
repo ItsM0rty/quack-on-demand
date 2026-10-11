@@ -47,11 +47,16 @@ tenants:
         federatedSources:
           - alias: acme_pg
             description: Federated read-only view of the acme tenant's TPC-H Postgres
+            # The password rides a temporary secret, never the ATTACH string: DuckDB prints an
+            # attach path in duckdb_databases() to every SQL user of the node. Dropped once
+            # attached, so no session can reattach the database writable with it.
             setupSql: |
               INSTALL postgres;
               LOAD postgres;
-              ATTACH 'host={{secret.PG_HOST}} port={{secret.PG_PORT}} dbname=acme_tpch user={{secret.PG_USER}} password={{secret.PG_PASSWORD}}'
-                AS {{alias}} (TYPE postgres, READ_ONLY);
+              CREATE OR REPLACE TEMPORARY SECRET {{alias}}_pg (TYPE postgres, PASSWORD '{{secret.PG_PASSWORD}}');
+              ATTACH 'host={{secret.PG_HOST}} port={{secret.PG_PORT}} dbname=acme_tpch user={{secret.PG_USER}}'
+                AS {{alias}} (TYPE postgres, SECRET {{alias}}_pg, READ_ONLY);
+              DROP SECRET IF EXISTS {{alias}}_pg;
             secrets:
               - { name: PG_HOST,     externalRef: "env:QOD_PG_HOST" }
               - { name: PG_PORT,     externalRef: "env:QOD_PG_PORT" }

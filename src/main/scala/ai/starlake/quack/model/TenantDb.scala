@@ -99,12 +99,13 @@ object TenantDb {
     */
   private val DataPathForbiddenChars: Set[Char] = Set('\'', '"', ';', '\\', '\n', '\r')
 
-  /** Characters that would break out of a single-quoted DuckDB connection-string literal (or chain
-    * extra statements) when `pgHost` / `pgUser` / `pgPassword` are interpolated verbatim into the
-    * `ATTACH 'host=... user=... password=...'` literals in [[scripts/spawn-quack-node.sh]]. These
-    * are free-form connection values (real passwords legitimately carry many symbols), so we deny
-    * only the literal-breaking metacharacters rather than imposing an identifier allowlist. A `"`
-    * is harmless inside a single-quoted literal, so it is intentionally not denied here (unlike
+  /** Characters that would break out of a single-quoted DuckDB literal (or chain extra statements)
+    * when `pgHost` / `pgUser` are interpolated verbatim into the `ATTACH 'host=... user=...'`
+    * literals and `pgPassword` into the catalog secret's `PASSWORD '...'` in
+    * [[scripts/spawn-quack-node.sh]] (the password never rides an ATTACH string). These are
+    * free-form connection values (real passwords legitimately carry many symbols), so we deny only
+    * the literal-breaking metacharacters rather than imposing an identifier allowlist. A `"` is
+    * harmless inside a single-quoted literal, so it is intentionally not denied here (unlike
     * [[DataPathForbiddenChars]]).
     */
   private val ConnParamForbiddenChars: Set[Char] = Set('\'', ';', '\\', '\n', '\r')

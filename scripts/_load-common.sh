@@ -203,6 +203,7 @@ load_print_banner() {
 # dataset-specific INSTALLs passed as $1, storage extension + secret, and the
 # DuckLake ATTACH.
 load_preamble_sql() {
+  local pg_pass_sql=${PG_PASS//\'/\'\'}
   cat <<SQL
 -- The seed loaders run in the BACKGROUND while run-jar.sh's manager owns the
 -- terminal; duckdb's carriage-return progress bar (on by default when stdout
@@ -215,8 +216,12 @@ INSTALL postgres;
 LOAD postgres;
 ${1:-}
 $STORAGE_SQL
-ATTACH 'ducklake:postgres:host=$PG_HOST port=$PG_PORT dbname=$DB_NAME user=$PG_USER password=$PG_PASS' AS $DB_NAME
-  (DATA_PATH '$DATA_PATH');
+-- The password rides a temporary secret, never the attach path (which DuckDB
+-- prints in duckdb_databases() and in errors); dropped once attached.
+CREATE OR REPLACE TEMPORARY SECRET qod_catalog_pg (TYPE postgres, PASSWORD '$pg_pass_sql');
+ATTACH 'ducklake:postgres:host=$PG_HOST port=$PG_PORT dbname=$DB_NAME user=$PG_USER' AS $DB_NAME
+  (DATA_PATH '$DATA_PATH', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});
+DROP SECRET IF EXISTS qod_catalog_pg;
 SQL
 }
 

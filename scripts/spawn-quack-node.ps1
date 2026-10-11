@@ -268,16 +268,25 @@ switch ($kind) {
     [void]$sb.AppendLine("INSTALL postgres;")
     [void]$sb.AppendLine("LOAD postgres;")
     if (-not [string]::IsNullOrEmpty($storageSql)) { [void]$sb.AppendLine($storageSql) }
-    [void]$sb.AppendLine("ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS qod_init_pg (TYPE postgres);")
+    # The catalog password rides a TEMPORARY secret, never an ATTACH string: DuckDB prints an attach
+    # path verbatim in duckdb_databases().path and in connection errors, readable by any SQL user
+    # of the node. Both ATTACHes name the secret, and it is dropped right after them (before
+    # federation SQL and quack_serve) so no session can attach the catalog again with it. Mirrors
+    # spawn-quack-node.sh and CatalogPgSecret.scala. TenantDb.validateSafety already refuses a
+    # quote in pgPassword; double one anyway.
+    $pgPasswordSql = ([string]$pgPassword).Replace("'", "''")
+    [void]$sb.AppendLine("CREATE OR REPLACE TEMPORARY SECRET qod_catalog_pg (TYPE postgres, PASSWORD '$pgPasswordSql');")
+    [void]$sb.AppendLine("ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS qod_init_pg (TYPE postgres, SECRET qod_catalog_pg);")
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');")
-    [void]$sb.AppendLine("ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS ""$catalogAlias""")
+    [void]$sb.AppendLine("ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS ""$catalogAlias""")
     if ($encrypted -ceq 'true') {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', ENCRYPTED);")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', ENCRYPTED, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
     } else {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath');")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
     }
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("DETACH qod_init_pg;")
+    [void]$sb.AppendLine("DROP SECRET IF EXISTS qod_catalog_pg;")
     [void]$sb.AppendLine("USE ""$catalogAlias"";")
     [void]$sb.AppendLine("CREATE SCHEMA IF NOT EXISTS ""$schemaName"";")
     [void]$sb.AppendLine("USE ""$catalogAlias"".""$schemaName"";")

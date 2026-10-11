@@ -160,9 +160,15 @@ CREATE OR REPLACE SECRET quack_azure (
   return [pscustomobject]@{ Sql = $storageSql; DataPath = $dp }
 }
 
-# The DuckLake ATTACH statement shared by the probe and the load script.
+# The DuckLake ATTACH statement shared by the probe and the load script. The password rides a
+# temporary secret, never the attach path (which DuckDB prints in duckdb_databases() and in
+# errors); dropped once attached. Mirrors _load-common.sh.
 function Get-AttachSql($cfg) {
-  "ATTACH 'ducklake:postgres:host=$($cfg.PgHost) port=$($cfg.PgPort) dbname=$($cfg.DbName) user=$($cfg.PgUser) password=$($cfg.PgPass)' AS $($cfg.DbName)`n  (DATA_PATH '$($cfg.DataPath)');"
+  $pw = ([string]$cfg.PgPass).Replace("'", "''")
+  "CREATE OR REPLACE TEMPORARY SECRET qod_catalog_pg (TYPE postgres, PASSWORD '$pw');`n" +
+  "ATTACH 'ducklake:postgres:host=$($cfg.PgHost) port=$($cfg.PgPort) dbname=$($cfg.DbName) user=$($cfg.PgUser)' AS $($cfg.DbName)`n" +
+  "  (DATA_PATH '$($cfg.DataPath)', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});`n" +
+  "DROP SECRET IF EXISTS qod_catalog_pg;"
 }
 
 # Stream SQL to the DuckDB CLI via `-c ".read '<tempfile>'"`. Writes the temp

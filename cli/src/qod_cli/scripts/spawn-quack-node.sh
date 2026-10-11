@@ -359,17 +359,26 @@ case "$kind" in
     INIT_SQL+=$'INSTALL ducklake;\nLOAD ducklake;\n'
     INIT_SQL+=$'INSTALL postgres;\nLOAD postgres;\n'
     INIT_SQL+="$STORAGE_SQL"$'\n'
-    INIT_SQL+="ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS qod_init_pg (TYPE postgres);"$'\n'
+    # The catalog password rides a TEMPORARY secret, never an ATTACH string: DuckDB prints an attach
+    # path verbatim in duckdb_databases().path and in connection errors, readable by any SQL user
+    # of the node. Both ATTACHes name the secret, and it is dropped right after them (before
+    # federation SQL and quack_serve) so no session can attach the catalog again with it. Mirrors
+    # CatalogPgSecret.scala.
+    # TenantDb.validateSafety already refuses a quote in pgPassword; double one anyway.
+    pg_password_sql=${pgPassword//\'/\'\'}
+    INIT_SQL+="CREATE OR REPLACE TEMPORARY SECRET qod_catalog_pg (TYPE postgres, PASSWORD '$pg_password_sql');"$'\n'
+    INIT_SQL+="ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS qod_init_pg (TYPE postgres, SECRET qod_catalog_pg);"$'\n'
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
-    INIT_SQL+="ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS \"$catalogAlias\""$'\n'
+    INIT_SQL+="ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS \"$catalogAlias\""$'\n'
     # Nodes attach as-is: the manager's DuckLakeInitializer migrates older catalogs once per boot.
     if [[ "${encrypted:-}" == "true" ]]; then
-      INIT_SQL+="  (DATA_PATH '$dataPath', ENCRYPTED);"$'\n'
+      INIT_SQL+="  (DATA_PATH '$dataPath', ENCRYPTED, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});"$'\n'
     else
-      INIT_SQL+="  (DATA_PATH '$dataPath');"$'\n'
+      INIT_SQL+="  (DATA_PATH '$dataPath', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});"$'\n'
     fi
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
     INIT_SQL+=$'DETACH qod_init_pg;\n'
+    INIT_SQL+=$'DROP SECRET IF EXISTS qod_catalog_pg;\n'
     INIT_SQL+="USE \"$catalogAlias\";"$'\n'
     INIT_SQL+="CREATE SCHEMA IF NOT EXISTS \"$schemaName\";"$'\n'
     INIT_SQL+="USE \"$catalogAlias\".\"$schemaName\";"$'\n'

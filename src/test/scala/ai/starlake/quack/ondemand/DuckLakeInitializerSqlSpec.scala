@@ -10,13 +10,22 @@ import org.scalatest.matchers.should.Matchers
   */
 class DuckLakeInitializerSqlSpec extends AnyFlatSpec with Matchers:
 
-  private val connstr = "ducklake:postgres:host=h port=5432 dbname=d user=u password=p"
+  private val connstr = CatalogPgSecret.connstr("h", "5432", "d", "u")
 
   "attachSql" should "carry DATA_PATH and AUTOMATIC_MIGRATION when encryption is off" in {
     val sql = DuckLakeInitializer.attachSql(connstr, "acme_lake", "/var/lake", encrypted = false)
     sql should include("DATA_PATH '/var/lake', AUTOMATIC_MIGRATION TRUE")
-    sql should endWith("(DATA_PATH '/var/lake', AUTOMATIC_MIGRATION TRUE)")
+    sql should endWith(
+      "(DATA_PATH '/var/lake', AUTOMATIC_MIGRATION TRUE, " +
+        "METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'})"
+    )
     sql should not include "ENCRYPTED"
+  }
+
+  it should "read the catalog password from the temporary secret, never from the ATTACH string" in {
+    val sql = DuckLakeInitializer.attachSql(connstr, "acme_lake", "/var/lake", encrypted = true)
+    sql.toLowerCase should not include "password"
+    sql should include("METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'}")
   }
 
   it should "carry ENCRYPTED alongside DATA_PATH when encryption is on" in {
@@ -27,7 +36,10 @@ class DuckLakeInitializerSqlSpec extends AnyFlatSpec with Matchers:
     // comma-separated options, so a missing or wrong separator is a syntax error at the one ATTACH
     // that decides a catalog's encryption forever.
     sql should include("DATA_PATH '/var/lake', ENCRYPTED")
-    sql should endWith("(DATA_PATH '/var/lake', ENCRYPTED, AUTOMATIC_MIGRATION TRUE)")
+    sql should endWith(
+      "(DATA_PATH '/var/lake', ENCRYPTED, AUTOMATIC_MIGRATION TRUE, " +
+        "METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'})"
+    )
   }
 
   "encryptionMismatch" should "pass when the catalog has no recorded value yet" in {

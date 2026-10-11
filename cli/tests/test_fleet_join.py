@@ -335,7 +335,11 @@ def test_the_spawn_script_reads_then_deletes_the_secrets_dir(tmp_path):
            "dataPath": str(tmp_path / "lake"), "QOD_SECRETS_DIR": str(d), "QOD_SECRETS_DIR_EPHEMERAL": "1",
            "encryptionKey": "from-env"}
     out = subprocess.run(["bash", str(script), "21999"], env=env, capture_output=True, text=True, check=True)
-    assert "password=from-file" in out.stdout and "token := 'tok-file'" in out.stdout
+    assert "PASSWORD 'from-file'" in out.stdout and "token := 'tok-file'" in out.stdout
+    # The password rides a temporary secret, never an ATTACH string (duckdb_databases() prints it).
+    attaches = [line for line in out.stdout.splitlines() if line.startswith("ATTACH")]
+    assert attaches and all("password" not in line.lower() for line in attaches)
+    assert "DROP SECRET IF EXISTS qod_catalog_pg;" in out.stdout
     assert "from-env" not in out.stdout and "ignoring encryptionKey" in out.stderr
     assert not d.exists()
 

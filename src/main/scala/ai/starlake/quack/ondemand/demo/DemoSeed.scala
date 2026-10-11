@@ -1,5 +1,6 @@
 package ai.starlake.quack.ondemand.demo
 
+import ai.starlake.quack.ondemand.CatalogPgSecret
 import com.typesafe.scalalogging.LazyLogging
 
 import java.nio.file.Files
@@ -33,14 +34,18 @@ object DemoSeed extends LazyLogging:
     val ctas = Tables
       .map(t => s"CREATE TABLE $dbName.$schema.$t AS SELECT * FROM memory.main.$t;")
       .mkString("\n")
+    // The password rides a temporary secret, never the attach path ([[CatalogPgSecret]]).
+    val secret = CatalogPgSecret.Name
     s"""INSTALL ducklake;
        |LOAD ducklake;
        |INSTALL postgres;
        |LOAD postgres;
        |INSTALL tpch;
        |LOAD tpch;
-       |ATTACH 'ducklake:postgres:host=${pg.host} port=${pg.port} dbname=$dbName user=${pg.user} password=${pg.password}' AS $dbName
-       |  (DATA_PATH '$dataPath');
+       |${CatalogPgSecret.createSql(secret, pg.password)};
+       |ATTACH 'ducklake:postgres:host=${pg.host} port=${pg.port} dbname=$dbName user=${pg.user}' AS $dbName
+       |  (DATA_PATH '$dataPath', ${CatalogPgSecret.metadataParameters(secret)});
+       |${CatalogPgSecret.dropSql(secret)};
        |CREATE SCHEMA IF NOT EXISTS $dbName.$schema;
        |CALL dbgen(sf = $sf);
        |$ctas

@@ -18,7 +18,7 @@ class BranchEncryptionSpec extends AnyFlatSpec with Matchers:
     "pgHost"     -> "h",
     "pgPort"     -> "5432",
     "pgUser"     -> "u",
-    "pgPassword" -> "p",
+    "pgPassword" -> "Catalog-Pw-7731",
     "schemaName" -> "main"
   )
 
@@ -55,6 +55,25 @@ class BranchEncryptionSpec extends AnyFlatSpec with Matchers:
       .get
     spec.extraSetupSql should include("ENCRYPTED")
     spec.extraSetupSql should include("READ_ONLY")
+  }
+
+  it should "carry the catalog password in a temporary secret, never in the ATTACH string" in {
+    val sql = fresh()
+      .mergeNodeSpec("acme", "acme_lake", "acme_lake__br_ab12cd34", "/var/lake__br_ab12cd34/")
+      .get
+      .extraSetupSql
+    val lines = sql.linesIterator.toVector
+    lines.filter(_.contains("Catalog-Pw-7731")) shouldBe Vector(
+      "CREATE OR REPLACE TEMPORARY SECRET qod_branch_pg " +
+        "(TYPE postgres, PASSWORD 'Catalog-Pw-7731');"
+    )
+    sql.toLowerCase should not include "password="
+    val create = lines.indexWhere(_.contains("CREATE OR REPLACE TEMPORARY SECRET qod_branch_pg"))
+    val attach = lines.indexWhere(_.startsWith("ATTACH 'ducklake:postgres:"))
+    val drop   = lines.indexOf("DROP SECRET IF EXISTS qod_branch_pg;")
+    lines(attach) should include("METADATA_PARAMETERS MAP {'SECRET': 'qod_branch_pg'}")
+    create should be < attach
+    attach should be < drop
   }
 
   it should "attach the branch catalog without ENCRYPTED when the parent is not encrypted" in {

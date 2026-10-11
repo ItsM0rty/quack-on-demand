@@ -953,12 +953,18 @@ final class PoolSupervisor(
           s"DATA_PATH ${SqlLiterals.duckdbLiteral(branchDataPath)}, READ_ONLY, ENCRYPTED"
         else s"DATA_PATH ${SqlLiterals.duckdbLiteral(branchDataPath)}, READ_ONLY"
       // Same unquoted connection-string shape as spawn-quack-node.sh: every value passed
-      // TenantDb.validateSafety (no quote, semicolon, backslash or newline).
+      // TenantDb.validateSafety (no quote, semicolon, backslash or newline). The password rides
+      // a temporary secret dropped right after the ATTACH, never the attach path, which
+      // duckdb_databases() prints ([[CatalogPgSecret]]); the node's own catalog secret is already
+      // dropped by the time this runs, hence a second name.
+      val secret = CatalogPgSecret.BranchName
       val attach =
-        s"ATTACH 'ducklake:postgres:host=${m.getOrElse("pgHost", "localhost")} " +
+        s"${CatalogPgSecret.createSql(secret, m.getOrElse("pgPassword", ""))};\n" +
+          s"ATTACH 'ducklake:postgres:host=${m.getOrElse("pgHost", "localhost")} " +
           s"port=${m.getOrElse("pgPort", "5432")} dbname=$branchDbName " +
-          s"user=${m.getOrElse("pgUser", "postgres")} password=${m.getOrElse("pgPassword", "")}' " +
-          s"AS $alias ($opts);"
+          s"user=${m.getOrElse("pgUser", "postgres")}' " +
+          s"AS $alias ($opts, ${CatalogPgSecret.metadataParameters(secret)});\n" +
+          s"${CatalogPgSecret.dropSql(secret)};"
       base.copy(
         poolKey = key,
         nodeId = s"merge-${branchDbName.takeRight(8)}-${System.nanoTime()}",

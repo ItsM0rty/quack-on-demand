@@ -113,6 +113,15 @@
     and the node image entrypoint no longer reads `QOD_NODE_TOKEN`; restart every K8s node after
     upgrading. On Kubernetes the mounted files stay readable by a node user with unrestricted SQL
     (superuser, or ACL off without lockdown).
+  - The DuckLake catalog's Postgres password no longer rides an ATTACH string, where
+    `SELECT path FROM duckdb_databases()` (and connection errors) showed it to any SQL user of the
+    node, who could then reach the catalog and its encryption keys under a name of their own. Nodes
+    (both spawn scripts), the merge node's branch attach, the manager's DuckLake initializer, the
+    demo seed, the TPC-H / TPC-DS / SSB loaders and the demo federation source put it in a
+    temporary `TYPE postgres` secret that the ATTACH names (`SECRET` / DuckLake
+    `METADATA_PARAMETERS`) and drop the secret right after attaching, so no session can reuse it.
+    Restart every node to pick it up. Federation sources you wrote yourself keep whatever their
+    `setupSql` says: use the same pattern for a Postgres or MySQL source.
 
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left
