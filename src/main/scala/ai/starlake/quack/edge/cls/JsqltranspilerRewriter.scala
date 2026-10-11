@@ -737,7 +737,8 @@ private[cls] object ResidualColumns:
 
   final class Suspects private[ResidualColumns] (
       val columns: java.util.Set[Column],
-      val unwalkable: Option[String]
+      val unwalkable: Option[String],
+      val refusal: Option[String]
   )
 
   /** One source a select reads: the lowercased names it is referenced by, its base table (None for
@@ -758,7 +759,8 @@ private[cls] object ResidualColumns:
   private final case class Scan(
       columns: List[(Column, List[Scope])],
       tables: List[Table],
-      unknown: Option[String]
+      unknown: Option[String],
+      tableStatements: List[String]
   )
 
   private def unquote(s: String): String = s.stripPrefix("\"").stripSuffix("\"")
@@ -841,15 +843,19 @@ private[cls] object ResidualColumns:
     val visited = java.util.Collections.newSetFromMap(
       new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
     )
-    val columns = scala.collection.mutable.ListBuffer.empty[(Column, List[Scope])]
-    val tables  = scala.collection.mutable.ListBuffer.empty[Table]
-    var unknown = Option.empty[String]
+    val columns         = scala.collection.mutable.ListBuffer.empty[(Column, List[Scope])]
+    val tables          = scala.collection.mutable.ListBuffer.empty[Table]
+    val tableStatements = scala.collection.mutable.ListBuffer.empty[String]
+    var unknown         = Option.empty[String]
     def walk(node: AnyRef, scopes: List[Scope], ctes: Map[String, Option[Set[String]]]): Unit =
       if visited.add(node) then
         node match
           case c: Column => columns += (c -> scopes)
           case t: Table  => tables += t
-          case _         => ()
+          case f: net.sf.jsqlparser.expression.Function
+              if ai.starlake.acl.parser.TableExtractor.tableStatementSources(f).isDefined =>
+            tableStatements += f.toString
+          case _ => ()
         // A WITH clause: its names are in scope for the whole select (and, for a recursive CTE,
         // its own body), and each body is walked with the scopes ENCLOSING this select.
         val withItems = node match
@@ -885,7 +891,7 @@ private[cls] object ResidualColumns:
         case leaf if AstChildren.isLeaf(leaf)      => ()
         case other => unknown = unknown.orElse(Some(other.getClass.getName))
     walk(root, Nil, Map.empty)
-    Scan(columns.toList, tables.toList, unknown)
+    Scan(columns.toList, tables.toList, unknown, tableStatements.toList)
 
   /** The column references in `sel` a policy could cover, noted before the rewrite. */
   def suspects(
@@ -943,7 +949,13 @@ private[cls] object ResidualColumns:
       new java.util.IdentityHashMap[Column, java.lang.Boolean]()
     )
     before.columns.collect { case (c, scopes) if covered(c, scopes) => c }.foreach(noted.add(_))
-    new Suspects(noted, before.unknown)
+    // `ARRAY(TABLE t)` / `x = ANY (TABLE t)` read every column of t with no column node to mask
+    // (JSqlParser holds t as the argument COLUMN of a function flagged TABLE).
+    val refusal = before.tableStatements.headOption.map(_ =>
+      "a TABLE statement in expression position (ARRAY(TABLE t), ANY (TABLE t)) reads every " +
+        "column unmasked under column policies; select the columns with a subquery instead"
+    )
+    new Suspects(noted, before.unknown, refusal)
 
   /** Some(deny reason) when a noted reference is still in `sel` after the rewrite, or the statement
     * holds a node the walk cannot follow.
@@ -952,7 +964,8 @@ private[cls] object ResidualColumns:
     val after = scan(sel)
     suspects.unwalkable.orElse(after.unknown) match
       case Some(cls) => Some(s"column policy rewrite cannot walk a $cls node")
-      case None      =>
+      case None if suspects.refusal.isDefined => suspects.refusal
+      case None                               =>
         after.columns
           .map(_._1)
           .find(suspects.columns.contains)

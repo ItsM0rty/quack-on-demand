@@ -952,3 +952,15 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       case Denied(_) => succeed
       case other     => fail(s"expected Denied, got $other")
   }
+
+  it should "deny a TABLE statement passed to ARRAY() or ANY, which reads every column raw" in
+    List(
+      "SELECT ARRAY(TABLE customer)",
+      "SELECT unnest(ARRAY(TABLE tpch1.customer))",
+      "SELECT 1 WHERE 'a@x' = ANY (TABLE customer)"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }

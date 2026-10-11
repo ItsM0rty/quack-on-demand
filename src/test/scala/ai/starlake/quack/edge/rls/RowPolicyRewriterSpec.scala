@@ -394,6 +394,16 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     ) shouldBe Passthrough
   }
 
+  "a TABLE statement passed to ARRAY() or ANY naming a policy table" should "be refused" in {
+    // JSqlParser holds `ARRAY(TABLE customer)` as a function whose argument is a column: no slot
+    // to wrap, while DuckDB reads every row of customer.
+    val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
+    go("SELECT ARRAY(TABLE customer)", effSet) shouldBe a[Refused]
+    go("SELECT len(ARRAY(TABLE tpch1.customer))", effSet) shouldBe a[Refused]
+    go("SELECT 1 WHERE 'x' = ANY (TABLE \"customer\")", effSet) shouldBe a[Refused]
+    go("SELECT ARRAY(TABLE orders)", effSet) shouldBe Passthrough
+  }
+
   // ---- expression positions outside JSqlParser's node types --------------------------------
 
   "a policy table read in a MAP literal or a json_object argument" should "be filtered" in {

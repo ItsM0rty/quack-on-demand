@@ -92,6 +92,10 @@ object RowPolicyRewriter:
   private val StatementSourceRefusal =
     "a parenthesized statement in table position reads a row-policy table; select from it instead"
 
+  private val TableStatementRefusal =
+    "a TABLE statement in expression position (ARRAY(TABLE t), ANY (TABLE t)) reads a " +
+      "row-policy table; use a subquery selecting from it instead"
+
   /** SQL-escape a scalar value into a quoted literal: `O'Brien` -> `'O''Brien'`. */
   private def lit(v: String): String = "'" + v.replace("'", "''") + "'"
 
@@ -219,7 +223,15 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
               .foreach(_ => throw new Refusal(StatementSourceRefusal))
             wrapped(pfi.getFromItem).foreach(pfi.setFromItem)
           case fq: FromQuery => wrapped(fq.getFromItem).foreach { w => fq.setFromItem(w); () }
-          case _             => ()
+          case f: net.sf.jsqlparser.expression.Function =>
+            // `ARRAY(TABLE t)` / `x = ANY (TABLE t)`: JSqlParser holds `t` as the argument column
+            // of a function flagged TABLE, so there is no slot to wrap, while DuckDB reads every
+            // row of t. Refused when t carries a policy (or cannot be read back).
+            TableExtractor
+              .tableStatementSources(f)
+              .filter(_.exists(_.forall(t => matchingPolicies(t, eff, ctx).nonEmpty)))
+              .foreach(_ => throw new Refusal(TableStatementRefusal))
+          case _ => ()
         // Only the reflective call is guarded (some jsqlparser getters cast `this` and throw on
         // a sibling subtype): an exception from the walk itself, a refusal or a predicate that
         // fails to apply on a nested table, must reach rewrite's handler and deny.

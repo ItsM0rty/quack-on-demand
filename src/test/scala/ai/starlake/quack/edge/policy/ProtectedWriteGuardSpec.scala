@@ -493,3 +493,14 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
       ctx
     ) shouldBe a[Deny]
   }
+
+  "a write whose source passes a policy table to ARRAY(TABLE ..)" should "be denied" in
+    List(eff(tenantUser, cols = List(maskEmail)), eff(tenantUser, rows = List(rowPolicy)))
+      .foreach { e =>
+        guardWithCls().check(
+          "INSERT INTO tpch1.t SELECT len(ARRAY(TABLE tpch1.customer))",
+          StatementKind.Dml,
+          e,
+          ctx
+        ) shouldBe a[Deny]
+      }

@@ -440,3 +440,16 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
     outcome("SELECT c.c_id FROM customer c JOIN orders o USING (c_email)") shouldBe
       a[RewriteOutcome.Denied]
   }
+
+  // ---- a TABLE statement in expression position -------------------------------------------------
+  //
+  // `ARRAY(TABLE customer)` / `x = ANY (TABLE customer)` read every column of customer, the masked
+  // ones raw, with no column node for the visitor to mask.
+
+  "a TABLE statement passed to ARRAY() or ANY" should "be denied under column policies" in
+    List(
+      "SELECT ARRAY(TABLE customer)",
+      "SELECT len(ARRAY(TABLE customer))",
+      "SELECT c_id FROM customer WHERE 'a@x' = ANY (TABLE customer)",
+      "SELECT ARRAY(TABLE v_customer)"
+    ).foreach(sql => withClue(sql)(outcome(sql) shouldBe a[RewriteOutcome.Denied]))

@@ -735,3 +735,11 @@ class MetadataFilterRewriterSpec extends AnyFlatSpec with Matchers:
       case Denied(_) => succeed
       case other     => fail(s"expected Denied, got $other")
   }
+
+  "a TABLE statement in expression position naming a filterable table" should "be denied" in {
+    // `ARRAY(TABLE information_schema.tables)` reads every row with no FROM slot to substitute;
+    // the ACL gate admits the read implicitly under filtered metadata, so the filter must refuse.
+    val e = eff(tenantUser, grant("acme_tpch", "tpch1", "*"))
+    go("SELECT ARRAY(TABLE information_schema.tables)", e) shouldBe a[Denied]
+    go("SELECT 1 WHERE 'x' = ANY (TABLE information_schema.schemata)", e) shouldBe a[Denied]
+  }

@@ -248,6 +248,22 @@ object TableExtractor:
         Some(asFromTable(raw).toRight(raw))
       case _ => None
 
+  /** Some(sources) when `f` holds a TABLE statement in expression position: DuckDB's
+    * `ARRAY(TABLE t)` and the quantified comparison `x = ANY | ALL | SOME (TABLE t)`, each reading
+    * every row of `t` (checked against DuckDB 2.0, where `t` binds like a FROM item: a CTE of that
+    * name first). JSqlParser holds either as a function flagged with the TABLE keyword whose
+    * argument is a COLUMN named `t`, so a walk that reads it as an expression sees no table at all.
+    *
+    * Each argument is read back exactly as `FROM <arg>` would parse it; Left(raw) when that fails
+    * (or the call has no argument), which the caller must refuse, since the table is then unknown.
+    */
+  def tableStatementSources(f: Function): Option[List[Either[String, Table]]] =
+    if !Option(f.getExtraKeyword).exists(_.trim.equalsIgnoreCase("TABLE")) then None
+    else
+      val args = Option(f.getParameters).map(_.asScala.toList).getOrElse(Nil)
+      if args.isEmpty then Some(List(Left(f.toString)))
+      else Some(args.map(a => asFromTable(String.valueOf(a)).toRight(String.valueOf(a))))
+
   /** `raw` (a single name as JSqlParser printed it) read back exactly as `FROM <raw>` parses it, or
     * None when that is not one bare table. The Table constructor is no substitute: it splits a
     * string literal, or a quoted name, on its dots.
@@ -592,6 +608,13 @@ private[parser] class TableExtractorVisitor:
       case exprList: ExpressionList[?] =>
         exprList.asScala.foreach(e => visitExpression(e.asInstanceOf[Expression]))
       case func: Function =>
+        // `ARRAY(TABLE t)` / `x = ANY (TABLE t)`: the argument is a read of t, not a column.
+        TableExtractor
+          .tableStatementSources(func)
+          .foreach(_.foreach {
+            case Right(table) => visitFromItem(table)
+            case Left(raw)    => unsupported += s"unreadable TABLE statement argument $raw"
+          })
         val params = func.getParameters
         if params != null then visitExpression(params)
       case analytic: AnalyticExpression =>

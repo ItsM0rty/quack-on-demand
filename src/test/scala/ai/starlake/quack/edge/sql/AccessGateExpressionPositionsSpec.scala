@@ -110,3 +110,55 @@ class AccessGateExpressionPositionsSpec extends AnyFlatSpec with Matchers:
           AccessGate.evaluate(sql, cfg, "lake", true, false) shouldBe a[GateOutcome.NothingGated]
         }
       }
+
+  // DuckDB's `ARRAY(TABLE t)` and `x = ANY (TABLE t)` read every row of t: a TABLE statement in
+  // the one function argument / quantified-comparison position DuckDB accepts it. JSqlParser holds
+  // it as a function flagged with the TABLE keyword whose argument is a COLUMN named t, so no read
+  // was gated and each form came back NothingGated, while the 2.0 CLI returned t's rows.
+  "a TABLE statement passed to ARRAY() or a quantified comparison" should "gate the table" in:
+    List(
+      "SELECT ARRAY(TABLE secret)",
+      "SELECT array(table \"secret\")",
+      "SELECT ARRAY(TABLE main.secret)",
+      "SELECT ARRAY(TABLE lake.main.secret)",
+      "SELECT len(ARRAY(TABLE secret))",
+      "SELECT unnest(ARRAY(TABLE secret))",
+      "SELECT ARRAY(TABLE secret)[1]",
+      "SELECT ARRAY(TABLE secret ORDER BY 1)",
+      "SELECT ARRAY(TABLE secret LIMIT 1)",
+      "SELECT 1 WHERE 'x' = ANY (TABLE secret)",
+      "SELECT 1 WHERE 'x' = ALL (TABLE secret)",
+      "SELECT 1 WHERE 'x' = SOME (TABLE secret)",
+      "SELECT 1 WHERE NOT 'x' = ANY (TABLE secret)",
+      "SELECT map {'a': ARRAY(TABLE secret)}",
+      "SET VARIABLE x = ARRAY(TABLE secret)"
+    ).foreach { sql =>
+      withClue(sql) {
+        AccessGate.evaluate(
+          sql,
+          cfg,
+          "lake",
+          filteredMetadata = true,
+          clientDataScans = false
+        ) match
+          case GateOutcome.Refuse(_, _, _) => succeed
+          case GateOutcome.Gated(g, _) => g.map(_.table.canonical) shouldBe Set("lake.main.secret")
+          case other                   => fail(s"admitted ungated: $other")
+      }
+    }
+
+  it should "gate it beside the other reads of a statement and in a write's source" in:
+    gated("SELECT a FROM t WHERE ARRAY(TABLE secret)[1] LIKE 'top%'") shouldBe
+      Set("lake.main.t", "lake.main.secret")
+    gated("INSERT INTO t SELECT len(ARRAY(TABLE secret)), 1") should contain("lake.main.secret")
+    gated("UPDATE t SET a = len(ARRAY(TABLE secret))") should contain("lake.main.secret")
+    gated("SELECT ARRAY(TABLE secret) FROM t") shouldBe Set("lake.main.t", "lake.main.secret")
+
+  it should "bind a CTE of that name to the CTE, as DuckDB does" in:
+    AccessGate.evaluate(
+      "WITH secret AS (SELECT 1 AS v) SELECT ARRAY(TABLE secret)",
+      cfg,
+      "lake",
+      filteredMetadata = true,
+      clientDataScans = false
+    ) shouldBe a[GateOutcome.NothingGated]
