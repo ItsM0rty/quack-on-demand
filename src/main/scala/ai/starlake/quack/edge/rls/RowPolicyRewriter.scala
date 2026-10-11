@@ -1,5 +1,6 @@
 package ai.starlake.quack.edge.rls
 
+import ai.starlake.acl.parser.TableExtractor
 import ai.starlake.quack.model.StatementKind
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.state.RoleRowPolicy
@@ -21,6 +22,7 @@ import net.sf.jsqlparser.statement.select.{
 
 import scala.jdk.CollectionConverters._
 import scala.util.Try
+import scala.util.control.NonFatal
 
 /** Schema/catalog defaults in scope when the statement runs, used to qualify bare table references
   * (`customer` -> catalog `acme_tpch`, schema `tpch1`) so they match policies keyed on
@@ -70,6 +72,12 @@ object RowPolicyRewriter:
   final case class Failed(reason: String) extends Outcome
 
   private val TokenRegex = "\\$\\{[a-zA-Z]+\\}".r
+
+  /** A shape the rewrite cannot filter, refused with a fixed reason (never the SQL). */
+  private final class Refusal(val reason: String) extends RuntimeException(reason)
+
+  private val StatementSourceRefusal =
+    "a parenthesized statement in table position reads a row-policy table; select from it instead"
 
   /** SQL-escape a scalar value into a quoted literal: `O'Brien` -> `'O''Brien'`. */
   private def lit(v: String): String = "'" + v.replace("'", "''") + "'"
@@ -171,6 +179,7 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
             else if exact then Rewritten(stmt.toString)
             else PassthroughParseFailed
           catch
+            case r: Refusal => Failed(r.reason)
             // A predicate that fails to apply at rewrite time (should never happen - the
             // create-time validator already parsed it) must not crash the request path, but it
             // also must not forward the statement unfiltered: that would silently disable the
@@ -216,12 +225,24 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
         node match
           case ps: PlainSelect => wrapped(ps.getFromItem).foreach(ps.setFromItem)
           case j: Join         => wrapped(j.getFromItem).foreach { w => j.setFromItem(w); () }
-          case pfi: ParenthesedFromItem => wrapped(pfi.getFromItem).foreach(pfi.setFromItem)
+          case pfi: ParenthesedFromItem =>
+            // `(TABLE t)` / `(SUMMARIZE t)`: JSqlParser holds `t` as an alias, so there is no slot
+            // to wrap, while DuckDB reads every row of t. Refused when t carries a policy.
+            TableExtractor
+              .statementSource(pfi)
+              .filter(_.forall(t => matchingPolicies(t, eff, ctx).nonEmpty))
+              .foreach(_ => throw new Refusal(StatementSourceRefusal))
+            wrapped(pfi.getFromItem).foreach(pfi.setFromItem)
           case fq: FromQuery => wrapped(fq.getFromItem).foreach { w => fq.setFromItem(w); () }
           case _             => ()
+        // Only the reflective call is guarded (some jsqlparser getters cast `this` and throw on
+        // a sibling subtype): an exception from the walk itself, a refusal or a predicate that
+        // fails to apply on a nested table, must reach rewrite's handler and deny.
         childAccessors(node.getClass).foreach { m =>
-          try route(m.invoke(node))
-          catch case _: Throwable => ()
+          route(
+            try m.invoke(node)
+            catch case NonFatal(_) => null
+          )
         }
 
     /** Some(wrapper) when the slot holds a base table matching a policy, None otherwise. */
@@ -243,6 +264,21 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
         case n: AnyRef if isJsqlNode(n) => walk(n)
         case _                          => ()
 
+  /** The principal's row policies covering `t`, its bare parts qualified by the session defaults.
+    */
+  private def matchingPolicies(
+      t: Table,
+      eff: EffectiveSet,
+      ctx: SchemaContext
+  ): List[RoleRowPolicy] =
+    val name    = unquote(t.getName)
+    val schema  = Option(t.getSchemaName).map(unquote).getOrElse(ctx.defaultSchema.getOrElse(""))
+    val catalog = Option(t.getDatabase)
+      .flatMap(d => Option(d.getDatabaseName))
+      .map(unquote)
+      .getOrElse(ctx.defaultDatabase.getOrElse(""))
+    eff.rowPolicies.filter(p => policyMatches(p, catalog, schema, name))
+
   /** If `t` matches one or more of the principal's row policies, return a parenthesed
     * `(SELECT * FROM t WHERE <ORed predicate>)` carrying t's original alias; else return `t`
     * unchanged.
@@ -254,14 +290,7 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
       values: Map[String, String],
       changed: java.util.concurrent.atomic.AtomicBoolean
   ): net.sf.jsqlparser.statement.select.FromItem =
-    val name    = unquote(t.getName)
-    val schema  = Option(t.getSchemaName).map(unquote).getOrElse(ctx.defaultSchema.getOrElse(""))
-    val catalog = Option(t.getDatabase)
-      .flatMap(d => Option(d.getDatabaseName))
-      .map(unquote)
-      .getOrElse(ctx.defaultDatabase.getOrElse(""))
-
-    val matched = eff.rowPolicies.filter(p => policyMatches(p, catalog, schema, name))
+    val matched = matchingPolicies(t, eff, ctx)
     if matched.isEmpty then t
     else
       val predicate =

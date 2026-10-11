@@ -372,3 +372,21 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     ) shouldBe PassthroughParseFailed
     go("SELECT 7 // 2", eff(tenantUser, List(policy("c_region = 'EU'")))) shouldBe Passthrough
   }
+
+  // ---- statements in table position -------------------------------------------------------
+
+  "a parenthesized statement naming a policy table" should "be refused, not passed through" in {
+    // JSqlParser reads `(TABLE customer)` as a table named TABLE aliased customer: no slot to wrap,
+    // while DuckDB returns every row of customer
+    val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
+    go("SELECT * FROM (TABLE customer)", effSet) shouldBe a[Failed]
+    go("SELECT * FROM (SUMMARIZE customer)", effSet) shouldBe a[Failed]
+    go("SELECT * FROM orders JOIN (TABLE \"customer\") c ON true", effSet) shouldBe a[Failed]
+  }
+
+  it should "pass through when the named table carries no policy" in {
+    go(
+      "SELECT * FROM (TABLE orders)",
+      eff(tenantUser, List(policy("c_region = 'EU'")))
+    ) shouldBe Passthrough
+  }

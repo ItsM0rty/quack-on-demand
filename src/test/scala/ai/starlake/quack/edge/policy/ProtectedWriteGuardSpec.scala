@@ -427,3 +427,29 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
       clientDataScans = true
     ) shouldBe a[Deny]
   }
+
+  // SUMMARIZE returns per-column min / max / quantiles of the true values. It is not a SELECT, so
+  // neither rewriter masks or filters it; the guard is what stands between it and a protected table.
+  "SUMMARIZE of a protected table" should "be denied for a principal with a row policy on it" in {
+    guardWithCls().check(
+      "SUMMARIZE tpch1.customer",
+      StatementKind.Other,
+      eff(tenantUser, rows = List(rowPolicy)),
+      ctx
+    ) shouldBe a[Deny]
+  }
+
+  it should "be denied for a principal with a column policy on it" in {
+    guardWithCls().check(
+      "SUMMARIZE customer",
+      StatementKind.Other,
+      eff(tenantUser, cols = List(maskEmail)),
+      ctx
+    ) shouldBe a[Deny]
+    guardWithCls().check(
+      "SUMMARIZE SELECT c_email FROM tpch1.customer",
+      StatementKind.Other,
+      eff(tenantUser, cols = List(maskEmail)),
+      ctx
+    ) shouldBe a[Deny]
+  }

@@ -182,6 +182,48 @@ object SqlParser:
   private def selectReads(select: Option[Select]): TableExtraction =
     select.map(TableExtractor.extract).getOrElse(TableExtraction(Nil, Nil))
 
+  /** An inner statement's result re-attributed to the statement that carries it (EXPLAIN,
+    * SUMMARIZE, DESCRIBE of a query): same accesses, the outer index and snippet.
+    */
+  private def asOuter(inner: StatementResult, index: Int, snippet: String): StatementResult =
+    inner match
+      case StatementResult.Extracted(_, _, accesses, errs, unsup) =>
+        StatementResult.Extracted(index, snippet, accesses, errs, unsup)
+      case StatementResult.ParseError(_, _, msg) =>
+        StatementResult.ParseError(index, snippet, msg)
+      case StatementResult.ControlFlow(_, _, t) =>
+        StatementResult.ControlFlow(index, snippet, s"EXPLAIN $t")
+
+  /** `SELECT * FROM <table>`: the read a statement naming a bare table performs on it. */
+  private def selectAllFrom(table: Table): Select =
+    val select = new net.sf.jsqlparser.statement.select.PlainSelect()
+    select.addSelectItem(new net.sf.jsqlparser.statement.select.AllColumns())
+    select.setFromItem(table)
+    select
+
+  /** Read on the one table a DESCRIBE / SHOW names, which reveals its shape. A string literal there
+    * is a file the node reads (a replacement scan), so it is a file reference with no table to
+    * grant on, as in FROM.
+    */
+  private def namedTableRead(
+      table: Table,
+      index: Int,
+      snippet: String,
+      config: Config
+  ): StatementResult =
+    if DuckDBDialectMapper.isFileReference(table) then
+      StatementResult.Extracted(
+        index,
+        snippet,
+        Set.empty,
+        Nil,
+        List(s"file reference ${table.getName}")
+      )
+    else
+      val (qTgt, errs) = TableQualifier.qualify(List(table), config)
+      StatementResult
+        .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
+
   // SHOW <keyword> forms that jsqlparser also parses as ShowStatement but that name
   // no table: they stay ControlFlow (v1 defers filtering them; see the spec).
   private val ShowKeywordForms: Set[String] = Set("DATABASES", "SCHEMAS")
@@ -304,17 +346,18 @@ object SqlParser:
       // `EXPLAIN ANALYZE <dml>` EXECUTES the inner statement. Classify by the
       // inner statement so an EXPLAIN ANALYZE DELETE is authorized as the DELETE
       // it really runs, not admitted as a table-free control-flow verb.
+      //
+      // SUMMARIZE parses to the same node. `SUMMARIZE <query>` carries the query as the inner
+      // statement; `SUMMARIZE <table>` carries no inner statement but the table, and returns its
+      // per-column min / max / quantiles: a read of every value, gated exactly like a
+      // `SELECT * FROM <table>` (a string literal there is a file the node reads, and a bare
+      // system-view name the view, both handled by the same FROM-item walk).
       case ex: ExplainStatement =>
-        Option(ex.getStatement) match
-          case Some(inner) =>
-            processStatement(inner, index, config) match
-              case StatementResult.Extracted(_, _, accesses, errs, unsup) =>
-                StatementResult.Extracted(index, snippet, accesses, errs, unsup)
-              case StatementResult.ParseError(_, _, msg) =>
-                StatementResult.ParseError(index, snippet, msg)
-              case StatementResult.ControlFlow(_, _, t) =>
-                StatementResult.ControlFlow(index, snippet, s"EXPLAIN $t")
-          case None =>
+        (Option(ex.getStatement), Option(ex.getTable)) match
+          case (Some(inner), _) => asOuter(processStatement(inner, index, config), index, snippet)
+          case (None, Some(table)) =>
+            asOuter(processStatement(selectAllFrom(table), index, config), index, snippet)
+          case (None, None) =>
             // Bare EXPLAIN with no inner statement carries no table refs.
             StatementResult.ControlFlow(index, snippet, "ExplainStatement")
 
@@ -327,10 +370,12 @@ object SqlParser:
       // SELECT. Plain SHOW TABLES stays ControlFlow and is replaced or denied by the
       // edge metadata filter downstream; SHOW ALL TABLES never parses (denied
       // fail-closed).
+      // `DESCRIBE <query>` (also `DESCRIBE FROM t`) carries the query instead of a table: its
+      // reads are the query's. A string literal in table position is a file the node reads.
       case d: DescribeStatement =>
-        val (qTgt, errs) = TableQualifier.qualify(List(d.getTable), config)
-        StatementResult
-          .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
+        Option(d.getSelect) match
+          case Some(select) => asOuter(processStatement(select, index, config), index, snippet)
+          case None         => namedTableRead(d.getTable, index, snippet, config)
       case sc: ShowColumnsStatement =>
         // Only the unqualified form reaches here; `SHOW COLUMNS FROM x.y` is not in
         // the grammar and already fails closed on the parse-error arm.
@@ -339,9 +384,10 @@ object SqlParser:
           .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
       case sh: ShowStatement
           if !ShowKeywordForms.contains(sh.getName.trim.toUpperCase(Locale.ROOT)) =>
-        val (qTgt, errs) = TableQualifier.qualify(List(new Table(sh.getName)), config)
-        StatementResult
-          .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
+        TableExtractor.asFromTable(sh.getName) match
+          case Some(t) => namedTableRead(t, index, snippet, config)
+          case None    =>
+            StatementResult.ParseError(index, snippet, s"unreadable SHOW target ${sh.getName}")
 
       // Explicit allowlist of statement types that provably carry no grantable
       // table reference. Admitted unconditionally as ControlFlow. Anything NOT

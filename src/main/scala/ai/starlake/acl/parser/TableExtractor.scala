@@ -220,6 +220,50 @@ object TableExtractor:
       s"DuckDB system view $name referenced by its bare name (no grantable table behind it; " +
         "qualify a real table with its catalog)"
 
+  /** DuckDB statements that may stand, parenthesized, in table position (`FROM (SUMMARIZE t)`,
+    * `FROM (TABLE t)`, `FROM (DESCRIBE t)`, `FROM (SHOW t)`), checked against DuckDB 2.0.
+    */
+  private val StatementSourceKeywords: Set[String] =
+    Set("summarize", "describe", "desc", "show", "table")
+
+  /** Some(source) when `pfi` is a parenthesized DuckDB statement in table position. JSqlParser
+    * reads `(SUMMARIZE t)` as a table NAMED `SUMMARIZE` aliased `t`, so a walk keyed on the table
+    * name would check the keyword, while DuckDB reads `t` (all of it for TABLE and SUMMARIZE).
+    * DuckDB parses the keyword there as the statement even when a table of that name exists, and
+    * only an unquoted keyword is one; an alias with a column list or a join inside the parentheses
+    * is not this shape.
+    *
+    * The source is `t` read back exactly as `FROM t` would parse it, so a string literal stays one
+    * (the caller's file-reference handling applies) and a quoted name keeps its parts. Left(raw)
+    * when that re-read fails: the caller must refuse it, since the table is then unknown.
+    */
+  def statementSource(pfi: ParenthesedFromItem): Option[Either[String, Table]] =
+    pfi.getFromItem match
+      case t: Table
+          if t.getSchemaName == null && t.getAlias != null && t.getAlias.getAliasColumns == null &&
+            Option(t.getName)
+              .exists(n => StatementSourceKeywords.contains(n.toLowerCase(Locale.ROOT))) &&
+            Option(pfi.getJoins).forall(_.isEmpty) =>
+        val raw = t.getAlias.getName
+        Some(asFromTable(raw).toRight(raw))
+      case _ => None
+
+  /** `raw` (a single name as JSqlParser printed it) read back exactly as `FROM <raw>` parses it, or
+    * None when that is not one bare table. The Table constructor is no substitute: it splits a
+    * string literal, or a quoted name, on its dots.
+    */
+  def asFromTable(raw: String): Option[Table] =
+    scala.util
+      .Try(net.sf.jsqlparser.parser.CCJSqlParserUtil.parse(s"SELECT * FROM $raw"))
+      .toOption
+      .collect {
+        case ps: PlainSelect
+            if Option(ps.getJoins).forall(_.isEmpty) && ps.getWhere == null &&
+              ps.getWithItemsList == null =>
+          ps.getFromItem
+      }
+      .collect { case src: Table if src.getAlias == null => src }
+
   /** Extract all Table references from a parsed Select statement.
     *
     * @param select
@@ -435,7 +479,14 @@ private[parser] class TableExtractorVisitor:
       case pfi: ParenthesedFromItem =>
         // `FROM (a JOIN b ON ...)`: recurse into the wrapped item and its joins.
         val inner = pfi.getFromItem
-        if inner != null then visitFromItem(inner)
+        TableExtractor.statementSource(pfi) match
+          case Some(source) =>
+            // `(SUMMARIZE t)` / `(TABLE t)`: the keyword table is never a read; `t` is.
+            visited.add(inner): Unit
+            source match
+              case Right(table) => visitFromItem(table)
+              case Left(raw)    => unsupported += s"unreadable statement source $raw"
+          case None => if inner != null then visitFromItem(inner)
         val joins = pfi.getJoins
         if joins != null then
           joins.asScala.foreach { j =>
