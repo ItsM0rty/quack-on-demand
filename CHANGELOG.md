@@ -173,17 +173,63 @@
     from a table with no policy (a staging CTE joined to a masked table, common in dbt): a
     covered-column check now binds unqualified names per query block, innermost first, as DuckDB
     does. `JOIN ... USING` on a covered column stays denied.
-  - BREAKING for tables whose name holds a dot: a double-quoted or backtick-quoted identifier
-    containing a dot (`"a.b"`) is refused for ACL-checked users (QoD grants and OPA), users with
-    column or row policies, and every caller on a lockdown pool. DuckDB reads it as one table
-    name, `main."a.b"`, while the access check read schema `a`, table `b`, so a grant on schema
-    `a` reached `main."a.b"`. An alias (`AS "t.x"`) and a remote URL (`"s3://b/x.parquet"`) are
-    still accepted; rename such tables.
+  - BREAKING for names holding a dot, an `@` or an escaped quote: a double-quoted or
+    backtick-quoted identifier containing a dot (`"a.b"`), an `@` (`"secret@x"`) or its own
+    doubled delimiter (`"a""b"`) is refused for ACL-checked users (QoD grants and OPA), users with
+    column or row policies, and every caller on a lockdown pool. DuckDB reads each as one name,
+    while the access check read `"a.b"` as schema `a`, table `b`, `"secret@x"` as table `secret`
+    (a database link) and `"a""b"` as `a""b`, so a grant on schema `a` reached `main."a.b"` and a
+    grant on `secret` read, wrote and dropped `secret@x`. The rule is lexical, so it also refuses
+    such a quoted COLUMN or struct-field name (`"price.usd"`, `s."a.b"`, common in CSV- or
+    JSON-derived tables), in any position but directly after `AS`. An alias (`AS "t.x"`) and a
+    remote URL starting with a scheme (`"s3://b/x.parquet"`) are still accepted (a `://` anywhere
+    else, `"other.x://"`, no longer is); rename such tables and columns (an `AS` alias only
+    renames an output label).
   - `quack_active_connections()` (every session's running query text and connection id) and
     `quack_server_list()` join the node-control calls reserved to superusers and refused to every
     caller on a lockdown pool.
   - The ACL walk scopes a CTE name to the query that declares it: a CTE inside `ARRAY(...)` or a
     derived table is no longer gated as a table of that name.
+  - A CTE name no longer hides a read of the real table of that name. Every name of a `WITH`
+    clause was in scope before any body was walked, while DuckDB binds a body's reference to its
+    own name, or to a later sibling's, to the real table: `WITH orders AS (SELECT * FROM orders)`
+    (common in dbt SQL) read the table `orders` with nothing gated, top level, nested and on a
+    write's `WITH` clause. The walk now follows DuckDB 2.0's visibility exactly: a body sees the
+    CTEs declared before it, the main query all of them, and in `WITH RECURSIVE` a union body's
+    recursive term also sees its own name. The column-policy residual check binds CTE names by the
+    same rules.
+  - `ARRAY(TABLE t)` and the quantified comparison `x = ANY | ALL | SOME (TABLE t)` read every row
+    of t; JSqlParser holds t as a column, so the ACL admitted them with nothing gated (also in
+    `SET VARIABLE` values and write sources). The table is now gated; the column-policy rewrite
+    denies the form and the row-policy rewrite refuses it on a policy table.
+  - The column-policy rewrite no longer schema-qualifies a CTE reference. It printed
+    `WITH t AS (..) SELECT .. FROM t` as `.. FROM <schema>.t`, a read of the real table `t` the
+    ACL never checked (it saw the CTE), for any principal with a mask policy whose statement
+    touched a masked column; where no such table existed the statement failed instead. Table names
+    now go out exactly as written. As defense in depth, every rewritten statement (column
+    policies, row policies, metadata filter) is refused if it needs a grant on a table or verb the
+    original did not, and is re-validated for the same principal in the same ACL mode before it
+    reaches a node.
+  - BREAKING for principals with a column (mask) policy: `COLUMNS(...)` in any position, the
+    unpacked `*COLUMNS(...)`, star patterns (`* LIKE` / `ILIKE` / `NOT LIKE` / `GLOB` /
+    `SIMILAR TO`, `t.* LIKE`) and any star inside an expression other than `count(*)` are refused
+    where a table with a column policy is in scope: each returned masked columns raw. So are a
+    table referenced as a column (`SELECT c FROM customer c`, `main.customer`, `to_json(c)`: the
+    whole row as a STRUCT) and a statement in table position over such a table (`(TABLE t)`,
+    `(SUMMARIZE t)`). Name the columns instead. `* EXCLUDE (..)` and `* REPLACE (.. AS ..)` (over
+    one table, or `t.*`) are now expanded to an explicit, masked column list: the rewrite used to
+    drop the modifier (excluded columns came back masked, a replacement was lost), and an aliased
+    table's star now expands under its alias (`SELECT * FROM customer c` used to fail on the node).
+    A modifier that cannot be expanded exactly over a table with a column policy is refused.
+  - DuckDB's method-call syntax on a masked column (`c_email.lower()`, `c.c_email.upper()`, in any
+    clause) went out unmasked: JSqlParser holds it as a function with a multi-part name and no
+    column. It is now rewritten to the function form and masked (`lower('***')`); a field read of
+    a masked column (`c_email.x`) is refused.
+  - A `NATURAL` join comparing a masked column is refused, like `JOIN ... USING` on one: joined
+    against a guess list it recovered every value of an enumerable masked column (phone numbers,
+    dates of birth) with its row.
+  - A FROM-first statement (`FROM t`) of a principal with a column policy is refused cleanly
+    instead of failing with an internal error.
 
 - **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
   open transaction's node connection too, so a statement after an idle pause longer than the
