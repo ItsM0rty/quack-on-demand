@@ -1209,6 +1209,101 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync() shouldBe a[Left[?, ?]]
     capturedSql() shouldBe ""
 
+  /** A validator that admits only statements free of `marker`: the original passes, a rewrite
+    * introducing the marker does not, so only the re-validation can refuse.
+    */
+  private def refusing(marker: String) = new StatementValidator:
+    def validate(c: ValidationContext): ValidationResult =
+      if c.statement.contains(marker) then Denied(s"no $marker", Set.empty) else Allowed
+
+  it should "re-validate the row policy wrap" in:
+    val (router, capturedSql, _) = setupWithRewriter(validator = refusing("c_region = 'X'"))
+    val out                      = router
+      .execute(
+        "rls-reval",
+        "alice",
+        poolKey,
+        "SELECT c_id FROM customer",
+        Some(effWithRowPolicies(List(rowPolicyCustomer)))
+      )
+      .unsafeRunSync()
+    out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    out.left.toOption.get.reason should include("policy rewrite")
+    capturedSql() shouldBe ""
+
+  it should "re-validate the metadata filter's rewrite" in:
+    val (router, capturedSql, _) = setupWithRewriter(
+      metadataFilter = metaFilterOn,
+      validator = refusing("table_schema = 'tpch1'")
+    )
+    val out = router
+      .execute(
+        "meta-reval",
+        "alice",
+        poolKey,
+        "SELECT table_name FROM information_schema.tables",
+        effectiveSet = customerOnly
+      )
+      .unsafeRunSync()
+    out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    out.left.toOption.get.reason should include("policy rewrite")
+    capturedSql() shouldBe ""
+
+  it should "re-validate a rewrite with the tenant's OPA in OPA mode" in:
+    // The policy refuses any statement text holding the masked literal: the original is
+    // allowed, only the rewrite carries it.
+    val bodies = scala.collection.mutable.ListBuffer.empty[String]
+    val auth   = new ai.starlake.quack.edge.opa.OpaAuthorizer(
+      ai.starlake.quack.edge.config.OpaConfig.default,
+      new ai.starlake.quack.edge.opa.OpaClient(
+        1000,
+        (_, body, _) =>
+          bodies += body
+          Right((200, s"""{"result":{"allow":${!body.contains("'***'")}}}"""))
+      ),
+      new ai.starlake.quack.edge.opa.OpaDecisionCache(0),
+      ai.starlake.quack.observability.metrics.OpaInstruments.noop
+    )
+    val tenant = ai.starlake.quack.model.Tenant(
+      poolKey.tenant,
+      acl = ai.starlake.quack.model.TenantAcl(
+        Some("opa"),
+        Some("http://opa"),
+        sendStatementText = true
+      )
+    )
+    val opa = new ai.starlake.quack.edge.opa.OpaValidator(
+      auth,
+      t => Option.when(t == poolKey.tenant)(tenant),
+      _ => Nil,
+      "memory",
+      "main",
+      "duckdb",
+      false
+    )
+    val (router, capturedSql, _) = setupWithRewriter(
+      new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+        new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+          Map(("memory", "main", "customer") -> List("c_id", "c_email"))
+        ),
+        enabled = true
+      ),
+      validator = opa
+    )
+    val out = router
+      .execute(
+        "opa-reval",
+        "alice",
+        poolKey,
+        "SELECT c_email FROM customer",
+        Some(effWithPolicies(List(maskCustomerEmailCls)))
+      )
+      .unsafeRunSync()
+    out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    capturedSql() shouldBe ""
+    bodies.exists(_.contains("'***'")) shouldBe true
+    bodies.exists(b => b.contains("SELECT c_email FROM customer")) shouldBe true
+
   it should "run an ordinary CTE query of a policy holder, the CTE reference left unqualified" in:
     val (router, capturedSql, _) = setupWithRewriter(
       new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
