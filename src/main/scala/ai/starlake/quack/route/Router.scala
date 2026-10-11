@@ -5,6 +5,28 @@ import ai.starlake.quack.model.{Role, StatementKind}
 
 object Router:
 
+  /** Whether a caller's SOFT pin (a preferred node, not a transaction pin) may be honored for a
+    * statement of `kind`: the node is still in the pool, routable, carries a role `kind` accepts
+    * and has capacity. When it is not, the caller passes no pin and [[pick]] makes its load-aware
+    * choice. A transaction pin is never filtered this way: its statements must reach the node that
+    * holds the transaction, or fail.
+    *
+    * `ignoreCapacity` drops the capacity condition, as a transaction pin does, for a pin whose
+    * statements are only coherent on one node (the native front door's catalog reads, which are
+    * tiny): briefly exceeding `maxConcurrent` beats splitting them.
+    */
+  def softPinUsable(
+      snapshot: PoolSnapshot,
+      kind: StatementKind,
+      nodeId: String,
+      ignoreCapacity: Boolean = false
+  ): Boolean =
+    snapshot.nodes.find(_.nodeId == nodeId).exists { n =>
+      val l = snapshot.loadOf(nodeId)
+      l.routable && RoleMatcher.preferred(kind).contains(n.role) &&
+      (ignoreCapacity || n.maxConcurrent == 0 || l.inFlight < n.maxConcurrent)
+    }
+
   def pick(
       snapshot: PoolSnapshot,
       kind: StatementKind,

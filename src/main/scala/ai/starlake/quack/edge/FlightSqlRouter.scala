@@ -307,8 +307,10 @@ final class FlightSqlRouter(
     * `effectiveSet = None` means no handshake state was attached; PostgresAclValidator denies
     * anything tenant-scoped in that case to fail safe.
     *
-    * `preferredNode` is a SOFT pin (prepared Prepare + Execute on the same node for warm caches): a
-    * transaction pin still overrides, and a vanished node falls back to the load-aware pick.
+    * `preferredNode` is a SOFT pin (prepared Prepare + Execute on the same node for warm caches; a
+    * native Quack session's catalog reads on one node): a transaction pin still overrides, and a
+    * node that vanished, is no longer routable, does not carry a role the statement accepts or is
+    * at capacity falls back to the load-aware pick (`Router.softPinUsable`).
     *
     * `recordExecution = false` (the Prepare-time probe) suppresses the history record AND the
     * per-node load / latency bookkeeping, so the UI shows one row per user-visible query and probes
@@ -436,7 +438,12 @@ final class FlightSqlRouter(
       prepareDurationMs: Option[Long] = None,
       patId: Option[String] = None,
       edge: String = "",
-      clientDataScans: Boolean = false
+      clientDataScans: Boolean = false,
+      /** Honor `preferredNode` even when that node is at its `maxConcurrent` cap (it must still be
+        * routable and role-compatible). Set by the native front door for its catalog reads, whose
+        * two listings are only coherent on one node; see `Router.softPinUsable`.
+        */
+      softPinOverCapacity: Boolean = false
   ): IO[Either[RouterFailure, Routed[A]]] =
     val resolvedEdge = if edge.isEmpty then source else edge
     val s            = sessions.get(connectionId).getOrElse {
@@ -756,11 +763,16 @@ final class FlightSqlRouter(
               )
               IO.pure(Left(f))
             case Right(snap) =>
-              // Tx pin wins; then the soft preferredNode if still in the snapshot;
-              // else Router.pick's load-aware choice.
+              // Tx pin wins; then the soft preferredNode while it is still in the snapshot,
+              // routable, role-compatible and under capacity; else Router.pick's load-aware
+              // choice.
               val txPin  = s.pinnedNodeId.filter(_ => s.txOpen)
               val pinned =
-                txPin.orElse(preferredNode.filter(id => snap.nodes.exists(_.nodeId == id)))
+                txPin.orElse(
+                  preferredNode.filter(id =>
+                    Router.softPinUsable(snap, kind, id, ignoreCapacity = softPinOverCapacity)
+                  )
+                )
               // Each statement lands in a fresh remote DuckDB session, so unqualified
               // refs need the USE prefix (see wrapWithDefaultSchema).
               val wrappedSql = wrapWithDefaultSchema(supervisor.get(poolKey), finalSql)

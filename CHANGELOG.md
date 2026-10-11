@@ -16,6 +16,12 @@
   (FlightSQL is unaffected). `VARIANT` columns reach FlightSQL clients as the Arrow
   `arrow.parquet.variant` extension type, a struct of two binary fields to a client that does not
   know it: cast to JSON for those clients.
+  Fixed: native front door catalog sync on multi-node pools. A DuckDB client attaching a pool with
+  more than one read-capable node could get an attached catalog with every schema and no table
+  ("Table with name ... does not exist!"): its schema and table listings, joined on node-local
+  oids, were routed to different nodes. A session's catalog reads now stay on one node. A FlightSQL
+  Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
+  unhealthy, draining, quarantined or at its `maxConcurrent` cap.
 
 - **Native client lease.** The manager-to-node native client heartbeats each node connection
   under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).
