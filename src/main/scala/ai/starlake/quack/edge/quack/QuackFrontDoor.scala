@@ -93,10 +93,16 @@ final class QuackFrontDoor(
       case Type.CancelRequest | Type.Acknowledgement =>
         forwardToCurrent(s, f, encodeSuccess())
       case Type.HeartbeatRequest =>
-        // Keep the node's own lease fresh while the client pauses; failures do not matter here.
-        s.current.get() match
-          case Some(st) => st.link.forward(f).attempt.as(encodeSuccess())
-          case None     => IO.pure(encodeSuccess())
+        // Keep the node's own lease fresh while the client pauses, on every node connection the
+        // session holds: the running statement's and an open transaction's (once a statement in
+        // the transaction drains, only `txLink` holds the node connection, and the node checks its
+        // lease when the next statement arrives). Each link once, by identity. Failures do not
+        // matter here.
+        val links = (s.current.get().map(_.link).toList ++ s.txLink.get().map(_._2).toList)
+          .foldLeft(List.empty[QuackNodeLink])((acc, l) =>
+            if acc.exists(_ eq l) then acc else acc :+ l
+          )
+        links.traverse_(_.forward(f).attempt.void).as(encodeSuccess())
       case Type.Disconnect =>
         s.mutex.lock.surround(finishCurrent(s, commit = false) *> releaseTx(s)) *>
           IO(unbind(s)).as(encodeSuccess())

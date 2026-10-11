@@ -328,6 +328,29 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     val connId = connect(fx)
     fx.door.handle(bare(Type.HeartbeatRequest, connId)).unsafeRunSync() shouldBe success
 
+  it should "renew the node lease of an open transaction whose statement has drained" in:
+    // The node checks its lease when the next message arrives: a client pausing inside a
+    // transaction longer than the lease must keep the transaction's node connection alive.
+    val fx     = setup()
+    val connId = connect(fx)
+    prepare(fx, connId, "BEGIN") shouldBe prepareResp(false)
+    prepare(fx, connId, "SELECT 1") shouldBe prepareResp(false)
+    fx.door.sweep(Instant.now().plusSeconds(10)).unsafeRunSync()
+    fx.sessions.get(connId).get.current.get() shouldBe None
+    fx.door.handle(bare(Type.HeartbeatRequest, connId)).unsafeRunSync() shouldBe success
+    val beat = fx.transport.posted.last
+    beat.header.msgType shouldBe Type.HeartbeatRequest
+    beat.header.connectionId shouldBe "NODE2"
+
+  it should "renew a link once when the statement rides the transaction's connection" in:
+    val fx     = setup()
+    val connId = connect(fx)
+    prepare(fx, connId, "BEGIN") shouldBe prepareResp(false)
+    fx.transport.prepareNeedsMore = true
+    prepare(fx, connId, "SELECT * FROM big") shouldBe prepareResp(true)
+    fx.door.handle(bare(Type.HeartbeatRequest, connId)).unsafeRunSync() shouldBe success
+    fx.transport.typesSinceHandshake.count(_ == Type.HeartbeatRequest) shouldBe 1
+
   "CANCEL_REQUEST and ACKNOWLEDGEMENT" should "answer SUCCESS when nothing is running" in:
     val fx     = setup()
     val connId = connect(fx)
