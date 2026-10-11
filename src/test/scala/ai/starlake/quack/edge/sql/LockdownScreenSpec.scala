@@ -906,3 +906,68 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT * FROM 'd/t.csv?v=1'") shouldBe true
     denied("SELECT * FROM 'a/b'") shouldBe false
   }
+
+  // ---- run-time-SQL table functions (2026-10-11 ruling: these gaps ship fixed with 2.0) ------
+
+  "query / query_table / json_execute_serialized_sql" should "be denied under lockdown" in {
+    // A computed argument runs SQL no lexical screen sees: a concatenation spells a denied reader.
+    denied("SELECT * FROM query('SELECT * FROM read' || '_text(''/etc/hosts'')')") shouldBe true
+    denied("SELECT * FROM query('SELECT 1')") shouldBe true
+    denied("SELECT * FROM query_table('/abs/t.csv')") shouldBe true
+    denied("SELECT * FROM query_table(['orders'])") shouldBe true
+    denied("SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))") shouldBe
+      true
+  }
+
+  // ---- replacement scans below the top level --------------------------------------------------
+
+  "replacement scans" should "be judged at every depth and after a join or a comma" in {
+    denied("SELECT * FROM (FROM '/data/s.parquet')") shouldBe true
+    denied("SELECT * FROM (SELECT * FROM '/data/s.parquet') x") shouldBe true
+    denied("SELECT * FROM t JOIN '/data/s.csv' x ON true") shouldBe true
+    denied("SELECT * FROM t LEFT JOIN (FROM '/data/s.csv') x ON true") shouldBe true
+    denied("FROM range(1), '/data/s.parquet'") shouldBe true
+    denied("SELECT * FROM t JOIN u USING (id), '/data/s.parquet'") shouldBe true
+    denied("WITH c AS (SELECT * FROM '/data/s.csv') SELECT * FROM c") shouldBe true
+    denied("SELECT * FROM t WHERE x IN (SELECT a FROM e'/data/s.csv')") shouldBe true
+    denied("SELECT * FROM t WHERE x IN (SELECT a FROM $$/data/s.csv$$)") shouldBe true
+    denied("SELECT ARRAY(SELECT a FROM '/data/s.csv')") shouldBe true
+    denied("SELECT * FROM trim((FROM '/data/s.csv'))") shouldBe true
+    // DuckDB folds a newline-separated literal into the first: judged as the folded name
+    denied("SELECT * FROM 'x'\n'/../data/s.csv'") shouldBe true
+    denied("SELECT * FROM t, /* c */ '/data/s.csv'") shouldBe true
+  }
+
+  it should "admit literals that are not in a table position" in {
+    denied("SELECT * FROM (FROM 's3://b/x.parquet')") shouldBe false
+    denied("SELECT extract(year FROM '2020-01-01'::DATE)") shouldBe false
+    denied("SELECT substring('/a/b.csv' FROM 2)") shouldBe false
+    denied("SELECT trim(both FROM '/a/b.csv'), overlay('/a.csv' PLACING 'x' FROM 1)") shouldBe false
+    denied("SELECT 'a', '/a/b.csv' FROM t") shouldBe false
+    denied("SELECT * FROM t WHERE c IN ('/a/b.csv', '/c/d.csv')") shouldBe false
+    denied("SELECT * FROM t WHERE c = '/a/b.csv' ORDER BY 1") shouldBe false
+    denied("INSERT INTO t VALUES ('/a/b.csv'), ('/c/d.csv')") shouldBe false
+    denied("SELECT * FROM t x, u y WHERE x.p = '/a/b.csv'") shouldBe false
+  }
+
+  // ---- extension readers autoloadable on a node ------------------------------------------------
+
+  "avro and iceberg readers" should "be denied over local paths and admitted on remote ones" in {
+    denied("SELECT * FROM read_avro('/data/x.avro')") shouldBe true
+    denied("SELECT * FROM avro_metadata('/data/x.avro')") shouldBe true
+    denied("SELECT * FROM iceberg_scan('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_metadata('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_snapshots('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_column_stats('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_load_table_response('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM read_avro('s3://b/x.avro')") shouldBe false
+    denied("SELECT * FROM iceberg_scan('s3://b/warehouse/t')") shouldBe false
+  }
+
+  "iceberg table maintenance and quack server control" should "be denied" in {
+    denied("SELECT * FROM iceberg_rollback_to_snapshot('cat.s.t', 1)") shouldBe true
+    denied("CALL set_iceberg_table_properties('cat.s.t', {'k': 'v'})") shouldBe true
+    denied("CALL iceberg_to_ducklake('ice', 'lake')") shouldBe true
+    denied("CALL quack_serve('quack:localhost:9999')") shouldBe true
+    denied("CALL quack_stop('quack:localhost:21900')") shouldBe true
+  }
