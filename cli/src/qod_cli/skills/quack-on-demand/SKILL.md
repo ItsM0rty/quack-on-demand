@@ -1929,6 +1929,13 @@ opt-in except pod security:
   `file_search_path`, `home_directory`, `allow_asterisks_in_http_paths`, `ca_cert_file`
   or the server certificate verification settings, and `shell_history()` is refused to
   every caller, superusers included (the node CLI's history holds its init SQL).
+- **Node-state introspection, superuser-only in every mode** - a tenant user cannot read
+  `duckdb_secrets()`, `which_secret()`, `whoami()`, `duckdb_settings()` / `pg_settings`,
+  `current_setting(..)` (except session settings such as `TimeZone` or `search_path`), the
+  logs (`duckdb_logs*`), `duckdb_external_file_cache()`, `duckdb_temporary_files()`,
+  `duckdb_databases()` / `PRAGMA database_list`, `duckdb_extensions()`, or
+  `pragma_storage_info` ("shows node state ... reserved to superusers"). Catalog
+  listings (`duckdb_tables()`, `information_schema`) stay open and filtered.
 - **Node lockdown** - `QOD_NODE_LOCKDOWN=true` (config
   `quack-on-demand.nodeLockdown.enabled`, default false). Two layers, both
   gated by the same flag:

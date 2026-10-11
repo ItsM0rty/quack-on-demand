@@ -287,6 +287,21 @@
     its DuckDB CLI through stdin, so the history held the object-store secret keys, the catalog
     password and the node token, readable by any tenant user with `*.*.* ALL`, and by everyone
     with the ACL off.
+  - BREAKING: tenant users can no longer read node state, ACL on or off: `duckdb_secrets()`,
+    `which_secret()`, `whoami()`, `duckdb_settings()` / `pg_settings` and `current_setting()`
+    (except over a session setting such as `TimeZone` or `search_path`), `duckdb_logs*`,
+    `duckdb_log_contexts`, `duckdb_external_file_cache`, `duckdb_temporary_files`,
+    `duckdb_databases` / `PRAGMA database_list`, `duckdb_extensions` / `PRAGMA
+    extension_versions`, `duckdb_extension_repositories`, `duckdb_external_resources` and
+    `pragma_storage_info` are reserved to superusers. They showed credentials or their names
+    (`key_id`, hosts, users, unredacted `s3_secret_access_key`), other sessions' statements and
+    file paths, and the node's own paths. `duckdb_settings()` is refused rather than filtered, its
+    values being reachable through `current_setting()` with a computed name.
+  - On a lockdown pool, a file in table position is judged like a tenant's: from the parse when the
+    statement parses, conservatively otherwise. A keyword used as an alias no longer hides a local
+    file after the next comma (`FROM range(1) AS values, '/etc/x.csv'`), and a relative path
+    (`FROM 'x.csv'`) or a quoted glob (`FROM "*".csv`) is denied; remote object-store URLs stay
+    admitted outside the DuckLake buckets.
   - An alias column list on a parenthesized FROM item holding a table with a column policy
     (`(customer) AS c(a, b, e)`, `(customer JOIN orders ..) AS j(..)`) is refused like one on
     the table itself: it renamed a masked column out of the policy's reach.
