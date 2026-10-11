@@ -49,6 +49,36 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
       case GateOutcome.Refuse(_, false, _) => succeed
       case other                           => fail(other.toString)
 
+  // A subquery in any expression position is a read of the table it names. DuckDB's
+  // `ARRAY(SELECT ...)` parses as a function whose argument is a bare (unparenthesized) select,
+  // which the walker used to mark visited as an expression and then skip as a select, so the
+  // statement came back NothingGated and was admitted with no grant at all.
+  it should "gate a table read by a subquery in every expression position" in:
+    val other = "tpch.secret.orders"
+    List(
+      "SELECT ARRAY(SELECT o FROM tpch.secret.orders)",
+      "SET VARIABLE x = ARRAY(SELECT o FROM tpch.secret.orders)",
+      "SELECT list_value(ARRAY(SELECT o FROM tpch.secret.orders))",
+      "SELECT coalesce(ARRAY(SELECT o FROM tpch.secret.orders), [])",
+      "SELECT (SELECT o FROM tpch.secret.orders)",
+      "SELECT coalesce((SELECT o FROM tpch.secret.orders), 'x')",
+      "SELECT EXISTS (SELECT 1 FROM tpch.secret.orders)",
+      "SELECT 1 WHERE 'a' IN (SELECT o FROM tpch.secret.orders)",
+      "SELECT 1 WHERE 'a' = ANY (SELECT o FROM tpch.secret.orders)",
+      "SELECT [(SELECT o FROM tpch.secret.orders)]",
+      "SELECT list_transform([1], x -> (SELECT o FROM tpch.secret.orders))",
+      "SELECT * FROM lineitem, LATERAL (SELECT o FROM tpch.secret.orders)",
+      "SELECT CASE WHEN true THEN ARRAY(SELECT o FROM tpch.secret.orders) END",
+      "SELECT 1 GROUP BY ARRAY(SELECT o FROM tpch.secret.orders)"
+    ).foreach { sql =>
+      withClue(sql) {
+        eval(sql) match
+          case GateOutcome.Gated(g, _)           => g.map(_.table.canonical) should contain(other)
+          case GateOutcome.Refuse(_, _, _)       => succeed
+          case nothing: GateOutcome.NothingGated => fail(s"admitted ungated: $nothing")
+      }
+    }
+
   it should "admit a pure info-schema read only with filtered metadata on" in:
     eval("SELECT table_name FROM information_schema.tables", fm = true) shouldBe
       a[GateOutcome.NothingGated]

@@ -88,6 +88,21 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
       Allowed
   }
 
+  it should "deny a subquery read passed as a function argument without its own parentheses" in {
+    // DuckDB's ARRAY(SELECT ...) returned the rows of a table the user holds no grant on: the
+    // walker skipped the bare select, so the statement had no gated access at all.
+    val eff = effectiveWith(permissions = List(perm("tpch", "main", "lineitem", "RO")))
+    List(
+      "SELECT ARRAY(SELECT o_comment FROM tpch.other.orders)",
+      "SET VARIABLE x = ARRAY(SELECT o_comment FROM tpch.other.orders)",
+      "SELECT list_value(ARRAY(SELECT o_comment FROM tpch.other.orders))",
+      "SELECT * FROM lineitem WHERE EXISTS (SELECT 1 FROM tpch.other.orders)"
+    ).foreach { sql =>
+      withClue(sql)(validator.validate(mkCtx(sql, eff)) shouldBe a[Denied])
+    }
+    validator.validate(mkCtx("SELECT ARRAY(SELECT l FROM lineitem)", eff)) shouldBe Allowed
+  }
+
   it should "deny SELECT against a federated alias when no grant exists" in {
     val eff = effectiveWith(permissions = Nil)
     val ctx = mkCtx("SELECT * FROM fedpg.public.orders", eff)

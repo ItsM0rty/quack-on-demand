@@ -296,6 +296,19 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
     }
   }
 
+  test("a bare select passed as a function argument is walked (DuckDB ARRAY(SELECT ...))") {
+    extracted("SELECT ARRAY(SELECT v FROM db.other.t)").accesses shouldBe Set(
+      TableAccess(TableRef("db", "other", "t"), Verb.Read)
+    )
+    extracted("SELECT ARRAY(SELECT v FROM t)").accesses shouldBe Set(
+      TableAccess(TableRef("db", "main", "t"), Verb.Read)
+    )
+    SqlParser
+      .extract("SET VARIABLE x = ARRAY(SELECT v FROM db.other.t)", config)
+      .statements
+      .head shouldBe a[StatementResult.ParseError]
+  }
+
   test("SET / SET VARIABLE with a table-free value stays control flow") {
     List("SET VARIABLE x = 42", "SET VARIABLE x = [1, 2, 3]", "SET threads = 4").foreach { sql =>
       withClue(sql) {

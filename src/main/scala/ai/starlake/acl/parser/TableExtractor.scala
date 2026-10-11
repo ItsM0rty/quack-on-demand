@@ -374,6 +374,17 @@ private[parser] class TableExtractorVisitor:
         unsupported += s"unrecognized FROM item ${other.getClass.getSimpleName}"
 
   private[parser] def visitExpression(expr: Expression): Unit =
+    expr match
+      // A select reached in expression position (a scalar subquery, or DuckDB's
+      // `ARRAY(SELECT ...)`, which parses as a function whose argument is a BARE select) is walked
+      // as a select, exactly once. It used to be marked visited here first, so the select arm
+      // below found it already visited and skipped it, and the reflective pass reached its FROM
+      // table only as a column qualifier: the read vanished and the statement was admitted with
+      // no gated access at all.
+      case sel: Select => visitSelect(sel)
+      case _           => visitNonSelectExpression(expr)
+
+  private def visitNonSelectExpression(expr: Expression): Unit =
     if expr != null && visited.add(expr) then
       matchExpression(expr)
       // Completeness backstop: after the explicit arms, unconditionally descend into every
@@ -385,11 +396,9 @@ private[parser] class TableExtractorVisitor:
       descendChildren(expr, recordBareTable = false)
 
   private def matchExpression(expr: Expression): Unit =
+    // Selects never reach here: visitExpression hands every Select (ParenthesedSelect included)
+    // to visitSelect.
     expr match
-      case psel: ParenthesedSelect =>
-        visitParenthesedSelect(psel)
-      case sel: Select =>
-        visitSelect(sel)
       case bin: BinaryExpression =>
         val left = bin.getLeftExpression
         if left != null then visitExpression(left)
@@ -473,19 +482,20 @@ private[parser] class TableExtractorVisitor:
       catch case _: Throwable => ()
     }
 
-  /** Route one reflectively-fetched child value to the right walk. `Expression` is tested before
-    * `Select` so a `ParenthesedSelect` (both) takes the visited-guarded expression path. A bare
-    * `Table` records only when it was reached from a select / from-item / holder; reached from an
-    * expression it is a column qualifier and is skipped. Any other jsqlparser node is an
-    * intermediate holder (GroupByElement, Distinct, WindowDefinition, Join, Top, Pivot, ...): guard
-    * it and descend reflectively, so no holder type needs to be enumerated by hand.
+  /** Route one reflectively-fetched child value to the right walk. A `Select` (also an
+    * `Expression`) is tested first and always walked as a select, guarded by `visitSelect`'s own
+    * visited check. A bare `Table` records only when it was reached from a select / from-item /
+    * holder; reached from an expression it is a column qualifier and is skipped. Any other
+    * jsqlparser node is an intermediate holder (GroupByElement, Distinct, WindowDefinition, Join,
+    * Top, Pivot, ...): guard it and descend reflectively, so no holder type needs to be enumerated
+    * by hand.
     */
   private def routeChild(value: Any, recordBareTable: Boolean): Unit =
     value match
       case null                      => ()
+      case s: Select                 => visitSelect(s)
       case e: Expression             => visitExpression(e)
       case t: Table                  => if recordBareTable then visitFromItem(t)
-      case s: Select                 => visitSelect(s)
       case fi: FromItem              => visitFromItem(fi)
       case oe: OrderByElement        => Option(oe.getExpression).foreach(visitExpression)
       case si: SelectItem[?]         => Option(si.getExpression).foreach(visitExpression)
