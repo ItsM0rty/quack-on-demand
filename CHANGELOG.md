@@ -259,6 +259,18 @@
     print it as another column).
   - The dbt shape `WITH customer AS (SELECT * FROM customer) SELECT c_email FROM customer` is
     masked instead of refused for a principal with a column policy.
+  - BREAKING: tenant users can no longer read or write files by path; a superuser or a
+    federated source must do it. Whenever the ACL validates (QoD grants or OPA), a tenant-scoped
+    principal, `*.*.* ALL` included, is refused file-reading table functions (`read_parquet`,
+    `read_csv`, `read_json`, `glob`, `read_text`, `parquet_metadata`, `iceberg_scan`, ...), a
+    path or URL in a table position (`FROM 'x.parquet'`, `JOIN 's3://..'`, `FROM "s3://.."`),
+    `COPY` to or from a path, `EXPORT` / `IMPORT DATABASE`, `ATTACH`, and `LOAD` / `INSTALL` from
+    a path, a URL or a repository. These were "unsupported constructs" a `*.*.* ALL` grant
+    covered, so a tenant admin could read anything the node's process and secrets reach (another
+    tenant's DuckLake data files, the node's disk), write files with COPY and load code from a
+    file. Superusers, an ACL turned off, the native front door's client data
+    (`scan_data_from_quack_client`), federated and Iceberg catalogs read by table name are
+    unchanged.
 
 - **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
   open transaction's node connection too, so a statement after an idle pause longer than the

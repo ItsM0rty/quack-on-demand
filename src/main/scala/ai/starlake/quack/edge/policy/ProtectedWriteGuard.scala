@@ -2,7 +2,12 @@ package ai.starlake.quack.edge.policy
 
 import ai.starlake.acl.model.{Config, TableRef}
 import ai.starlake.acl.parser.{SqlParser, StatementResult, TableExtractor, Verb}
-import ai.starlake.quack.edge.sql.{BacktickScreen, CatalogReachingCalls, DottedIdentifierScreen}
+import ai.starlake.quack.edge.sql.{
+  BacktickScreen,
+  CatalogReachingCalls,
+  DottedIdentifierScreen,
+  FileAccessScreen
+}
 import ai.starlake.quack.edge.cls.{
   ColumnCatalog,
   ColumnPolicyRewriter,
@@ -76,7 +81,8 @@ final class ProtectedWriteGuard(
       BacktickScreen
         .find(sql)
         .orElse(DottedIdentifierScreen.find(sql))
-        .orElse(CatalogReachingCalls.find(sql).map(CatalogReachingCalls.denyReason)) match
+        .orElse(CatalogReachingCalls.find(sql).map(CatalogReachingCalls.denyReason))
+        .orElse(FileAccessScreen.find(sql)) match
         case Some(reason)                         => Deny(s"access denied: $reason")
         case None if kind == StatementKind.Select => Allow
         case None => checkWrite(sql, eff, ctx, colPolicies, rowPolicies, clientDataScans)

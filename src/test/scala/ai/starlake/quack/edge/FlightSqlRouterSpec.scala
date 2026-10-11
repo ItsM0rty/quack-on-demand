@@ -3521,3 +3521,74 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       )
       .unsafeRunSync()
       .map(_.value) shouldBe Right("count")
+
+  // ---- direct file access: superusers only (owner ruling 2026-10-11) ----
+
+  private val fileReads = List(
+    "SELECT * FROM read_parquet('s3://bucket/main/customer/x.parquet')",
+    "SELECT * FROM 's3://bucket/main/customer/x.parquet'",
+    "COPY (SELECT 1) TO '/tmp/x.csv'"
+  )
+
+  "a direct file read or write" should "be refused to a *.*.* ALL tenant principal, QoD and OPA" in:
+    Seq(wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      fileReads.foreach { sql =>
+        withClue(s"$v: $sql") {
+          router
+            .execute("file-1", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+            .unsafeRunSync()
+            .left
+            .toOption
+            .get shouldBe a[RouterFailure.AccessDenied]
+          // the native front door, client data scans on
+          router
+            .executeWith(
+              "file-2",
+              "alice",
+              poolKey,
+              sql,
+              Some(wildcardAllSet),
+              okSend,
+              source = "quack",
+              clientDataScans = true
+            )
+            .unsafeRunSync()
+            .left
+            .toOption
+            .get shouldBe a[RouterFailure.AccessDenied]
+          captured() shouldBe ""
+        }
+      }
+    }
+
+  it should "stay open to a superuser" in:
+    val (router, captured, _) = setupWithRewriter(validator = wildcardAcl)
+    fileReads.foreach { sql =>
+      withClue(sql) {
+        router
+          .execute("file-3", "alice", poolKey, sql, effectiveSet = Some(superuserSet))
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+        captured() should include(sql)
+      }
+    }
+
+  it should "leave the front door's client data scan to a *.*.* ALL principal" in:
+    Seq(wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, _, _) = setupWithRewriter(validator = v)
+      withClue(v.toString) {
+        router
+          .executeWith(
+            "file-4",
+            "alice",
+            poolKey,
+            ClientFedInsert,
+            Some(wildcardAllSet),
+            okSend,
+            source = "quack",
+            clientDataScans = true
+          )
+          .unsafeRunSync()
+          .map(_.value) shouldBe Right("count")
+      }
+    }

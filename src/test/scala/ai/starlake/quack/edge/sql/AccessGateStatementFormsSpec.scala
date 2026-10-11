@@ -39,7 +39,7 @@ class AccessGateStatementFormsSpec extends AnyFlatSpec with Matchers:
     gated("SUMMARIZE (SELECT * FROM secret)") shouldBe Set("lake.main.secret")
 
   it should "refuse a string literal as a file reference" in:
-    refused("SUMMARIZE '/data/p.csv'") should include("file reference")
+    refused("SUMMARIZE '/data/p.csv'") should include("direct file access")
 
   it should "not admit DuckDB's bare system views as a session-catalog table" in:
     // `SUMMARIZE duckdb_tables` summarizes the system view, which lists every catalog
@@ -52,8 +52,8 @@ class AccessGateStatementFormsSpec extends AnyFlatSpec with Matchers:
       Set("lake.main.secret", "lake.main.other")
 
   "DESCRIBE and SHOW of a string literal" should "be refused as a file reference" in:
-    refused("DESCRIBE '/data/p.csv'") should include("file reference")
-    refused("SHOW '/data/p.csv'") should include("file reference")
+    refused("DESCRIBE '/data/p.csv'") should include("direct file access")
+    refused("SHOW '/data/p.csv'") should include("direct file access")
 
   "a parenthesized statement in table position" should "gate the table it names" in:
     gated("SELECT * FROM (SUMMARIZE secret)") shouldBe Set("lake.main.secret")
@@ -67,8 +67,8 @@ class AccessGateStatementFormsSpec extends AnyFlatSpec with Matchers:
       Set("lake.main.secret")
 
   it should "refuse a string literal as a file reference" in:
-    refused("SELECT * FROM (SUMMARIZE '/data/p.csv')") should include("file reference")
-    refused("SELECT * FROM (DESCRIBE '/data/p.csv')") should include("file reference")
+    refused("SELECT * FROM (SUMMARIZE '/data/p.csv')") should include("direct file access")
+    refused("SELECT * FROM (DESCRIBE '/data/p.csv')") should include("direct file access")
 
   it should "leave an ordinary parenthesized table with an alias alone" in:
     gated("SELECT * FROM (secret s)") shouldBe Set("lake.main.secret")

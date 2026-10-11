@@ -601,13 +601,15 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "treat the 2.0 single-file readers like read_csv for a tenant principal" in {
-    // Both are unsupported table functions: denied without the wildcard, covered by it.
+    // File reads are reserved to superusers: denied with or without the wildcard ALL grant.
     val narrow   = effectiveWith(List(perm("acme_tpch", "main", "orders", "RO")))
     val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
     for fn <- List("read_csv", "read_single_csv_file", "read_duckdb", "read_postgres_binary") do
       withClue(fn) {
         catalogAware.validate(mkAcmeCtx(s"SELECT * FROM $fn('/etc/x')", narrow)) shouldBe a[Denied]
-        catalogAware.validate(mkAcmeCtx(s"SELECT * FROM $fn('/etc/x')", wildcard)) shouldBe Allowed
+        catalogAware.validate(mkAcmeCtx(s"SELECT * FROM $fn('/etc/x')", wildcard)) match
+          case Denied(msg, _, _) => msg should include("direct file access")
+          case other             => fail(s"expected Denied, got $other")
       }
   }
 

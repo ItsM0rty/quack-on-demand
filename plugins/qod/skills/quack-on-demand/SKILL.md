@@ -654,8 +654,9 @@ ordinary user: the DuckDB client syncs the remote catalog with
 denied for anyone without a `*.*.*` ALL grant (`unsupported constructs (deny,
 fail-closed): table function duckdb_tables`). The attached catalog then lists only the
 tables the user is granted; an ungranted table is simply absent (`does not exist` on
-the client), never described. Other table functions (`read_parquet`, ...) are unchanged
-and stay denied without a wildcard ALL grant.
+the client), never described. Other table functions stay denied without a wildcard ALL
+grant, and the file-reading ones (`read_parquet`, `read_csv`, `glob`, ...) are refused to
+every tenant user, `*.*.* ALL` included (see "Direct file access" under Hardening).
 
 An **explicit** `information_schema` grant is still meaningful: it is the escape hatch
 that turns the filter off for that principal and restores the unfiltered read (useful
@@ -1910,6 +1911,16 @@ opt-in except pod security:
     Set resources at node start instead: database / pool `initSql` or
     `qod pool set-resources`. Session settings (`search_path`, `TimeZone`,
     `http_timeout`, `SET VARIABLE`, ...) stay open.
+- **Direct file access, superuser-only whenever the ACL validates** (QoD grants or
+  OPA; not with the ACL off) - a tenant user, `*.*.* ALL` included, cannot read or
+  write a file by path: file-reading table functions (`read_parquet`, `read_csv`,
+  `read_json`, `glob`, `read_text`, `parquet_metadata`, `iceberg_scan`, ...), a path
+  or URL in a table position (`FROM 's3://b/x.parquet'`, `FROM "s3://b/x.parquet"`),
+  `COPY ... TO` / `COPY ... FROM` a path, `EXPORT` / `IMPORT DATABASE`, `ATTACH`, and
+  `LOAD` / `INSTALL` from a path, a URL or a repository ("direct file access is not
+  available to tenant-scoped principals"). Load files as a superuser, or expose them
+  through a federated source and grant its tables. The native front door's client
+  data (`INSERT INTO t SELECT * FROM <client table>`) still flows.
 - **Node lockdown** - `QOD_NODE_LOCKDOWN=true` (config
   `quack-on-demand.nodeLockdown.enabled`, default false). Two layers, both
   gated by the same flag:

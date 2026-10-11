@@ -78,7 +78,7 @@ object LockdownScreen:
   // and iceberg autoload on a node (autoinstall off, autoload on), and their readers open a
   // caller-named path like any core reader. LockdownTableFunctionsSpec pins the derivation: a table
   // function with a string first argument that no list here judges fails it.
-  private val FileReadFunctions = Set(
+  private[sql] val FileReadFunctions = Set(
     "read_text",
     "read_blob",
     "glob",
@@ -372,8 +372,8 @@ object LockdownScreen:
         settingHit
           .orElse(copyHit)
           .orElse(deniedFunctionIn(stmt, deniedBuckets))
-          .orElse(replacementScans(stmt, deniedBuckets))
-          .orElse(quotedPathFrom(stmt, deniedBuckets))
+          .orElse(replacementScans(stmt, fromPathVerdict(_, _, deniedBuckets)))
+          .orElse(quotedPathFrom(stmt, fromPathVerdict(_, strict = false, deniedBuckets)))
 
   /** Splits the input on top-level semicolons: a semicolon inside any of DuckDB's quoting forms
     * (plain `'...'`, escape `E'...'`, double-quoted and backtick identifiers, dollar-quoted
@@ -621,8 +621,15 @@ object LockdownScreen:
     * its escapes can encode a path no heuristic spots. A literal DuckDB folds into the previous one
     * across a newline is judged alone and folded. A remote object-store literal is exempt unless it
     * addresses a denied DuckLake bucket.
+    *
+    * `judge` gives the verdict on each literal (its lowercased value, and whether it must be judged
+    * strictly): the path-shape and bucket verdict above here, any literal for [[FileAccessScreen]],
+    * which refuses every file read to tenant-scoped principals.
     */
-  private def replacementScans(stmt: String, deniedBuckets: Set[String]): Option[String] =
+  private[sql] def replacementScans(
+      stmt: String,
+      judge: (String, Boolean) => Option[String]
+  ): Option[String] =
     val view                                    = SqlLexer.engineView(stmt)
     val toks                                    = SqlLexer.tokens(view)
     def text(t: SqlLexer.Token): String         = view.substring(t.start, t.end)
@@ -663,7 +670,7 @@ object LockdownScreen:
           val names         = if parts.size > 1 then parts :+ parts.mkString else parts
           val strict        = view.charAt(t.start) != '\''
           verdict = names.iterator
-            .flatMap(n => fromPathVerdict(n.toLowerCase(Locale.ROOT), strict, deniedBuckets))
+            .flatMap(n => judge(n.toLowerCase(Locale.ROOT), strict))
             .nextOption()
           prev = Some(toks(next - 1))
           i = next
@@ -739,9 +746,9 @@ object LockdownScreen:
     * gets the plain literal's verdict (remote exemption, denied buckets, the path-shape heuristic),
     * so `"orders"`, `"main"."orders"` and a remote name stay admitted. Identifiers inside a string
     * literal body are not judged: a literal holding a JSON document with a path value is ordinary
-    * SQL.
+    * SQL. `judge` gives the verdict on each joined name ([[FileAccessScreen]] passes its own).
     */
-  private def quotedPathFrom(stmt: String, deniedBuckets: Set[String]): Option[String] =
+  private[sql] def quotedPathFrom(stmt: String, judge: String => Option[String]): Option[String] =
     val view  = SqlLexer.engineView(stmt)
     val toks  = SqlLexer.tokens(view).filterNot(_.isTrivia)
     val names = ListBuffer.empty[String]
@@ -764,14 +771,14 @@ object LockdownScreen:
           case None => more = false
       if quoted then names += parts.mkString(".")
       i = math.max(j, i + 1)
-    names.iterator.flatMap(fromPathVerdict(_, strict = false, deniedBuckets)).nextOption()
+    names.iterator.flatMap(judge).nextOption()
 
   /** True when the (quoted) literal looks like a local filesystem path: it starts with an absolute
     * or relative path prefix or a drive letter, or it contains a path separator AND carries a data
     * file extension a replacement scan recognizes (see `DataExtensions`). Ordinary values like
     * 'a/b' (no data extension) do not match.
     */
-  private def looksLikePath(quoted: String): Boolean =
+  private[sql] def looksLikePath(quoted: String): Boolean =
     val s = quoted.stripPrefix("'").stripSuffix("'")
     s.startsWith("/") || s.startsWith("./") || s.startsWith("../") ||
     DriveLetter.findFirstIn(s).isDefined ||

@@ -59,11 +59,14 @@ object AccessGate:
     // A SET of a SQL-valued setting is control flow to the parser, but its value runs later on the
     // catalog Postgres or as the node's auth callback, outside every grant.
     // A quoted name holding a dot is one identifier to DuckDB and a qualified name to the parser
-    // (see DottedIdentifierScreen), so the grant checked would not be the table read.
+    // (see DottedIdentifierScreen), so the grant checked would not be the table read. A file read
+    // or write by path is no table a grant names, and is reserved to superusers whatever the
+    // grants (FileAccessScreen).
     BacktickScreen
       .find(statement)
       .orElse(DottedIdentifierScreen.find(statement, rewriteOf))
       .orElse(CatalogReachingCalls.find(statement).map(CatalogReachingCalls.denyReason))
+      .orElse(FileAccessScreen.find(statement))
       .orElse(
         CatalogReachingCalls.sqlValuedSetting(statement).map(CatalogReachingCalls.settingDenyReason)
       )
