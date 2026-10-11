@@ -964,3 +964,29 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
           .unsafeRunSync() shouldBe a[Denied]
       }
     }
+
+  it should "deny the star expansion and whole-row forms that read a masked column raw" in
+    List(
+      "SELECT COLUMNS('c_e.*') FROM customer",
+      "SELECT * LIKE 'c_e%' FROM customer",
+      "SELECT concat(*COLUMNS(*)) FROM customer",
+      "SELECT c_id FROM customer ORDER BY COLUMNS('c_e.*')",
+      "SELECT c FROM customer c",
+      "SELECT to_json(customer) FROM customer"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
+  it should "expand a star modifier into a masked column list" in {
+    rw.rewrite(
+      "SELECT * EXCLUDE (c_ssn) FROM customer c",
+      StatementKind.Select,
+      eff(tenantUser, List(maskEmail)),
+      ctx
+    ).unsafeRunSync() shouldBe Rewritten(
+      "SELECT c.c_id, '***' AS c_email, c.c_phone FROM customer c"
+    )
+  }

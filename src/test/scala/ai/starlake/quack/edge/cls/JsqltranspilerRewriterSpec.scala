@@ -502,3 +502,106 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
     outcome("SELECT c_email FROM acme_tpch.tpch1.customer") shouldBe
       RewriteOutcome.Rewritten("SELECT '***' AS c_email FROM acme_tpch.tpch1.customer")
   }
+
+  // ---- star expansion and whole-row forms -------------------------------------------------
+  //
+  // DuckDB expands COLUMNS(...), `* LIKE` / ILIKE / GLOB / SIMILAR TO patterns, unpacked
+  // `*COLUMNS(...)`, a table referenced as a column (the whole row as a STRUCT) and a statement in
+  // table position into the table's columns, with no column node for the visitor to mask. Each
+  // returned the raw values on the 2.0 CLI.
+
+  private def denied(sql: String): Unit =
+    withClue(sql)(outcome(sql) shouldBe a[RewriteOutcome.Denied])
+
+  "a star expansion form over a masked table" should "be denied" in
+    List(
+      "SELECT COLUMNS('c_e.*') FROM customer",
+      "SELECT COLUMNS(*) FROM customer",
+      "SELECT COLUMNS(['c_email']) FROM customer",
+      "SELECT COLUMNS('c_e.*') AS e FROM customer",
+      "SELECT * LIKE 'c_e%' FROM customer",
+      "SELECT * ILIKE 'C_E%' FROM customer",
+      "SELECT * NOT LIKE 'c_i%' FROM customer",
+      "SELECT * GLOB 'c_e*' FROM customer",
+      "SELECT * SIMILAR TO 'c_e.*' FROM customer",
+      "SELECT c.* LIKE '%mail' FROM customer c",
+      "SELECT concat(*COLUMNS(*)) FROM customer",
+      "SELECT list_value(*COLUMNS('c_e.*')) FROM customer",
+      "SELECT max(COLUMNS('c_e.*')) FROM customer",
+      "SELECT c_id FROM customer WHERE COLUMNS('c_e.*') LIKE 'a%'",
+      "SELECT c_id FROM customer ORDER BY COLUMNS('c_e.*')",
+      "SELECT count(*) FROM customer GROUP BY COLUMNS('c_e.*')",
+      "SELECT o_id, (SELECT max(COLUMNS('c_e.*')) FROM customer) FROM orders",
+      "WITH x AS (SELECT COLUMNS('c_e.*') FROM customer) SELECT * FROM x"
+    ).foreach(denied)
+
+  "a table referenced as a column (the whole row)" should "be denied" in
+    List(
+      "SELECT c FROM customer c",
+      "SELECT customer FROM customer",
+      "SELECT to_json(c) FROM customer c",
+      "SELECT c_id FROM customer c WHERE c::VARCHAR LIKE '%alice%'",
+      "SELECT main.customer FROM customer",
+      "SELECT list(c) FROM customer c",
+      "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM customer c WHERE c IS NOT NULL)"
+    ).foreach(denied)
+
+  "a statement in table position over a masked table" should "be denied" in
+    List(
+      "SELECT * FROM (TABLE customer)",
+      "SELECT * FROM (SUMMARIZE customer)",
+      "SELECT o_id FROM orders, (TABLE customer) c"
+    ).foreach { sql =>
+      withClue(sql) {
+        outcome(sql) should (be(a[RewriteOutcome.Denied]) or be(RewriteOutcome.ParseFailed))
+      }
+    }
+
+  "star modifiers" should "be expanded to an explicit, masked column list" in {
+    outcome("SELECT * EXCLUDE (c_phone) FROM customer") shouldBe RewriteOutcome.Rewritten(
+      "SELECT customer.c_id, customer.c_name, '***' AS c_email FROM customer"
+    )
+    outcome("SELECT * EXCLUDE (C_PHONE, c_name) FROM customer c") shouldBe
+      RewriteOutcome.Rewritten("SELECT c.c_id, '***' AS c_email FROM customer c")
+    outcome(
+      "SELECT c.* EXCLUDE (c_phone) FROM customer c JOIN orders o ON o.c_id = c.c_id"
+    ) shouldBe
+      RewriteOutcome.Rewritten(
+        "SELECT c.c_id, c.c_name, '***' AS c_email FROM customer c JOIN orders o ON o.c_id = c.c_id"
+      )
+    outcome("SELECT * REPLACE (upper(c_email) AS c_email) FROM customer") shouldBe
+      RewriteOutcome.Rewritten(
+        "SELECT customer.c_id, customer.c_name, upper('***') AS c_email, customer.c_phone " +
+          "FROM customer"
+      )
+    outcome("SELECT * EXCLUDE (c_phone) REPLACE (c_id + 1 AS c_id) FROM customer") shouldBe
+      RewriteOutcome.Rewritten(
+        "SELECT c_id + 1 AS c_id, customer.c_name, '***' AS c_email FROM customer"
+      )
+    // nothing masked once excluded: the caller's statement goes out as written
+    outcome("SELECT * EXCLUDE (c_email) FROM customer") shouldBe RewriteOutcome.Passthrough
+  }
+
+  it should "qualify an aliased table's star by its alias" in {
+    outcome("SELECT * FROM customer c") shouldBe RewriteOutcome.Rewritten(
+      "SELECT c.c_id, c.c_name, '***' AS c_email, c.c_phone FROM customer c"
+    )
+    outcome("SELECT c.* FROM customer c") shouldBe RewriteOutcome.Rewritten(
+      "SELECT c.c_id, c.c_name, '***' AS c_email, c.c_phone FROM customer c"
+    )
+  }
+
+  it should "be denied where they cannot be expanded soundly" in {
+    denied("SELECT * EXCLUDE (o_total) FROM customer JOIN orders USING (c_id)")
+    denied("SELECT * EXCLUDE (no_such) FROM customer")
+    denied("SELECT * REPLACE (upper(c_email) AS no_such) FROM customer")
+  }
+
+  it should "leave count(*) and stars over unmasked tables alone" in {
+    outcome("SELECT count(*) FROM customer") shouldBe RewriteOutcome.Passthrough
+    outcome("SELECT count(*) FROM customer WHERE c_email IS NULL") shouldBe a[
+      RewriteOutcome.Rewritten
+    ]
+    outcome("SELECT COLUMNS('o_.*') FROM orders") shouldBe RewriteOutcome.Passthrough
+    outcome("SELECT * LIKE 'o_%' FROM orders") shouldBe RewriteOutcome.Passthrough
+  }

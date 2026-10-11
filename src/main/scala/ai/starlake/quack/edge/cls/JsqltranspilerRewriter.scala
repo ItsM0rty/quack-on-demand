@@ -25,106 +25,127 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
   ): RewriteOutcome =
     if policies.isEmpty then Passthrough
     else
-      // Register the caller-provided tables under CURRENT_CATALOG/CURRENT_SCHEMA so SQL schema
-      // qualifiers (e.g. `tpch1.customer`) match them when tpch1 IS the current schema; a table
-      // with an empty column list is deliberately NOT registered (same as the old 3-arg
-      // JSQLColumResolver constructor), which keeps "catalog knows nothing" -> unresolvedMode.
-      // defaultCatalog/defaultSchema come from the caller's SchemaContext (the session-defaults
-      // pinned at handshake time).
-      val currentCatalog = defaultCatalog.getOrElse("")
-      val currentSchema  = defaultSchema.getOrElse("")
-      val metaData       = new JdbcMetaData(currentCatalog, currentSchema)
-      schema.foreach { case (tableKey, cols) =>
-        cols.foreach { col =>
-          metaData.addTable(
-            currentCatalog,
-            currentSchema,
-            tableKey,
-            new ai.starlake.transpiler.schema.JdbcColumn(col)
+      // Star modifiers become explicit column lists first: the resolver drops them on the floor.
+      StarExpansion.expand(sql, schema, policies) match
+        case Left(reason)   => Denied(reason)
+        case Right(starSql) =>
+          rewriteWithPolicies(
+            starSql,
+            schema,
+            policies,
+            defaultCatalog,
+            defaultSchema,
+            unresolvedMode
           )
-        }
+
+  private def rewriteWithPolicies(
+      sql: String,
+      schema: Map[String, List[String]],
+      policies: List[RoleColumnPolicy],
+      defaultCatalog: Option[String],
+      defaultSchema: Option[String],
+      unresolvedMode: UnresolvedMode
+  ): RewriteOutcome =
+    // Register the caller-provided tables under CURRENT_CATALOG/CURRENT_SCHEMA so SQL schema
+    // qualifiers (e.g. `tpch1.customer`) match them when tpch1 IS the current schema; a table
+    // with an empty column list is deliberately NOT registered (same as the old 3-arg
+    // JSQLColumResolver constructor), which keeps "catalog knows nothing" -> unresolvedMode.
+    // defaultCatalog/defaultSchema come from the caller's SchemaContext (the session-defaults
+    // pinned at handshake time).
+    val currentCatalog = defaultCatalog.getOrElse("")
+    val currentSchema  = defaultSchema.getOrElse("")
+    val metaData       = new JdbcMetaData(currentCatalog, currentSchema)
+    schema.foreach { case (tableKey, cols) =>
+      cols.foreach { col =>
+        metaData.addTable(
+          currentCatalog,
+          currentSchema,
+          tableKey,
+          new ai.starlake.transpiler.schema.JdbcColumn(col)
+        )
       }
-      // Seed DuckDB's fixed system-catalog shapes under their REAL schema names so metadata
-      // queries (`information_schema.schemata`, `pg_catalog.pg_tables`, ...) resolve instead of
-      // tripping the STRICT resolver into a fail-closed deny. They must be schema-qualified
-      // entries: the flat `schema` map above lands under CURRENT_SCHEMA and can never match an
-      // `information_schema.x` reference. Column policies never target system schemas, so these
-      // seeds can only make a metadata query resolve, never unmask a user column; a system table
-      // absent from SystemSchemaColumns stays unresolved and keeps failing closed.
-      SystemSchemaColumns.all.foreach { case ((sysSchema, table), cols) =>
-        cols.foreach { col =>
-          metaData.addTable(
-            currentCatalog,
-            sysSchema,
-            table,
-            new ai.starlake.transpiler.schema.JdbcColumn(col)
-          )
-        }
+    }
+    // Seed DuckDB's fixed system-catalog shapes under their REAL schema names so metadata
+    // queries (`information_schema.schemata`, `pg_catalog.pg_tables`, ...) resolve instead of
+    // tripping the STRICT resolver into a fail-closed deny. They must be schema-qualified
+    // entries: the flat `schema` map above lands under CURRENT_SCHEMA and can never match an
+    // `information_schema.x` reference. Column policies never target system schemas, so these
+    // seeds can only make a metadata query resolve, never unmask a user column; a system table
+    // absent from SystemSchemaColumns stays unresolved and keeps failing closed.
+    SystemSchemaColumns.all.foreach { case ((sysSchema, table), cols) =>
+      cols.foreach { col =>
+        metaData.addTable(
+          currentCatalog,
+          sysSchema,
+          table,
+          new ai.starlake.transpiler.schema.JdbcColumn(col)
+        )
       }
-      val resolver = new JSQLColumResolver(metaData)
-      resolver.setErrorMode(unresolvedMode match
-        case UnresolvedMode.Deny => JdbcMetaData.ErrorMode.STRICT
-        case UnresolvedMode.Pass => JdbcMetaData.ErrorMode.LENIENT)
+    }
+    val resolver = new JSQLColumResolver(metaData)
+    resolver.setErrorMode(unresolvedMode match
+      case UnresolvedMode.Deny => JdbcMetaData.ErrorMode.STRICT
+      case UnresolvedMode.Pass => JdbcMetaData.ErrorMode.LENIENT)
 
-      // Capture try/catch outcomes as Either so the early-exit flows through a structured
-      // match instead of an exception. jsqltranspiler 1.9 does NOT ship a single
-      // `JSQLDataException` umbrella; it raises one of the table/column/schema/catalog-not-
-      // found exceptions under `ai.starlake.transpiler.*`.
-      val resolveAttempt: Either[RewriteOutcome, String] =
-        try Right(resolvedText(resolver, metaData, sql))
-        catch
-          case e: ai.starlake.transpiler.TableNotFoundException    => Left(Denied(e.getMessage))
-          case e: ai.starlake.transpiler.TableNotDeclaredException => Left(Denied(e.getMessage))
-          case e: ai.starlake.transpiler.ColumnNotFoundException   => Left(Denied(e.getMessage))
-          case e: ai.starlake.transpiler.SchemaNotFoundException   => Left(Denied(e.getMessage))
-          case e: ai.starlake.transpiler.CatalogNotFoundException  => Left(Denied(e.getMessage))
-          case _: net.sf.jsqlparser.JSQLParserException            => Left(ParseFailed)
-          case _: Throwable                                        => Left(ParseFailed)
+    // Capture try/catch outcomes as Either so the early-exit flows through a structured
+    // match instead of an exception. jsqltranspiler 1.9 does NOT ship a single
+    // `JSQLDataException` umbrella; it raises one of the table/column/schema/catalog-not-
+    // found exceptions under `ai.starlake.transpiler.*`.
+    val resolveAttempt: Either[RewriteOutcome, String] =
+      try Right(resolvedText(resolver, metaData, sql))
+      catch
+        case e: ai.starlake.transpiler.TableNotFoundException    => Left(Denied(e.getMessage))
+        case e: ai.starlake.transpiler.TableNotDeclaredException => Left(Denied(e.getMessage))
+        case e: ai.starlake.transpiler.ColumnNotFoundException   => Left(Denied(e.getMessage))
+        case e: ai.starlake.transpiler.SchemaNotFoundException   => Left(Denied(e.getMessage))
+        case e: ai.starlake.transpiler.CatalogNotFoundException  => Left(Denied(e.getMessage))
+        case _: net.sf.jsqlparser.JSQLParserException            => Left(ParseFailed)
+        case _: Throwable                                        => Left(ParseFailed)
 
-      resolveAttempt match
-        case Left(failure)       => failure
-        case Right(resolvedText) =>
-          val rsMeta                                          = resolver.getResultSetMetaData(sql)
-          val projectionOrigins: IndexedSeq[(String, String)] =
-            (1 to rsMeta.getColumnCount).toIndexedSeq.map { i =>
-              (
-                Option(rsMeta.getTableName(i)).getOrElse(""),
-                Option(rsMeta.getColumnName(i)).getOrElse("")
-              )
-            }
+    resolveAttempt match
+      case Left(failure)       => failure
+      case Right(resolvedText) =>
+        val rsMeta                                          = resolver.getResultSetMetaData(sql)
+        val projectionOrigins: IndexedSeq[(String, String)] =
+          (1 to rsMeta.getColumnCount).toIndexedSeq.map { i =>
+            (
+              Option(rsMeta.getTableName(i)).getOrElse(""),
+              Option(rsMeta.getColumnName(i)).getOrElse("")
+            )
+          }
 
-          val parseAttempt: Either[RewriteOutcome, net.sf.jsqlparser.statement.Statement] =
-            try Right(CCJSqlParserUtil.parse(resolvedText))
-            catch case _: Throwable => Left(ParseFailed)
+        val parseAttempt: Either[RewriteOutcome, net.sf.jsqlparser.statement.Statement] =
+          try Right(CCJSqlParserUtil.parse(resolvedText))
+          catch case _: Throwable => Left(ParseFailed)
 
-          parseAttempt match
-            case Left(failure) => failure
-            case Right(parsed) =>
-              parsed match
-                case sel: Select =>
-                  // The resolver's STRICT mode only enforces table existence at the
-                  // top level; a table referenced ONLY inside a subquery (IN / EXISTS /
-                  // ANY / scalar) slips past it. Enforce the same fail-closed invariant
-                  // at every nesting depth ourselves before any masking runs.
-                  val nestedUnknown =
-                    if unresolvedMode == UnresolvedMode.Deny then
-                      firstUnknownTable(sql, schema, currentCatalog, currentSchema)
-                    else None
-                  nestedUnknown match
-                    case Some(name) => Denied(s"unresolvable table $name")
-                    case None       =>
-                      try
-                        // The visitor masks the positions it models and leaves every other node
-                        // as it found it; a covered column still in the tree afterwards would
-                        // reach the node unmasked, so it denies (ResidualColumns).
-                        val suspects     = ResidualColumns.suspects(sel, policies, schema)
-                        val (changed, _) = applyPolicies(sel, projectionOrigins, policies)
-                        ResidualColumns.unmasked(sel, suspects) match
-                          case Some(reason) => Denied(reason)
-                          case None => if changed then Rewritten(sel.toString) else Passthrough
-                      catch case e: DenyException => Denied(e.reason)
-                case _ =>
-                  Passthrough
+        parseAttempt match
+          case Left(failure) => failure
+          case Right(parsed) =>
+            parsed match
+              case sel: Select =>
+                // The resolver's STRICT mode only enforces table existence at the
+                // top level; a table referenced ONLY inside a subquery (IN / EXISTS /
+                // ANY / scalar) slips past it. Enforce the same fail-closed invariant
+                // at every nesting depth ourselves before any masking runs.
+                val nestedUnknown =
+                  if unresolvedMode == UnresolvedMode.Deny then
+                    firstUnknownTable(sql, schema, currentCatalog, currentSchema)
+                  else None
+                nestedUnknown match
+                  case Some(name) => Denied(s"unresolvable table $name")
+                  case None       =>
+                    try
+                      // The visitor masks the positions it models and leaves every other node
+                      // as it found it; a covered column still in the tree afterwards would
+                      // reach the node unmasked, so it denies (ResidualColumns).
+                      val suspects     = ResidualColumns.suspects(sel, policies, schema)
+                      val (changed, _) = applyPolicies(sel, projectionOrigins, policies)
+                      ResidualColumns.unmasked(sel, suspects) match
+                        case Some(reason) => Denied(reason)
+                        case None => if changed then Rewritten(sel.toString) else Passthrough
+                    catch case e: DenyException => Denied(e.reason)
+              case _ =>
+                Passthrough
 
   /** The resolver's rewrite of `sql` (star expansion, column lineage) with every table name the
     * caller wrote printed exactly as written. `JSQLColumResolver.getResolvedStatementText` also
@@ -790,8 +811,38 @@ private[cls] object ResidualColumns:
       columns: List[(Column, List[Scope])],
       tables: List[Table],
       unknown: Option[String],
-      tableStatements: List[String]
+      forms: List[(Form, List[Scope])]
   )
+
+  /** Nodes that read columns with no column node of their own for the visitor to mask. */
+  private enum Form:
+    /** `ARRAY(TABLE t)` / `x = ANY (TABLE t)`: JSqlParser holds t as a function's argument column.
+      */
+    case TableStatement
+
+    /** A star the resolver did not expand (`* LIKE ..`, `*COLUMNS(..)`, a star in an expression) or
+      * a COLUMNS(..) call: DuckDB expands it into the columns of the FROM clause.
+      */
+    case Expansion
+
+    /** `(TABLE t)` / `(SUMMARIZE t)` in table position: the table read, None when unreadable. */
+    case StatementSource(table: Option[String])
+
+  private def isColumnsCall(f: net.sf.jsqlparser.expression.Function): Boolean =
+    Option(f.getMultipartName).exists(_.size == 1) &&
+      Option(f.getName).exists(n => unquote(n).equalsIgnoreCase("columns"))
+
+  /** The star of `count(*)` / `count(t.*)`, which counts rows and exposes no value. */
+  private def countStar(f: net.sf.jsqlparser.expression.Function): Option[AllColumns] =
+    val params = Option(f.getParameters).map(_.asScala.toList).getOrElse(Nil)
+    params match
+      case List(star: AllColumns)
+          if Option(f.getMultipartName).exists(_.size == 1) &&
+            Option(f.getName).exists(_.equalsIgnoreCase("count")) &&
+            Option(star.getExceptColumns).forall(_.isEmpty) &&
+            Option(star.getReplaceExpressions).forall(_.isEmpty) =>
+        Some(star)
+      case _ => None
 
   private def unquote(s: String): String = s.stripPrefix("\"").stripSuffix("\"")
 
@@ -873,10 +924,13 @@ private[cls] object ResidualColumns:
     val visited = java.util.Collections.newSetFromMap(
       new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
     )
-    val columns         = scala.collection.mutable.ListBuffer.empty[(Column, List[Scope])]
-    val tables          = scala.collection.mutable.ListBuffer.empty[Table]
-    val tableStatements = scala.collection.mutable.ListBuffer.empty[String]
-    var unknown         = Option.empty[String]
+    val columns = scala.collection.mutable.ListBuffer.empty[(Column, List[Scope])]
+    val tables  = scala.collection.mutable.ListBuffer.empty[Table]
+    val forms   = scala.collection.mutable.ListBuffer.empty[(Form, List[Scope])]
+    val counted = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
+    )
+    var unknown = Option.empty[String]
     def walk(node: AnyRef, scopes: List[Scope], ctes: Map[String, Option[Set[String]]]): Unit =
       if visited.add(node) then
         node match
@@ -884,7 +938,29 @@ private[cls] object ResidualColumns:
           case t: Table  => tables += t
           case f: net.sf.jsqlparser.expression.Function
               if ai.starlake.acl.parser.TableExtractor.tableStatementSources(f).isDefined =>
-            tableStatements += f.toString
+            forms += (Form.TableStatement -> scopes)
+          case f: net.sf.jsqlparser.expression.Function if isColumnsCall(f) =>
+            forms += (Form.Expansion -> scopes)
+          case f: net.sf.jsqlparser.expression.Function =>
+            countStar(f).foreach(counted.add(_))
+          case ae: net.sf.jsqlparser.expression.AnalyticExpression
+              if Option(ae.getName).exists(_.equalsIgnoreCase("count")) =>
+            // `count(*) FILTER (..)` / `count(*) OVER (..)`
+            ae.getExpression match
+              case star: AllColumns
+                  if Option(star.getExceptColumns).forall(_.isEmpty) &&
+                    Option(star.getReplaceExpressions).forall(_.isEmpty) =>
+                counted.add(star): Unit
+              case _ => ()
+          case k: net.sf.jsqlparser.expression.Function.KeywordArgument
+              if Option(k.getKeyword).exists(_.trim.equalsIgnoreCase("columns")) =>
+            forms += (Form.Expansion -> scopes)
+          case star: AllColumns if !counted.contains(star) =>
+            forms += (Form.Expansion -> scopes)
+          case pfi: ParenthesedFromItem =>
+            ai.starlake.acl.parser.TableExtractor.statementSource(pfi).foreach { src =>
+              forms += (Form.StatementSource(src.toOption.map(t => unquote(t.getName))) -> scopes)
+            }
           case _ => ()
         // A WITH clause: its names are in scope for the whole select. Each body is walked with the
         // scopes ENCLOSING this select and sees only what DuckDB lets it see: the CTEs declared
@@ -937,7 +1013,7 @@ private[cls] object ResidualColumns:
         case leaf if AstChildren.isLeaf(leaf)      => ()
         case other => unknown = unknown.orElse(Some(other.getClass.getName))
     walk(root, Nil, Map.empty)
-    Scan(columns.toList, tables.toList, unknown, tableStatements.toList)
+    Scan(columns.toList, tables.toList, unknown, forms.toList)
 
   /** Every table node of `root` except column qualifiers, by identity. */
   def tablesOf(root: AnyRef): List[Table] = scan(root).tables
@@ -998,13 +1074,35 @@ private[cls] object ResidualColumns:
       new java.util.IdentityHashMap[Column, java.lang.Boolean]()
     )
     before.columns.collect { case (c, scopes) if covered(c, scopes) => c }.foreach(noted.add(_))
-    // `ARRAY(TABLE t)` / `x = ANY (TABLE t)` read every column of t with no column node to mask
-    // (JSqlParser holds t as the argument COLUMN of a function flagged TABLE).
-    val refusal = before.tableStatements.headOption.map(_ =>
-      "a TABLE statement in expression position (ARRAY(TABLE t), ANY (TABLE t)) reads every " +
-        "column unmasked under column policies; select the columns with a subquery instead"
-    )
-    new Suspects(noted, before.unknown, refusal)
+    // Reads with no column node to mask, refused where a policy table is in scope.
+    def policyTable(table: String): Boolean       = isPolicyTable(table, policies)
+    def policyScope(scopes: List[Scope]): Boolean =
+      scopes.exists(_.exists(_.table.exists(policyTable)))
+    val formRefusal = before.forms.collectFirst {
+      case (Form.TableStatement, _) =>
+        "a TABLE statement in expression position (ARRAY(TABLE t), ANY (TABLE t)) reads every " +
+          "column unmasked under column policies; select the columns with a subquery instead"
+      case (Form.Expansion, scopes) if policyScope(scopes) =>
+        "a star expansion (COLUMNS(..), * LIKE / ILIKE / GLOB / SIMILAR TO, *COLUMNS(..), a star " +
+          "inside an expression) over a table with column policies cannot be masked; name the " +
+          "columns instead"
+      case (Form.StatementSource(table), _) if table.forall(policyTable) =>
+        "a statement in table position ((TABLE t), (SUMMARIZE t), ..) reads a table with column " +
+          "policies unmasked; select from the table instead"
+    }
+    // DuckDB binds a name no source has as a column to a FROM binding of that name: the whole row
+    // as a STRUCT (`SELECT c FROM customer c`, `main.customer`, `to_json(c)`), every column raw.
+    def wholeRow(col: Column, scopes: List[Scope]): Boolean =
+      val name    = lower(unquote(Option(col.getColumnName).getOrElse("")))
+      val sources = scopes.flatten
+      sources.exists(src => src.table.exists(policyTable) && src.names.contains(name)) &&
+      !sources.exists(src => has(src, name).contains(true))
+    val wholeRowRefusal = before.columns.collectFirst {
+      case (c, scopes) if wholeRow(c, scopes) =>
+        "a table referenced as a column (the whole row as a struct) cannot be masked under " +
+          "column policies; name the columns instead"
+    }
+    new Suspects(noted, before.unknown, formRefusal.orElse(wholeRowRefusal))
 
   /** Some(deny reason) when a noted reference is still in `sel` after the rewrite, or the statement
     * holds a node the walk cannot follow.
