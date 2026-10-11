@@ -56,10 +56,14 @@ object FileAccessScreen:
 
   /** Every table function that opens a caller-named file, path list, glob or URL: the lockdown
     * screen's list (derived from the 2.0 CLI's table functions with every extension a node loads,
-    * pinned by LockdownTableFunctionsSpec), plus the readers of extensions a node may install that
-    * the 2.0 toolchain lacks (excel, spatial, delta).
+    * pinned by LockdownTableFunctionsSpec), `sql_auto_complete`, plus the readers of extensions a
+    * node may install that the 2.0 toolchain lacks (excel, spatial, delta). FileAccessFunctionsSpec
+    * fails on any 2.0 table function nobody judged.
     */
   val FileFunctions: Set[String] = LockdownScreen.FileReadFunctions ++ Set(
+    // lists the entries of a node directory named in its argument (`FROM '/etc/ho` completes to
+    // the file names of /etc)
+    "sql_auto_complete",
     "read_xlsx",
     "st_read",
     "st_read_meta",
@@ -67,6 +71,101 @@ object FileAccessScreen:
     "st_readshp",
     "delta_scan"
   )
+
+  /** Table functions that open no caller-named file or directory, each judged on the 2.0 CLI:
+    * catalog and node introspection (`duckdb_*`, `pragma_*`; `pragma_table_info('<path>')` fails on
+    * a path rather than reading it), value generators and test tables, text tokenizers and JSON
+    * walkers, Arrow pointer scans, static TPC-H text, `which_secret` (matches a path against the
+    * secrets, opens nothing), `iceberg_scan_tasks` (its input is a scan plan, read by a refused
+    * reader), `checkpoint` (a catalog), and the front door's client stream.
+    */
+  private[sql] val NoFileFunctions: Set[String] = Set(
+    "arrow_scan",
+    "arrow_scan_dumb",
+    "check_peg_parser",
+    "checkpoint",
+    "generate_series",
+    "histogram",
+    "histogram_values",
+    "iceberg_scan_tasks",
+    "icu_calendar_names",
+    "json_each",
+    "json_tree",
+    "pg_timezone_names",
+    "range",
+    "repeat",
+    "repeat_row",
+    "scan_data_from_quack_client",
+    "seq_scan",
+    "sql_tokenize",
+    "summary",
+    "test_all_types",
+    "test_vector_types",
+    "tpch_answers",
+    "tpch_queries",
+    "unnest",
+    "which_secret",
+    "whoami"
+  ) ++ Set(
+    "approx_database_count",
+    "available_metrics",
+    "columns",
+    "connection_count",
+    "constraints",
+    "coordinate_systems",
+    "databases",
+    "dependencies",
+    "dialects",
+    "eviction_queues",
+    "extension_repositories",
+    "extensions",
+    "external_file_cache",
+    "external_resource_types",
+    "external_resources",
+    "functions",
+    "grammar_extensions",
+    "indexes",
+    "keywords",
+    "log_contexts",
+    "logs",
+    "logs_parsed",
+    "memory",
+    "optimizers",
+    "prepared_statements",
+    "profiling_settings",
+    "schemas",
+    "secret_type_parameters",
+    "secret_types",
+    "secrets",
+    "sequences",
+    "settings",
+    "tables",
+    "temporary_files",
+    "triggers",
+    "types",
+    "variables",
+    "views"
+  ).map("duckdb_" + _) ++ Set(
+    "collations",
+    "database_size",
+    "metadata_info",
+    "platform",
+    "show",
+    "storage_info",
+    "table_info",
+    "user_agent",
+    "version"
+  ).map("pragma_" + _)
+
+  /** Whether the tenant screens have judged the table function `name` (FileAccessFunctionsSpec):
+    * refused as a file reader here, as a catalog-reaching or node-escaping call
+    * ([[CatalogReachingCalls]]), as a node-wide or credential-exposing call
+    * ([[NodeSettingScreen]]), or admitted on purpose.
+    */
+  private[sql] def judged(name: String): Boolean =
+    FileFunctions(name) || NoFileFunctions(name) || CatalogReachingCalls.LockdownNames(name) ||
+      name.startsWith("ducklake_") || NodeSettingScreen.NodeWideCalls(name) ||
+      NodeSettingScreen.SecretCalls(name)
 
   /** Some(reason) when `sql` reads or writes a file directly. */
   def find(sql: String): Option[String] =

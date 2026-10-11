@@ -330,3 +330,12 @@ class NodeWideSettingScreenSpec extends AnyFlatSpec with Matchers:
   it should "leave a column of that name alone" in {
     NodeSettingScreen.screen("SELECT shell_history FROM t") shouldBe None
   }
+
+  // tpch's generator writes tables into the catalog its argument names, at any scale factor.
+  "dbgen" should "be reserved to superusers" in {
+    NodeSettingScreen.screenNodeWide("CALL dbgen(sf = 0.01)") shouldBe
+      Some(NodeSettingScreen.nodeWideCallRefusal("dbgen"))
+    NodeSettingScreen.screenNodeWide(
+      "SELECT * FROM dbgen(sf = 1, catalog = 'other')"
+    ) shouldBe defined
+  }

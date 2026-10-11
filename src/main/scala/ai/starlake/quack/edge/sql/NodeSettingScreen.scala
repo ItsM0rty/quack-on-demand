@@ -253,7 +253,10 @@ object NodeSettingScreen:
     "truncate_duckdb_logs",
     "enable_profiling",
     "disable_profiling",
-    "force_checkpoint"
+    "force_checkpoint",
+    // tpch's generator: creates and fills TPC-H tables in whatever catalog its argument names, at
+    // any scale factor (the node's disk and memory)
+    "dbgen"
   )
 
   val NodeWideRefusal =
