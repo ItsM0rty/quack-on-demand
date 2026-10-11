@@ -108,18 +108,36 @@ object LockdownScreen:
 
   // Read-style functions that take a path or URL as their FIRST argument. A remote URL literal is
   // admitted (UrlExempt), a local path denied; glob (directory listing) never exempts.
+  // The list is every DuckDB 2.0 table function (duckdb_functions(), function_type = 'table') whose
+  // first argument is a caller-named file, path list or glob.
   private val FileReadFunctions = Set(
     "read_text",
     "read_blob",
     "glob",
     "read_csv",
     "read_csv_auto",
+    "read_single_csv_file",
+    "sniff_csv",
     "read_parquet",
+    "parquet_scan",
+    "read_single_parquet_file",
+    "parquet_metadata",
+    "parquet_file_metadata",
+    "parquet_full_metadata",
+    "parquet_kv_metadata",
+    "parquet_schema",
+    "parquet_bloom_probe",
     "read_json",
     "read_json_auto",
+    "read_json_objects",
+    "read_json_objects_auto",
+    "read_single_json_file",
     "read_ndjson",
     "read_ndjson_auto",
-    "parquet_scan"
+    "read_ndjson_objects",
+    "read_duckdb",
+    "read_postgres_binary",
+    "ducklake_scan"
   )
 
   // Functions that run raw SQL elsewhere, open a connection to a caller-chosen target, or read the

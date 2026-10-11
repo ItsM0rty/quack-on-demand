@@ -2066,6 +2066,11 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       )
       .unsafeRunSync()
     out.isRight shouldBe true
+    // A SQL-valued setting is refused only to tenant principals under the ACL and under lockdown.
+    val set = router
+      .execute("psr-8", "alice", poolKey, "SET pg_staleness_query = 'SELECT 1'", None)
+      .unsafeRunSync()
+    set.isRight shouldBe true
 
   // ---- node lockdown (QOD_NODE_LOCKDOWN) ----
 

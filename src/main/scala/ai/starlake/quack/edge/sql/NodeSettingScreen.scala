@@ -95,15 +95,30 @@ object NodeSettingScreen:
     */
   private def screenOne(stmt: String): Option[String] =
     val h = StatementHead.of(stmt)
+    if h.word(h.start).contains("import") && h.word(h.start + 1).contains("database") then
+      Some(ImportRefusalMessage)
+    else
+      settingTarget(h).collect {
+        case n if ParserSettings(n) => RefusalMessage
+        case n if SecretSettings(n) => SecretRefusalMessage
+      }
+
+  /** The setting each statement of `sql` sets, resets or pragmas, lowercased and unquoted, read the
+    * same way this screen reads it (EXPLAIN / PREPARE carried statement, glued quotes, scope
+    * keywords). Shared with [[CatalogReachingCalls]], which refuses the SQL-valued settings to
+    * tenant-scoped principals.
+    */
+  def targetedSettings(sql: String): Iterator[String] =
+    LockdownScreen.splitStatements(sql).iterator.flatMap(s => settingTarget(StatementHead.of(s)))
+
+  /** SET [SESSION | GLOBAL | LOCAL] <name>, RESET ..., PRAGMA <name>: the name, if the carried
+    * statement is one of those. A scope word followed by a name is a scope.
+    */
+  private def settingTarget(h: StatementHead.Head): Option[String] =
     val i = h.start
     h.word(i) match
       case Some("set" | "reset" | "pragma") =>
-        // SET [SESSION | GLOBAL | LOCAL] <name>: a scope word followed by a name is a scope
         val target =
           if h.word(i + 1).exists(Scopes) && h.identifier(i + 2).isDefined then i + 2 else i + 1
-        h.identifier(target).collect {
-          case n if ParserSettings(n) => RefusalMessage
-          case n if SecretSettings(n) => SecretRefusalMessage
-        }
-      case Some("import") if h.word(i + 1).contains("database") => Some(ImportRefusalMessage)
-      case _                                                    => None
+        h.identifier(target)
+      case _ => None

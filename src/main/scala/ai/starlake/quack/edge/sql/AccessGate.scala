@@ -54,7 +54,12 @@ object AccessGate:
     CatalogReachingCalls.find(statement) match
       case Some(fn) => GateOutcome.Refuse(CatalogReachingCalls.denyReason(fn), false, "")
       case None     =>
-        evaluateParsed(statement, config, sessionCatalog, filteredMetadata, clientDataScans)
+        // A SET of a SQL-valued setting is control flow to the parser, but its value runs later on
+        // the catalog Postgres or as the node's auth callback, outside every grant.
+        CatalogReachingCalls.sqlValuedSetting(statement) match
+          case Some(s) => GateOutcome.Refuse(CatalogReachingCalls.settingDenyReason(s), false, "")
+          case None    =>
+            evaluateParsed(statement, config, sessionCatalog, filteredMetadata, clientDataScans)
 
   private def evaluateParsed(
       statement: String,

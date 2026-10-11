@@ -122,7 +122,9 @@ class OpaValidatorSpec extends AnyFlatSpec with Matchers:
   it should "deny a node-escaping call (postgres_query / getenv) before asking OPA" in:
     for sql <- List(
         "SELECT * FROM postgres_query('c', 'SELECT 1')",
-        "SELECT getenv('pgPassword')"
+        "SELECT * FROM sqlite_query('s', 'SELECT 1')",
+        "SELECT getenv('pgPassword')",
+        "SET pg_pool_health_check_query = 'SELECT 1'"
       )
     do
       val calls = StringBuilder()

@@ -525,6 +525,33 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     }
   }
 
+  it should "refuse SQL-valued settings to a tenant principal, even under the wildcard ALL" in {
+    val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
+    List(
+      "SET pg_staleness_query = 'SELECT 1 ${SCHEMA}'",
+      "SET GLOBAL pg_pool_health_check_query = 'SELECT 1'",
+      "SET quack_authorization_function = 'f'"
+    ).foreach { sql =>
+      withClue(sql) {
+        catalogAware.validate(mkAcmeCtx(sql, wildcard)) match
+          case Denied(msg, _, _) => msg should include("runs SQL")
+          case other             => fail(s"expected Denied, got $other")
+      }
+    }
+    catalogAware.validate(mkAcmeCtx("SET schema = 'main'", wildcard)) shouldBe Allowed
+  }
+
+  it should "treat the 2.0 single-file readers like read_csv for a tenant principal" in {
+    // Both are unsupported table functions: denied without the wildcard, covered by it.
+    val narrow   = effectiveWith(List(perm("acme_tpch", "main", "orders", "RO")))
+    val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
+    for fn <- List("read_csv", "read_single_csv_file", "read_duckdb", "read_postgres_binary") do
+      withClue(fn) {
+        catalogAware.validate(mkAcmeCtx(s"SELECT * FROM $fn('/etc/x')", narrow)) shouldBe a[Denied]
+        catalogAware.validate(mkAcmeCtx(s"SELECT * FROM $fn('/etc/x')", wildcard)) shouldBe Allowed
+      }
+  }
+
   it should "still be available to superusers" in {
     val superuser = RbacUser(id = "u-su", tenant = None, username = "admin", kind = "admin")
     val eff       = EffectiveSet(superuser, Nil, Nil, Nil, Nil)
@@ -534,6 +561,7 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     catalogAware.validate(
       mkAcmeCtx("SELECT * FROM postgres_query('acme_other', 'SELECT 1')", eff)
     ) shouldBe Allowed
+    catalogAware.validate(mkAcmeCtx("SET pg_staleness_query = 'SELECT 1'", eff)) shouldBe Allowed
   }
 
   it should "not trip on identifiers that merely contain the function names" in {

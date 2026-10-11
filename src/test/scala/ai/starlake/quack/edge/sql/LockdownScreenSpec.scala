@@ -620,11 +620,36 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT * FROM postgres_query('c', 'SELECT 1')") shouldBe true
     denied("CALL postgres_execute('c', 'DROP TABLE t')") shouldBe true
     denied("SELECT * FROM mysql_query('c', 'SELECT 1')") shouldBe true
+    denied("SELECT * FROM sqlite_query('s', 'SELECT 1')") shouldBe true
     denied("SELECT * FROM sqlite_scan('/x.db', 't')") shouldBe true
     denied("SELECT getenv('pgPassword')") shouldBe true
     LockdownScreen.screen("SELECT * FROM postgres_query('c', 'x')", Set.empty) match
       case Some(m) => m should not include "over local paths"
       case None    => fail("expected a refusal")
+  }
+
+  "every 2.0 file-reading table function" should "deny a local path and admit a remote one" in {
+    // read_single_*_file are new in 2.0; the rest predate it. Each takes a caller-named file first.
+    for fn <- List(
+        "read_single_csv_file",
+        "read_single_json_file",
+        "read_single_parquet_file",
+        "read_duckdb",
+        "read_json_objects",
+        "read_ndjson_objects",
+        "read_postgres_binary",
+        "sniff_csv",
+        "parquet_metadata",
+        "parquet_schema",
+        "ducklake_scan"
+      )
+    do
+      withClue(fn) {
+        denied(s"SELECT * FROM $fn('/proc/self/environ')") shouldBe true
+        denied(s"SELECT * FROM `$fn`('./x.csv')") shouldBe true
+        denied(s"SELECT * FROM $fn('s3://staging/x.csv')") shouldBe false
+        deniedB(s"SELECT * FROM $fn('s3://lakebucket/x.csv')") shouldBe true
+      }
   }
 
   "the postgres control functions" should "be denied (ATTACH and pool-config bypasses)" in {

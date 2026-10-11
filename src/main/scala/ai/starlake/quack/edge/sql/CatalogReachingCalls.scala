@@ -42,9 +42,10 @@ object CatalogReachingCalls:
   private val Fixed = Set("query", "query_table", "json_execute_serialized_sql")
 
   /** Calls that run raw SQL elsewhere, open an arbitrary connection, or read node env vars. The
-    * mysql / sqlite entries are classified by name and DuckDB extension documentation (the mysql
-    * and sqlite extensions are not in the 2.0 toolchain, so they were not probed); the postgres
-    * entries and `getenv` were verified on the 2.0 CLI.
+    * postgres entries and `getenv` were verified on the 2.0 CLI; the mysql / sqlite entries are the
+    * SQL-running and connection-target functions those extensions export, listed from the 1.5.6 CLI
+    * (neither extension is in the 2.0 toolchain). `mysql_clear_cache`, `mysql_debug_execution_plan`
+    * and `mysql_explain_federated` run nothing and open nothing.
     */
   private val NodeEscaping = Set(
     "postgres_query",
@@ -54,12 +55,32 @@ object CatalogReachingCalls:
     "postgres_attach",
     "mysql_query",
     "mysql_execute",
-    "mysql_scan",
-    "mysql_attach",
+    "sqlite_query",
     "sqlite_scan",
     "sqlite_attach",
     "getenv"
   )
+
+  /** Settings whose value is SQL (or the name of a function) the node runs later, outside the ACL:
+    * the postgres extension runs `pg_staleness_query` / `pg_pool_health_check_query` on the
+    * attached catalog Postgres, and the quack server calls the named auth callbacks on every
+    * connection. Refused to tenant-scoped principals when the ACL validates (a SET is otherwise
+    * control flow and admitted); lockdown already protects all four for every caller.
+    */
+  val SqlValuedSettings: Set[String] = Set(
+    "pg_staleness_query",
+    "pg_pool_health_check_query",
+    "quack_authentication_function",
+    "quack_authorization_function"
+  )
+
+  /** The first SQL-valued setting a statement of `sql` sets, resets or pragmas, or None. */
+  def sqlValuedSetting(sql: String): Option[String] =
+    NodeSettingScreen.targetedSettings(sql).find(SqlValuedSettings)
+
+  def settingDenyReason(name: String): String =
+    s"setting $name runs SQL the gateway cannot authorize; " +
+      "not available to tenant-scoped principals (deny, fail-closed)"
 
   /** The names refused for every caller under lockdown too; [[LockdownScreen]] reads this so the
     * lockdown and ACL-validates paths can never drift apart.

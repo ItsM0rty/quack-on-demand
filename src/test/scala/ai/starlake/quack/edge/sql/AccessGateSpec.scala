@@ -80,8 +80,8 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
     CatalogReachingCalls.find("SELECT \"query\" FROM t") shouldBe None
 
   it should "find the node-escaping calls (raw SQL, arbitrary connection, node env)" in:
-    // postgres_* and getenv verified on the 2.0 CLI; mysql_* / sqlite_* classified by name (the
-    // extensions are not in the toolchain). Each must deny for a tenant-scoped principal.
+    // postgres_* and getenv verified on the 2.0 CLI; mysql_* / sqlite_* listed from the 1.5.6 CLI
+    // (the extensions are not in the 2.0 toolchain). Each must deny for a tenant-scoped principal.
     for name <- List(
         "postgres_query",
         "postgres_execute",
@@ -90,8 +90,7 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
         "postgres_attach",
         "mysql_query",
         "mysql_execute",
-        "mysql_scan",
-        "mysql_attach",
+        "sqlite_query",
         "sqlite_scan",
         "sqlite_attach",
         "getenv"
@@ -103,6 +102,24 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
         CatalogReachingCalls.denyReason(name) should include("cannot authorize")
       }
     CatalogReachingCalls.find("SELECT postgres_query, getenv FROM t") shouldBe None
+
+  it should "refuse a SET / RESET / PRAGMA of a SQL-valued setting, not wildcard-coverable" in:
+    for sql <- List(
+        "SET pg_staleness_query = 'SELECT 1 ${SCHEMA}'",
+        "SET GLOBAL\"pg_pool_health_check_query\" = 'SELECT 1'",
+        "RESET pg_staleness_query",
+        "PRAGMA quack_authentication_function = 'f'",
+        "EXPLAIN ANALYZE SET quack_authorization_function = 'f'"
+      )
+    do
+      withClue(sql) {
+        eval(sql) match
+          case GateOutcome.Refuse(msg, false, _) => msg should include("runs SQL")
+          case other                             => fail(other.toString)
+      }
+    CatalogReachingCalls.sqlValuedSetting("SET schema = 'pg_staleness_query'") shouldBe None
+    CatalogReachingCalls.sqlValuedSetting("SELECT current_setting('pg_staleness_query')") shouldBe
+      None
 
   it should "fail closed when string literals nest past the scan depth" in:
     // A reaching call reachable only past FunctionCalls.MaxDepth: each level is a plain string
