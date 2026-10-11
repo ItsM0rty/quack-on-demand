@@ -254,9 +254,13 @@ def _finish_starflow_stop(pgid: int) -> None:
 
 
 def _stop_manager_and_nodes():
-    mgr_port = int(os.environ.get("QOD_ON_DEMAND_PORT", "20900"))
-    edge_port = int(os.environ.get("PROXY_PORT", "31338"))
-    force_after = int(os.environ.get("FORCE_AFTER", "10"))
+    # Same resolution as `qod start` and `qod status`: a real env var over a value `qod setup`
+    # persisted, over the default. Reading the environment alone stopped (and, for nodes, scoped
+    # to) port 20900 when the manager had been set up on another port.
+    merged = {**load_start_env(), **os.environ}
+    mgr_port = int(merged.get("QOD_ON_DEMAND_PORT") or "20900")
+    edge_port = int(merged.get("PROXY_PORT") or "31338")
+    force_after = int(merged.get("FORCE_AFTER") or "10")
 
     # Only this manager's nodes: each wrapper's argv and node directory carry the manager's marker
     # `<rest-port>-<boot id>` (LocalQuackBackend.managerMarker), so another manager on this host

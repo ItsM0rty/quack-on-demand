@@ -114,8 +114,37 @@ def test_kill_quack_nodes_documents_all_in_its_usage():
 def test_qod_stop_matches_only_its_managers_nodes(monkeypatch):
     from qod_cli.commands import stop as stop_cmd
     seen = []
+    monkeypatch.setattr(stop_cmd, "load_start_env", lambda: {})
     monkeypatch.setattr(stop_cmd, "_listening_pid", lambda port: None)
     monkeypatch.setattr(stop_cmd, "_pgrep", lambda pattern: seen.append(pattern) or [])
     monkeypatch.setenv("QOD_ON_DEMAND_PORT", "29993")
     stop_cmd._stop_manager_and_nodes()
     assert seen and all("29993-" in p for p in seen), seen
+
+
+def test_qod_stop_uses_the_port_qod_setup_saved(monkeypatch):
+    # `qod setup` persists the manager's ports; with none in the environment, `qod stop` must use
+    # them (as `qod start` does), not stop and scope its node sweep to the default 20900.
+    from qod_cli.commands import stop as stop_cmd
+    seen, listened = [], []
+    monkeypatch.delenv("QOD_ON_DEMAND_PORT", raising=False)
+    monkeypatch.delenv("PROXY_PORT", raising=False)
+    monkeypatch.setattr(stop_cmd, "load_start_env",
+                        lambda: {"QOD_ON_DEMAND_PORT": "29995", "PROXY_PORT": "31495"})
+    monkeypatch.setattr(stop_cmd, "_listening_pid", lambda port: listened.append(port) or None)
+    monkeypatch.setattr(stop_cmd, "_pgrep", lambda pattern: seen.append(pattern) or [])
+    stop_cmd._stop_manager_and_nodes()
+    assert set(listened) == {29995, 31495}
+    assert seen and all("29995-" in p for p in seen), seen
+    assert not any("20900" in p for p in seen)
+
+
+def test_qod_stop_prefers_the_environment_over_the_saved_port(monkeypatch):
+    from qod_cli.commands import stop as stop_cmd
+    seen = []
+    monkeypatch.setenv("QOD_ON_DEMAND_PORT", "29996")
+    monkeypatch.setattr(stop_cmd, "load_start_env", lambda: {"QOD_ON_DEMAND_PORT": "29995"})
+    monkeypatch.setattr(stop_cmd, "_listening_pid", lambda port: None)
+    monkeypatch.setattr(stop_cmd, "_pgrep", lambda pattern: seen.append(pattern) or [])
+    stop_cmd._stop_manager_and_nodes()
+    assert seen and all("29996-" in p for p in seen), seen
