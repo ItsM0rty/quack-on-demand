@@ -257,14 +257,31 @@ object LocalQuackBackend:
   def defaultCommand(script: String): (NodeSpec, Int, String) => List[String] =
     (_, port, _) => List(script, port.toString)
 
-  /** OS-aware default command. On Windows the child is `powershell.exe -File <winScript> <port>`
-    * (the wrapper process the manager holds a `Process` handle for; its `duckdb.exe` grandchild is
-    * reaped via `taskkill /T`). On Unix it is the bash `<unixScript> <port>` invocation,
-    * byte-identical to [[defaultCommand]].
+  /** This manager process's spawn marker: its REST port plus a per-boot random id, e.g.
+    * `20900-3fa9c1e2`. Every node gets it as the spawn script's second argument, and the script
+    * puts it in the node directory name (`quack-node.<marker>.XXXXXX`, which duckdb's `-init` argv
+    * carries). `stop-jar`, `kill-quack-nodes` and `qod stop` match on `<port>-`, so stopping one
+    * manager only touches that manager's nodes, not those of another manager on the same host (an
+    * isolated test stack next to the one on :20900). The boot id tells two lives of the same port
+    * apart in the node directory names.
+    */
+  def managerMarker(restPort: Int): String = s"$restPort-$bootId"
+
+  private lazy val bootId: String =
+    val b = new Array[Byte](4)
+    new SecureRandom().nextBytes(b)
+    b.map(x => f"${x & 0xff}%02x").mkString
+
+  /** OS-aware default command. On Windows the child is
+    * `powershell.exe -File <winScript> <port> <marker>` (the wrapper process the manager holds a
+    * `Process` handle for; its `duckdb.exe` grandchild is reaped via `taskkill /T`). On Unix it is
+    * `<unixScript> <port> <marker>`. `marker` is [[managerMarker]]; it is required so no production
+    * spawn goes out unmarked (an unmarked node is invisible to the per-manager stop paths).
     */
   def defaultCommand(
       unixScript: String,
-      winScript: String
+      winScript: String,
+      marker: String
   ): (NodeSpec, Int, String) => List[String] =
     if isWindows then
       (_, port, _) =>
@@ -276,9 +293,10 @@ object LocalQuackBackend:
           "Bypass",
           "-File",
           winScript,
-          port.toString
+          port.toString,
+          marker
         )
-    else (_, port, _) => List(unixScript, port.toString)
+    else (_, port, _) => List(unixScript, port.toString, marker)
 
   /** Terminate a spawned node by pid. On Windows uses `taskkill /PID <pid> /T` (`/F` when `force`)
     * so the whole process tree — the PowerShell wrapper and its `duckdb.exe` child — is killed;

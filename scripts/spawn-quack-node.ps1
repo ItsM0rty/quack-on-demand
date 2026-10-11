@@ -4,7 +4,9 @@
 
 .DESCRIPTION
   PowerShell mirror of scripts/spawn-quack-node.sh. LocalQuackBackend wraps
-  this as `powershell.exe -File spawn-quack-node.ps1 <port>`.
+  this as `powershell.exe -File spawn-quack-node.ps1 <port> <manager-marker>`. The marker
+  (LocalQuackBackend.managerMarker: REST port plus a per-boot id) names the node directory
+  `quack-node.<marker>.<id>`, so stop-jar.ps1 stops only its own manager's nodes.
 
   The non-sensitive metastore connection details arrive as environment
   variables that LocalQuackBackend.start() sets from CreatePoolRequest.metastore.
@@ -40,13 +42,26 @@
   The Postgres `CREATE DATABASE` step the bash script performs as a fallback is
   intentionally omitted here: the manager JVM already provisions the tenant-db
   (DbAdmin.createDatabase via PoolSupervisor.createTenantDb + DuckLakeInitializer).
+
+  duckdb runs in an empty directory private to the current user, created here per node: DuckDB 2.0
+  replacement-scans an unquoted dotted name as a file (`SELECT * FROM x.csv` reads .\x.csv), and
+  an unquoted name cannot hold a path separator, so the working directory is the one place that
+  form reaches. Every relative path the node relies on (dataPath, the duckdb binary, the spill
+  directory) is made absolute against the directory this script started in. The node directory
+  is removed when duckdb exits; `taskkill /T /F` gives this script no chance to, so each spawn
+  also removes the node directories whose owning script is gone. Mirrors spawn-quack-node.sh.
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true, Position = 0)] [int]    $Port
+  [Parameter(Mandatory = $true, Position = 0)] [int]    $Port,
+  [Parameter(Mandatory = $false, Position = 1)] [string] $Marker = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The directory relative paths resolve against (the manager's working directory, where duckdb
+# itself used to run).
+$startDir = (Get-Location).ProviderPath
 
 # Keep in sync with NodeSecretFiles.Keys (Scala) and SECRET_KEYS in spawn-quack-node.sh;
 # NodeSecretFilesSpec pins both.
@@ -172,6 +187,19 @@ CREATE OR REPLACE SECRET quack_azure (
   }
 }
 
+# A relative local dataPath used to resolve against duckdb's working directory; resolve it against
+# the starting directory instead. DuckLake refuses a DATA_PATH that differs from the one recorded at
+# catalog creation (still the relative spelling), so the ATTACH then passes OVERRIDE_DATA_PATH, which
+# applies to this attach only and rewrites nothing in the catalog. Mirrors spawn-quack-node.sh.
+$dataPathOverride = ''
+if (-not $isRemote -and -not [string]::IsNullOrEmpty($dataPath) -and
+    -not [System.IO.Path]::IsPathRooted($dataPath)) {
+  $dataPath = [System.IO.Path]::GetFullPath((Join-Path $startDir $dataPath))
+  $dataPathOverride = ', OVERRIDE_DATA_PATH true'
+}
+# The starting directory is not validated like the rest of the metastore: double any quote.
+$dataPathSql = ([string]$dataPath).Replace("'", "''")
+
 # New-Item behaviour differs by kind: for `ducklake`, dataPath is a parquet
 # DIRECTORY, so creating the path itself is correct. For `duckdb-file`,
 # dataPath is a .duckdb FILE path - creating a directory at that exact path
@@ -213,7 +241,106 @@ if ([string]::IsNullOrEmpty($duckdbBin)) {
     if ($null -eq $cmd) { Write-Error "ERROR: duckdb not on PATH"; exit 1 }
     $duckdbBin = $cmd.Source
   }
+} elseif (-not $dryRun -and -not [System.IO.Path]::IsPathRooted($duckdbBin)) {
+  # Absolute, since duckdb starts in its own directory.
+  $cmd = Get-Command $duckdbBin -ErrorAction SilentlyContinue
+  if ($null -ne $cmd -and -not [string]::IsNullOrEmpty($cmd.Source)) { $duckdbBin = $cmd.Source }
+  else { $duckdbBin = [System.IO.Path]::GetFullPath((Join-Path $startDir $duckdbBin)) }
 }
+# The node is held open by a `.shell` dot-command (the keep-alive below). A CLI without it would go
+# straight to `.exit` after starting to serve, a silent crash loop; refuse up front instead. One
+# duckdb start with no init file (-no-init: never the user's ~/.duckdbrc). Mirrors the bash twin.
+if (-not $dryRun) {
+  $probe = ''
+  try { $probe = (& $duckdbBin -no-init -noheader -c ".shell 'echo qod-shell-ok'" 2>$null | Out-String) } catch {}
+  if ($probe -notmatch 'qod-shell-ok') {
+    [Console]::Error.WriteLine("ERROR: $duckdbBin cannot run the .shell dot-command the node keep-alive needs")
+    exit 1
+  }
+}
+
+$onWindows = ($env:OS -eq 'Windows_NT')
+
+# A directory only the current user can reach (the analogue of mktemp's 0700).
+function New-PrivateDirectory([string]$path) {
+  New-Item -ItemType Directory -Path $path -Force | Out-Null
+  if ($onWindows) {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+      $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    Set-Acl -LiteralPath $path -AclObject $acl
+  } else {
+    & chmod 700 $path
+  }
+}
+
+# Remove a node directory and the spill directory it records.
+function Remove-NodeDirectory([string]$dir) {
+  $spillFile = Join-Path $dir 'spill.path'
+  if (Test-Path -LiteralPath $spillFile -PathType Leaf) {
+    $spill = ([System.IO.File]::ReadAllText($spillFile)).Trim()
+    if (-not [string]::IsNullOrEmpty($spill)) {
+      Remove-Item -LiteralPath $spill -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+  Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Per-node private state: $nodeDir holds owner.pid (the owning script's PID and its start ticks),
+# spill.path and $workDir, the empty directory duckdb runs in. Node directories of earlier spawns
+# whose owning script is gone (taskkill /T /F skipped their cleanup) are removed first. The owner is
+# alive only when a process of that PID exists AND started at the recorded time: Windows recycles
+# PIDs, so the start time keeps the sweep from sparing (or killing) an unrelated process's dir. A
+# dir with no owner.pid yet (still being created) or an unparseable one is left alone.
+$tempRoot = [System.IO.Path]::GetTempPath()
+Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'quack-node.*' -ErrorAction SilentlyContinue |
+  ForEach-Object {
+    $ownerFile = Join-Path $_.FullName 'owner.pid'
+    if (Test-Path -LiteralPath $ownerFile -PathType Leaf) {
+      $parts = (([System.IO.File]::ReadAllText($ownerFile)).Trim() -split '\s+')
+      $owner = 0
+      if ($parts.Count -ge 1 -and [int]::TryParse($parts[0], [ref]$owner)) {
+        $proc  = Get-Process -Id $owner -ErrorAction SilentlyContinue
+        $alive = $false
+        if ($null -ne $proc) {
+          if ($parts.Count -ge 2) {
+            try { $alive = ($proc.StartTime.Ticks.ToString() -eq $parts[1]) } catch { $alive = $true }
+          } else {
+            $alive = $true
+          }
+        }
+        if (-not $alive) { Remove-NodeDirectory $_.FullName }
+      }
+    }
+  }
+$nodeId  = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+if (-not [string]::IsNullOrEmpty($Marker) -and $Marker -notmatch '^[0-9]+-[0-9a-f]+$') {
+  [Console]::Error.WriteLine("ERROR: invalid manager marker '$Marker' (expected <rest-port>-<hex boot id>)")
+  exit 1
+}
+$markerPart = ''
+if (-not [string]::IsNullOrEmpty($Marker)) { $markerPart = "$Marker." }
+$nodeDir = Join-Path $tempRoot "quack-node.$markerPart$nodeId"
+New-PrivateDirectory $nodeDir
+$workDir = Join-Path $nodeDir 'cwd'
+New-PrivateDirectory $workDir
+# DuckDB's spill directory defaults to `.tmp` under its working directory, which no longer persists
+# across nodes. Give each node its own under `.tmp` of the starting directory (where it spilled
+# before), per node so that under lockdown, where DuckDB admits its temp directory, no node can read
+# another's spill files. Under $nodeDir when that is not writable.
+try {
+  $spillDir = Join-Path (Join-Path $startDir '.tmp') "qod-node.$nodeId"
+  New-PrivateDirectory $spillDir
+} catch {
+  $spillDir = Join-Path $nodeDir 'tmp'
+  New-PrivateDirectory $spillDir
+}
+[System.IO.File]::WriteAllText((Join-Path $nodeDir 'spill.path'), $spillDir)
+$ownerTicks = ''
+try { $ownerTicks = (Get-Process -Id $PID).StartTime.Ticks.ToString() } catch {}
+[System.IO.File]::WriteAllText((Join-Path $nodeDir 'owner.pid'), "$PID $ownerTicks")
 
 # DuckDB does NOT honour HTTP_PROXY/HTTPS_PROXY for `INSTALL <extension>`
 # downloads - those go through libcurl via the SQL `SET http_proxy=...`
@@ -239,7 +366,18 @@ $encryptionKey = Secret-Or 'encryptionKey' ''
 # Build init SQL piecemeal based on $kind so memory / duckdb-file skip the
 # DuckLake-specific setup entirely. Mirrors spawn-quack-node.sh.
 $sb = [System.Text.StringBuilder]::new()
+# The CLI exits on the first error of an -init file by default; a node has always carried on past
+# a failing statement (an unreachable federated source, an offline INSTALL), so keep doing that.
+[void]$sb.AppendLine('.bail off')
+# First, before any CREATE SECRET or ATTACH: DuckDB loads every persistent secret of the OS user
+# (~/.duckdb/stored_secrets) on first secret use, which would put an operator's own cloud keys on
+# every node. Reading duckdb_secrets() then puts the secret manager in use, after which DuckDB
+# refuses to change the setting from any session. Mirrors spawn-quack-node.sh.
+[void]$sb.AppendLine('SET allow_persistent_secrets = false;')
+[void]$sb.AppendLine('SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();')
 if (-not [string]::IsNullOrEmpty($proxySql))  { [void]$sb.AppendLine($proxySql) }
+# Before dbInitSql, so an operator's own SET temp_directory still wins.
+[void]$sb.AppendLine("SET temp_directory = '$($spillDir.Replace("'", "''"))';")
 if (-not [string]::IsNullOrEmpty($dbInitSql)) { [void]$sb.AppendLine($dbInitSql) }
 [void]$sb.AppendLine("INSTALL quack;")
 [void]$sb.AppendLine("LOAD quack;")
@@ -280,9 +418,9 @@ switch ($kind) {
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS ""$catalogAlias""")
     if ($encrypted -ceq 'true') {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', ENCRYPTED, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPathSql', ENCRYPTED$dataPathOverride, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
     } else {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPathSql'$dataPathOverride, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
     }
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("DETACH qod_init_pg;")
@@ -293,9 +431,9 @@ switch ($kind) {
   }
   'duckdb-file' {
     if ($encrypted -ceq 'true') {
-      [void]$sb.AppendLine("ATTACH '$dataPath' AS ""$catalogAlias"" (ENCRYPTION_KEY '$encryptionKey');")
+      [void]$sb.AppendLine("ATTACH '$dataPathSql' AS ""$catalogAlias"" (ENCRYPTION_KEY '$encryptionKey');")
     } else {
-      [void]$sb.AppendLine("ATTACH '$dataPath' AS ""$catalogAlias"";")
+      [void]$sb.AppendLine("ATTACH '$dataPathSql' AS ""$catalogAlias"";")
     }
     [void]$sb.AppendLine("USE ""$catalogAlias"";")
     [void]$sb.AppendLine("CREATE SCHEMA IF NOT EXISTS ""$schemaName"";")
@@ -313,33 +451,128 @@ if (-not [string]::IsNullOrEmpty($extraSetupSql)) { [void]$sb.AppendLine($extraS
 # node serves any tenant statement.
 if (-not [string]::IsNullOrEmpty($lockdownSql)) { [void]$sb.AppendLine($lockdownSql) }
 
-[void]$sb.AppendLine("CALL quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
+# SELECT only listen_url (not the CALL's row) so the node token never reaches the inherited stdout.
+# quack_serve is the last PAYLOAD statement; the keep-alive is a dot-command in the OUTER init file
+# (below), not a query, so it pins no DuckDB transaction and no scheduler task. Mirrors
+# spawn-quack-node.sh.
+[void]$sb.AppendLine("SELECT listen_url FROM quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
 
-$initSql = $sb.ToString()
+$payloadSql = $sb.ToString()
 
-# Test seam, mirror of QOD_SPAWN_DRY_RUN in spawn-quack-node.sh: print the assembled init SQL
-# and exit without launching duckdb. Used by SpawnScriptEncryptionWindowsSpec to assert the
-# emitted SQL, which is the only testable surface of a script the manager shells out to.
+# The init SQL goes through `-init <file>` (the CLI records stdin in shell_history(), not -init).
+# Windows has no FIFO that -init accepts, so to keep the credentials off disk the init is SPLIT:
+#   - a secrets file holds the payload (token, catalog password, object-store / federation SQL);
+#   - the outer init file holds NO secrets: it `.read`s the secrets file, has DuckDB itself delete
+#     it once read, then blocks on the keep-alive (a dot-command waiting for this wrapper to exit,
+#     not a query, so it pins no DuckDB transaction).
+# Every path handed to the CLI (-init, .read, the delete) is RELATIVE to duckdb's working directory
+# ($workDir = <nodeDir>\cwd) and pure ASCII. The CLI converts its argv to UTF-8, then opens -init
+# and .read files with plain fopen() and runs .shell through system(), both of which the CRT reads
+# in the ANSI code page: an absolute path under a non-ASCII %TEMP% (C:\Users\Hélène\...) would
+# never open, and the node would fail to start in a respawn loop. `..` is the node directory, which
+# holds init.sql and secrets.sql. Every dot-command argument is also SINGLE-quoted, which both CLIs
+# take literally (they resolve backslash escapes inside a double-quoted one). The spill directory
+# and dataPath go through DuckDB's own UTF-8 file system, not these calls, so they are unaffected.
+# Rendering target: this host, or (dry run only) QOD_SPAWN_TARGET_OS=windows|unix, so a dry run on
+# any OS can show the exact Windows outer init.
+$targetWindows = $onWindows
+$targetOs = [Environment]::GetEnvironmentVariable('QOD_SPAWN_TARGET_OS')
+if ($dryRun -and $targetOs -eq 'windows') { $targetWindows = $true }
+if ($dryRun -and $targetOs -eq 'unix') { $targetWindows = $false }
+
+$secretsFile = Join-Path $nodeDir 'secrets.sql'
+$initFile    = Join-Path $nodeDir 'init.sql'
+$initArg     = '../init.sql'
+if ($targetWindows) {
+  $delCmd  = 'cmd /c del /f /q ..\secrets.sql'
+  $waitCmd = "powershell -NoProfile -Command `"Wait-Process -Id $PID -ErrorAction SilentlyContinue`""
+} else {
+  $delCmd  = 'rm -f ../secrets.sql'
+  $waitCmd = "tail --pid=$PID -f /dev/null 2>/dev/null || while kill -0 $PID 2>/dev/null; do sleep 1; done"
+}
+$outer = ".bail off`n.read '../secrets.sql'`n.shell '$delCmd'`n.shell '$waitCmd'`n.exit`n"
+
+# Test seam, mirror of QOD_SPAWN_DRY_RUN in spawn-quack-node.sh: print the payload and the outer
+# init exactly as the node would get them, and exit without launching duckdb. Used by
+# SpawnScriptEncryptionWindowsSpec (payload) and SpawnScriptWindowsInitSpec (outer init quoting).
 if ($dryRun) {
-  [Console]::Out.Write($initSql)
+  [Console]::Out.Write($payloadSql)
+  # The -init argument, as an SQL comment so the output stays runnable.
+  [Console]::Out.Write("-- init: $initArg`n")
+  [Console]::Out.Write($outer)
+  Remove-NodeDirectory $nodeDir
   exit 0
 }
 
-# Start duckdb with a redirected stdin we keep OPEN (the Windows analogue of
-# the bash FIFO). stdout/stderr are inherited so node logs flow to the
-# manager's console (LocalQuackBackend uses inheritIO()).
+# stdout/stderr are inherited so node logs flow to the manager's console (LocalQuackBackend uses
+# inheritIO()). stdin is closed right after start: nothing is fed to the CLI, so no statement can be
+# injected on the node's own connection. `-init` also stops the CLI from running ~/.duckdbrc.
+# Both files are current-user-only (explicit ACL on Windows, 0600 elsewhere) inside the private node
+# directory; a crash before `.read` leaves the secrets file to the stale sweep of a later spawn.
+[System.IO.File]::WriteAllText($secretsFile, $payloadSql)
+[System.IO.File]::WriteAllText($initFile, $outer)
+function Restrict-ToCurrentUser([string]$file) {
+  if ($onWindows) {
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+      $me, 'FullControl', 'Allow')))
+    Set-Acl -LiteralPath $file -AclObject $acl
+  } else {
+    & chmod 600 $file
+  }
+}
+Restrict-ToCurrentUser $secretsFile
+Restrict-ToCurrentUser $initFile
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName               = $duckdbBin
+$psi.Arguments              = '-init ' + $initArg
 $psi.RedirectStandardInput  = $true
 $psi.RedirectStandardOutput = $false
 $psi.RedirectStandardError  = $false
 $psi.UseShellExecute        = $false
+$psi.WorkingDirectory       = $workDir
 
-$proc = [System.Diagnostics.Process]::Start($psi)
-$proc.StandardInput.Write($initSql)
-$proc.StandardInput.Flush()
-# Do NOT close StandardInput: duckdb's main thread blocks reading it, which
-# keeps the process (and the background quack_serve thread) alive until the
-# manager terminates the tree.
-$proc.WaitForExit()
-exit $proc.ExitCode
+try {
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  # stdin carries nothing; the keep-alive dot-command, not stdin, holds the process open.
+  $proc.StandardInput.Close()
+  # Check that DuckDB really deleted the secrets file after reading it. The delete runs right after
+  # the `.read` returns, i.e. right after quack_serve: once the node answers on its port the file
+  # must be gone within a short grace, or the delete failed and the serving node's own users could
+  # read it (`read_text('../secrets.sql')`), so the node is stopped. A stranger holding the port
+  # cannot cause a false stop: quack_serve then fails, but `.read` still returns and the delete
+  # still runs. Only a node that never listens gets the long bound (a slow INSTALL or catalog).
+  $graceSec   = 20
+  $neverAfter = [DateTime]::UtcNow.AddMinutes(15)
+  $listenedAt = $null
+  while ((Test-Path -LiteralPath $secretsFile) -and -not $proc.HasExited) {
+    if ($null -eq $listenedAt) {
+      $client = [System.Net.Sockets.TcpClient]::new()
+      try { if ($client.ConnectAsync('127.0.0.1', $Port).Wait(200)) { $listenedAt = [DateTime]::UtcNow } }
+      catch {} finally { $client.Dispose() }
+    }
+    if ($null -ne $listenedAt -and ([DateTime]::UtcNow - $listenedAt).TotalSeconds -gt $graceSec) { break }
+    if ($null -eq $listenedAt -and [DateTime]::UtcNow -gt $neverAfter) { break }
+    Start-Sleep -Milliseconds 500
+  }
+  if ((Test-Path -LiteralPath $secretsFile) -and -not $proc.HasExited) {
+    if ($null -ne $listenedAt) {
+      [Console]::Error.WriteLine("ERROR: the node serves on port $Port but did not delete its secrets file within ${graceSec}s; stopping the node")
+    } else {
+      [Console]::Error.WriteLine("ERROR: the node neither listened on port $Port nor deleted its secrets file within 15 minutes; stopping the node")
+    }
+    try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+  }
+  Remove-Item -LiteralPath $secretsFile -Force -ErrorAction SilentlyContinue
+  $proc.WaitForExit()
+  # A normal stop kills this wrapper with the node (taskkill /T), so reaching here means duckdb ended
+  # on its own while the wrapper is alive: the keep-alive only returns once the wrapper is gone. Say
+  # so and exit non-zero rather than vanishing; the manager then sees the node down.
+  [Console]::Error.WriteLine("ERROR: the node's duckdb exited (status $($proc.ExitCode)) while its wrapper was still running; see the node output above")
+  $exitCode = 1
+} finally {
+  Remove-NodeDirectory $nodeDir
+}
+exit $exitCode

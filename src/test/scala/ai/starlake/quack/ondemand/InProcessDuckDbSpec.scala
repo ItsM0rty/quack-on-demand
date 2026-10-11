@@ -66,7 +66,8 @@ class InProcessDuckDbSpec extends AnyFlatSpec with Matchers:
   }
 
   "InProcessDuckDb.url" should "carry the budget as URL options, in memory and on a file" in {
-    InProcessDuckDb.url() shouldBe "jdbc:duckdb:;threads=1;async_threads=1"
+    InProcessDuckDb.url() shouldBe
+      "jdbc:duckdb:;threads=1;async_threads=1;allow_persistent_secrets=false"
     val mem = DriverManager.getConnection(InProcessDuckDb.url())
     try settingsOf(mem) shouldBe ("1", "1")
     finally mem.close()
@@ -74,6 +75,37 @@ class InProcessDuckDbSpec extends AnyFlatSpec with Matchers:
     val file = dir.resolve("t.duckdb")
     val c    = DriverManager.getConnection(InProcessDuckDb.url(file.toAbsolutePath.toString))
     try settingsOf(c) shouldBe ("1", "1")
+    finally
+      c.close()
+      Files.list(dir).iterator().asScala.foreach(Files.deleteIfExists)
+      Files.deleteIfExists(dir)
+  }
+
+  // DuckDB loads every persistent secret of the OS user (~/.duckdb/stored_secrets) into an instance
+  // on first secret use, so an operator's own cloud keys would serve the manager's statements.
+  // `secret_directory` stands in for that home directory here.
+  "An in-process instance" should "not load persistent secrets" in {
+    val dir   = Files.createTempDirectory("qod-inproc-secrets")
+    val plain = new java.util.Properties()
+    plain.setProperty("secret_directory", dir.toString)
+    val maker = DriverManager.getConnection("jdbc:duckdb:", plain)
+    try
+      val st = maker.createStatement()
+      try
+        st.execute("CREATE PERSISTENT SECRET operator_keys (TYPE s3, KEY_ID 'k', SECRET 's')")
+        val rs = st.executeQuery("SELECT count(*) FROM duckdb_secrets()")
+        rs.next(); rs.getInt(1) shouldBe 1
+      finally st.close()
+    finally maker.close()
+    val p = DuckDbExtensionSource(None).connectionProperties
+    p.setProperty("secret_directory", dir.toString)
+    val c = DriverManager.getConnection("jdbc:duckdb:", p)
+    try
+      val st = c.createStatement()
+      try
+        val rs = st.executeQuery("SELECT count(*) FROM duckdb_secrets()")
+        rs.next(); rs.getInt(1) shouldBe 0
+      finally st.close()
     finally
       c.close()
       Files.list(dir).iterator().asScala.foreach(Files.deleteIfExists)

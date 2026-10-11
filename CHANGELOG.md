@@ -23,6 +23,56 @@
   Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
   unhealthy, draining, quarantined or at its `maxConcurrent` cap.
 
+- **Security: nodes and the manager no longer load the OS user's persistent DuckDB secrets.**
+  DuckDB loads every secret stored under `~/.duckdb/stored_secrets` into an instance on first
+  secret use, so a developer's or operator's own cloud keys reached every node (any tenant query
+  could use them) and the manager's in-process DuckDB. Every node now starts with
+  `SET allow_persistent_secrets = false`, before any secret or ATTACH, then puts the secret manager
+  in use so no session can switch it back; the manager's in-process instances carry the same
+  setting. `CREATE PERSISTENT SECRET` on a node now fails: use a temporary secret, or the database's
+  `objectStore`.
+
+- **Security: node init SQL no longer lands in `shell_history()`.** On DuckDB 2.0 the CLI records
+  every statement it reads from stdin, and the spawn scripts fed the node's whole init SQL that way,
+  so `SELECT * FROM shell_history()` on a node returned it: the node token, the catalog Postgres
+  password, and the object-store and federation credentials. The init SQL now reaches duckdb through
+  `-init` (a FIFO on Linux and macOS; on Windows a current-user-only secrets file that DuckDB itself
+  deletes the instant it has read it, named from a no-secrets outer init file), which the CLI does
+  not record. The node's stdin is the null device, so no statement or dot-command can be injected on
+  the node's own connection. The node is kept alive by a `.shell` dot-command that waits for the
+  wrapper process to exit, not by a query: a query pinned a DuckDB transaction (blocking CHECKPOINT
+  on a duckdb-file node and holding a catalog Postgres session idle-in-transaction on a DuckLake
+  node) and on 2.0 could spin a CPU core for the node's life. The wait also means a node no longer
+  outlives a forced kill of its wrapper. A crash before the Windows secrets file is read leaves it
+  only until a later spawn's sweep, and the wrapper stops a node that fails to delete it. On Windows
+  the CLI is only ever handed paths relative to the node's working directory, in ASCII, so a temp
+  directory under a profile with an accented or other non-ASCII name (or a quote) works. A failing init statement still does not stop the node. `-init`
+  also means a node no longer runs the OS user's
+  `~/.duckdbrc`. The CLI only keeps this history in memory when stdin is not a terminal (nothing was
+  written to `~/.duckdb_history`), and 1.x CLIs have no `shell_history()`. If you ran DuckDB 2.0
+  nodes before this release, rotate what they could read: the catalog Postgres passwords, the
+  object-store keys and the federated-source credentials.
+
+- **Nodes run in an empty private working directory.** DuckDB 2.0 reads a file named by an
+  unquoted dotted table name when no such schema exists (`SELECT * FROM x.csv` read `./x.csv` from
+  the manager's own working directory). Every node, on every runtime (local, Windows, fleet,
+  Kubernetes), now starts duckdb in a fresh, empty, per-node directory private to its user, removed
+  when the node stops. A relative local dataPath (the bundled `./ducklake/tpch` default is one) is
+  resolved against the directory the node used to run in and attached with `OVERRIDE_DATA_PATH`,
+  since DuckLake recorded the relative spelling; the override applies to that attach only. Each
+  node now spills to its own `temp_directory` (a per-node directory under `/duckdb-tmp` on
+  Kubernetes, under `.tmp` of the starting directory elsewhere) instead of a `.tmp` shared by every
+  node of the host. An operator's `SET temp_directory` in the database or pool init SQL still wins.
+  Branches of a database with a relative dataPath now record the parent's files by absolute path,
+  and the merge node attaches the branch by its absolute path. BREAKING: a relative path in an
+  operator's database or pool `initSql` or federation SQL (for example `CREATE VIEW ... FROM
+  'data/x.parquet'` or `ATTACH 'x.duckdb'`) no longer resolves against the manager's directory,
+  because the node no longer runs there; use an absolute path or an object-store URL. Every spawn
+  also creates the per-node spill directory under `.tmp/` in the manager's (or `qod start` user's)
+  working directory up front, where duckdb previously created `.tmp` only on first spill.
+  Upgrading: a branch cloned before this release from a relative-dataPath database cannot read the
+  parent's files any more; discard and recreate it.
+
 - **Native client lease.** The manager-to-node native client heartbeats each node connection
   under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).
   Node connections are released on error and on cancel. New `QOD_DUCKDB_EXTENSION_DIR` points the

@@ -400,8 +400,9 @@ class FleetMember:
         if pid is None or pid <= 1 or "spawn-quack-node" not in _cmdline(pid):
             return None
         sys.stderr.write(f"qod fleet join: reaping orphan node pid {pid} from a previous join process\n")
-        # TERM the script so its trap stops duckdb and removes the FIFO; if it lingers, KILL its
-        # whole process group (it leads its own session), which takes the duckdb grandchild too.
+        # TERM the script so its trap stops duckdb and removes the node and spill directories; if
+        # it lingers, KILL its whole process group (it leads its own session), which takes the
+        # duckdb grandchild too.
         for target, sig in ((pid, signal.SIGTERM), (-pid, signal.SIGKILL)):
             try:
                 os.kill(target, sig)

@@ -98,3 +98,39 @@ class BranchClonerSpec extends AnyFlatSpec with Matchers with BranchLiveFixture:
         res.left.toOption.get should include("no DuckLake metadata")
       }
     }
+
+  // A node runs in an empty directory of its own (spawn-quack-node.sh), so a parent file path left
+  // relative (the bundled `./ducklake/tpch` default records one) would resolve there, not where the
+  // parent's files are. The clone resolves it against this process's working directory, the one the
+  // local spawn script starts in.
+  it should "resolve a relative parent data path to an absolute one" in
+    withCatalog("brrel", extra) { (_, parentDir) =>
+      val relative = java.nio.file.Paths.get("").toAbsolutePath.relativize(parentDir).toString + "/"
+      val c        = java.sql.DriverManager.getConnection(
+        ai.starlake.quack.ondemand.state.testkit.TestPostgres.dbUrl(parentMeta("dbName")),
+        parentMeta("pgUser"),
+        parentMeta("pgPassword")
+      )
+      try
+        val st = c.createStatement()
+        try
+          st.executeUpdate(
+            s"UPDATE ducklake_metadata SET value = '$relative' WHERE key = 'data_path'"
+          )
+        finally st.close()
+      finally c.close()
+      withBranchDb { (branchDb, branchDir) =>
+        BranchCloner(parentMeta)
+          .clone(parentMeta("dbName"), branchDb, branchDir.toString + "/")
+          .isRight shouldBe true
+        val br = branchReader(branchDb)
+        try
+          val files = br.filesReferencedAt(br.maxSnapshotId().get)
+          files should not be empty
+          files.foreach { f =>
+            java.nio.file.Path.of(f).isAbsolute shouldBe true
+            Files.exists(java.nio.file.Path.of(f)) shouldBe true
+          }
+        finally br.close()
+      }
+    }
