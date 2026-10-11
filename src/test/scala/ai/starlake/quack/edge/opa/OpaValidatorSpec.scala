@@ -123,8 +123,11 @@ class OpaValidatorSpec extends AnyFlatSpec with Matchers:
     for sql <- List(
         "SELECT * FROM postgres_query('c', 'SELECT 1')",
         "SELECT * FROM sqlite_query('s', 'SELECT 1')",
+        "SELECT * FROM quack_query('quack:h:9494', 'SELECT 1', token := 't')",
+        "SELECT * FROM destroy_external_resource('read_text', '/x')",
         "SELECT getenv('pgPassword')",
-        "SET pg_pool_health_check_query = 'SELECT 1'"
+        "SET pg_pool_health_check_query = 'SELECT 1'",
+        "CALL postgres_configure_pool(health_check_query := 'SELECT 1')"
       )
     do
       val calls = StringBuilder()

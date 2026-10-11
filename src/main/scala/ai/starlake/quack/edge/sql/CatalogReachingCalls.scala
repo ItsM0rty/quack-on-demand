@@ -41,11 +41,21 @@ object CatalogReachingCalls:
   /** Table functions whose target is a run-time string the ACL never sees. */
   private val Fixed = Set("query", "query_table", "json_execute_serialized_sql")
 
-  /** Calls that run raw SQL elsewhere, open an arbitrary connection, or read node env vars. The
-    * postgres entries and `getenv` were verified on the 2.0 CLI; the mysql / sqlite entries are the
-    * SQL-running and connection-target functions those extensions export, listed from the 1.5.6 CLI
-    * (neither extension is in the 2.0 toolchain). `mysql_clear_cache`, `mysql_debug_execution_plan`
-    * and `mysql_explain_federated` run nothing and open nothing.
+  /** Calls that run raw SQL elsewhere, open an arbitrary connection, read node env vars, or invoke
+    * a table function named at run time. The postgres / quack entries and `getenv` were verified on
+    * the 2.0 CLI; the mysql / sqlite entries are the SQL-running and connection-target functions
+    * those extensions export, listed from the 1.5.6 CLI (neither extension is in the 2.0
+    * toolchain). `mysql_clear_cache`, `mysql_debug_execution_plan` and `mysql_explain_federated`
+    * run nothing and open nothing.
+    *
+    * The `*_external_resource` family (new in 2.0) invokes a table function whose NAME is a value:
+    * `destroy_external_resource('read' || '_text', '/x')` ran `read_text` on 2.0, so the name
+    * defeats a lexical screen; refusing the invokers themselves closes it, since they cannot be
+    * named indirectly. `postgres_configure_pool` sets `health_check_query` (run on every pool
+    * acquire), the function twin of the protected `pg_pool_health_check_query`; `quack_query` /
+    * `quack_query_by_name` send raw SQL to a quack endpoint. A DuckDB client's own `quack_query`
+    * runs client-side and never reaches the edge as node SQL (QuackCompatibilitySpec), so refusing
+    * it in node-bound SQL breaks no federation path.
     */
   private val NodeEscaping = Set(
     "postgres_query",
@@ -53,11 +63,19 @@ object CatalogReachingCalls:
     "postgres_scan",
     "postgres_scan_pushdown",
     "postgres_attach",
+    "postgres_configure_pool",
     "mysql_query",
     "mysql_execute",
     "sqlite_query",
     "sqlite_scan",
     "sqlite_attach",
+    "quack_query",
+    "quack_query_by_name",
+    "create_external_resource",
+    "register_external_resource",
+    "register_external_resource_type",
+    "deregister_external_resource",
+    "destroy_external_resource",
     "getenv"
   )
 

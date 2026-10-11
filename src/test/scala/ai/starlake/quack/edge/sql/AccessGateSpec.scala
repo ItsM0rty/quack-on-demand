@@ -93,6 +93,14 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
         "sqlite_query",
         "sqlite_scan",
         "sqlite_attach",
+        "quack_query",
+        "quack_query_by_name",
+        "postgres_configure_pool",
+        "create_external_resource",
+        "register_external_resource",
+        "register_external_resource_type",
+        "deregister_external_resource",
+        "destroy_external_resource",
         "getenv"
       )
     do

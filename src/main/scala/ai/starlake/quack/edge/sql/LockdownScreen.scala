@@ -109,7 +109,13 @@ object LockdownScreen:
   // Read-style functions that take a path or URL as their FIRST argument. A remote URL literal is
   // admitted (UrlExempt), a local path denied; glob (directory listing) never exempts.
   // The list is every DuckDB 2.0 table function (duckdb_functions(), function_type = 'table') whose
-  // first argument is a caller-named file, path list or glob.
+  // first argument is a caller-named file, path list or glob. Rows judged and excluded: the
+  // argument-free duckdb_* / pragma_* / ducklake_* introspection functions (no path);
+  // query / query_table / json_execute_serialized_sql and the postgres_* / mysql_* / sqlite_* /
+  // quack_* / *_external_resource functions (NodeEscapingFunctions); arrow_scan / arrow_scan_dumb
+  // (pointers, not a path); which_secret (matches a path against secrets, opens no file);
+  // ducklake_add_data_files (path is the THIRD argument, in NoPathFunctions below); the write-side
+  // enable_logging / enable_profiling (NoPathFunctions). read_single_*_file are new in 2.0.
   private val FileReadFunctions = Set(
     "read_text",
     "read_blob",
@@ -146,10 +152,13 @@ object LockdownScreen:
   // / mysql / sqlite connection functions + getenv) so the two paths never drift.
   private val NodeEscapingFunctions = CatalogReachingCalls.LockdownNames
 
-  // Other lockdown-only denials that take no path: enable_logging writes a log file under a named
-  // storage_path argument; postgres_configure_pool carries health_check_query, the lever of the
-  // protected setting pg_pool_health_check_query.
-  private val NoPathFunctions = Set("enable_logging", "postgres_configure_pool")
+  // Lockdown-only denials whose caller-named local path is NOT the first argument, so the
+  // first-argument remote exemption must never apply: enable_logging (storage_path) and
+  // enable_profiling (save_location) write a file; ducklake_add_data_files registers a local
+  // Parquet file named in its third argument. (postgres_configure_pool is in NodeEscapingFunctions,
+  // refused for tenant principals under the ACL as well, matching pg_pool_health_check_query.)
+  private val NoPathFunctions =
+    Set("enable_logging", "enable_profiling", "ducklake_add_data_files")
 
   private val DeniedFunctions = FileReadFunctions ++ NodeEscapingFunctions ++ NoPathFunctions
 
@@ -421,11 +430,24 @@ object LockdownScreen:
         case None      => LitVerdict.Local
 
   private def literalVerdict(quoted: String, deniedBuckets: Set[String]): LitVerdict =
-    if !isRemoteLiteral(quoted) then LitVerdict.Local
+    // The argument must be exactly ONE string-literal token before the scheme test, so an
+    // expression that merely starts and ends with a quote cannot pass: `'s3://x'[1:0] ||
+    // '/proc/self/environ'` reads a local file on 2.0 and lexes as several tokens, so it is Local.
+    if !isSingleStringLiteral(quoted) || !isRemoteLiteral(quoted) then LitVerdict.Local
     else
       deniedBucketOf(quoted, deniedBuckets) match
         case Some(b) => LitVerdict.Bucket(b)
         case None    => LitVerdict.Safe
+
+  /** True when `s` lexes, under the shared DuckDB 2.0 lexer, as a single single-quoted string
+    * literal and nothing else (`'it''s'` stays one token). Any operator, bracket, concat or second
+    * token makes it false, so a computed argument never earns the remote exemption.
+    */
+  private def isSingleStringLiteral(s: String): Boolean =
+    val trimmed = s.trim
+    val toks    = SqlLexer.tokens(SqlLexer.engineView(trimmed)).filterNot(_.isTrivia)
+    toks.length == 1 && toks.head.kind == SqlLexer.Kind.Literal &&
+    trimmed.nonEmpty && trimmed.charAt(0) == '\''
 
   /** The denied bucket a remote literal addresses, if any. Object-store schemes match on the
     * BucketKeys authority; http(s) literals match a denied bucket appearing as the first path

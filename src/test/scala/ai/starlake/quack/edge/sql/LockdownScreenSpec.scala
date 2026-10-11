@@ -622,7 +622,14 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT * FROM mysql_query('c', 'SELECT 1')") shouldBe true
     denied("SELECT * FROM sqlite_query('s', 'SELECT 1')") shouldBe true
     denied("SELECT * FROM sqlite_scan('/x.db', 't')") shouldBe true
+    denied("SELECT * FROM quack_query('quack:h:9494', 'SELECT 1', token := 't')") shouldBe true
+    denied("SELECT * FROM quack_query_by_name('c', 'SELECT 1')") shouldBe true
+    denied("CALL postgres_configure_pool(health_check_query := 'SELECT 1')") shouldBe true
     denied("SELECT getenv('pgPassword')") shouldBe true
+    // *_external_resource invokes a table function named at run time; refuse the invokers.
+    denied("SELECT * FROM destroy_external_resource('read' || '_text', '/x')") shouldBe true
+    denied("SELECT * FROM create_external_resource('t', {}, 'r')") shouldBe true
+    denied("SELECT * FROM register_external_resource('t', 'n', 'h')") shouldBe true
     LockdownScreen.screen("SELECT * FROM postgres_query('c', 'x')", Set.empty) match
       case Some(m) => m should not include "over local paths"
       case None    => fail("expected a refusal")
@@ -650,6 +657,25 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
         denied(s"SELECT * FROM $fn('s3://staging/x.csv')") shouldBe false
         deniedB(s"SELECT * FROM $fn('s3://lakebucket/x.csv')") shouldBe true
       }
+  }
+
+  it should "not grant the remote exemption to an argument built from string operations" in {
+    // Pre-existing smuggle: the arg must lex as exactly ONE string-literal token. An expression
+    // that merely starts with a remote-looking literal reads a local file on 2.0, so it is denied.
+    denied("SELECT * FROM read_text('s3://x'[1:0] || '/proc/self/environ')") shouldBe true
+    denied("SELECT * FROM read_csv('s3://x' || '/etc/passwd')") shouldBe true
+    denied("SELECT * FROM read_text('s3://staging/ok.csv')") shouldBe false
+    denied("SELECT * FROM read_text('s3://staging/it''s.csv')") shouldBe false
+  }
+
+  it should "deny the write-side and third-argument-path functions (no path exemption)" in {
+    // enable_profiling writes a profile file; ducklake_add_data_files registers a local Parquet
+    // file named in its third argument, so a remote-looking first argument must not exempt it.
+    denied("CALL enable_profiling(save_location := '/tmp/p.json')") shouldBe true
+    denied("SELECT * FROM ducklake_add_data_files('c', 't', '/tmp/x.parquet')") shouldBe true
+    denied(
+      "SELECT * FROM ducklake_add_data_files('c', 't', 's3://staging/x.parquet')"
+    ) shouldBe true
   }
 
   "the postgres control functions" should "be denied (ATTACH and pool-config bypasses)" in {

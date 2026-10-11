@@ -515,6 +515,10 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
       "CALL postgres_execute('acme_other', 'DROP TABLE t')",
       "SELECT * FROM postgres_scan('host=h dbname=qod user=postgres', 'public', 'qodstate_user')",
       "SELECT * FROM postgres_attach('dbname=qod', source := 'pg')",
+      "SELECT * FROM quack_query('quack:h:9494', 'SELECT 1', token := 't')",
+      "SELECT * FROM quack_query_by_name('c', 'SELECT 1')",
+      "CALL postgres_configure_pool(health_check_query := 'SELECT 1')",
+      "SELECT * FROM destroy_external_resource('read_text', '/x')",
       "SELECT getenv('pgPassword')"
     ).foreach { sql =>
       withClue(sql) {
