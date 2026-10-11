@@ -117,7 +117,10 @@ object LockdownScreen:
     * bypasses per-table grants and can corrupt catalog-referenced data files).
     */
   def screen(sql: String, deniedBuckets: Set[String]): Option[String] =
-    splitStatements(sql).iterator.flatMap(screenOne(_, deniedBuckets)).nextOption()
+    // First: on a DuckDB 1.x engine a backtick pair can hide a call from every check below.
+    BacktickScreen
+      .find(sql)
+      .orElse(splitStatements(sql).iterator.flatMap(screenOne(_, deniedBuckets)).nextOption())
 
   private def screenOne(stmt: String, deniedBuckets: Set[String]): Option[String] =
     // Normalized ONLY for screening, in three passes, each closing a gap the previous one leaves

@@ -141,3 +141,17 @@ class OpaValidatorSpec extends AnyFlatSpec with Matchers:
     // A read inside the ceiling still goes to OPA.
     v.validate(ctx("SELECT * FROM orders", Some(ro))) shouldBe Allowed
     calls.toString should include("/v1/data/qod/authz/statement")
+
+  it should "deny a backtick pair without asking OPA while the backtick screen is active" in:
+    assume(BacktickScreen.active, "backtick screen is inert on this DuckDB pin")
+    val calls = StringBuilder()
+    val b     = "`"
+    val sql = s"SELECT 1 $b 2; SET search_path='tpch.other'; SELECT * FROM orders WHERE 3 $b 4 = 7"
+    validator(Right((200, """{"result":{"allow":true}}""")), calls)
+      .validate(ctx(sql, Some(eff(true)))) match
+      case Denied(reason, _, _) => reason should include("backtick")
+      case other                => fail(s"expected Denied, got $other")
+    calls.toString shouldBe ""
+    // A superuser never reaches OPA or the screen.
+    validator(Right((200, """{"result":{"allow":true}}""")), calls)
+      .validate(ctx(sql, Some(eff(false)))) shouldBe Allowed

@@ -49,13 +49,14 @@ object AccessGate:
     // a string the parser cannot see, so the wildcard's tenant-catalog scoping cannot apply.
     // The same holds for a batch that moves the schema or search path: every bare name after
     // it resolves somewhere `config` does not describe, possibly in a catalog outside the
-    // tenant's (see SessionScopeScreen).
-    CatalogReachingCalls.find(statement) match
-      case Some(fn) => GateOutcome.Refuse(CatalogReachingCalls.denyReason(fn), false, "")
-      case None     =>
-        SessionScopeScreen.find(statement) match
-          case Some(reason) => GateOutcome.Refuse(reason, false, "")
-          case None         => evaluateParsed(statement, config, sessionCatalog, filteredMetadata)
+    // tenant's (see SessionScopeScreen). The backtick screen goes first: on a DuckDB 1.x engine a
+    // backtick pair can hide separators and calls from both screens after it (see BacktickScreen).
+    BacktickScreen
+      .find(statement)
+      .orElse(CatalogReachingCalls.find(statement).map(CatalogReachingCalls.denyReason))
+      .orElse(SessionScopeScreen.find(statement)) match
+      case Some(reason) => GateOutcome.Refuse(reason, false, "")
+      case None         => evaluateParsed(statement, config, sessionCatalog, filteredMetadata)
 
   private def evaluateParsed(
       statement: String,
