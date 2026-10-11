@@ -74,9 +74,9 @@ object FileAccessScreen:
   /** Table functions that open no caller-named file or directory, each judged on the 2.0 CLI:
     * catalog and node introspection (`duckdb_*`, `pragma_*`; `pragma_table_info('<path>')` fails on
     * a path rather than reading it), value generators and test tables, text tokenizers and JSON
-    * walkers, Arrow pointer scans, static TPC-H text, `which_secret` (matches a path against the
-    * secrets, opens nothing), `iceberg_scan_tasks` (its input is a scan plan, read by a refused
-    * reader), `checkpoint` (a catalog), and the front door's client stream.
+    * walkers, Arrow pointer scans, static TPC-H text, `iceberg_scan_tasks` (its input is a scan
+    * plan, read by a refused reader), `checkpoint` (a catalog), and the front door's client stream.
+    * The introspection showing node state is [[NodeStateScreen]]'s, refused there.
     */
   private[sql] val NoFileFunctions: Set[String] = Set(
     "arrow_scan",
@@ -102,9 +102,7 @@ object FileAccessScreen:
     "test_vector_types",
     "tpch_answers",
     "tpch_queries",
-    "unnest",
-    "which_secret",
-    "whoami"
+    "unnest"
   ) ++ Set(
     "approx_database_count",
     "available_metrics",
@@ -112,22 +110,14 @@ object FileAccessScreen:
     "connection_count",
     "constraints",
     "coordinate_systems",
-    "databases",
     "dependencies",
     "dialects",
     "eviction_queues",
-    "extension_repositories",
-    "extensions",
-    "external_file_cache",
     "external_resource_types",
-    "external_resources",
     "functions",
     "grammar_extensions",
     "indexes",
     "keywords",
-    "log_contexts",
-    "logs",
-    "logs_parsed",
     "memory",
     "optimizers",
     "prepared_statements",
@@ -135,11 +125,8 @@ object FileAccessScreen:
     "schemas",
     "secret_type_parameters",
     "secret_types",
-    "secrets",
     "sequences",
-    "settings",
     "tables",
-    "temporary_files",
     "triggers",
     "types",
     "variables",
@@ -150,7 +137,6 @@ object FileAccessScreen:
     "metadata_info",
     "platform",
     "show",
-    "storage_info",
     "table_info",
     "user_agent",
     "version"
@@ -159,12 +145,12 @@ object FileAccessScreen:
   /** Whether the tenant screens have judged the table function `name` (FileAccessFunctionsSpec):
     * refused as a file reader here, as a catalog-reaching or node-escaping call
     * ([[CatalogReachingCalls]]), as a node-wide or credential-exposing call
-    * ([[NodeSettingScreen]]), or admitted on purpose.
+    * ([[NodeSettingScreen]]), as node state ([[NodeStateScreen]]), or admitted on purpose.
     */
   private[sql] def judged(name: String): Boolean =
     FileFunctions(name) || NoFileFunctions(name) || CatalogReachingCalls.LockdownNames(name) ||
       name.startsWith("ducklake_") || NodeSettingScreen.NodeWideCalls(name) ||
-      NodeSettingScreen.SecretCalls(name)
+      NodeSettingScreen.SecretCalls(name) || NodeStateScreen.Refused.contains(name)
 
   /** Some(reason) when `sql` reads or writes a file directly. */
   def find(sql: String): Option[String] = find(sql, FileReferences.extraction(sql))

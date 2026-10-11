@@ -3736,3 +3736,38 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         Some(wildcardAllSet)
       )
       .unsafeRunSync() shouldBe a[Right[?, ?]]
+
+  "node-state introspection" should "be refused to a tenant user, ACL off or on, and open to a superuser" in:
+    Seq(StatementValidator.allowAll, wildcardAcl).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      List(
+        "SELECT * FROM duckdb_secrets()",
+        "SELECT name, value FROM duckdb_settings()",
+        "SELECT current_setting('s3_secret_access_key')",
+        "SELECT * FROM duckdb_external_file_cache()",
+        "PRAGMA database_list"
+      ).foreach { sql =>
+        withClue(s"$v: $sql") {
+          router
+            .execute("ns-1", "alice", poolKey, sql, Some(wildcardAllSet))
+            .unsafeRunSync()
+            .swap
+            .toOption
+            .get
+            .reason should include("shows node state")
+          captured() should not include sql
+          router
+            .execute("ns-2", "alice", poolKey, sql, Some(superuserSet))
+            .unsafeRunSync() shouldBe a[Right[?, ?]]
+        }
+      }
+      router
+        .execute(
+          "ns-3",
+          "alice",
+          poolKey,
+          "SELECT current_setting('TimeZone')",
+          Some(wildcardAllSet)
+        )
+        .unsafeRunSync() shouldBe a[Right[?, ?]]
+    }

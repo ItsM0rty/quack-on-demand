@@ -11,6 +11,7 @@ import ai.starlake.quack.edge.sql.{
   Denied,
   LockdownScreen,
   NodeSettingScreen,
+  NodeStateScreen,
   StatementValidator,
   TriggerScreen,
   ValidationContext,
@@ -529,7 +530,8 @@ final class FlightSqlRouter(
       else None
     // Superuser-only, whatever the ACL mode and the grants, and nobody's under lockdown (the
     // screens' scaladocs have the why): the DuckLake metadata catalog and the key-returning
-    // DuckLake functions, and the settings and calls that act on the whole shared node.
+    // DuckLake functions, the settings and calls that act on the whole shared node, and the
+    // introspection that shows node state (credentials, paths, other sessions).
     val restrictedDenial =
       if isSuperuser && !lockedDown then None
       else
@@ -537,6 +539,7 @@ final class FlightSqlRouter(
           .screen(sql)
           .map(r => s"catalog: $r")
           .orElse(NodeSettingScreen.screenNodeWide(sql).map(r => s"node: $r"))
+          .orElse(NodeStateScreen.find(sql).map(r => s"node: $r"))
 
     // Trigger DDL is reserved to superusers and the pool tenant's admins, whatever the ACL mode
     // and the lockdown flag (TriggerScreen's scaladoc has the why). The screen runs first so the
