@@ -336,6 +336,12 @@ $sb = [System.Text.StringBuilder]::new()
 # The CLI exits on the first error of an -init file by default; a node has always carried on past
 # a failing statement (an unreachable federated source, an offline INSTALL), so keep doing that.
 [void]$sb.AppendLine('.bail off')
+# First, before any CREATE SECRET or ATTACH: DuckDB loads every persistent secret of the OS user
+# (~/.duckdb/stored_secrets) on first secret use, which would put an operator's own cloud keys on
+# every node. Reading duckdb_secrets() then puts the secret manager in use, after which DuckDB
+# refuses to change the setting from any session. Mirrors spawn-quack-node.sh.
+[void]$sb.AppendLine('SET allow_persistent_secrets = false;')
+[void]$sb.AppendLine('SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();')
 if (-not [string]::IsNullOrEmpty($proxySql))  { [void]$sb.AppendLine($proxySql) }
 # Before dbInitSql, so an operator's own SET temp_directory still wins.
 [void]$sb.AppendLine("SET temp_directory = '$($spillDir.Replace("'", "''"))';")

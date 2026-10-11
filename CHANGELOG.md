@@ -23,6 +23,15 @@
   Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
   unhealthy, draining, quarantined or at its `maxConcurrent` cap.
 
+- **Security: nodes and the manager no longer load the OS user's persistent DuckDB secrets.**
+  DuckDB loads every secret stored under `~/.duckdb/stored_secrets` into an instance on first
+  secret use, so a developer's or operator's own cloud keys reached every node (any tenant query
+  could use them) and the manager's in-process DuckDB. Every node now starts with
+  `SET allow_persistent_secrets = false`, before any secret or ATTACH, then puts the secret manager
+  in use so no session can switch it back; the manager's in-process instances carry the same
+  setting. `CREATE PERSISTENT SECRET` on a node now fails: use a temporary secret, or the database's
+  `objectStore`.
+
 - **Security: node init SQL no longer lands in `shell_history()`.** On DuckDB 2.0 the CLI records
   every statement it reads from stdin, and the spawn scripts fed the node's whole init SQL that way,
   so `SELECT * FROM shell_history()` on a node returned it: the node token, the catalog Postgres

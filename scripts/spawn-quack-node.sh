@@ -381,6 +381,12 @@ INIT_SQL=""
 # The CLI exits on the first error of an -init file by default; a node has always carried on past
 # a failing statement (an unreachable federated source, an offline INSTALL), so keep doing that.
 INIT_SQL+=$'.bail off\n'
+# First, before any CREATE SECRET or ATTACH: DuckDB loads every persistent secret of the OS user
+# (~/.duckdb/stored_secrets) on first secret use, which would put an operator's own cloud keys on
+# every node. Reading duckdb_secrets() then puts the secret manager in use, after which DuckDB
+# refuses to change the setting from any session.
+INIT_SQL+=$'SET allow_persistent_secrets = false;\n'
+INIT_SQL+=$'SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();\n'
 INIT_SQL+="$PROXY_SQL"$'\n'
 # Cgroup-derived memory_limit / temp_directory / threads (see above) run
 # right after the proxy settings and before dbInitSql, so an operator's

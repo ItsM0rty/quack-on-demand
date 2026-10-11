@@ -15,7 +15,11 @@ import java.util.Properties
   * one.
   *
   * libquackwire's process-wide helper instance (`shared_client_properties` in quackwire.cpp)
-  * applies the same two settings through `DBConfig`.
+  * applies the same two thread settings through `DBConfig`.
+  *
+  * `allow_persistent_secrets = false`: DuckDB otherwise loads every persistent secret of the OS
+  * user (`~/.duckdb/stored_secrets`) on first secret use, so an operator's own cloud keys would
+  * serve the manager's statements in place of the configured ones.
   */
 object InProcessDuckDb:
 
@@ -23,7 +27,8 @@ object InProcessDuckDb:
     * refuses a second connection to the same database file with a different configuration, so every
     * connection to one file must carry them.
     */
-  val Settings: List[(String, String)] = List("threads" -> "1", "async_threads" -> "1")
+  val Settings: List[(String, String)] =
+    List("threads" -> "1", "async_threads" -> "1", "allow_persistent_secrets" -> "false")
 
   /** [[Settings]] as JDBC connection properties. A fresh object per call: callers add their own. */
   def properties: Properties =

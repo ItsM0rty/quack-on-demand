@@ -114,3 +114,50 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
       history should not include "quack_serve"
     }
   }
+
+  // DuckDB loads every persistent secret of the OS user (~/.duckdb/stored_secrets) into a node on
+  // first secret use, so an operator's own cloud keys would serve every tenant on the node. The
+  // node starts with persistent secrets off and the secret manager already in use, which DuckDB
+  // then refuses to switch back.
+  it should "not load the OS user's persistent secrets" in {
+    assume(pinnedDuckdb.nonEmpty, "the pinned DuckDB CLI is not available")
+    val home = Files.createDirectories(tempDir.resolve("home"))
+    Process(
+      Seq(
+        pinnedDuckdb.get.toString,
+        "-c",
+        "CREATE PERSISTENT SECRET operator_keys (TYPE s3, KEY_ID 'AKIAOPERATOR', SECRET 's')"
+      ),
+      tempDir.toFile,
+      "HOME"              -> home.toString,
+      "DUCKDB_AGENT_MODE" -> "0"
+    ).!! should include("true")
+    withNode("SELECT 1;", "HOME" -> home.toString) { port =>
+      onNode(port, "SELECT count(*) FROM duckdb_secrets()") shouldBe List("0")
+      onNode(port, "SELECT current_setting('allow_persistent_secrets')") shouldBe List("false")
+    }
+  }
+
+  "the node init SQL" should "turn persistent secrets off before anything else" in {
+    val dir = NodeSecretFiles.writePrivateDir(
+      Map(NodeSecretFiles.TokenKey -> Token, "pgPassword" -> "p"),
+      Some(tempDir)
+    )
+    val lines = Process(
+      Seq("bash", script, "21999"),
+      None,
+      "QOD_SPAWN_DRY_RUN"          -> "1",
+      "kind"                       -> "ducklake",
+      "schemaName"                 -> "main",
+      "dbName"                     -> "acme_lake",
+      "dataPath"                   -> tempDir.resolve("lake").toString,
+      "dbInitSql"                  -> "SELECT 'db-init';",
+      NodeSecretFiles.DirEnv       -> dir.toString,
+      NodeSecretFiles.EphemeralEnv -> "1"
+    ).!!.linesIterator.filter(_.trim.nonEmpty).toVector
+    lines.take(3) shouldBe Vector(
+      ".bail off",
+      "SET allow_persistent_secrets = false;",
+      "SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();"
+    )
+  }
