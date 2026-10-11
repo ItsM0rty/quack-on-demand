@@ -23,6 +23,7 @@ import ai.starlake.quack.ondemand.fleet.MissingSlots
 import ai.starlake.quack.ondemand.runtime.{
   NoFreeServer,
   NodeLockdown,
+  NodePaths,
   ObjectStoreSecret,
   QuackBackend
 }
@@ -948,10 +949,12 @@ final class PoolSupervisor(
       // two different tenants), so an unscoped scan could match an unrelated tenant's db.
       val parentEncrypted =
         findTenantDb(tenantName, parentDbName).exists(_.encrypted)
-      val opts =
-        if parentEncrypted then
-          s"DATA_PATH ${SqlLiterals.duckdbLiteral(branchDataPath)}, READ_ONLY, ENCRYPTED"
-        else s"DATA_PATH ${SqlLiterals.duckdbLiteral(branchDataPath)}, READ_ONLY"
+      // The merge node runs in an empty directory of its own: a relative branch prefix is attached
+      // by its absolute path, overriding the relative spelling DuckLake recorded (this attach only).
+      val dataPathOpt =
+        s"DATA_PATH ${SqlLiterals.duckdbLiteral(NodePaths.resolve(branchDataPath))}, READ_ONLY" +
+          (if NodePaths.isRelativeLocal(branchDataPath) then ", OVERRIDE_DATA_PATH true" else "")
+      val opts = if parentEncrypted then s"$dataPathOpt, ENCRYPTED" else dataPathOpt
       // Same unquoted connection-string shape as spawn-quack-node.sh: every value passed
       // TenantDb.validateSafety (no quote, semicolon, backslash or newline). The password rides
       // a temporary secret dropped right after the ATTACH, never the attach path, which

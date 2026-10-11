@@ -1,5 +1,6 @@
 package ai.starlake.quack.ondemand.branch
 
+import ai.starlake.quack.ondemand.runtime.NodePaths
 import com.typesafe.scalalogging.LazyLogging
 import org.postgresql.PGConnection
 
@@ -210,7 +211,9 @@ final class BranchCloner(
     val s  = q(schema)
     val st = dst.createStatement()
     try
-      val parentPath = {
+      // A relative data_path is resolved the way a node resolves it: nodes run in an empty
+      // directory of their own, where a relative file path would find nothing.
+      val parentPath = NodePaths.resolve {
         val rs = st.executeQuery(s"SELECT value FROM $s.ducklake_metadata WHERE key = 'data_path'")
         try if rs.next() then rs.getString(1) else ""
         finally rs.close()
