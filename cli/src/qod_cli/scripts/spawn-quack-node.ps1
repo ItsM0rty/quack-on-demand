@@ -492,7 +492,7 @@ if ($targetWindows) {
 } else {
   $readPath = $secretsFile
   $delCmd   = "rm -f `"$secretsFile`""
-  $waitCmd  = "while kill -0 $PID 2>/dev/null; do sleep 1; done"
+  $waitCmd  = "tail --pid=$PID -f /dev/null 2>/dev/null || while kill -0 $PID 2>/dev/null; do sleep 1; done"
 }
 $outer = ".bail off`n.read '$readPath'`n.shell '$delCmd'`n.shell '$waitCmd'`n.exit`n"
 

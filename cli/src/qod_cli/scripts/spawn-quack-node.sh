@@ -534,8 +534,10 @@ INIT_SQL+="SELECT listen_url FROM quack_serve('quack:${NODE_BIND}:$PORT', token 
 # transaction and no scheduler task: it waits for this wrapper's pid ($$) to disappear, so a SIGKILL
 # of the wrapper (which skips the trap) ends the loop, `.shell` returns, the CLI reads EOF from
 # /dev/null and exits - the node no longer outlives its wrapper. `.exit` right after keeps any bytes
-# a later writer could append to the init pipe from ever being read.
-INIT_SQL+=$'.shell "while kill -0 '"$$"$' 2>/dev/null; do sleep 1; done"\n.exit\n'
+# a later writer could append to the init pipe from ever being read. GNU `tail --pid` (Linux, the
+# node image) waits without forking; where it is missing (macOS, busybox) it fails at once and the
+# `kill -0` loop, one `sleep 1` fork a second, takes over.
+INIT_SQL+=$'.shell "tail --pid='"$$"$' -f /dev/null 2>/dev/null || while kill -0 '"$$"$' 2>/dev/null; do sleep 1; done"\n.exit\n'
 
 # Test seam: print the assembled init SQL and exit without launching duckdb.
 # Used by SpawnScriptEncryptionSpec to assert the emitted SQL, which is the only
