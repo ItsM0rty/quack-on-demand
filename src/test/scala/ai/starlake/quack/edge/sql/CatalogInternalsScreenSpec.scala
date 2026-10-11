@@ -80,6 +80,48 @@ class CatalogInternalsScreenSpec extends AnyFlatSpec with Matchers:
       "SET GLOBAL schema = getvariable('s')"
     ).foreach(sql => withClue(sql)(refused(sql) shouldBe true))
 
+  it should "refuse a computed search_path / schema in every setting form" in {
+    // PRAGMA search_path / schema = <expr> applies on 2.0 like SET does (verified), and the edge
+    // prefixes a PRAGMA with USE, so the batch below read ducklake_data_file from the metadata
+    // catalog before this screen read PRAGMA heads.
+    val computed = "'__duck' || 'lake_metadata_lake'"
+    Seq(
+      s"PRAGMA search_path = $computed",
+      s"PRAGMA schema = $computed",
+      s"PRAGMA search_path($computed)",
+      s"USE lake.main; PRAGMA search_path = $computed; SELECT count(*) FROM ducklake_data_file",
+      s"SET SESSION search_path = $computed",
+      s"SET LOCAL search_path TO $computed",
+      s"SET GLOBAL schema = $computed",
+      "SET\"search_path\"='__duck'||'lake_metadata_lake'",
+      "PRAGMA\"search_path\"='__duck'||'lake_metadata_lake'",
+      "PRAGMA `schema`=concat('__duck', 'lake_metadata_lake')",
+      s"EXPLAIN ANALYZE SET search_path = $computed",
+      s"EXPLAIN ANALYZE PRAGMA search_path = $computed",
+      s"EXPLAIN (ANALYZE) PRAGMA schema = $computed",
+      s"PREPARE p AS SET search_path = $computed",
+      "SET search_path = getvariable('v')",
+      "PRAGMA search_path = getvariable('v')",
+      "SET search_path =- 'x'"
+    ).foreach { sql =>
+      withClue(sql)(CatalogInternalsScreen.screen(sql).exists(_.contains("computed")) shouldBe true)
+    }
+  }
+
+  it should "admit constant and reset forms of search_path / schema" in
+    Seq(
+      "RESET search_path",
+      "RESET SESSION schema",
+      "PRAGMA search_path = 'lake.main'",
+      "PRAGMA schema='main'",
+      "PRAGMA search_path('lake.main')",
+      "SET search_path = lake.main",
+      "SET SESSION search_path TO 'lake.main', 'memory.main'",
+      "EXPLAIN ANALYZE PRAGMA search_path = 'lake.main'",
+      "UPDATE t SET search_path = a || b",
+      "PRAGMA table_info('t')"
+    ).foreach(sql => withClue(sql)(refused(sql) shouldBe false))
+
   it should "admit ordinary reads, the data tables, constant targets and the other DuckLake calls" in
     Seq(
       "SELECT * FROM lake.main.customer",

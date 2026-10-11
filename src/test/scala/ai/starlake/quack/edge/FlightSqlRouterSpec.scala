@@ -1426,6 +1426,19 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     admitted.unsafeRunSync().isRight shouldBe true
     openCaptured() should include("json_execute_serialized_sql")
 
+  it should "refuse a computed PRAGMA search_path batch to every non-superuser" in:
+    val batch =
+      "PRAGMA search_path = '__duck' || 'lake_metadata_lake'; " +
+        "SELECT encryption_key FROM ducklake_data_file"
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      val out                   = router
+        .execute("dlm-15", "alice", poolKey, batch, effectiveSet = Some(wildcardAllSet))
+        .unsafeRunSync()
+      withClue(v.getClass.getSimpleName)(out.swap.toOption.get.reason should include("computed"))
+      captured() shouldBe ""
+    }
+
   "the Iceberg catalog functions" should "be refused to *.*.* ALL under QoD and OPA, not su" in:
     val calls = Seq(
       "SELECT * FROM duckdb_table_sample('memory.main.t')",

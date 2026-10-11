@@ -104,34 +104,39 @@ object CatalogInternalsScreen:
         .orElse(computedNameSetting(sql))
         .orElse(if scan.truncated then Some(NestingRefusal) else None)
 
-  /** A `SET [scope] search_path | schema` whose value is anything but constants and names. */
+  /** A `search_path` / `schema` whose value is computed at run time, in any setting form the shared
+    * reader ([[NodeSettingScreen.settingAt]]) recognizes: `SET [SESSION | GLOBAL | LOCAL]`,
+    * `PRAGMA` assignment and call forms (`PRAGMA search_path = <expr>` applies on 2.0 like SET),
+    * glued quotes, behind EXPLAIN / PREPARE. `RESET` carries no value. After the introducer (`=` or
+    * `TO`, or the parens of a call form), any operator other than `.` and any punctuation other
+    * than `,` or `;` computes the value; an operator glued to `=` (`=-`) is no introducer.
+    */
   private def computedNameSetting(sql: String): Option[String] =
     LockdownScreen
       .splitStatements(sql)
       .iterator
       .flatMap { stmt =>
         val h = StatementHead.of(stmt)
-        val i = h.start
-        if !h.word(i).contains("set") then None
-        else
-          val nameAt =
-            if h.word(i + 1).exists(Set("session", "global", "local")) &&
-              h.identifier(i + 2).isDefined
-            then i + 2
-            else i + 1
-          h.identifier(nameAt).filter(NameSettings).filter { _ =>
-            h.toks.drop(nameAt + 1).zipWithIndex.exists { case (t, k) =>
-              val text = h.view.substring(t.start, t.end)
-              // The first `=` (or TO) introduces the value; any operator, paren or cast after it
-              // computes the value at run time.
-              val introducer = k == 0 && (text == "=" || text.equalsIgnoreCase("to"))
-              !introducer && (t.kind match
-                case ai.starlake.sql.SqlLexer.Kind.Operator => true
-                case ai.starlake.sql.SqlLexer.Kind.Punct    =>
-                  text != "," && text != "." && text != ";"
-                case _ => false)
+        NodeSettingScreen.settingAt(h).filter((name, _) => NameSettings(name)).flatMap {
+          (name, at) =>
+            val texts = h.toks
+              .drop(at + 1)
+              .map(t => t -> h.view.substring(t.start, t.end))
+              .reverse
+              .dropWhile(_._2 == ";")
+              .reverse
+            val value = texts.headOption.map(_._2) match
+              case Some(t) if t == "=" || t.equalsIgnoreCase("to") => texts.drop(1)
+              case Some("(") if texts.last._2 == ")"               => texts.drop(1).dropRight(1)
+              case _                                               => texts
+            val computed = value.exists { (t, text) =>
+              t.kind match
+                case ai.starlake.sql.SqlLexer.Kind.Operator => text != "."
+                case ai.starlake.sql.SqlLexer.Kind.Punct    => text != "," && text != ";"
+                case _                                      => false
             }
-          }
+            Option.when(computed)(name)
+        }
       }
       .nextOption()
       .map(computedRefusal)

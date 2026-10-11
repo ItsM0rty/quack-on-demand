@@ -73,7 +73,8 @@
     (QoD grants, OPA, ACL off) and the grants (the built-in `qod_all_tables` `*.*.* ALL` no longer
     reaches them), and to every caller on a pool under lockdown. Any quoting, `USE`,
     `SET search_path`, string arguments and `query()` bodies are covered; a run-time-computed
-    target (`query_table('__duck' || 'lake...')`, `SET search_path = <expression>`, the
+    target (`query_table('__duck' || 'lake...')`, a `search_path` / `schema` set to an expression
+    in any `SET` / `PRAGMA` form, the
     `postgres_query` / `query` family with a non-constant argument) is refused for the same
     callers. The string-named table carriers (`query_table('<name>')`, `query('<sql>')`,
     `duckdb_table_sample('<table>')`) have their literal screened for the metadata catalog and are

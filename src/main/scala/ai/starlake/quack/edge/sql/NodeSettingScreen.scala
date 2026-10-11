@@ -262,14 +262,14 @@ object NodeSettingScreen:
 
   private def nodeWideOne(h: StatementHead.Head): Option[String] =
     val i = h.start
-    h.word(i) match
-      case Some("set" | "reset" | "pragma") =>
-        val scoped = h.word(i + 1).exists(Scopes) && h.identifier(i + 2).isDefined
-        if scoped && h.word(i + 1).contains("global") then Some(GlobalScopeRefusal)
-        else
-          h.identifier(if scoped then i + 2 else i + 1).filter(isNodeWide).map(_ => NodeWideRefusal)
-      case Some("force") if h.word(i + 1).contains("checkpoint") => Some(NodeWideRefusal)
-      case _                                                     => None
+    if h.word(i).contains("force") && h.word(i + 1).contains("checkpoint") then
+      Some(NodeWideRefusal)
+    else
+      settingAt(h).flatMap { (name, at) =>
+        // The name sits past a scope word exactly when the statement is scoped.
+        if at == i + 2 && h.word(i + 1).contains("global") then Some(GlobalScopeRefusal)
+        else Option.when(isNodeWide(name))(NodeWideRefusal)
+      }
 
   private val Scopes = Set("session", "global", "local")
 
@@ -319,11 +319,19 @@ object NodeSettingScreen:
   /** SET [SESSION | GLOBAL | LOCAL] <name>, RESET ..., PRAGMA <name>: the name, if the carried
     * statement is one of those. A scope word followed by a name is a scope.
     */
-  private def settingTarget(h: StatementHead.Head): Option[String] =
+  private def settingTarget(h: StatementHead.Head): Option[String] = settingAt(h).map(_._1)
+
+  /** The one reading of a setting statement every screen shares: for SET [SESSION | GLOBAL | LOCAL]
+    * <name>, RESET [scope] <name> and PRAGMA <name> (assignment and call form), the lowercased,
+    * unquoted name and the index of its token in `h.toks`, so a caller can read the value that
+    * follows. Read from DuckDB 2.0's tokens: glued quotes, comments between tokens, the statement
+    * an EXPLAIN / PREPARE carries.
+    */
+  private[sql] def settingAt(h: StatementHead.Head): Option[(String, Int)] =
     val i = h.start
     h.word(i) match
       case Some("set" | "reset" | "pragma") =>
         val target =
           if h.word(i + 1).exists(Scopes) && h.identifier(i + 2).isDefined then i + 2 else i + 1
-        h.identifier(target)
+        h.identifier(target).map(_ -> target)
       case _ => None
