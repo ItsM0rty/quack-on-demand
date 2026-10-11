@@ -840,8 +840,9 @@ private[cls] object ResidualColumns:
     /** A NATURAL join: it compares, raw, every column its two sides share. */
     case NaturalJoin(left: List[Source], right: List[Source])
 
-    /** `t AS a(x, y)` over a base table: the list renames t's columns positionally, so a covered
-      * column is read under a name no policy holds.
+    /** `t AS a(x, y)` over a base table, or `(t ..) AS a(x, y)` over a parenthesized FROM item
+      * holding it: the list renames t's columns positionally, so a covered column is read under a
+      * name no policy holds.
       */
     case AliasColumns(table: String)
 
@@ -988,6 +989,12 @@ private[cls] object ResidualColumns:
             ai.starlake.acl.parser.TableExtractor.statementSource(pfi).foreach { src =>
               forms += (Form.StatementSource(src.toOption.map(t => unquote(t.getName))) -> scopes)
             }
+            // `(customer) AS c(a, b, e)`, `(customer JOIN orders ..) j(..)`: the list renames the
+            // columns of every base table inside the parentheses, nested ones included.
+            if Option(pfi.getAlias).flatMap(a => Option(a.getAliasColumns)).exists(!_.isEmpty) then
+              sourcesOf(pfi, ctes).flatMap(_.table).foreach { t =>
+                forms += (Form.AliasColumns(t) -> scopes)
+              }
           case _ => ()
         // A WITH clause: its names are in scope for the whole select. Each body is walked with the
         // scopes ENCLOSING this select and sees only what DuckDB lets it see: the CTEs declared

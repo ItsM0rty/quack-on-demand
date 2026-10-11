@@ -1417,17 +1417,25 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         enabled = true
       )
     )
-    val out = router
-      .execute(
-        "cls-alias-cols",
-        "alice",
-        poolKey,
-        "SELECT e FROM customer AS c(a, b, e)",
-        Some(effWithPolicies(List(maskCustomerEmailCls)))
-      )
-      .unsafeRunSync()
-    out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
-    capturedSql() shouldBe ""
+    List(
+      "SELECT e FROM customer AS c(a, b, e)",
+      "SELECT e FROM (customer) AS c(a, b, e)",
+      "SELECT x.e FROM (customer AS c) x(a, b, e)"
+    ).foreach { sql =>
+      withClue(sql) {
+        val out = router
+          .execute(
+            "cls-alias-cols",
+            "alice",
+            poolKey,
+            sql,
+            Some(effWithPolicies(List(maskCustomerEmailCls)))
+          )
+          .unsafeRunSync()
+        out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+        capturedSql() shouldBe ""
+      }
+    }
 
   // ---- ProtectedWriteGuard integration tests ----
   //

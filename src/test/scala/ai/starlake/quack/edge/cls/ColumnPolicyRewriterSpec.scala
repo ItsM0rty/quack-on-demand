@@ -1037,6 +1037,20 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "deny an alias column list on a parenthesized FROM item holding a masked table" in
+    List(
+      "SELECT e FROM (customer) AS c(a, b, e)",
+      "SELECT e FROM ((customer)) AS c(a, b, e)",
+      "SELECT e FROM (customer c) AS d(a, b, e)",
+      "SELECT x.e FROM (customer AS c) x(a, b, e)",
+      "SELECT e FROM (customer JOIN orders USING (c_id)) AS j(a, b, e)"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
   it should "admit an alias column list on a table without a column policy" in {
     val orders = new ColumnPolicyRewriter(
       new ColumnCatalog.MapCatalog(

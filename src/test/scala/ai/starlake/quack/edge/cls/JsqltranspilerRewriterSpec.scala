@@ -715,6 +715,17 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
       "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM customer c(a, b, e) WHERE e = 'x')"
     ).foreach(denied)
 
+  // The list on a parenthesized FROM item renames the columns of everything inside it.
+  it should "be denied on a parenthesized FROM item holding a masked table" in
+    List(
+      "SELECT e FROM (customer) AS c(a, b, e)",
+      "SELECT e FROM ((customer)) AS c(a, b, e)",
+      "SELECT e FROM (customer c) AS d(a, b, e)",
+      "SELECT x.e FROM (customer AS c) x(a, b, e)",
+      "SELECT e FROM (customer JOIN orders USING (c_id)) AS j(a, b, e)",
+      "SELECT e FROM orders o, (customer) AS c(a, b, e)"
+    ).foreach(denied)
+
   // A derived table or CTE carries values already masked inside it, so renaming its columns
   // reveals nothing.
   "a column list on a derived table or CTE over a masked column" should "keep the mask" in
