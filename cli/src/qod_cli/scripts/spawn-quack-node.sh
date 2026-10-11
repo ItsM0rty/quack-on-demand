@@ -31,6 +31,12 @@
 # DuckDB is kept alive after `quack_serve` returns via a FIFO held open
 # by this shell, so the background quack thread keeps serving until the
 # process is terminated (SIGTERM from `LocalQuackBackend.stop`).
+#
+# duckdb runs in an empty, private (0700) directory of its own, created here and removed when the
+# node stops: DuckDB 2.0 replacement-scans an unquoted dotted name as a file (`SELECT * FROM x.csv`
+# reads ./x.csv), and an unquoted name cannot hold a path separator, so the working directory is
+# the one place that form reaches. Every relative path the node relies on (dataPath, the duckdb
+# binary, the spill directory) is made absolute against the directory this script started in.
 
 set -euo pipefail
 
@@ -39,6 +45,10 @@ set -euo pipefail
 export DUCKDB_AGENT_MODE=0
 
 PORT="${1:?port required}"
+
+# The directory relative paths resolve against (the manager's or join process's working directory,
+# where duckdb itself used to run). Physical, so it matches the manager JVM's own resolution.
+START_DIR="$(pwd -P)"
 
 # Keep in sync with NodeSecretFiles.Keys (Scala), SECRET_KEYS in spawn-quack-node.ps1 and
 # _SECRET_KEYS in cli/src/qod_cli/fleet_join.py; NodeSecretFilesSpec pins all four.
@@ -137,6 +147,20 @@ CREATE OR REPLACE SECRET quack_azure (
     ;;
 esac
 
+# A relative local dataPath (the bundled default `./ducklake/tpch` is one) used to resolve against
+# duckdb's working directory; resolve it against the starting directory instead, since duckdb no
+# longer runs there. DuckLake refuses a DATA_PATH that differs from the one recorded at catalog
+# creation (still the relative spelling), so the ATTACH then passes OVERRIDE_DATA_PATH, which applies
+# to this attach only and rewrites nothing in the catalog.
+DATA_PATH_OVERRIDE=""
+if [[ "$IS_REMOTE" == "0" && -n "$dataPath" && "$dataPath" != /* ]]; then
+  while [[ "$dataPath" == ./* ]]; do dataPath="${dataPath#./}"; done
+  dataPath="$START_DIR/$dataPath"
+  DATA_PATH_OVERRIDE=", OVERRIDE_DATA_PATH true"
+fi
+# The starting directory is not validated like the rest of the metastore: double any quote.
+data_path_sql=${dataPath//\'/\'\'}
+
 # mkdir behaviour differs by kind: for `ducklake`, dataPath is a parquet
 # DIRECTORY, so mkdir -p on the path itself is correct. For `duckdb-file`,
 # dataPath is a .duckdb FILE path - mkdir -p on the path itself would create
@@ -173,6 +197,45 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
     echo "ERROR: duckdb not found (DUCKDB_BIN='${DUCKDB_BIN:-}', 'duckdb' not on PATH)" >&2
     exit 1
   }
+  # Absolute, since duckdb starts in its own directory (a relative DUCKDB_BIN or PATH entry
+  # would otherwise resolve there).
+  DUCKDB="$(command -v "$DUCKDB")"
+  [[ "$DUCKDB" == /* ]] || DUCKDB="$START_DIR/$DUCKDB"
+fi
+
+# Per-node private state, all removed by cleanup() when the node stops: NODE_DIR (0700, from mktemp)
+# holds the FIFO, the psql passfile while it is needed, and WORK_DIR, the empty directory duckdb
+# runs in. Created in dry-run mode too, so the SQL below names the same spill directory a real
+# spawn would.
+NODE_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/quack-node.XXXXXX)"
+SPILL_DIR=""
+DUCK_PID=""
+cleanup() {
+  if [[ -n "$DUCK_PID" ]]; then
+    kill -TERM "$DUCK_PID" 2>/dev/null || true
+    wait "$DUCK_PID" 2>/dev/null || true
+  fi
+  exec 9>&- 2>/dev/null || true
+  rm -rf -- "$NODE_DIR" ${SPILL_DIR:+"$SPILL_DIR"}
+}
+trap cleanup TERM INT EXIT
+WORK_DIR="$NODE_DIR/cwd"
+mkdir -m 700 "$WORK_DIR"
+# DuckDB's spill directory defaults to `.tmp` under its working directory, which no longer persists
+# across nodes. Give each node its own, on the filesystem it spilled to before: the emptyDir
+# KubernetesQuackBackend mounts on every pod when present, else `.tmp` of the starting directory
+# (not TMPDIR, which is often RAM-backed on Linux). Per node so that under lockdown, where DuckDB
+# admits its temp directory, no node can read another's spill files. NODE_DIR when neither works.
+if [[ -d /duckdb-tmp && -w /duckdb-tmp ]]; then
+  SPILL_ROOT=/duckdb-tmp
+else
+  SPILL_ROOT="$START_DIR/.tmp"
+fi
+SPILL_DIR="$(mkdir -p "$SPILL_ROOT" 2>/dev/null && mktemp -d "$SPILL_ROOT/qod-node.XXXXXX" 2>/dev/null)" ||
+  SPILL_DIR=""
+if [[ -z "$SPILL_DIR" ]]; then
+  SPILL_DIR="$NODE_DIR/tmp"
+  mkdir -m 700 "$SPILL_DIR"
 fi
 
 # Ensure the Postgres database $dbName exists. Connects to PG_ADMIN_DB (default
@@ -186,24 +249,22 @@ fi
 if [[ "$kind" == "ducklake" && "${QOD_SPAWN_DRY_RUN:-}" != "1" ]] && command -v psql >/dev/null 2>&1; then
   ADMIN_DB="${PG_ADMIN_DB:-postgres}"
   # The password reaches psql through a private passfile, never PGPASSWORD: psql's own
-  # environment is as readable as duckdb's while it runs.
-  PGPASS_DIR="$(mktemp -d -t qod-pgpass.XXXXXX)"
-  # Removed on any exit (a kill during psql included), not only on the normal path below.
-  trap 'rm -rf -- "$PGPASS_DIR"' EXIT
+  # environment is as readable as duckdb's while it runs. It sits in NODE_DIR, so cleanup()
+  # removes it on any exit (a kill during psql included), not only on the normal path below.
+  PGPASS_FILE="$NODE_DIR/pgpass"
   pgpass_escaped="${pgPassword//\\/\\\\}"
   pgpass_escaped="${pgpass_escaped//:/\\:}"
-  (umask 077 && printf '*:*:*:*:%s\n' "$pgpass_escaped" > "$PGPASS_DIR/pgpass")
-  EXISTS=$(PGPASSFILE="$PGPASS_DIR/pgpass" psql -w -h "$pgHost" -p "$pgPort" -U "$pgUser" \
+  (umask 077 && printf '*:*:*:*:%s\n' "$pgpass_escaped" > "$PGPASS_FILE")
+  EXISTS=$(PGPASSFILE="$PGPASS_FILE" psql -w -h "$pgHost" -p "$pgPort" -U "$pgUser" \
     -d "$ADMIN_DB" -tAc "SELECT 1 FROM pg_database WHERE datname = '$dbName'" 2>/dev/null || true)
   if [[ "$EXISTS" != "1" ]]; then
     echo "spawn: creating Postgres database $dbName"
-    PGPASSFILE="$PGPASS_DIR/pgpass" psql -w -h "$pgHost" -p "$pgPort" -U "$pgUser" \
+    PGPASSFILE="$PGPASS_FILE" psql -w -h "$pgHost" -p "$pgPort" -U "$pgUser" \
       -d "$ADMIN_DB" -tAc "CREATE DATABASE \"$dbName\"" >/dev/null || {
         echo "WARN: CREATE DATABASE $dbName failed; ATTACH below may fail" >&2
       }
   fi
-  rm -rf -- "$PGPASS_DIR"
-  trap - EXIT
+  rm -f -- "$PGPASS_FILE"
 fi
 
 # Early guard: in dry-run mode we only want the assembled INIT_SQL (below), never a live
@@ -212,24 +273,16 @@ fi
 if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
   # A named pipe keeps duckdb's stdin live without blocking after we feed the
   # init SQL. fd 9 holds the writer side open until this shell exits.
-  FIFO_DIR="$(mktemp -d -t quack-fifo.XXXXXX)"
-  FIFO="$FIFO_DIR/in"
+  FIFO="$NODE_DIR/in"
   mkfifo "$FIFO"
 
-  # Start duckdb first - open() on FIFO blocks until the writer side appears.
-  "$DUCKDB" < "$FIFO" &
+  # Start duckdb first - open() on FIFO blocks until the writer side appears. It runs in WORK_DIR
+  # (the subshell execs it, so $! is duckdb's own pid); this script stays where it started.
+  (cd "$WORK_DIR" && exec "$DUCKDB") < "$FIFO" &
   DUCK_PID=$!
 
   # Open the writer end; this unblocks duckdb's open().
   exec 9> "$FIFO"
-
-  cleanup() {
-    kill -TERM "$DUCK_PID" 2>/dev/null || true
-    wait "$DUCK_PID" 2>/dev/null || true
-    exec 9>&- 2>/dev/null || true
-    rm -rf "$FIFO_DIR"
-  }
-  trap cleanup TERM INT EXIT
 fi
 
 # DuckDB does NOT honour the HTTP_PROXY / HTTPS_PROXY env vars for
@@ -269,11 +322,8 @@ fi
 # script shares its cgroup with the manager JVM during a local demo load
 # (hence a conservative 40%), whereas a node pod runs nothing but DuckDB,
 # so 85% (in line with general DuckDB memory-tuning guidance) is safe.
-# `/duckdb-tmp` is the emptyDir KubernetesQuackBackend already mounts on
-# every pod for `readOnlyRootFilesystem` compatibility; only point
-# temp_directory at it when it actually exists so LocalQuackBackend (no
-# such mount, no meaningful cgroup either) is unaffected.
-RESOURCE_SQL=""
+# temp_directory is the per-node SPILL_DIR chosen above, on every runtime.
+RESOURCE_SQL="SET temp_directory = '${SPILL_DIR//\'/\'\'}';"$'\n'
 if [[ -r /sys/fs/cgroup/memory.max ]]; then
   MEM_BYTES="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"        # cgroup v2
 elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
@@ -285,9 +335,6 @@ if [[ "$MEM_BYTES" =~ ^[0-9]+$ ]] && (( MEM_BYTES > 0 && MEM_BYTES < 90000000000
   MEM_MIB=$(( MEM_BYTES / 1024 / 1024 * 85 / 100 ))
   (( MEM_MIB < 256 )) && MEM_MIB=256
   RESOURCE_SQL+="SET memory_limit = '${MEM_MIB}MiB';"$'\n'
-fi
-if [[ -d /duckdb-tmp && -w /duckdb-tmp ]]; then
-  RESOURCE_SQL+="SET temp_directory = '/duckdb-tmp';"$'\n'
 fi
 if [[ -r /sys/fs/cgroup/cpu.max ]]; then
   read -r CPU_QUOTA CPU_PERIOD < /sys/fs/cgroup/cpu.max              # cgroup v2: "<quota> <period>"
@@ -375,9 +422,9 @@ case "$kind" in
     INIT_SQL+="ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS \"$catalogAlias\""$'\n'
     # Nodes attach as-is: the manager's DuckLakeInitializer migrates older catalogs once per boot.
     if [[ "${encrypted:-}" == "true" ]]; then
-      INIT_SQL+="  (DATA_PATH '$dataPath', ENCRYPTED, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});"$'\n'
+      INIT_SQL+="  (DATA_PATH '$data_path_sql', ENCRYPTED$DATA_PATH_OVERRIDE, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});"$'\n'
     else
-      INIT_SQL+="  (DATA_PATH '$dataPath', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});"$'\n'
+      INIT_SQL+="  (DATA_PATH '$data_path_sql'$DATA_PATH_OVERRIDE, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});"$'\n'
     fi
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
     INIT_SQL+=$'DETACH qod_init_pg;\n'
@@ -388,9 +435,9 @@ case "$kind" in
     ;;
   duckdb-file)
     if [[ "${encrypted:-}" == "true" ]]; then
-      INIT_SQL+="ATTACH '$dataPath' AS \"$catalogAlias\" (ENCRYPTION_KEY '$encryptionKey');"$'\n'
+      INIT_SQL+="ATTACH '$data_path_sql' AS \"$catalogAlias\" (ENCRYPTION_KEY '$encryptionKey');"$'\n'
     else
-      INIT_SQL+="ATTACH '$dataPath' AS \"$catalogAlias\";"$'\n'
+      INIT_SQL+="ATTACH '$data_path_sql' AS \"$catalogAlias\";"$'\n'
     fi
     INIT_SQL+="USE \"$catalogAlias\";"$'\n'
     INIT_SQL+="CREATE SCHEMA IF NOT EXISTS \"$schemaName\";"$'\n'

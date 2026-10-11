@@ -40,6 +40,14 @@
   The Postgres `CREATE DATABASE` step the bash script performs as a fallback is
   intentionally omitted here: the manager JVM already provisions the tenant-db
   (DbAdmin.createDatabase via PoolSupervisor.createTenantDb + DuckLakeInitializer).
+
+  duckdb runs in an empty directory private to the current user, created here per node: DuckDB 2.0
+  replacement-scans an unquoted dotted name as a file (`SELECT * FROM x.csv` reads .\x.csv), and
+  an unquoted name cannot hold a path separator, so the working directory is the one place that
+  form reaches. Every relative path the node relies on (dataPath, the duckdb binary, the spill
+  directory) is made absolute against the directory this script started in. The node directory
+  is removed when duckdb exits; `taskkill /T /F` gives this script no chance to, so each spawn
+  also removes the node directories whose owning script is gone. Mirrors spawn-quack-node.sh.
 #>
 [CmdletBinding()]
 param(
@@ -47,6 +55,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The directory relative paths resolve against (the manager's working directory, where duckdb
+# itself used to run).
+$startDir = (Get-Location).ProviderPath
 
 # Keep in sync with NodeSecretFiles.Keys (Scala) and SECRET_KEYS in spawn-quack-node.sh;
 # NodeSecretFilesSpec pins both.
@@ -172,6 +184,19 @@ CREATE OR REPLACE SECRET quack_azure (
   }
 }
 
+# A relative local dataPath used to resolve against duckdb's working directory; resolve it against
+# the starting directory instead. DuckLake refuses a DATA_PATH that differs from the one recorded at
+# catalog creation (still the relative spelling), so the ATTACH then passes OVERRIDE_DATA_PATH, which
+# applies to this attach only and rewrites nothing in the catalog. Mirrors spawn-quack-node.sh.
+$dataPathOverride = ''
+if (-not $isRemote -and -not [string]::IsNullOrEmpty($dataPath) -and
+    -not [System.IO.Path]::IsPathRooted($dataPath)) {
+  $dataPath = [System.IO.Path]::GetFullPath((Join-Path $startDir $dataPath))
+  $dataPathOverride = ', OVERRIDE_DATA_PATH true'
+}
+# The starting directory is not validated like the rest of the metastore: double any quote.
+$dataPathSql = ([string]$dataPath).Replace("'", "''")
+
 # New-Item behaviour differs by kind: for `ducklake`, dataPath is a parquet
 # DIRECTORY, so creating the path itself is correct. For `duckdb-file`,
 # dataPath is a .duckdb FILE path - creating a directory at that exact path
@@ -213,7 +238,76 @@ if ([string]::IsNullOrEmpty($duckdbBin)) {
     if ($null -eq $cmd) { Write-Error "ERROR: duckdb not on PATH"; exit 1 }
     $duckdbBin = $cmd.Source
   }
+} elseif (-not $dryRun -and -not [System.IO.Path]::IsPathRooted($duckdbBin)) {
+  # Absolute, since duckdb starts in its own directory.
+  $cmd = Get-Command $duckdbBin -ErrorAction SilentlyContinue
+  if ($null -ne $cmd -and -not [string]::IsNullOrEmpty($cmd.Source)) { $duckdbBin = $cmd.Source }
+  else { $duckdbBin = [System.IO.Path]::GetFullPath((Join-Path $startDir $duckdbBin)) }
 }
+
+$onWindows = ($env:OS -eq 'Windows_NT')
+
+# A directory only the current user can reach (the analogue of mktemp's 0700).
+function New-PrivateDirectory([string]$path) {
+  New-Item -ItemType Directory -Path $path -Force | Out-Null
+  if ($onWindows) {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+      $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    Set-Acl -LiteralPath $path -AclObject $acl
+  } else {
+    & chmod 700 $path
+  }
+}
+
+# Remove a node directory and the spill directory it records.
+function Remove-NodeDirectory([string]$dir) {
+  $spillFile = Join-Path $dir 'spill.path'
+  if (Test-Path -LiteralPath $spillFile -PathType Leaf) {
+    $spill = ([System.IO.File]::ReadAllText($spillFile)).Trim()
+    if (-not [string]::IsNullOrEmpty($spill)) {
+      Remove-Item -LiteralPath $spill -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+  Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Per-node private state: $nodeDir holds owner.pid, spill.path and $workDir, the empty directory
+# duckdb runs in. Node directories of earlier spawns whose owning script is gone (taskkill /T /F
+# skipped their cleanup) are removed first; one still being created has no owner.pid yet and is
+# left alone.
+$tempRoot = [System.IO.Path]::GetTempPath()
+Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'quack-node.*' -ErrorAction SilentlyContinue |
+  ForEach-Object {
+    $ownerFile = Join-Path $_.FullName 'owner.pid'
+    if (Test-Path -LiteralPath $ownerFile -PathType Leaf) {
+      $owner = 0
+      [void][int]::TryParse(([System.IO.File]::ReadAllText($ownerFile)).Trim(), [ref]$owner)
+      if ($null -eq (Get-Process -Id $owner -ErrorAction SilentlyContinue)) {
+        Remove-NodeDirectory $_.FullName
+      }
+    }
+  }
+$nodeId  = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+$nodeDir = Join-Path $tempRoot "quack-node.$nodeId"
+New-PrivateDirectory $nodeDir
+$workDir = Join-Path $nodeDir 'cwd'
+New-PrivateDirectory $workDir
+# DuckDB's spill directory defaults to `.tmp` under its working directory, which no longer persists
+# across nodes. Give each node its own under `.tmp` of the starting directory (where it spilled
+# before), per node so that under lockdown, where DuckDB admits its temp directory, no node can read
+# another's spill files. Under $nodeDir when that is not writable.
+try {
+  $spillDir = Join-Path (Join-Path $startDir '.tmp') "qod-node.$nodeId"
+  New-PrivateDirectory $spillDir
+} catch {
+  $spillDir = Join-Path $nodeDir 'tmp'
+  New-PrivateDirectory $spillDir
+}
+[System.IO.File]::WriteAllText((Join-Path $nodeDir 'spill.path'), $spillDir)
+[System.IO.File]::WriteAllText((Join-Path $nodeDir 'owner.pid'), [string]$PID)
 
 # DuckDB does NOT honour HTTP_PROXY/HTTPS_PROXY for `INSTALL <extension>`
 # downloads - those go through libcurl via the SQL `SET http_proxy=...`
@@ -240,6 +334,8 @@ $encryptionKey = Secret-Or 'encryptionKey' ''
 # DuckLake-specific setup entirely. Mirrors spawn-quack-node.sh.
 $sb = [System.Text.StringBuilder]::new()
 if (-not [string]::IsNullOrEmpty($proxySql))  { [void]$sb.AppendLine($proxySql) }
+# Before dbInitSql, so an operator's own SET temp_directory still wins.
+[void]$sb.AppendLine("SET temp_directory = '$($spillDir.Replace("'", "''"))';")
 if (-not [string]::IsNullOrEmpty($dbInitSql)) { [void]$sb.AppendLine($dbInitSql) }
 [void]$sb.AppendLine("INSTALL quack;")
 [void]$sb.AppendLine("LOAD quack;")
@@ -280,9 +376,9 @@ switch ($kind) {
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS ""$catalogAlias""")
     if ($encrypted -ceq 'true') {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', ENCRYPTED, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPathSql', ENCRYPTED$dataPathOverride, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
     } else {
-      [void]$sb.AppendLine("  (DATA_PATH '$dataPath', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
+      [void]$sb.AppendLine("  (DATA_PATH '$dataPathSql'$dataPathOverride, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});")
     }
     [void]$sb.AppendLine("SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');")
     [void]$sb.AppendLine("DETACH qod_init_pg;")
@@ -293,9 +389,9 @@ switch ($kind) {
   }
   'duckdb-file' {
     if ($encrypted -ceq 'true') {
-      [void]$sb.AppendLine("ATTACH '$dataPath' AS ""$catalogAlias"" (ENCRYPTION_KEY '$encryptionKey');")
+      [void]$sb.AppendLine("ATTACH '$dataPathSql' AS ""$catalogAlias"" (ENCRYPTION_KEY '$encryptionKey');")
     } else {
-      [void]$sb.AppendLine("ATTACH '$dataPath' AS ""$catalogAlias"";")
+      [void]$sb.AppendLine("ATTACH '$dataPathSql' AS ""$catalogAlias"";")
     }
     [void]$sb.AppendLine("USE ""$catalogAlias"";")
     [void]$sb.AppendLine("CREATE SCHEMA IF NOT EXISTS ""$schemaName"";")
@@ -322,6 +418,7 @@ $initSql = $sb.ToString()
 # emitted SQL, which is the only testable surface of a script the manager shells out to.
 if ($dryRun) {
   [Console]::Out.Write($initSql)
+  Remove-NodeDirectory $nodeDir
   exit 0
 }
 
@@ -334,12 +431,18 @@ $psi.RedirectStandardInput  = $true
 $psi.RedirectStandardOutput = $false
 $psi.RedirectStandardError  = $false
 $psi.UseShellExecute        = $false
+$psi.WorkingDirectory       = $workDir
 
-$proc = [System.Diagnostics.Process]::Start($psi)
-$proc.StandardInput.Write($initSql)
-$proc.StandardInput.Flush()
-# Do NOT close StandardInput: duckdb's main thread blocks reading it, which
-# keeps the process (and the background quack_serve thread) alive until the
-# manager terminates the tree.
-$proc.WaitForExit()
-exit $proc.ExitCode
+try {
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $proc.StandardInput.Write($initSql)
+  $proc.StandardInput.Flush()
+  # Do NOT close StandardInput: duckdb's main thread blocks reading it, which
+  # keeps the process (and the background quack_serve thread) alive until the
+  # manager terminates the tree.
+  $proc.WaitForExit()
+  $exitCode = $proc.ExitCode
+} finally {
+  Remove-NodeDirectory $nodeDir
+}
+exit $exitCode
