@@ -60,7 +60,9 @@ def test_duckdb_runs_in_an_empty_private_directory_removed_on_stop(tmp_path):
         f"pwd -P > '{probe}/cwd.part'\n"
         f"ls -A | wc -l | tr -d ' ' > '{probe}/entries'\n"
         f"mv '{probe}/cwd.part' '{probe}/cwd'\n"
-        f"cat \"$2\" > '{probe}/init'\n"
+        f"cat \"$2\" > '{probe}/init' & reader=$!\n"
+        "trap 'kill $reader 2>/dev/null; exit 143' TERM INT\n"
+        "wait $reader\n"
         "while :; do sleep 1; done\n"
     )
     fake.chmod(0o700)

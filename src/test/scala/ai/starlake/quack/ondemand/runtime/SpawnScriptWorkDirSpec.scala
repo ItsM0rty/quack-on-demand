@@ -126,7 +126,9 @@ class SpawnScriptWorkDirSpec extends AnyFlatSpec with Matchers with SpawnScriptT
          |ls -A | wc -l | tr -d ' ' > '$probe/entries'
          |(stat -f %Lp . 2>/dev/null || stat -c %a .) > '$probe/mode'
          |mv '$probe/cwd.part' '$probe/cwd'
-         |cat "$$2" > '$probe/init'
+         |cat "$$2" > '$probe/init' & reader=$$!
+         |trap 'kill $$reader 2>/dev/null; exit 143' TERM INT
+         |wait $$reader
          |while :; do sleep 1; done
          |""".stripMargin
     )

@@ -30,7 +30,9 @@ def _fake_duckdb(path: pathlib.Path) -> pathlib.Path:
     path.write_text(
         "#!/bin/sh\n"
         '[ "$1" = -no-init ] && { echo qod-shell-ok; exit 0; }\n'
-        'cat "$2" > /dev/null\n'
+        'cat "$2" > /dev/null & reader=$!\n'
+        "trap 'kill $reader 2>/dev/null; exit 143' TERM INT\n"
+        "wait $reader\n"
         "while :; do sleep 1; done\n"
     )
     path.chmod(0o700)
