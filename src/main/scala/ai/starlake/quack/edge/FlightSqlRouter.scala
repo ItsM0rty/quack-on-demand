@@ -688,6 +688,13 @@ final class FlightSqlRouter(
           case ai.starlake.quack.edge.rls.RowPolicyRewriter.Rewritten(s) =>
             stmtInstruments.recordRowPolicyRewrite(poolKey.tenant, poolKey.pool, "rewritten")
             Right(s)
+          case ai.starlake.quack.edge.rls.RowPolicyRewriter.Refused(reason) =>
+            // Fail closed with the rewriter's fixed reason (never the SQL): the statement holds a
+            // shape the row filter cannot apply to, and the caller can rephrase it.
+            stmtInstruments.recordRowPolicyRewrite(poolKey.tenant, poolKey.pool, "refused")
+            val f = RouterFailure.AccessDenied(s"access denied: $reason")
+            maybeRecord(nodeId = "-", durationMs = 0, status = "denied", error = Some(f.reason))
+            Left(f)
           case ai.starlake.quack.edge.rls.RowPolicyRewriter.Failed(_) =>
             // Fail closed: a stored row policy could not be applied to this statement, so
             // forwarding it would return unfiltered rows. See RowPolicyRewriter.Failed.

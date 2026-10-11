@@ -27,6 +27,9 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("RESET enable_external_access") shouldBe true
     denied("PRAGMA temp_directory = '/tmp/x'") shouldBe true
     denied("SET allowed_directories = ['/']") shouldBe true
+    // iceberg: lets a scan guess the metadata version by listing the table's directory
+    denied("SET unsafe_enable_version_guessing = true") shouldBe true
+    denied("RESET unsafe_enable_version_guessing") shouldBe true
     denied("SET schema = 'tpch1'") shouldBe false
     denied("PRAGMA table_info('t')") shouldBe false
   }

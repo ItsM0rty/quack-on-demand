@@ -109,7 +109,7 @@ final class StatementInstruments(registry: MeterRegistry):
     )
 
   /** Increment the row-policy rewrite counter. `outcome` is one of: `rewritten`, `passthrough`,
-    * `parse_failed`.
+    * `parse_failed`, `refused`, `failed`.
     */
   def recordRowPolicyRewrite(tenant: String, pool: String, outcome: String): Unit =
     registry

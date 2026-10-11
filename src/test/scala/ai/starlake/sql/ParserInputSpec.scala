@@ -76,7 +76,9 @@ class ParserInputSpec extends AnyFlatSpec with Matchers:
     ParserInput.decodeEscapes("\\303\\251") shouldBe Right("é")
     ParserInput.decodeEscapes("trailing\\") shouldBe Right("trailing\\")
 
-  /** Each statement and its rendering return the same row on DuckDB 2.0. */
+  /** Each statement and its rendering return the same row, under the same column names, on DuckDB
+    * 2.0.
+    */
   "an exact rendering" should "be the same statement on DuckDB" in:
     val corpus = List(
       "SELECT E'\\'' AS a, E'x\\ny' AS b, e'\\x41\\101\\u0041\\q\\\\' AS c",
@@ -88,7 +90,9 @@ class ParserInputSpec extends AnyFlatSpec with Matchers:
       "SELECT 'back\\slash' AS a, '\\' AS b",
       "SELECT a$q$ FROM (SELECT 7 AS a$q$) t",
       "SELECT café FROM (SELECT 3 AS café) t",
-      "SELECT 'nbsp in' AS a, 1 + 1 AS b"
+      "SELECT 'nbsp in' AS a, 1 + 1 AS b",
+      // implicit column names, which a client reads as much as the values
+      "SELECT E'x', $$y$$, N'n', 'a'\n'b', 1 + 1, café FROM (SELECT 3 AS café) t"
     )
     Class.forName("org.duckdb.DuckDBDriver")
     val conn = DriverManager.getConnection("jdbc:duckdb:", InProcessDuckDb.properties)
@@ -98,7 +102,10 @@ class ParserInputSpec extends AnyFlatSpec with Matchers:
         val rs = st.executeQuery(sql)
         try
           rs.next() shouldBe true
-          (1 to rs.getMetaData.getColumnCount).toList.map(i => String.valueOf(rs.getString(i)))
+          val md = rs.getMetaData
+          (1 to md.getColumnCount).toList.map(i =>
+            s"${md.getColumnLabel(i)}=${String.valueOf(rs.getString(i))}"
+          )
         finally rs.close()
       finally st.close()
     try

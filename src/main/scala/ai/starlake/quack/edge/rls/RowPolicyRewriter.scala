@@ -52,11 +52,18 @@ object RowPolicyRewriter:
   final case class Rewritten(sql: String) extends Outcome
   case object Passthrough                 extends Outcome
 
-  /** SQL could not be parsed. Routed identically to [[Passthrough]] (original SQL forwarded) but
-    * tagged separately on `row_policy_rewrites_total` so dashboards can split "rewriter blind" from
-    * "no policy applied".
+  /** SQL could not be parsed, so its policy tables cannot be filtered. The router DENIES it
+    * (fail-closed), tagged `parse_failed` on `row_policy_rewrites_total` so dashboards can split
+    * "rewriter blind" from a policy refusal.
     */
   case object PassthroughParseFailed extends Outcome
+
+  /** The statement parses but holds a shape the rewrite cannot filter or cannot ship (a
+    * parenthesized statement reading a policy table, a syntax node the walk cannot follow, DuckDB's
+    * `//` integer division). Denied by the router with `reason`, a fixed string that never carries
+    * the SQL, so the caller learns what to change.
+    */
+  final case class Refused(reason: String) extends Outcome
 
   /** A stored row policy predicate could not be applied at splice time (e.g. it fails to re-parse
     * once wrapped and OR-combined with the statement's own SQL). Should never happen for a
@@ -74,6 +81,10 @@ object RowPolicyRewriter:
 
   /** A shape the rewrite cannot filter, refused with a fixed reason (never the SQL). */
   private final class Refusal(val reason: String) extends RuntimeException(reason)
+
+  private val InexactRefusal =
+    "row policies cannot be applied to a statement using integer division (//); " +
+      "split the statement or compute the division outside the filtered read"
 
   private val UnwalkedRefusal =
     "the statement holds a syntax node the row policy rewrite cannot walk"
@@ -151,9 +162,9 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
             // statement (ParserInput.Rendered.exact) shipping it would run a different one.
             if !changed.get() then Passthrough
             else if exact then Rewritten(stmt.toString)
-            else PassthroughParseFailed
+            else Refused(InexactRefusal)
           catch
-            case r: Refusal => Failed(r.reason)
+            case r: Refusal => Refused(r.reason)
             // A predicate that fails to apply at rewrite time (should never happen - the
             // create-time validator already parsed it) must not crash the request path, but it
             // also must not forward the statement unfiltered: that would silently disable the

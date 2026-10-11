@@ -27,11 +27,19 @@ object ColumnPolicyRewriter:
   final case class Denied(reason: String) extends Outcome
   case object Passthrough                 extends Outcome
 
-  /** Inner rewriter could not parse the SQL. Routed identically to [[Passthrough]] (the original
-    * SQL is forwarded to the node) but tagged separately on the `column_policy_rewrites_total`
-    * counter so dashboards can distinguish "no policy applied" from "rewriter blind".
+  /** The rewriter could not parse the SQL, so it cannot prove the masked columns absent. The router
+    * DENIES it (fail-closed), tagged `parse_failed` on the `column_policy_rewrites_total` counter
+    * so dashboards can tell "rewriter blind" from a policy deny.
     */
   case object PassthroughParseFailed extends Outcome
+
+  /** The deny reason for a rewrite that would be printed from a parser input that is not the
+    * caller's statement (DuckDB's `//` integer division reaches JSqlParser as `/`), so shipping it
+    * would run a different statement.
+    */
+  private[cls] val InexactRefusal: String =
+    "column policies cannot be applied to a statement using integer division (//); " +
+      "split the statement or select the division without the masked columns"
 
   /** Inner rewriter raised a deny because the table/schema/catalog could not be resolved, not
     * because a policy matched. Same wire-level error as [[Denied]] but tagged separately so
@@ -83,7 +91,7 @@ final class ColumnPolicyRewriter(
           rewriteCanonical(input.text, eff, ctx).map {
             // The rewrite is printed from the parser input, which is not the caller's statement
             // here (ParserInput.Rendered.exact): shipping it would run a different statement.
-            case Rewritten(_) if !input.exact => PassthroughParseFailed
+            case Rewritten(_) if !input.exact => Denied(InexactRefusal)
             case other                        => other
           }
 

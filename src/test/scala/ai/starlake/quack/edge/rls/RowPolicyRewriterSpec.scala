@@ -51,6 +51,7 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       case Passthrough            => s"$sql  [passthrough]"
       case PassthroughParseFailed => s"$sql  [parse-failed]"
       case Failed(reason)         => s"$sql  [failed: $reason]"
+      case Refused(reason)        => s"$sql  [refused: $reason]"
     info(s"original:  $sql")
     info(s"predicate: ${if preds.isEmpty then "(none)" else preds.mkString("  ;  ")}")
     info(s"result:    $result")
@@ -369,7 +370,9 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     go(
       "SELECT c_custkey // 2 FROM customer",
       eff(tenantUser, List(policy("c_region = 'EU'")))
-    ) shouldBe PassthroughParseFailed
+    ) match
+      case Refused(reason) => reason should include("//")
+      case other           => fail(s"expected Refused, got $other")
     go("SELECT 7 // 2", eff(tenantUser, List(policy("c_region = 'EU'")))) shouldBe Passthrough
   }
 
@@ -379,9 +382,9 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     // JSqlParser reads `(TABLE customer)` as a table named TABLE aliased customer: no slot to wrap,
     // while DuckDB returns every row of customer
     val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
-    go("SELECT * FROM (TABLE customer)", effSet) shouldBe a[Failed]
-    go("SELECT * FROM (SUMMARIZE customer)", effSet) shouldBe a[Failed]
-    go("SELECT * FROM orders JOIN (TABLE \"customer\") c ON true", effSet) shouldBe a[Failed]
+    go("SELECT * FROM (TABLE customer)", effSet) shouldBe a[Refused]
+    go("SELECT * FROM (SUMMARIZE customer)", effSet) shouldBe a[Refused]
+    go("SELECT * FROM orders JOIN (TABLE \"customer\") c ON true", effSet) shouldBe a[Refused]
   }
 
   it should "pass through when the named table carries no policy" in {

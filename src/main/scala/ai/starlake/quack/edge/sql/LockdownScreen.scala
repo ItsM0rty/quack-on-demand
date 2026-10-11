@@ -63,6 +63,9 @@ object LockdownScreen:
     "custom_extension_repository",
     "autoinstall_extension_repository",
     "allow_extensions_metadata_mismatch",
+    // iceberg: lets iceberg_scan guess a table's metadata version by listing its directory, which
+    // reads what sits beside the table rather than the version its catalog pins.
+    "unsafe_enable_version_guessing",
     // Secrets: where they persist (whether they print unredacted is NodeSettingScreen's).
     "allow_persistent_secrets",
     "default_secret_storage",
