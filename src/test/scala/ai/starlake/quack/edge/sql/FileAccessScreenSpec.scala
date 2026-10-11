@@ -97,6 +97,14 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
     "INSTALL httpfs",
     "INSERT INTO orders SELECT * FROM scan_data_from_quack_client(" +
       "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(a INTEGER), ordered := true)",
+    // `IS [NOT] DISTINCT FROM` takes a value, not a table
+    "SELECT * FROM orders WHERE o_comment IS DISTINCT FROM 'x'",
+    "SELECT * FROM orders WHERE o_comment IS NOT DISTINCT FROM 'x'",
+    "SELECT o_comment IS DISTINCT FROM 'x' FROM orders",
+    "SELECT * FROM orders o JOIN lineitem l ON o.o_orderkey = l.l_orderkey " +
+      "AND l.l_comment IS DISTINCT FROM 'z'",
+    "SELECT * FROM orders ORDER BY o_id DESC, 'x'",
+    "SELECT o_id AS \"Revenue / Cost\" FROM orders",
     // dbt adapter's ordinary statements
     "create table \"lake\".\"main\".\"m__dbt_tmp\" as (select 1 as id)",
     "alter table \"lake\".\"main\".\"m__dbt_tmp\" rename to \"m\"",

@@ -3607,3 +3607,26 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
           .map(_.value) shouldBe Right("count")
       }
     }
+
+  it should "leave a row policy holding IS DISTINCT FROM a literal to its re-validation" in:
+    // `IS DISTINCT FROM 'X'` takes a value; the re-validated wrap carries the policy's SQL.
+    val withRows = wildcardAllSet.copy(rowPolicies =
+      List(
+        ai.starlake.quack.ondemand.state
+          .RoleRowPolicy("rp-d", "r-1", "*", "main", "customer", "c_region IS DISTINCT FROM 'X'")
+      )
+    )
+    val (router, captured, _) = setupWithRewriter(validator = wildcardAcl)
+    router
+      .execute("file-5", "alice", poolKey, "SELECT c_id FROM customer", Some(withRows))
+      .unsafeRunSync() shouldBe a[Right[?, ?]]
+    captured() should include("IS DISTINCT FROM 'X'")
+    router
+      .execute(
+        "file-6",
+        "alice",
+        poolKey,
+        "SELECT c_id FROM customer WHERE c_name IS NOT DISTINCT FROM 'a'",
+        Some(withRows)
+      )
+      .unsafeRunSync() shouldBe a[Right[?, ?]]
