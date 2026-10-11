@@ -214,14 +214,24 @@ object NodeSettingScreen:
     NodeWideSettings(name) || NodeWidePrefixes.exists(name.startsWith)
 
   /** Calls that act on the node itself rather than on data: start / stop / cancel its quack server
-    * or rename it, clear the shared caches, turn the logger or the profiler on or off, truncate the
-    * shared log, and FORCE CHECKPOINT (aborts every other session's transaction).
+    * or rename it, list the other sessions it serves, clear the shared caches, turn the logger or
+    * the profiler on or off, truncate the shared log, and FORCE CHECKPOINT (aborts every other
+    * session's transaction).
+    *
+    * `quack_active_connections()` returns every session of the node's quack server with its
+    * connection id, client id hash, state and the text of its running query (checked on the 2.0
+    * CLI), so one tenant's session reads another's SQL, literals included, and learns the ids
+    * `quack_cancel` takes. `quack_server_list()` lists the node's servers with their listen
+    * address, their count of open connections and their info map. Neither has a use in a data
+    * session; operators read them on the node.
     */
   val NodeWideCalls: Set[String] = Set(
     "quack_serve",
     "quack_stop",
     "quack_cancel",
     "quack_identify",
+    "quack_active_connections",
+    "quack_server_list",
     "quack_clear_cache",
     "pg_clear_cache",
     "enable_logging",

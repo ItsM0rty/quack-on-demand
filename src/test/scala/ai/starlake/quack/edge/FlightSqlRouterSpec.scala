@@ -1590,6 +1590,33 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
       .isRight shouldBe true
 
+  "quack session calls" should "be refused to non-superusers and under lockdown" in:
+    // quack_active_connections() returns every session's running query text and connection id,
+    // the id quack_cancel takes (2.0 CLI).
+    val calls = Seq(
+      "SELECT query FROM quack_active_connections()",
+      "SELECT * FROM quack_server_list()",
+      "SELECT * FROM quack_cancel('qod', '42')"
+    )
+    def refusedIn(router: FlightSqlRouter, eff: ai.starlake.quack.ondemand.rbac.EffectiveSet) =
+      calls.foreach { sql =>
+        val out = router.execute("qa-1", "alice", poolKey, sql, Some(eff)).unsafeRunSync()
+        withClue(sql)(out.swap.toOption.get.reason should include("reserved to superusers"))
+      }
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      refusedIn(router, wildcardAllSet)
+      captured() shouldBe ""
+    }
+    val (locked, lockedCaptured, _) = setupWithRewriter(lockdownFor = _ => true)
+    refusedIn(locked, superuserSet)
+    lockedCaptured() shouldBe ""
+    val (open, _, _) = setupWithRewriter()
+    open
+      .execute("qa-2", "alice", poolKey, calls.head, Some(superuserSet))
+      .unsafeRunSync()
+      .isRight shouldBe true
+
   it should "leave the allowlisted session settings to a non-superuser, ACL on or off" in:
     Seq(StatementValidator.allowAll, wildcardAcl).foreach { v =>
       val (router, _, _) = setupWithRewriter(validator = v)
