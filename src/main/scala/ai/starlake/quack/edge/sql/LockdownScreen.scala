@@ -41,70 +41,25 @@ object LockdownScreen:
     "disconnect" -> "DISCONNECT is disabled on this deployment"
   )
 
+  // Lockdown-specific settings; the node-wide ones (resources, extension loading, logging,
+  // allowed paths, temp and secret directories...) live in NodeSettingScreen.NodeWideSettings, the
+  // one list both screens read, refused to non-superusers whatever the lockdown flag and to every
+  // caller under lockdown.
   private val ProtectedSettings = Set(
-    "disabled_filesystems",
-    "allow_community_extensions",
-    "allow_unsigned_extensions",
-    "allow_extension_repositories",
-    "autoinstall_known_extensions",
-    "autoload_known_extensions",
-    "enable_external_access",
-    "lock_configuration",
-    "temp_directory",
-    "extension_directory",
-    "secret_directory",
-    "allowed_directories",
-    "allowed_paths",
-    "allowed_configs",
-    // Where extensions come from and how they are trusted (extension_directories replaces the
-    // deprecated extension_directory in DuckDB 2.0).
-    "extension_directories",
-    "extension_repository_directory",
-    "custom_extension_repository",
-    "autoinstall_extension_repository",
-    "allow_extensions_metadata_mismatch",
-    // Secrets: where they persist (whether they print unredacted is NodeSettingScreen's).
-    "allow_persistent_secrets",
-    "default_secret_storage",
-    // Logging: the settings twin of the denied enable_logging() call. A tenant turning the logger
-    // on, raising its level or pointing it at stdout reads or spills other sessions' query text
-    // and HTTP traffic (redact_http_logs, refused for every caller, is NodeSettingScreen's).
-    "enable_logging",
-    "logging_level",
-    "logging_mode",
-    "logging_storage",
-    "enabled_log_types",
-    "disabled_log_types",
-    "pg_debug_show_queries",
     // Local files read or written by path.
     "home_directory",
     "file_search_path",
-    "log_query_path",
-    "profile_output",
-    "profiling_output",
-    // Outbound connections: TLS trust, proxying, scheme routing, and SQL the node runs against the
-    // Postgres catalog with its own credentials.
+    // Outbound connections: TLS trust, and SQL the node runs against the Postgres catalog with its
+    // own credentials.
     "ca_cert_file",
     "enable_server_cert_verification",
     "enable_curl_server_cert_verification",
-    "http_proxy",
-    "s3_url_scheme_aliases",
     "pg_staleness_query",
     "pg_pool_health_check_query",
-    // The node's own quack server authentication and authorization callbacks.
+    // The node's own quack server authentication and authorization callbacks (also quack_*).
     "quack_authentication_function",
-    "quack_authorization_function",
-    // Resource settings: not a data-exfiltration surface, but an unguarded resource-abuse vector.
-    // A tenant raising memory_limit past the node's spawn-time default can OOM the node (K8s) or
-    // pressure the whole host's RAM (local backend). Spawn-time defaults (dbInitSql, cgroup-derived
-    // RESOURCE_SQL) run node-side before quack_serve, so protecting these at the edge never blocks
-    // legitimate operator-set values.
-    "memory_limit",
-    "max_memory",
-    "threads",
-    "worker_threads",
-    "max_temp_directory_size"
-  ) ++ NodeSettingScreen.Settings // also refused for every caller by NodeSettingScreen
+    "quack_authorization_function"
+  ) ++ NodeSettingScreen.Settings ++ NodeSettingScreen.NodeWideSettings
 
   // Read-style functions that take a path or URL as their FIRST argument. A remote URL literal is
   // admitted (UrlExempt), a local path denied; glob (directory listing) never exempts.

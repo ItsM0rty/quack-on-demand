@@ -203,3 +203,98 @@ class NodeSettingScreenSpec extends AnyFlatSpec with Matchers:
     NodeSettingScreen.screen("SET dialect_compatibility_mode = 'spark'") shouldBe
       Some(NodeSettingScreen.RefusalMessage)
   }
+
+class NodeWideSettingScreenSpec extends AnyFlatSpec with Matchers:
+
+  private def refused(sql: String): Boolean = NodeSettingScreen.screenNodeWide(sql).isDefined
+
+  "screenNodeWide" should "refuse the node-wide settings in every SET / RESET / PRAGMA form" in
+    Seq(
+      "threads"                        -> "2",
+      "worker_threads"                 -> "2",
+      "external_threads"               -> "2",
+      "async_threads"                  -> "2",
+      "memory_limit"                   -> "'100GB'",
+      "max_memory"                     -> "'100GB'",
+      "max_temp_directory_size"        -> "'1TB'",
+      "temp_directory"                 -> "'/tmp/x'",
+      "allocator_flush_threshold"      -> "'1MB'",
+      "checkpoint_threshold"           -> "'1GB'",
+      "wal_autocheckpoint"             -> "'1GB'",
+      "enable_profiling"               -> "'json'",
+      "profiling_output"               -> "'/tmp/p'",
+      "quack_server_max_connections"   -> "1",
+      "quack_debug_drop_batch"         -> "true",
+      "quack_debug_send_delay_ms"      -> "60000",
+      "debug_checkpoint_scan_sleep_ms" -> "1000",
+      "pg_pool_max_connections"        -> "1",
+      "enable_logging"                 -> "true",
+      "disabled_optimizers"            -> "'filter_pushdown'"
+    ).foreach { case (name, value) =>
+      val upper = name.toUpperCase(java.util.Locale.ROOT)
+      withClue(name) {
+        refused(s"SET $name = $value") shouldBe true
+        refused(s"SET $name TO $value") shouldBe true
+        refused(s"set $upper = $value") shouldBe true
+        refused(s"SET SESSION $name = $value") shouldBe true
+        refused(s"SET LOCAL $name = $value") shouldBe true
+        refused(s"RESET $name") shouldBe true
+        refused(s"RESET SESSION $name") shouldBe true
+        refused(s"PRAGMA $name = $value") shouldBe true
+        refused(s"PRAGMA $name($value)") shouldBe true
+        refused(s"""SET"$name"=$value""") shouldBe true
+        refused(s"SET`$name`=$value") shouldBe true
+        refused(s"SET/* c */$name = $value") shouldBe true
+        refused(s"EXPLAIN ANALYZE SET $name = $value") shouldBe true
+        refused(s"SELECT 1; SET $name = $value") shouldBe true
+      }
+    }
+
+  it should "refuse GLOBAL scope for any setting, and the node-wide pragmas and calls" in
+    Seq(
+      "SET GLOBAL TimeZone = 'UTC'",
+      "RESET GLOBAL search_path",
+      "SET GLOBAL\"http_timeout\" = 1",
+      "PRAGMA enable_profiling",
+      "PRAGMA verify_parallelism",
+      "PRAGMA disable_verify_parallelism",
+      "PRAGMA enable_checkpoint_on_shutdown",
+      "PRAGMA force_checkpoint",
+      "FORCE CHECKPOINT",
+      "SELECT * FROM quack_stop('quack:0.0.0.0:21900')",
+      "SELECT * FROM quack_serve('quack:0.0.0.0:9999', token := 'x')",
+      "CALL quack_serve('quack:0.0.0.0:9999', token := 'x')",
+      "SELECT * FROM quack_identify('n', 'p', 'h', 'r', 'm')",
+      "SELECT * FROM quack_clear_cache()",
+      "SELECT * FROM pg_clear_cache()",
+      "SELECT * FROM enable_logging()",
+      "SELECT * FROM truncate_duckdb_logs()",
+      "SELECT * FROM query('SELECT * FROM quack_stop(''quack:0.0.0.0:21900'')')"
+    ).foreach(sql => withClue(sql)(refused(sql) shouldBe true))
+
+  it should "admit the session settings an ordinary client sends" in
+    Seq(
+      "SET search_path = 'lake.main'",
+      "SET schema = 'main'",
+      "SET TimeZone = 'Europe/Paris'",
+      "SET SESSION TimeZone = 'UTC'",
+      "SET Calendar = 'gregorian'",
+      "SET http_timeout = 300",
+      "SET default_order = 'DESC'",
+      "SET default_null_order = 'nulls_first'",
+      "SET preserve_insertion_order = false",
+      "SET enable_progress_bar = false",
+      "SET errors_as_json = true",
+      "SET max_execution_time = '10s'",
+      "SET VARIABLE x = 42",
+      "RESET VARIABLE x",
+      "RESET search_path",
+      "CHECKPOINT",
+      "SELECT current_setting('threads')",
+      "SELECT * FROM duckdb_settings() WHERE name = 'memory_limit'",
+      "UPDATE t SET threads = 2"
+    ).foreach(sql => withClue(sql)(refused(sql) shouldBe false))
+
+  "NodeWideSettings" should "not overlap the settings refused for every caller" in {
+    NodeSettingScreen.NodeWideSettings.intersect(NodeSettingScreen.Settings) shouldBe empty
+  }

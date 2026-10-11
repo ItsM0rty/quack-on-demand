@@ -1895,6 +1895,21 @@ Self-serve / hosted deployments need a tighter isolation posture than the OSS
 default (single trusted-operator assumption). Four independent knobs, all
 opt-in except pod security:
 
+- **Always on, superuser-only (no flag)** - whatever the ACL mode (QoD
+  grants, OPA, ACL off) and the grants (`*.*.* ALL` included), a caller who is
+  not a superuser is refused, and on a locked-down pool so is a superuser:
+  - the DuckLake metadata catalog `__ducklake_metadata_<alias>` (it holds the
+    per-file encryption keys) and `ducklake_list_files` / `ducklake_commit`
+    ("catalog: the DuckLake metadata catalog is internal ...");
+  - node-wide settings in any `SET` / `RESET` / `PRAGMA` form (threads,
+    `memory_limit`, `max_temp_directory_size`, `temp_directory`, checkpoint /
+    WAL / allocator knobs, logging and profiling, every `quack_*`, `debug_*`,
+    `verify_*`), any `SET GLOBAL` / `RESET GLOBAL`, `FORCE CHECKPOINT`, and the
+    node-control calls (`quack_serve`, `quack_stop`, `enable_logging`, ...)
+    ("node: settings that act on the whole node are reserved to superusers").
+    Set resources at node start instead: database / pool `initSql` or
+    `qod pool set-resources`. Session settings (`search_path`, `TimeZone`,
+    `http_timeout`, `SET VARIABLE`, ...) stay open.
 - **Node lockdown** - `QOD_NODE_LOCKDOWN=true` (config
   `quack-on-demand.nodeLockdown.enabled`, default false). Two layers, both
   gated by the same flag:

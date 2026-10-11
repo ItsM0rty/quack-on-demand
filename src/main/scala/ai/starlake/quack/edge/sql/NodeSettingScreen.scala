@@ -66,6 +66,211 @@ object NodeSettingScreen:
   /** Every setting this screen refuses. */
   val Settings: Set[String] = ParserSettings ++ SecretSettings
 
+  // ---- node-wide settings: superuser-only ----
+
+  /** Settings that act on the whole shared node, refused by [[screenNodeWide]] to every caller who
+    * is not a superuser (whatever the ACL mode and the grants: a setting is not a table) and to
+    * every caller on a pool under lockdown. One session changing them starves or slows every other
+    * session of the pool, changes how the node stores or checkpoints data, or turns on logging and
+    * profiling that capture other sessions' statements. Operators set them at node start (database
+    * / pool `initSql`, `qod pool set-resources`), which never goes through the router.
+    *
+    * Built from the DuckDB 2.0 CLI (`duckdb_settings()` with httpfs, postgres, ducklake and quack
+    * loaded): every setting 2.0 refuses at session scope ("can only be set globally" / "cannot be
+    * set locally"), plus the ones it accepts per session but that act on shared machinery (the
+    * allocator, WAL checkpointing, the postgres connection pool, profiling and its output), plus
+    * the PRAGMA names that toggle the same machinery. [[NodeWidePrefixes]] covers every `quack_*`
+    * (server limits, timeouts, `quack_debug_*` fault injection), `debug_*` and `verify_*` setting.
+    * Excludes what [[Settings]] already refuses for everyone. Session-scoped settings a client
+    * legitimately sends (search_path, schema, TimeZone, Calendar, http_timeout, default_order,
+    * null_order, preserve_insertion_order, enable_progress_bar, errors_as_json, max_execution_time,
+    * s3_* per-session credentials, SET VARIABLE, ...) are not listed and stay admitted, except at
+    * GLOBAL scope (see [[GlobalScopeRefusal]]).
+    */
+  val NodeWideSettings: Set[String] = Set(
+    // Threads and scheduling.
+    "threads",
+    "worker_threads",
+    "external_threads",
+    "async_threads",
+    "pin_threads",
+    "scheduler_process_partial",
+    // Memory, temp space and the allocator.
+    "memory_limit",
+    "max_memory",
+    "max_temp_directory_size",
+    "temp_directory",
+    "temp_file_encryption",
+    "block_allocator_memory",
+    "allocator_flush_threshold",
+    "allocator_bulk_deallocation_flush_threshold",
+    "allocator_background_threads",
+    "write_buffer_row_group_memory_limit",
+    // Storage, checkpoint, WAL and buffer manager.
+    "access_mode",
+    "checkpoint_threshold",
+    "wal_autocheckpoint",
+    "wal_autocheckpoint_entries",
+    "auto_checkpoint_skip_wal_threshold",
+    "checkpoint_on_detach",
+    "fsync_mode",
+    "storage_compatibility_version",
+    "default_block_size",
+    "standard_vector_size",
+    "storage_block_prefetch",
+    "max_vacuum_tasks",
+    "force_compression",
+    "disabled_compression_methods",
+    "zstd_min_string_length",
+    "enable_fsst_vectors",
+    "experimental_metadata_reuse",
+    "force_column_metadata_reuse",
+    "variant_minimum_shredding_size",
+    "geometry_minimum_shredding_size",
+    "disabled_optimizers",
+    "warnings_as_errors",
+    "current_transaction_invalidation_policy",
+    "disable_database_invalidation",
+    "duckdb_api",
+    "custom_user_agent",
+    // Caches and the HTTP client shared by every session.
+    "cache_local_files",
+    "enable_external_file_cache",
+    "external_file_cache_local_max_block_size",
+    "external_file_cache_remote_max_block_size",
+    "external_file_cache_remote_min_block_size",
+    "external_file_cache_request_sizing",
+    "external_file_cache_spill",
+    "http_client_pool_capacity",
+    "httpfs_client_implementation",
+    "httpfs_connection_caching",
+    "http_proxy",
+    "http_proxy_username",
+    "http_proxy_password",
+    "s3_url_scheme_aliases",
+    // The catalog Postgres connection pool.
+    "pg_connection_limit",
+    "pg_connection_cache",
+    "pg_pool_max_connections",
+    "pg_pool_acquire_mode",
+    "pg_pool_enable_reaper_thread",
+    "pg_pool_enable_thread_local_cache",
+    "pg_pool_idle_timeout_millis",
+    "pg_pool_max_lifetime_millis",
+    "pg_pool_wait_timeout_millis",
+    "pg_debug_show_queries",
+    // Extension loading and security posture (also lockdown-protected).
+    "allow_community_extensions",
+    "allow_extension_repositories",
+    "allow_extensions_metadata_mismatch",
+    "allow_unsigned_extensions",
+    "autoinstall_extension_repository",
+    "autoinstall_known_extensions",
+    "autoload_known_extensions",
+    "custom_extension_repository",
+    "extension_directories",
+    "extension_directory", // the deprecated 2.0 alias, still accepted
+    "extension_repository_directory",
+    "enable_external_access",
+    "lock_configuration",
+    "allowed_configs",
+    "allowed_directories",
+    "allowed_paths",
+    "disabled_filesystems",
+    "allow_persistent_secrets",
+    "default_secret_storage",
+    "secret_directory",
+    // Logging and profiling: capture other sessions' statements, or write files.
+    "enable_logging",
+    "logging_level",
+    "logging_mode",
+    "logging_storage",
+    "enabled_log_types",
+    "disabled_log_types",
+    "log_query_path",
+    "enable_profiling",
+    "profiling_output",
+    "profile_output",
+    "profiling_coverage",
+    "profiling_renderer_settings",
+    "tracked_metrics",
+    // PRAGMA toggles of the same machinery.
+    "enable_profile",
+    "disable_profile",
+    "disable_profiling",
+    "enable_checkpoint_on_shutdown",
+    "disable_checkpoint_on_shutdown",
+    "enable_object_cache",
+    "disable_object_cache",
+    "force_checkpoint"
+  ) -- Settings
+
+  /** Every `quack_*` server setting (limits, timeouts, buffers, `quack_debug_*` fault injection),
+    * and every `debug_*` / `verify_*` setting or pragma, present and future.
+    */
+  val NodeWidePrefixes: Seq[String] = Seq("quack_", "debug_", "verify_", "disable_verify_")
+
+  def isNodeWide(name: String): Boolean =
+    NodeWideSettings(name) || NodeWidePrefixes.exists(name.startsWith)
+
+  /** Calls that act on the node itself rather than on data: start / stop / cancel its quack server
+    * or rename it, clear the shared caches, turn the logger or the profiler on or off, truncate the
+    * shared log, and FORCE CHECKPOINT (aborts every other session's transaction).
+    */
+  val NodeWideCalls: Set[String] = Set(
+    "quack_serve",
+    "quack_stop",
+    "quack_cancel",
+    "quack_identify",
+    "quack_clear_cache",
+    "pg_clear_cache",
+    "enable_logging",
+    "disable_logging",
+    "truncate_duckdb_logs",
+    "enable_profiling",
+    "disable_profiling",
+    "force_checkpoint"
+  )
+
+  val NodeWideRefusal =
+    "settings that act on the whole node are reserved to superusers"
+
+  val GlobalScopeRefusal =
+    "SET GLOBAL / RESET GLOBAL changes every session on the node and is reserved to superusers"
+
+  def nodeWideCallRefusal(fn: String): String =
+    s"$fn acts on the whole node and is reserved to superusers"
+
+  /** The refusal for the first statement of `sql` that sets, resets or pragmas a node-wide setting
+    * ([[isNodeWide]]) in any form, uses GLOBAL scope for any setting, runs FORCE CHECKPOINT, or
+    * calls one of [[NodeWideCalls]] anywhere (literal bodies included). Read like [[screen]]:
+    * DuckDB 2.0 tokens, glued quotes, the statement an EXPLAIN / PREPARE carries.
+    */
+  def screenNodeWide(sql: String): Option[String] =
+    LockdownScreen
+      .splitStatements(sql)
+      .iterator
+      .flatMap(s => nodeWideOne(StatementHead.of(s)))
+      .nextOption()
+      .orElse(
+        FunctionCalls
+          .scan(sql)
+          .calls
+          .find(c => NodeWideCalls(c.name))
+          .map(c => nodeWideCallRefusal(c.name))
+      )
+
+  private def nodeWideOne(h: StatementHead.Head): Option[String] =
+    val i = h.start
+    h.word(i) match
+      case Some("set" | "reset" | "pragma") =>
+        val scoped = h.word(i + 1).exists(Scopes) && h.identifier(i + 2).isDefined
+        if scoped && h.word(i + 1).contains("global") then Some(GlobalScopeRefusal)
+        else
+          h.identifier(if scoped then i + 2 else i + 1).filter(isNodeWide).map(_ => NodeWideRefusal)
+      case Some("force") if h.word(i + 1).contains("checkpoint") => Some(NodeWideRefusal)
+      case _                                                     => None
+
   private val Scopes = Set("session", "global", "local")
 
   /** The refusal for the first statement of `sql` that changes one of [[Settings]], or imports a

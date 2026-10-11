@@ -76,6 +76,22 @@
     target (`query_table('__duck' || 'lake...')`, `SET search_path = <expression>`, the
     `postgres_query` / `query` family with a non-constant argument) is refused for the same
     callers. The data tables themselves and the other DuckLake functions are unchanged.
+  - BREAKING for non-superusers who set these: node-wide settings are reserved to superusers,
+    whatever the ACL mode and the grants, and refused to every caller on a pool under lockdown:
+    in any `SET` / `RESET` / `PRAGMA` form (glued quotes, behind `EXPLAIN` / `PREPARE`), threads
+    (`threads`, `worker_threads`, `external_threads`, `async_threads`), memory and temp space
+    (`memory_limit`, `max_memory`, `max_temp_directory_size`, `temp_directory`), the allocator,
+    checkpoint / WAL / storage knobs, the shared HTTP client and Postgres pool, logging and
+    profiling, extension loading, and every `quack_*` (server limits, `quack_debug_*`), `debug_*`
+    and `verify_*` setting; any `SET GLOBAL` / `RESET GLOBAL`; `FORCE CHECKPOINT`; and the
+    node-control calls `quack_serve`, `quack_stop`, `quack_cancel`, `quack_identify`,
+    `quack_clear_cache`, `pg_clear_cache`, `enable_logging` / `disable_logging`,
+    `truncate_duckdb_logs`, `enable_profiling` / `disable_profiling`, `force_checkpoint`. One
+    session changing them starved or slowed every session of the pool. Operators set them at node
+    start (database / pool `initSql`, `qod pool set-resources`). Session settings a client sends
+    (`search_path`, `schema`, `TimeZone`, `Calendar`, `http_timeout`, `default_order`,
+    `preserve_insertion_order`, `enable_progress_bar`, `errors_as_json`, `SET VARIABLE`, ...) are
+    unchanged. The list is shared with lockdown's protected settings (one source).
   - No secret reaches a node process's environment or command line, on any backend: a node user
     with SQL could read `getenv()` or `/proc/<pid>/environ` of duckdb and of its wrapper script.
     The catalog password, the encryption key, the federation and object-store SQL, the node token

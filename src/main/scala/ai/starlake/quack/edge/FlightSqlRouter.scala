@@ -521,10 +521,14 @@ final class FlightSqlRouter(
       else None
     // Superuser-only, whatever the ACL mode and the grants, and nobody's under lockdown (the
     // screens' scaladocs have the why): the DuckLake metadata catalog and the key-returning
-    // DuckLake functions.
+    // DuckLake functions, and the settings and calls that act on the whole shared node.
     val restrictedDenial =
       if isSuperuser && !lockedDown then None
-      else CatalogInternalsScreen.screen(sql).map(r => s"catalog: $r")
+      else
+        CatalogInternalsScreen
+          .screen(sql)
+          .map(r => s"catalog: $r")
+          .orElse(NodeSettingScreen.screenNodeWide(sql).map(r => s"node: $r"))
 
     // Trigger DDL is reserved to superusers and the pool tenant's admins, whatever the ACL mode
     // and the lockdown flag (TriggerScreen's scaladoc has the why). The screen runs first so the

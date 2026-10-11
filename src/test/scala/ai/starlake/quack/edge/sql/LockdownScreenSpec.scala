@@ -560,8 +560,9 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     }
 
   it should "keep the settings that only share a prefix with a protected one admitted" in {
-    denied("SET http_proxy_username = 'u'") shouldBe false
-    denied("SET http_proxy_password = 'p'") shouldBe false
+    // (http_proxy_username / _password are node-wide on 2.0, global-only: protected themselves.)
+    denied("SET http_retries = 3") shouldBe false
+    denied("SET http_keep_alive = false") shouldBe false
     denied("SET http_timeout = 300") shouldBe false
   }
 

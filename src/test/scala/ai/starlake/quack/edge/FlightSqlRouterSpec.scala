@@ -1367,6 +1367,77 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out.isRight shouldBe true
     captured() should include("memory.main.t")
 
+  // ---- node-wide settings (superuser-only, every ACL mode, never wildcard-coverable) ----
+
+  private val nodeWideRefusal =
+    s"access denied: node: ${ai.starlake.quack.edge.sql.NodeSettingScreen.NodeWideRefusal}"
+
+  "a node-wide setting" should "be admitted for a superuser, lockdown off" in:
+    val (router, captured, _) = setupWithRewriter()
+    val out                   = router
+      .execute("nw-1", "alice", poolKey, "SET threads = 2", effectiveSet = Some(superuserSet))
+      .unsafeRunSync()
+    out.isRight shouldBe true
+    captured() should include("threads")
+
+  it should "be refused to a tenant user holding *.*.* ALL, under QoD grants and under OPA" in:
+    Seq(wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      Seq("SET memory_limit = '500GB'", "SET quack_debug_send_delay_ms = 60000").foreach { sql =>
+        val out = router
+          .execute("nw-2", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+          .unsafeRunSync()
+        withClue(sql)(out.swap.toOption.get.reason shouldBe nodeWideRefusal)
+      }
+      captured() shouldBe ""
+    }
+
+  it should "be refused to a non-superuser with the ACL off" in:
+    val (router, captured, _) = setupWithRewriter()
+    val out                   = router
+      .execute("nw-3", "alice", poolKey, "PRAGMA threads = 64", effectiveSet = Some(wildcardAllSet))
+      .unsafeRunSync()
+    out.swap.toOption.get.reason shouldBe nodeWideRefusal
+    val stop = router
+      .execute(
+        "nw-4",
+        "alice",
+        poolKey,
+        "SELECT * FROM quack_stop('quack:0.0.0.0:21900')",
+        effectiveSet = Some(wildcardAllSet)
+      )
+      .unsafeRunSync()
+    stop.swap.toOption.get.reason should include("quack_stop")
+    captured() shouldBe ""
+
+  it should "be refused to a superuser on a pool under lockdown" in:
+    val (router, captured, _) = setupWithRewriter(lockdownFor = _ => true)
+    val out                   = router
+      .execute("nw-5", "alice", poolKey, "SET threads = 64", effectiveSet = Some(superuserSet))
+      .unsafeRunSync()
+    out.swap.toOption.get.reason shouldBe nodeWideRefusal
+    captured() shouldBe ""
+
+  it should "leave the allowlisted session settings to a non-superuser, ACL on or off" in:
+    Seq(StatementValidator.allowAll, wildcardAcl).foreach { v =>
+      val (router, _, _) = setupWithRewriter(validator = v)
+      Seq(
+        "SET search_path = 'memory.main'",
+        "SET TimeZone = 'UTC'",
+        "SET http_timeout = 300",
+        "SET preserve_insertion_order = false",
+        "SET enable_progress_bar = false",
+        "SET errors_as_json = true",
+        "SET default_order = 'DESC'",
+        "SET VARIABLE x = 42"
+      ).foreach { sql =>
+        val out = router
+          .execute("nw-6", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+          .unsafeRunSync()
+        withClue(sql)(out.isRight shouldBe true)
+      }
+    }
+
   it should "deny (not forward) a plain read when a stored row policy fails to apply at rewrite time" in:
     // Simulates a row policy stored before RowPredicateValidator rejected splice-unsafe
     // predicates: a trailing line comment that comments out the rewriter's own closing paren at
