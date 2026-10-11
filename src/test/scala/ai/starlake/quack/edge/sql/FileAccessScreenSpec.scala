@@ -94,6 +94,7 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
     "SELECT trim(leading '/' from '/a/b.csv')",
     "COPY FROM DATABASE a TO b",
     "LOAD httpfs",
+    // not a file read; refused to non-superusers in every mode by NodeSettingScreen.screenNodeWide
     "INSTALL httpfs",
     "INSERT INTO orders SELECT * FROM scan_data_from_quack_client(" +
       "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(a INTEGER), ordered := true)",

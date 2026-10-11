@@ -2714,6 +2714,26 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  "INSTALL" should "be refused to a tenant user, ACL off or on, and open to a superuser" in:
+    Seq(StatementValidator.allowAll, wildcardAcl).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      withClue(v.toString) {
+        router
+          .execute("inst-1", "alice", poolKey, "INSTALL httpfs", Some(wildcardAllSet))
+          .unsafeRunSync()
+          .swap
+          .toOption
+          .get shouldBe a[RouterFailure.AccessDenied]
+        captured() shouldBe ""
+        router
+          .execute("inst-2", "alice", poolKey, "LOAD httpfs", Some(wildcardAllSet))
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+        router
+          .execute("inst-3", "alice", poolKey, "INSTALL httpfs", Some(superuserSet))
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+      }
+    }
+
   // ---- parser settings (DuckDB 2.0) ----
 
   "a parser setting" should "be refused for a regular user with acl disabled, lockdown off" in:

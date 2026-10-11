@@ -301,12 +301,32 @@ object NodeSettingScreen:
     val i = h.start
     if h.word(i).contains("force") && h.word(i + 1).contains("checkpoint") then
       Some(NodeWideRefusal)
+    else if installsCode(h, i) then Some(ExtensionRefusal)
     else
       settingAt(h).flatMap { (name, at) =>
         // The name sits past a scope word exactly when the statement is scoped.
         if at == i + 2 && h.word(i + 1).contains("global") then Some(GlobalScopeRefusal)
         else Option.when(isNodeWide(name))(NodeWideRefusal)
       }
+
+  /** `INSTALL` (any form: it downloads extension code onto the shared node, from the default
+    * repository too), `FORCE INSTALL`, `UPDATE EXTENSIONS`, and a `LOAD` naming a path or URL (code
+    * read from a file). A bare `LOAD <name>` of an extension the node already has stays open.
+    */
+  private def installsCode(h: StatementHead.Head, i: Int): Boolean =
+    h.word(i) match
+      case Some("install") => true
+      case Some("force")   => h.word(i + 1).contains("install")
+      case Some("update")  => h.word(i + 1).contains("extensions")
+      case Some("load")    =>
+        (i + 1 until h.toks.length).exists(k =>
+          h.toks(k).kind == ai.starlake.sql.SqlLexer.Kind.Literal
+        )
+      case _ => false
+
+  val ExtensionRefusal =
+    "installing an extension, or loading one from a path or URL, is reserved to superusers; " +
+      "LOAD an installed extension by its bare name"
 
   private val Scopes = Set("session", "global", "local")
 

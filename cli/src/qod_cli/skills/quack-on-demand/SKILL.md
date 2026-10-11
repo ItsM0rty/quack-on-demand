@@ -1916,11 +1916,19 @@ opt-in except pod security:
   write a file by path: file-reading table functions (`read_parquet`, `read_csv`,
   `read_json`, `glob`, `read_text`, `parquet_metadata`, `iceberg_scan`, ...), a path
   or URL in a table position (`FROM 's3://b/x.parquet'`, `FROM "s3://b/x.parquet"`),
-  `COPY ... TO` / `COPY ... FROM` a path, `EXPORT` / `IMPORT DATABASE`, `ATTACH`, and
-  `LOAD` / `INSTALL` from a path, a URL or a repository ("direct file access is not
-  available to tenant-scoped principals"). Load files as a superuser, or expose them
-  through a federated source and grant its tables. The native front door's client
-  data (`INSERT INTO t SELECT * FROM <client table>`) still flows.
+  `COPY ... TO` / `COPY ... FROM` a path, `EXPORT` / `IMPORT DATABASE`, and `ATTACH`
+  ("direct file access is not available to tenant-scoped principals"). Load files as a
+  superuser, or expose them through a federated source and grant its tables. The
+  native front door's client data (`INSERT INTO t SELECT * FROM <client table>`) still
+  flows.
+- **Extensions and path settings, superuser-only in every mode** (ACL on or off) -
+  a tenant user cannot `INSTALL` / `FORCE INSTALL` / `UPDATE EXTENSIONS` or `LOAD` an
+  extension from a path or URL ("installing an extension ... is reserved to
+  superusers"); install extensions at node start and `LOAD httpfs` by its bare name
+  (`LOAD 'httpfs'`, quoted, is refused). Nor can a tenant user set
+  `file_search_path`, `home_directory`, `allow_asterisks_in_http_paths`, `ca_cert_file`
+  or the server certificate verification settings, and `shell_history()` is refused to
+  every caller, superusers included (the node CLI's history holds its init SQL).
 - **Node lockdown** - `QOD_NODE_LOCKDOWN=true` (config
   `quack-on-demand.nodeLockdown.enabled`, default false). Two layers, both
   gated by the same flag:

