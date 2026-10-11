@@ -101,34 +101,13 @@ private[parser] object DuckDBDialectMapper extends DialectMapper:
     * cannot resolve, its parts joined with dots, so `FROM "s3://b/x.parquet"`, `` FROM
     * `file:///d/x.csv` ``, `FROM "/d/x"."csv"` and `FROM "s3://b/x"."parquet"` read the object or
     * file exactly as the literal does (checked on the 2.0 CLI), with the node's credentials. Read
-    * as a table, the name would be admitted by a wildcard grant on its schema. No quoting is needed
-    * for a relative file: `FROM x.parquet` and `FROM sub.x.parquet` (schema x, table parquet,
-    * neither found) read the files of those names under the node's working directory, so a
-    * qualified name whose last part is a replacement-scan extension
-    * ([[TableExtractor.ReplacementScanExtensions]], a trailing gz / zst dropped first) is one too;
-    * a real table named like one is reachable only under a wildcard ALL grant.
+    * as a table, the name would be admitted by a wildcard grant on its schema.
     */
   def isFileReference(table: Table): Boolean =
     (table.getName != null && table.getName.startsWith("'")) ||
       Option(table.getNameParts).exists(
         _.asScala.exists(p => p != null && FileNameMarks.exists(p.contains))
-      ) || endsInExtension(table)
-
-  private def endsInExtension(table: Table): Boolean =
-    def part(s: String) = Option(s).map(unquote(_).toLowerCase(Locale.ROOT))
-    (part(table.getName), part(table.getSchemaName)) match
-      case (Some(name), Some(prev)) =>
-        TableExtractor.ReplacementScanExtensions.contains(name) ||
-        (CompressionSuffixes.contains(name) &&
-          TableExtractor.ReplacementScanExtensions.contains(prev))
-      case _ => false
-
-  private val CompressionSuffixes = Set("gz", "zst")
-
-  private def unquote(s: String): String =
-    if s.length >= 2 && (s.head == '"' || s.head == '`') && s.last == s.head then
-      s.substring(1, s.length - 1)
-    else s
+      )
 
   // A path separator (a URL scheme's `://` holds one) or a glob character.
   private val FileNameMarks = List("/", "\\", "*", "?", "[", "{")

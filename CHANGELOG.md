@@ -242,14 +242,13 @@
     for (`FROM 's3://b/x.parquet'`): only a wildcard ALL grant (`*.*.* ALL`) covers it, in every
     position (FROM, DESCRIBE / SUMMARIZE, write and DDL targets). DuckDB 2.0 replacement-scans a
     name it cannot resolve, its parts joined with dots, so a quoted URL (`"s3://b/*.parquet"`,
-    `` `file:///d/x.csv` ``), a quoted path (`"/d/x"."csv"`) and even a bare relative file
-    (`x.parquet`, `sub.x.json`) read the object or file with the node's credentials, while the
-    access check saw a table a wildcard read grant (`*.*.* RO`, `<db>.*.* RO`) admits: a raw read
-    of the pool's DuckLake data files, past any row policy. Refused now: a name with a part
-    holding `/`, `\`, `*`, `?`, `[` or `{` (a URL's `://` included), and a qualified name whose
-    last part is a replacement-scan extension (`parquet`, `csv`, `json`, `duckdb`, ..., a trailing
-    `gz` / `zst` dropped first). A real table named like one (`raw.json`, `"data_*"`) is reachable
-    only under a wildcard ALL grant; rename it.
+    `` `file:///d/x.csv` ``) or a quoted path (`"/d/x"."csv"`) read the object or file with the
+    node's credentials, while the access check saw a table a wildcard read grant (`*.*.* RO`,
+    `<db>.*.* RO`) admits: a raw read of the pool's DuckLake data files, past any row policy.
+    Refused now: a name with a part holding `/`, `\`, `*`, `?`, `[` or `{` (a URL's `://`
+    included). A real table named like one (`"data_*"`) is reachable only under a wildcard ALL
+    grant; rename it. Known gap: an unquoted relative file name (`x.parquet`, schema `x` and table
+    `parquet` not found) is still read as a file under a wildcard read grant.
   - BREAKING for quoted names JSqlParser misreads: the quoted-identifier screen no longer lists
     characters but reads each quoted name back through the access check's parser and refuses it
     unless that reading is the name DuckDB reads. Newly refused: square brackets (`"[secret]"`,

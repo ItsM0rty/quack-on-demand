@@ -26,32 +26,6 @@ final case class TableExtraction(tables: List[Table], unsupported: List[String])
   */
 object TableExtractor:
 
-  /** The file extensions DuckDB 2.0's replacement scans recognize: read_csv's csv / tsv, the json
-    * extension's json / jsonl / ndjson / geojson / geojsonl, parquet's parquet, the core
-    * read_duckdb's db / ddb / duckdb, and the suffixes that autoload an extension
-    * (`EXTENSION_FILE_POSTFIXES`): xlsx, avro, shp, gpkg, fgb. Every scan but read_duckdb's drops a
-    * trailing gz or zst first. Shared by the access check (a table name ending in one is a file
-    * reference) and the lockdown screen (a path carrying one is a file read).
-    */
-  val ReplacementScanExtensions: Set[String] = Set(
-    "parquet",
-    "csv",
-    "tsv",
-    "json",
-    "jsonl",
-    "ndjson",
-    "geojson",
-    "geojsonl",
-    "db",
-    "ddb",
-    "duckdb",
-    "xlsx",
-    "avro",
-    "shp",
-    "gpkg",
-    "fgb"
-  )
-
   /** DuckDB's catalog-introspection table functions the edge metadata filter narrows to the session
     * catalog and the principal's grants (issue #114). The single list both the walk below and
     * `ai.starlake.quack.edge.meta.MetadataFilterRewriter` key off, so the admit and the filter
