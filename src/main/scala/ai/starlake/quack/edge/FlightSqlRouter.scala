@@ -778,7 +778,7 @@ final class FlightSqlRouter(
         ) match
           case Some(reason) => denied(s"policy rewrite: $reason")
           case None         =>
-            validator.validate(ctx.copy(statement = rewrittenSql)) match
+            validator.validate(ctx.copy(statement = rewrittenSql, rewriteOf = Some(sql))) match
               case Allowed                      => Right(rewrittenSql)
               case Denied(reason, _, _)         => denied(s"policy rewrite: $reason")
               case ValidatorUnavailable(reason) =>

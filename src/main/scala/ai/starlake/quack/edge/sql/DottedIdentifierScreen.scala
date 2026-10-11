@@ -57,21 +57,34 @@ object DottedIdentifierScreen:
   // A scheme with no dot, so JSqlParser's first split part always holds the `://`.
   private val UrlScheme = "^[A-Za-z][A-Za-z0-9+-]*://.*".r
 
-  /** Some(reason) when `sql` holds such a quoted identifier outside an alias. */
-  def find(sql: String): Option[String] =
-    if sql == null || (sql.indexOf('"') < 0 && sql.indexOf('`') < 0) then None
+  /** Some(reason) when `sql` holds such a quoted identifier outside an alias.
+    *
+    * `rewriteOf` is the statement the caller wrote when `sql` is an edge rewrite of it: only the
+    * quoted identifiers the caller wrote are screened then. The others were printed by the rewriter
+    * (a star expansion's catalog column names, policy SQL), every table name of a rewrite being
+    * printed as the caller wrote it; a column name the gate misreads changes no table it checks.
+    */
+  def find(sql: String, rewriteOf: Option[String] = None): Option[String] =
+    val written = rewriteOf.map(quotedIdentifiers(_).map(_._2).toSet)
+    val hit     = quotedIdentifiers(sql).exists { (afterAs, token) =>
+      !afterAs && written.forall(_.contains(token)) && misread(token)
+    }
+    Option.when(hit)(Reason)
+
+  /** Every double-quoted or backtick-quoted identifier token of `sql`, as the access check parses
+    * it (ParserInput: the engine view with each kept unicode space restored, position for
+    * position), with whether it directly follows the keyword `AS`.
+    */
+  private def quotedIdentifiers(sql: String): List[(Boolean, String)] =
+    if sql == null || (sql.indexOf('"') < 0 && sql.indexOf('`') < 0) then Nil
     else
       val view = SqlLexer.engineView(sql)
-      // The text the access check parses (ParserInput): the view with each kept unicode space
-      // restored, position for position.
       val text = SqlLexer.keptSpacesRestored(view)
       val toks = SqlLexer.tokens(view).filterNot(_.isTrivia)
-      val hit  = toks.indices.exists { i =>
-        val t = toks(i)
-        t.kind == SqlLexer.Kind.Literal && isQuotedIdentifier(view, t) &&
-        misread(text.substring(t.start, t.end)) && !(i > 0 && isAs(view, toks(i - 1)))
+      toks.indices.toList.collect {
+        case i if toks(i).kind == SqlLexer.Kind.Literal && isQuotedIdentifier(view, toks(i)) =>
+          (i > 0 && isAs(view, toks(i - 1))) -> text.substring(toks(i).start, toks(i).end)
       }
-      Option.when(hit)(Reason)
 
   // A name JSqlParser cannot read differently: no separator, quote or bracket to act on.
   private val PlainName = "[A-Za-z0-9_]+".r

@@ -47,7 +47,8 @@ object AccessGate:
       config: Config,
       sessionCatalog: String,
       filteredMetadata: Boolean,
-      clientDataScans: Boolean
+      clientDataScans: Boolean,
+      rewriteOf: Option[String] = None
   ): GateOutcome =
     // Ahead of every other arm, and never wildcard-coverable: the target of these calls is
     // a string the parser cannot see, so the wildcard's tenant-catalog scoping cannot apply.
@@ -61,7 +62,7 @@ object AccessGate:
     // (see DottedIdentifierScreen), so the grant checked would not be the table read.
     BacktickScreen
       .find(statement)
-      .orElse(DottedIdentifierScreen.find(statement))
+      .orElse(DottedIdentifierScreen.find(statement, rewriteOf))
       .orElse(CatalogReachingCalls.find(statement).map(CatalogReachingCalls.denyReason))
       .orElse(
         CatalogReachingCalls.sqlValuedSetting(statement).map(CatalogReachingCalls.settingDenyReason)
@@ -96,10 +97,10 @@ object AccessGate:
       case GateOutcome.Refuse(_, _, _)    => None
       case GateOutcome.NothingGated(_, _) => Some(Set.empty)
       case GateOutcome.Gated(gated, _)    => Some(gated)
-    def eval(sql: String) =
-      evaluate(sql, config, sessionCatalog, filteredMetadata = true, clientDataScans)
-    gatedOf(eval(original)).flatMap { authorized =>
-      eval(rewritten) match
+    def eval(sql: String, rewriteOf: Option[String]) =
+      evaluate(sql, config, sessionCatalog, filteredMetadata = true, clientDataScans, rewriteOf)
+    gatedOf(eval(original, None)).flatMap { authorized =>
+      eval(rewritten, Some(original)) match
         case GateOutcome.Refuse(message, _, _) =>
           Some(s"the rewritten statement cannot be authorized ($message)")
         case other =>

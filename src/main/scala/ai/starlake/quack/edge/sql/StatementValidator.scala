@@ -45,7 +45,13 @@ case class ValidationContext(
     // anywhere else would park the statement on the node forever. Set by the front door's call
     // into `FlightSqlRouter.executeWith` and nowhere else; false keeps the scan refused as an
     // unsupported construct (AccessGate, ProtectedWriteGuard).
-    clientDataScans: Boolean = false
+    clientDataScans: Boolean = false,
+    // The statement the caller wrote, when `statement` is an edge rewrite of it (column or row
+    // policies, metadata filter) the router re-validates. The quoted identifiers the rewrite
+    // introduced (catalog column names of a star expansion, policy SQL) are no names the caller
+    // chose, so they are not screened as misread table names (DottedIdentifierScreen); every one
+    // the caller wrote still is. None for a statement as the caller wrote it.
+    rewriteOf: Option[String] = None
 )
 
 sealed trait ValidationResult

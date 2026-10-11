@@ -50,6 +50,12 @@ private[cls] object StarExpansion:
     "a star with EXCLUDE / REPLACE cannot be expanded over this FROM clause under column " +
       "policies; name the columns instead"
 
+  // JSqlParser splits a quoted column name on its dots when the expansion is parsed again
+  // (`c."price.usd"` came out as `"price"."usd"`, another column), so it cannot be printed.
+  private val DottedColumnRefusal =
+    "a star over a table with a column whose name holds a dot cannot be expanded under column " +
+      "policies; name the columns instead"
+
   /** Right(the statement to resolve: `sql` itself when no star was expanded), or Left(reason). */
   def expand(
       sql: String,
@@ -191,11 +197,13 @@ private[cls] object StarExpansion:
         .filter(known.contains)
         .map(_ -> r.getExpression.asInstanceOf[Expression])
     }
+    val drop = excluded.flatten.toSet
+    val kept = cols.filterNot(c => drop.contains(lower(c)))
     if excluded.contains(None) || replaced.contains(None) then Left(Refusal)
+    else if kept.exists(_.contains('.')) then Left(DottedColumnRefusal)
     else
-      val drop = excluded.flatten.toSet
       val subs = replaced.flatten.toMap
-      Right(cols.filterNot(c => drop.contains(lower(c))).map { c =>
+      Right(kept.map { c =>
         subs.get(lower(c)) match
           case Some(expr) => new SelectItem[Expression](expr, new Alias(quoteIfNeeded(c)))
           case None => new SelectItem[Column](new Column(new Table(bindingName), quoteIfNeeded(c)))

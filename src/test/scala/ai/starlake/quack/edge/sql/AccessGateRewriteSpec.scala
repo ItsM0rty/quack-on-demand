@@ -54,3 +54,20 @@ class AccessGateRewriteSpec extends AnyFlatSpec with Matchers:
   it should "leave an original it cannot compare to the router's re-validation" in {
     beyond("SELECT * FROM read_parquet('/x')", "SELECT * FROM read_parquet('/y')") shouldBe None
   }
+
+  // A star expansion prints the catalog's column names, quoted when needed: `c."a@b"` is a name
+  // the caller never wrote, so the quoted-identifier screen does not refuse the rewrite for it.
+  // Every quoted name the caller wrote is still screened, an alias moved out of AS position too.
+  it should "screen only the quoted names the caller wrote" in {
+    beyond(
+      "SELECT * FROM customer c",
+      "SELECT c.c_id, c.\"a@b\", c.\"x]\" FROM customer c"
+    ) shouldBe
+      None
+    beyond("SELECT 1 AS \"a@b\" FROM customer", "SELECT \"a@b\" FROM customer") shouldBe defined
+    beyond("SELECT * FROM customer", "SELECT * FROM \"[customer]\"") shouldBe defined
+    DottedIdentifierScreen.find("SELECT c.\"a@b\" FROM t c", Some("SELECT * FROM t c")) shouldBe
+      None
+    DottedIdentifierScreen.find("SELECT c.\"a@b\" FROM t c", None) shouldBe
+      Some(DottedIdentifierScreen.Reason)
+  }

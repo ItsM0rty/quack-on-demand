@@ -1326,6 +1326,60 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     capturedSql() should include("SELECT a FROM t")
     capturedSql() should not include "main.t"
 
+  // The star expansion quotes a catalog column the screen would refuse as a caller-written name
+  // (`c."a@b"`, `c."x]"`): the caller wrote no such token, so the re-validation admits the rewrite.
+  "a star expansion over an unusual column name" should "pass the re-validation" in:
+    // QoD grants: the re-validation goes through the validator too, not only the gate compare.
+    val acl = new ai.starlake.quack.edge.sql.PostgresAclValidator(
+      tenantCatalogs = _ => Set("memory"),
+      filteredMetadata = true
+    )
+    val (router, capturedSql, _) = setupWithRewriter(
+      new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+        new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+          Map(("memory", "main", "customer") -> List("c_id", "c_email", "a@b", "x]"))
+        ),
+        enabled = true
+      ),
+      validator = acl
+    )
+    val granted = effWithPolicies(List(maskCustomerEmailCls)).copy(permissions =
+      List(ai.starlake.quack.ondemand.state.RolePermission("p-1", "r-1", "*", "*", "*", "RO"))
+    )
+    List("SELECT * FROM customer c", "SELECT * EXCLUDE (c_id) FROM customer").foreach { sql =>
+      withClue(sql) {
+        router
+          .execute("cls-odd", "alice", poolKey, sql, Some(granted))
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+        capturedSql() should include("'***' AS c_email")
+        capturedSql() should include("\"a@b\"")
+        capturedSql() should include("\"x]\"")
+      }
+    }
+
+  // JSqlParser splits a quoted dotted column name when it parses the expansion again
+  // (`c."price.usd"` came out as `"price"."usd"`, another column): refused, never printed.
+  it should "refuse a column whose name holds a dot rather than print another column" in:
+    val (router, capturedSql, _) = setupWithRewriter(
+      new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+        new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+          Map(("memory", "main", "customer") -> List("c_id", "c_email", "price.usd"))
+        ),
+        enabled = true
+      )
+    )
+    val out = router
+      .execute(
+        "cls-dotted",
+        "alice",
+        poolKey,
+        "SELECT * FROM customer c",
+        Some(effWithPolicies(List(maskCustomerEmailCls)))
+      )
+      .unsafeRunSync()
+    out.left.toOption.get.reason should include("holds a dot")
+    capturedSql() shouldBe ""
+
   // `c.to_json()` is `to_json(c)`: the whole row of customer, c_email raw.
   "a method call on a masked table's binding" should "be denied before the node" in:
     val (router, capturedSql, _) = setupWithRewriter(

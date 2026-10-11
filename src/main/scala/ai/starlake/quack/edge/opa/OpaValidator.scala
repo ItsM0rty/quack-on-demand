@@ -38,7 +38,8 @@ final class OpaValidator(
               config,
               sessionCatalog,
               filteredMetadata,
-              context.clientDataScans
+              context.clientDataScans,
+              context.rewriteOf
             ) match
               case GateOutcome.Refuse(msg, _, _) =>
                 logger.info(s"OPA gate refused for user:${context.username}: $msg")

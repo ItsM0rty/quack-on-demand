@@ -76,7 +76,8 @@ final class PostgresAclValidator(
           config,
           sessionCatalog,
           filteredMetadata,
-          context.clientDataScans
+          context.clientDataScans,
+          context.rewriteOf
         ) match
           case GateOutcome.Refuse(msg, true, covered) =>
             denyUnlessWildcardAll(eff, context.username, covered, msg)
