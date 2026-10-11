@@ -990,3 +990,19 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       "SELECT c.c_id, '***' AS c_email, c.c_phone FROM customer c"
     )
   }
+
+  it should "mask a method call on a masked column and deny a field read of one" in {
+    val effSet = eff(tenantUser, List(maskEmail))
+    rw.rewrite("SELECT c_email.lower() FROM customer", StatementKind.Select, effSet, ctx)
+      .unsafeRunSync() shouldBe Rewritten("SELECT lower('***') FROM customer")
+    rw.rewrite(
+      "SELECT c_id FROM customer c WHERE c.c_email.contains('alice')",
+      StatementKind.Select,
+      effSet,
+      ctx
+    ).unsafeRunSync() shouldBe Rewritten(
+      "SELECT c_id FROM customer c WHERE contains('***', 'alice')"
+    )
+    rw.rewrite("SELECT c_email.x FROM customer", StatementKind.Select, effSet, ctx)
+      .unsafeRunSync() shouldBe a[Denied]
+  }

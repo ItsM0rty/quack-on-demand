@@ -605,3 +605,48 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
     outcome("SELECT COLUMNS('o_.*') FROM orders") shouldBe RewriteOutcome.Passthrough
     outcome("SELECT * LIKE 'o_%' FROM orders") shouldBe RewriteOutcome.Passthrough
   }
+
+  // ---- DuckDB method-call syntax ----------------------------------------------------------
+  //
+  // `c_email.lower()` is `lower(c_email)` in DuckDB, but JSqlParser holds it as a function with the
+  // multi-part name [c_email, lower] and no column node, so the column went out unmasked. A call
+  // whose leading parts name a masked column is rewritten to the function form, then masked.
+
+  private def rewrittenTo(sql: String, expected: String): Unit =
+    withClue(sql)(outcome(sql) shouldBe RewriteOutcome.Rewritten(expected))
+
+  "a method call on a masked column" should "be masked as the function call it is" in {
+    rewrittenTo("SELECT c_email.lower() FROM customer", "SELECT lower('***') FROM customer")
+    rewrittenTo("SELECT c.c_email.upper() FROM customer c", "SELECT upper('***') FROM customer c")
+    rewrittenTo(
+      "SELECT customer.c_email.lower() FROM customer",
+      "SELECT lower('***') FROM customer"
+    )
+    rewrittenTo(
+      "SELECT c_email.concat('') FROM customer",
+      "SELECT concat('***', '') FROM customer"
+    )
+    rewrittenTo(
+      "SELECT c_email.substr(1, 3) AS s FROM customer",
+      "SELECT substr('***', 1, 3) AS s FROM customer"
+    )
+    rewrittenTo(
+      "SELECT c_id FROM customer WHERE c_email.contains('alice')",
+      "SELECT c_id FROM customer WHERE contains('***', 'alice')"
+    )
+    rewrittenTo(
+      "SELECT c_email.lower().upper() FROM customer",
+      "SELECT lower('***').upper() FROM customer"
+    )
+  }
+
+  it should "leave a method call on an unmasked column, and a qualified function, alone" in {
+    outcome("SELECT o.c_email.lower() FROM orders o") shouldBe RewriteOutcome.Passthrough
+    outcome("SELECT c_name.lower() FROM customer") shouldBe RewriteOutcome.Passthrough
+    outcome("SELECT main.my_macro(c_id) FROM customer") shouldBe RewriteOutcome.Passthrough
+  }
+
+  "a field of a masked column" should "be denied" in {
+    denied("SELECT c_email.x FROM customer")
+    denied("SELECT c.c_email.x FROM customer c")
+  }

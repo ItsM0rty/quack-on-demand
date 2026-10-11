@@ -135,6 +135,10 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
                   case Some(name) => Denied(s"unresolvable table $name")
                   case None       =>
                     try
+                      // `c_email.lower()` to `lower(c_email)`, so the visitor sees the column.
+                      ResidualColumns
+                        .normalizeMethodCalls(sel, policies, schema)
+                        .foreach(reason => throw DenyException(reason))
                       // The visitor masks the positions it models and leaves every other node
                       // as it found it; a covered column still in the tree afterwards would
                       // reach the node unmasked, so it denies (ResidualColumns).
@@ -811,7 +815,8 @@ private[cls] object ResidualColumns:
       columns: List[(Column, List[Scope])],
       tables: List[Table],
       unknown: Option[String],
-      forms: List[(Form, List[Scope])]
+      forms: List[(Form, List[Scope])],
+      methodCalls: List[(net.sf.jsqlparser.expression.Function, List[Scope])]
   )
 
   /** Nodes that read columns with no column node of their own for the visitor to mask. */
@@ -927,6 +932,9 @@ private[cls] object ResidualColumns:
     val columns = scala.collection.mutable.ListBuffer.empty[(Column, List[Scope])]
     val tables  = scala.collection.mutable.ListBuffer.empty[Table]
     val forms   = scala.collection.mutable.ListBuffer.empty[(Form, List[Scope])]
+    val calls   =
+      scala.collection.mutable.ListBuffer
+        .empty[(net.sf.jsqlparser.expression.Function, List[Scope])]
     val counted = java.util.Collections.newSetFromMap(
       new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
     )
@@ -943,6 +951,7 @@ private[cls] object ResidualColumns:
             forms += (Form.Expansion -> scopes)
           case f: net.sf.jsqlparser.expression.Function =>
             countStar(f).foreach(counted.add(_))
+            if Option(f.getMultipartName).exists(_.size > 1) then calls += (f -> scopes)
           case ae: net.sf.jsqlparser.expression.AnalyticExpression
               if Option(ae.getName).exists(_.equalsIgnoreCase("count")) =>
             // `count(*) FILTER (..)` / `count(*) OVER (..)`
@@ -1013,24 +1022,23 @@ private[cls] object ResidualColumns:
         case leaf if AstChildren.isLeaf(leaf)      => ()
         case other => unknown = unknown.orElse(Some(other.getClass.getName))
     walk(root, Nil, Map.empty)
-    Scan(columns.toList, tables.toList, unknown, forms.toList)
+    Scan(columns.toList, tables.toList, unknown, forms.toList, calls.toList)
 
   /** Every table node of `root` except column qualifiers, by identity. */
   def tablesOf(root: AnyRef): List[Table] = scan(root).tables
 
-  /** The column references in `sel` a policy could cover, noted before the rewrite. */
-  def suspects(
-      sel: AnyRef,
+  /** How a policy covers the column references of one scan: DuckDB's binding of each name. */
+  private final class Coverage(
+      before: Scan,
       policies: List[RoleColumnPolicy],
       schema: Map[String, List[String]]
-  ): Suspects =
-    val before  = scan(sel)
-    val aliases = before.tables.flatMap { t =>
+  ):
+    private val aliases = before.tables.flatMap { t =>
       Option(t.getAlias).map(a => lower(unquote(a.getName)) -> unquote(t.getName))
     }
-    def columnsOf(table: String): Option[List[String]] =
+    private def columnsOf(table: String): Option[List[String]] =
       schema.find(_._1.equalsIgnoreCase(table)).map(_._2).filter(_.nonEmpty)
-    def isPolicyTable(table: String, byName: List[RoleColumnPolicy]): Boolean =
+    def isPolicyTable(table: String, byName: List[RoleColumnPolicy] = policies): Boolean =
       byName.exists(p =>
         p.tableName == RoleColumnPolicy.Wildcard || p.tableName.equalsIgnoreCase(table)
       )
@@ -1042,7 +1050,7 @@ private[cls] object ResidualColumns:
         case None    => src.outputs.map(_.contains(lower(name)))
 
     /** Innermost-first binding of an unqualified `name`. */
-    def unqualifiedCovered(
+    private def unqualifiedCovered(
         name: String,
         scopes: List[Scope],
         byName: List[RoleColumnPolicy]
@@ -1055,21 +1063,83 @@ private[cls] object ResidualColumns:
           if candidates.exists(_.table.exists(isPolicyTable(_, byName))) then true
           else if definite then false
           else unqualifiedCovered(name, rest, byName)
+
+    /** Whether the bare name `name` binds to a covered column. */
+    private def nameCovered(name: String, scopes: List[Scope]): Boolean =
+      val byName = policies.filter(_.columnName.equalsIgnoreCase(name))
+      byName.nonEmpty &&
+      (byName.exists(_.tableName == RoleColumnPolicy.Wildcard) ||
+        unqualifiedCovered(name, scopes, byName))
+
     def covered(col: Column, scopes: List[Scope]): Boolean =
       val name   = unquote(Option(col.getColumnName).getOrElse(""))
       val byName = policies.filter(_.columnName.equalsIgnoreCase(name))
-      if byName.isEmpty then false
-      else if byName.exists(_.tableName == RoleColumnPolicy.Wildcard) then true
+      Option(col.getTable).flatMap(t => Option(t.getName)).map(unquote) match
+        case Some(q) =>
+          scopes.iterator.map(_.filter(_.names.contains(lower(q)))).find(_.nonEmpty) match
+            case Some(bound) =>
+              byName.exists(_.tableName == RoleColumnPolicy.Wildcard) ||
+              bound.exists(_.table.exists(isPolicyTable(_, byName)))
+            case None =>
+              // Not named by any scope: any table the qualifier aliases anywhere, or itself. Or
+              // the qualifier is itself a column and `name` one of its fields (`c_email.x`,
+              // `c.c_email.x`): a read of that column.
+              val targets = aliases.collect { case (a, t) if a == lower(q) => t } :+ q
+              byName.exists(_.tableName == RoleColumnPolicy.Wildcard) ||
+              targets.exists(isPolicyTable(_, byName)) || nameCovered(q, scopes)
+        case None => nameCovered(name, scopes)
+
+  /** DuckDB's method call `x.f(args)` is `f(x, args)`; JSqlParser holds it as a function with the
+    * multi-part name `[.., x, f]` and no node for `x`, so the masking visitor never saw the column
+    * (`c_email.lower()`, `c.c_email.upper()`, in any clause). Each call whose leading parts name a
+    * covered column, read as DuckDB binds a column reference, is rewritten in place to the function
+    * form, which the visitor then masks like any other call. A call whose leading parts name no
+    * covered column (a method on another column, a schema-qualified function) is left as written.
+    * Some(reason) when a covered call cannot be rewritten exactly (named or keyword arguments,
+    * DISTINCT, a chained argument list).
+    */
+  def normalizeMethodCalls(
+      sel: AnyRef,
+      policies: List[RoleColumnPolicy],
+      schema: Map[String, List[String]]
+  ): Option[String] =
+    val before   = scan(sel)
+    val coverage = new Coverage(before, policies, schema)
+    val refusals = before.methodCalls.flatMap { (f, scopes) =>
+      val parts    = f.getMultipartName.asScala.toList
+      val receiver = parts.init
+      val column   =
+        if receiver.size == 1 then new Column(receiver.head)
+        else new Column(new Table(receiver.init.asJava), receiver.last)
+      if !coverage.covered(column, scopes) then None
+      else if f.getNamedParameters != null || f.getKeywordArguments != null || f.isDistinct ||
+        f.isAllColumns || f.getChainedParameters != null || f.getExtraKeyword != null
+      then
+        Some(
+          s"a method call on the masked column ${column.getFullyQualifiedName} cannot be " +
+            "rewritten to its function form; call the function instead"
+        )
       else
-        Option(col.getTable).flatMap(t => Option(t.getName)).map(unquote) match
-          case Some(q) =>
-            scopes.iterator.map(_.filter(_.names.contains(lower(q)))).find(_.nonEmpty) match
-              case Some(bound) => bound.exists(_.table.exists(isPolicyTable(_, byName)))
-              case None        =>
-                // Not named by any scope: any table the qualifier aliases anywhere, or itself.
-                val targets = aliases.collect { case (a, t) if a == lower(q) => t } :+ q
-                targets.exists(isPolicyTable(_, byName))
-          case None => unqualifiedCovered(name, scopes, byName)
+        val args = new net.sf.jsqlparser.expression.operators.relational.ExpressionList[
+          Expression
+        ]()
+        args.add(column)
+        Option(f.getParameters).foreach(_.forEach(p => args.add(p.asInstanceOf[Expression])))
+        f.setName(java.util.List.of(parts.last))
+        f.setParameters(args)
+        None
+    }
+    refusals.headOption
+
+  /** The column references in `sel` a policy could cover, noted before the rewrite. */
+  def suspects(
+      sel: AnyRef,
+      policies: List[RoleColumnPolicy],
+      schema: Map[String, List[String]]
+  ): Suspects =
+    val before   = scan(sel)
+    val coverage = new Coverage(before, policies, schema)
+    import coverage.{covered, has, isPolicyTable}
     val noted = java.util.Collections.newSetFromMap(
       new java.util.IdentityHashMap[Column, java.lang.Boolean]()
     )
