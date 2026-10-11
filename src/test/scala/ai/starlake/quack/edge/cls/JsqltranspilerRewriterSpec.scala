@@ -650,3 +650,27 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
     denied("SELECT c_email.x FROM customer")
     denied("SELECT c.c_email.x FROM customer c")
   }
+
+  // ---- NATURAL JOIN -----------------------------------------------------------------------
+  //
+  // A NATURAL join compares the columns both sides share, raw, with no column node: a guess list
+  // joined NATURAL to the masked table recovers every value it holds (an enumerable domain such as
+  // phone numbers comes back whole). Denied like JOIN .. USING on a masked column.
+
+  "a NATURAL join over a masked column" should "be denied" in
+    List(
+      "SELECT g.c_email, c_id FROM (SELECT 'a@x' AS c_email) g NATURAL JOIN customer",
+      "SELECT c_id FROM customer NATURAL JOIN orders",
+      "SELECT c_name FROM customer NATURAL LEFT JOIN orders",
+      "SELECT c_name FROM orders o NATURAL JOIN customer c",
+      "SELECT c_name FROM lineitem, customer NATURAL JOIN (SELECT 'a@x' AS c_email) g",
+      "SELECT 1 FROM (customer NATURAL JOIN orders)"
+    ).foreach(denied)
+
+  it should "be admitted when the shared columns carry no policy" in {
+    outcome("SELECT c_name FROM customer NATURAL JOIN lineitem") shouldBe RewriteOutcome.Passthrough
+    outcome("SELECT o_id FROM orders NATURAL JOIN lineitem") shouldBe RewriteOutcome.Passthrough
+    outcome(
+      "SELECT c_name FROM customer NATURAL JOIN (SELECT 1 AS c_id) k"
+    ) shouldBe RewriteOutcome.Passthrough
+  }

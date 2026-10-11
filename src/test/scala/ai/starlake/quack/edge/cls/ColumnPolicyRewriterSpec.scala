@@ -1006,3 +1006,13 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     rw.rewrite("SELECT c_email.x FROM customer", StatementKind.Select, effSet, ctx)
       .unsafeRunSync() shouldBe a[Denied]
   }
+
+  it should "deny a NATURAL join that compares a masked column against a guess list" in {
+    rw.rewrite(
+      "SELECT g.c_phone, c_id FROM (SELECT '555-' || lpad(unnest(range(10000))::VARCHAR, 4, '0') " +
+        "AS c_phone) g NATURAL JOIN customer",
+      StatementKind.Select,
+      eff(tenantUser, List(maskPhone)),
+      ctx
+    ).unsafeRunSync() shouldBe a[Denied]
+  }

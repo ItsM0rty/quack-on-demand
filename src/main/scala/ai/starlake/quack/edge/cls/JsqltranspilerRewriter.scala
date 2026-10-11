@@ -833,6 +833,9 @@ private[cls] object ResidualColumns:
     /** `(TABLE t)` / `(SUMMARIZE t)` in table position: the table read, None when unreadable. */
     case StatementSource(table: Option[String])
 
+    /** A NATURAL join: it compares, raw, every column its two sides share. */
+    case NaturalJoin(left: List[Source], right: List[Source])
+
   private def isColumnsCall(f: net.sf.jsqlparser.expression.Function): Boolean =
     Option(f.getMultipartName).exists(_.size == 1) &&
       Option(f.getName).exists(n => unquote(n).equalsIgnoreCase("columns"))
@@ -1001,7 +1004,24 @@ private[cls] object ResidualColumns:
           walk(wi, scopes, visible)
         }
         val inCtes = ctes ++ declared.flatten
-        val inner  = fromItemsOf(node) match
+        // A NATURAL join compares the columns its two sides share: the FROM items before it, and
+        // its own item.
+        val (head, joins) = node match
+          case ps: PlainSelect => (ps.getFromItem, Option(ps.getJoins).toList.flatMap(_.asScala))
+          case pfi: ParenthesedFromItem =>
+            (pfi.getFromItem, Option(pfi.getJoins).toList.flatMap(_.asScala))
+          case fq: net.sf.jsqlparser.statement.piped.FromQuery =>
+            (fq.getFromItem, Option(fq.getJoins).toList.flatMap(_.asScala))
+          case _ => (null, Nil)
+        joins.zipWithIndex.foreach { (j, i) =>
+          if j.isNatural then
+            val left = (head :: joins.take(i).map(_.getFromItem)).filter(_ != null)
+            forms += (Form.NaturalJoin(
+              left.flatMap(sourcesOf(_, inCtes)),
+              Option(j.getFromItem).toList.flatMap(sourcesOf(_, inCtes))
+            ) -> scopes)
+        }
+        val inner = fromItemsOf(node) match
           case Nil   => scopes
           case items => items.filter(_ != null).flatMap(sourcesOf(_, inCtes)) :: scopes
         AstChildren.accessors(node.getClass).foreach { m =>
@@ -1036,7 +1056,7 @@ private[cls] object ResidualColumns:
     private val aliases = before.tables.flatMap { t =>
       Option(t.getAlias).map(a => lower(unquote(a.getName)) -> unquote(t.getName))
     }
-    private def columnsOf(table: String): Option[List[String]] =
+    def columnsOf(table: String): Option[List[String]] =
       schema.find(_._1.equalsIgnoreCase(table)).map(_._2).filter(_.nonEmpty)
     def isPolicyTable(table: String, byName: List[RoleColumnPolicy] = policies): Boolean =
       byName.exists(p =>
@@ -1148,6 +1168,30 @@ private[cls] object ResidualColumns:
     def policyTable(table: String): Boolean       = isPolicyTable(table, policies)
     def policyScope(scopes: List[Scope]): Boolean =
       scopes.exists(_.exists(_.table.exists(policyTable)))
+    // The columns a NATURAL join compares are the names its sides share; with a side whose columns
+    // are unknown the set cannot be told, so a policy table on either side denies.
+    def naturalOverPolicy(left: List[Source], right: List[Source]): Boolean =
+      def columns(srcs: List[Source]): Option[Set[String]] =
+        srcs
+          .map(src =>
+            src.table match
+              case Some(t) => coverage.columnsOf(t).map(_.map(lower).toSet)
+              case None    => src.outputs
+          )
+          .foldLeft(Option(Set.empty[String]))((acc, c) => acc.zip(c).map(_ ++ _))
+      val sides = left ++ right
+      sides.exists(_.table.exists(policyTable)) && {
+        (columns(left), columns(right)) match
+          case (Some(l), Some(r)) =>
+            (l intersect r).exists(name =>
+              policies.exists(p =>
+                p.columnName.equalsIgnoreCase(name) &&
+                  (p.tableName == RoleColumnPolicy.Wildcard ||
+                    sides.exists(_.table.exists(_.equalsIgnoreCase(p.tableName))))
+              )
+            )
+          case _ => true
+      }
     val formRefusal = before.forms.collectFirst {
       case (Form.TableStatement, _) =>
         "a TABLE statement in expression position (ARRAY(TABLE t), ANY (TABLE t)) reads every " +
@@ -1159,6 +1203,9 @@ private[cls] object ResidualColumns:
       case (Form.StatementSource(table), _) if table.forall(policyTable) =>
         "a statement in table position ((TABLE t), (SUMMARIZE t), ..) reads a table with column " +
           "policies unmasked; select from the table instead"
+      case (Form.NaturalJoin(left, right), _) if naturalOverPolicy(left, right) =>
+        "a NATURAL join over a column with a column policy compares it unmasked; join with ON " +
+          "over the masked column instead"
     }
     // DuckDB binds a name no source has as a column to a FROM binding of that name: the whole row
     // as a STRUCT (`SELECT c FROM customer c`, `main.customer`, `to_json(c)`), every column raw.
