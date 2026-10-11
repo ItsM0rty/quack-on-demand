@@ -53,6 +53,7 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     @volatile var fetchChunksBeforeEnd: Int    = 1
     val posted: ArrayBuffer[Frame]             = ArrayBuffer.empty
     val prepareUris: ArrayBuffer[URI]          = ArrayBuffer.empty
+    @volatile var unreachablePorts: Set[Int]   = Set.empty
     private val connections                    = new AtomicInteger(0)
     private var fetchesServed                  = 0
     def types: List[Int]                       = posted.toList.map(_.header.msgType)
@@ -63,6 +64,8 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     def sinceHandshake: List[Frame]                        = posted.toList.drop(2)
     def typesSinceHandshake: List[Int]                     = sinceHandshake.map(_.header.msgType)
     def post(uri: URI, body: Array[Byte]): IO[Array[Byte]] = IO {
+      if unreachablePorts.contains(uri.getPort) then
+        throw new java.io.IOException(s"connection refused: ${uri.getPort}")
       val f = frame(body).toOption.get
       posted.synchronized(posted += f)
       f.header.msgType match
@@ -95,7 +98,8 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
       validator: StatementValidator = StatementValidator.allowAll,
       superuser: Boolean = false,
       withAdmin: Boolean = false,
-      ttlSec: Long = 3600
+      ttlSec: Long = 3600,
+      maxConcurrent: Int = 0
   ): Fixture =
     val backend = new QuackBackend:
       private val n          = TrieMap.empty[String, RunningNode]
@@ -124,7 +128,9 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     sup
       .createTenantDb(poolKey.tenant, poolKey.tenantDb, TenantDbKind.InMemory, Map.empty, "")
       .unsafeRunSync()
-    sup.createPool(poolKey, RoleDistribution(0, 0, 2)).unsafeRunSync()
+    sup
+      .createPool(poolKey, RoleDistribution(0, 0, 2), maxConcurrentPerNode = maxConcurrent)
+      .unsafeRunSync()
     val store                  = new RecordingTelemetryStore
     val journal                = new EventJournal(store)
     val events                 = ArrayBuffer.empty[ManagerEvent]
@@ -572,9 +578,53 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     prepare(fx, b, SchemaSync) shouldBe prepareResp(false)
     lastPrepareNode(fx) shouldBe other
 
-  "QuackFrontDoor.readsCatalog" should "spot a duckdb_* catalog function call only" in:
+  it should "hold the pin over the node's maxConcurrent cap" in:
+    val fx     = setup(maxConcurrent = 1)
+    val connId = connect(fx)
+    prepare(fx, connId, SchemaSync) shouldBe prepareResp(false)
+    val first = lastPrepareNode(fx)
+    val other = fx.nodes.map(_.nodeId).find(_ != first).getOrElse(fail("need two nodes"))
+    fx.tracker.onStart(first) // at its cap of 1
+    prepare(fx, connId, "SELECT 42") shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe other
+    prepare(fx, connId, TableSync) shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe first
+
+  it should "re-pin the session to the node a transient retry actually used" in:
+    val fx     = setup()
+    val connId = connect(fx)
+    prepare(fx, connId, SchemaSync) shouldBe prepareResp(false)
+    val first     = lastPrepareNode(fx)
+    val other     = fx.nodes.map(_.nodeId).find(_ != first).getOrElse(fail("need two nodes"))
+    val firstPort = fx.nodes.find(_.nodeId == first).get.port
+    // The next sync starts on the pinned node, which refuses the connection: the router's
+    // transient retry serves it on the other node, and the session's catalog node follows.
+    fx.transport.unreachablePorts = Set(firstPort)
+    prepare(fx, connId, SchemaSync) shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe other
+    fx.sessions.get(connId).flatMap(_.catalogNode.get()) shouldBe Some(other)
+    // The first node is back and the other one is now busier: the table listing still follows
+    // the schema listing.
+    fx.transport.unreachablePorts = Set.empty
+    fx.tracker.setHealthy(first, true)
+    fx.tracker.onStart(other)
+    prepare(fx, connId, TableSync) shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe other
+
+  "QuackFrontDoor.readsCatalog" should "spot a duckdb_* catalog function from lexer tokens" in:
     QuackFrontDoor.readsCatalog(SchemaSync) shouldBe true
     QuackFrontDoor.readsCatalog(TableSync) shouldBe true
     QuackFrontDoor.readsCatalog("select * from main.DUCKDB_TABLES ()") shouldBe true
+    QuackFrontDoor.readsCatalog("SELECT * FROM \"duckdb_tables\"()") shouldBe true
+    QuackFrontDoor.readsCatalog("SELECT * FROM system.main.\"DuckDB_Schemas\"()") shouldBe true
+    QuackFrontDoor.readsCatalog("FROM duckdb_tables") shouldBe true
+    QuackFrontDoor.readsCatalog("SELECT * FROM duckdb_views /* listing */ ()") shouldBe true
+
+  it should "ignore literals, comments and names that only resemble one" in:
     QuackFrontDoor.readsCatalog("SELECT count(*) FROM tpch1.lineitem") shouldBe false
     QuackFrontDoor.readsCatalog("SELECT my_duckdb_tables() FROM t") shouldBe false
+    QuackFrontDoor.readsCatalog("SELECT 'duckdb_tables()' AS s") shouldBe false
+    QuackFrontDoor.readsCatalog("SELECT 1 -- FROM duckdb_tables()") shouldBe false
+    QuackFrontDoor.readsCatalog("SELECT 1 /* duckdb_schemas() */") shouldBe false
+    QuackFrontDoor.readsCatalog("SELECT duckdb_x.a FROM t") shouldBe false
+    QuackFrontDoor.readsCatalog("") shouldBe false

@@ -10,12 +10,21 @@ object Router:
     * and has capacity. When it is not, the caller passes no pin and [[pick]] makes its load-aware
     * choice. A transaction pin is never filtered this way: its statements must reach the node that
     * holds the transaction, or fail.
+    *
+    * `ignoreCapacity` drops the capacity condition, as a transaction pin does, for a pin whose
+    * statements are only coherent on one node (the native front door's catalog reads, which are
+    * tiny): briefly exceeding `maxConcurrent` beats splitting them.
     */
-  def softPinUsable(snapshot: PoolSnapshot, kind: StatementKind, nodeId: String): Boolean =
+  def softPinUsable(
+      snapshot: PoolSnapshot,
+      kind: StatementKind,
+      nodeId: String,
+      ignoreCapacity: Boolean = false
+  ): Boolean =
     snapshot.nodes.find(_.nodeId == nodeId).exists { n =>
       val l = snapshot.loadOf(nodeId)
       l.routable && RoleMatcher.preferred(kind).contains(n.role) &&
-      (n.maxConcurrent == 0 || l.inFlight < n.maxConcurrent)
+      (ignoreCapacity || n.maxConcurrent == 0 || l.inFlight < n.maxConcurrent)
     }
 
   def pick(

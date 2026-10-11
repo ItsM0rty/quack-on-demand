@@ -619,7 +619,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
   // ---- preferredNode (soft pin) tests ----
 
   /** Spin up a pool with N dual-role nodes so we have routing choices to make. */
-  private def setupMultiNode(replicas: Int) =
+  private def setupMultiNode(replicas: Int, maxConcurrent: Int = 0) =
     val backend = new QuackBackend:
       private val n          = TrieMap.empty[String, RunningNode]
       def start(s: NodeSpec) = IO {
@@ -649,7 +649,9 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     sup
       .createTenantDb(key.tenant, key.tenantDb, TenantDbKind.InMemory, Map.empty, "")
       .unsafeRunSync()
-    sup.createPool(key, RoleDistribution(0, 0, replicas)).unsafeRunSync()
+    sup
+      .createPool(key, RoleDistribution(0, 0, replicas), maxConcurrentPerNode = maxConcurrent)
+      .unsafeRunSync()
     val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(TestArrow.okResponse())
@@ -681,6 +683,39 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         nodes.map(_.nodeId) should contain(qr.nodeId)
         qr.close()
       case Left(msg) => fail(s"expected Right, got Left($msg)")
+
+  // The Prepare -> Execute soft pin: Execute re-sends the SQL text with preferredNode = the node
+  // that served the Prepare probe, so this is exactly the Execute call.
+  private def executeOn(router: FlightSqlRouter, key: PoolKey, conn: String, pref: String) =
+    router.execute(conn, "alice", key, "SELECT 1", preferredNode = Some(pref)).unsafeRunSync() match
+      case Right(qr) => qr.close(); qr.nodeId
+      case Left(f)   => fail(s"expected Right, got Left($f)")
+
+  it should "keep Execute on the Prepare node while it is healthy and under its cap" in:
+    val (router, _, nodes, key) = setupMultiNode(2, maxConcurrent = 2)
+    val target                  = nodes.head.nodeId
+    // One statement in flight on the target: a load-aware pick would choose the other node.
+    router.tracker.onStart(target)
+    executeOn(router, key, "sp-1", target) shouldBe target
+
+  it should "route Execute normally once the Prepare node is unhealthy, draining or quarantined" in:
+    for (mark, conn) <- List[(NodeLoadTracker, String) => Unit](
+        (t, id) => t.setHealthy(id, false),
+        (t, id) => t.setDraining(id, true),
+        (t, id) => t.setQuarantined(id, true)
+      ).zip(List("sp-2", "sp-3", "sp-4"))
+    do
+      val (router, _, nodes, key) = setupMultiNode(2)
+      val target                  = nodes.head.nodeId
+      val other                   = nodes(1).nodeId
+      mark(router.tracker, target)
+      executeOn(router, key, conn, target) shouldBe other
+
+  it should "route Execute normally once the Prepare node is at its maxConcurrent cap" in:
+    val (router, _, nodes, key) = setupMultiNode(2, maxConcurrent = 1)
+    val target                  = nodes.head.nodeId
+    router.tracker.onStart(target)
+    executeOn(router, key, "sp-5", target) shouldBe nodes(1).nodeId
 
   it should "skip history recording when recordExecution=false (Prepare-time probe)" in:
     val (router, _, _, key) = setupMultiNode(1)

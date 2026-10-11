@@ -438,7 +438,12 @@ final class FlightSqlRouter(
       prepareDurationMs: Option[Long] = None,
       patId: Option[String] = None,
       edge: String = "",
-      clientDataScans: Boolean = false
+      clientDataScans: Boolean = false,
+      /** Honor `preferredNode` even when that node is at its `maxConcurrent` cap (it must still be
+        * routable and role-compatible). Set by the native front door for its catalog reads, whose
+        * two listings are only coherent on one node; see `Router.softPinUsable`.
+        */
+      softPinOverCapacity: Boolean = false
   ): IO[Either[RouterFailure, Routed[A]]] =
     val resolvedEdge = if edge.isEmpty then source else edge
     val s            = sessions.get(connectionId).getOrElse {
@@ -756,7 +761,11 @@ final class FlightSqlRouter(
               // choice.
               val txPin  = s.pinnedNodeId.filter(_ => s.txOpen)
               val pinned =
-                txPin.orElse(preferredNode.filter(id => Router.softPinUsable(snap, kind, id)))
+                txPin.orElse(
+                  preferredNode.filter(id =>
+                    Router.softPinUsable(snap, kind, id, ignoreCapacity = softPinOverCapacity)
+                  )
+                )
               // Each statement lands in a fresh remote DuckDB session, so unqualified
               // refs need the USE prefix (see wrapWithDefaultSchema).
               val wrappedSql = wrapWithDefaultSchema(supervisor.get(poolKey), finalSql)

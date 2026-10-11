@@ -66,6 +66,18 @@ class RouterSpec extends AnyFlatSpec with Matchers:
       "ro1"
     ) shouldBe true
 
+  it should "hold a pin over the cap when asked, but never over routability or role" in:
+    val capped = ro1.copy(maxConcurrent = 1)
+    val busy   = Map("ro1" -> NodeLoad(1, 0))
+    Router.softPinUsable(snap(List(capped), busy), StatementKind.Select, "ro1", true) shouldBe true
+    Router.softPinUsable(
+      snap(List(capped), Map("ro1" -> NodeLoad(1, 0, healthy = false))),
+      StatementKind.Select,
+      "ro1",
+      ignoreCapacity = true
+    ) shouldBe false
+    Router.softPinUsable(snap(List(capped), busy), StatementKind.Ddl, "ro1", true) shouldBe false
+
   "Router" should "pick the least-loaded role-compatible node" in:
     val loads = Map("ro1" -> NodeLoad(inFlight = 3, ewmaMs = 100), "ro2" -> NodeLoad(2, 100))
     Router.pick(snap(List(ro1, ro2), loads), StatementKind.Select, None) shouldBe
