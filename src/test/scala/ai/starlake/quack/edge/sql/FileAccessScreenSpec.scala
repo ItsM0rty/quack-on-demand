@@ -106,6 +106,9 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
       "AND l.l_comment IS DISTINCT FROM 'z'",
     "SELECT * FROM orders ORDER BY o_id DESC, 'x'",
     "SELECT o_id AS \"Revenue / Cost\" FROM orders",
+    // an alias is no table: judged from the parse, a path-shaped alias is a label
+    "SELECT o_id AS \"/\" FROM orders",
+    "SELECT o_id \"/path\" FROM orders",
     // dbt adapter's ordinary statements
     "create table \"lake\".\"main\".\"m__dbt_tmp\" as (select 1 as id)",
     "alter table \"lake\".\"main\".\"m__dbt_tmp\" rename to \"m\"",
