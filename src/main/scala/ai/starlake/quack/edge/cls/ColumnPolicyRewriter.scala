@@ -6,6 +6,7 @@ import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import cats.effect.IO
 import cats.syntax.traverse._
 import ai.starlake.acl.parser.TableExtractor
+import ai.starlake.sql.ParserInput
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.statement.select.{ParenthesedSelect, PlainSelect, Select, SetOperationList}
 
@@ -72,7 +73,22 @@ final class ColumnPolicyRewriter(
     else if eff.user.tenant.isEmpty then IO.pure(Passthrough)
     else if kind != StatementKind.Select then IO.pure(Passthrough)
     else if eff.columnPolicies.isEmpty then IO.pure(Passthrough)
-    else if readsOnlyCatalogFunctions(sql) then IO.pure(Passthrough)
+    else
+      // Every parse below reads the lexer-canonical rendering, never the raw text: JSqlParser
+      // tokenizes DuckDB's escape and dollar-quoted strings differently, and a table it cannot see
+      // is a table no policy masks. A rendering refusal is input DuckDB rejects anyway.
+      ParserInput.render(sql) match
+        case Left(_)      => IO.pure(PassthroughParseFailed)
+        case Right(input) =>
+          rewriteCanonical(input.text, eff, ctx).map {
+            // The rewrite is printed from the parser input, which is not the caller's statement
+            // here (ParserInput.Rendered.exact): shipping it would run a different statement.
+            case Rewritten(_) if !input.exact => PassthroughParseFailed
+            case other                        => other
+          }
+
+  private def rewriteCanonical(sql: String, eff: EffectiveSet, ctx: SchemaContext): IO[Outcome] =
+    if readsOnlyCatalogFunctions(sql) then IO.pure(Passthrough)
     else
       buildSchema(sql, ctx).map { schema =>
         PositionalReferences.resolve(sql, schema) match

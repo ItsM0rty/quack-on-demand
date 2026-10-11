@@ -2,6 +2,7 @@ package ai.starlake.acl.parser
 
 import java.util.Locale
 import ai.starlake.acl.model.Config
+import ai.starlake.sql.ParserInput
 import net.sf.jsqlparser.JSQLParserException
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.parser.feature.{Feature, FeatureConfiguration}
@@ -157,33 +158,44 @@ object SqlParser:
   private def clientBeginTransaction(index: Int, sql: String): StatementResult =
     StatementResult.ControlFlow(index, truncateSnippet(sql.trim), "BeginTransaction")
 
+  /** Parses `sql` as JSqlParser must read it for an access decision: from its lexer-canonical
+    * rendering ([[ParserInput.render]]), never from the raw text, whose escape strings,
+    * dollar-quoted strings and `//` JSqlParser tokenizes differently from DuckDB. A rendering
+    * refusal (input DuckDB rejects outright) is a parse error.
+    */
   private def extractParsed(sql: String, config: Config): ExtractionResult =
-    try
-      val stmts: Statements = CCJSqlParserUtil.parseStatements(
-        stripTimeTravelClauses(sql),
-        (parser: net.sf.jsqlparser.parser.CCJSqlParser) => {
-          val featureConfig = new FeatureConfiguration()
-          featureConfig.setValue(Feature.allowUnsupportedStatements, true): Unit
-          parser.withConfiguration(featureConfig): Unit
-        }
-      )
-
-      val statements =
-        try stmts.asScala.toList
-        catch case _: NullPointerException => Nil
-      val results = statements.zipWithIndex.map { case (stmt, idx) =>
-        processStatement(stmt, idx, config)
-      }
-
-      ExtractionResult.fromStatements(results)
-    catch
-      case e: JSQLParserException =>
-        // Entire input is unparseable
-        val snippet = truncateSnippet(sql)
-        val message = Option(e.getMessage).getOrElse("Unknown parse error")
+    ParserInput.render(stripTimeTravelClauses(sql)) match
+      case Left(reason) =>
         ExtractionResult.fromStatements(
-          List(StatementResult.ParseError(0, snippet, message))
+          List(StatementResult.ParseError(0, truncateSnippet(sql), reason))
         )
+      case Right(input) =>
+        try
+          val stmts: Statements = CCJSqlParserUtil.parseStatements(
+            input.text,
+            (parser: net.sf.jsqlparser.parser.CCJSqlParser) => {
+              val featureConfig = new FeatureConfiguration()
+              featureConfig.setValue(Feature.allowUnsupportedStatements, true): Unit
+              parser.withConfiguration(featureConfig): Unit
+            }
+          )
+
+          val statements =
+            try stmts.asScala.toList
+            catch case _: NullPointerException => Nil
+          val results = statements.zipWithIndex.map { case (stmt, idx) =>
+            processStatement(stmt, idx, config)
+          }
+
+          ExtractionResult.fromStatements(results)
+        catch
+          case e: JSQLParserException =>
+            // Entire input is unparseable
+            val snippet = truncateSnippet(sql)
+            val message = Option(e.getMessage).getOrElse("Unknown parse error")
+            ExtractionResult.fromStatements(
+              List(StatementResult.ParseError(0, snippet, message))
+            )
 
   /** Extract table references from a single SQL statement.
     *
@@ -200,7 +212,10 @@ object SqlParser:
   def extractSingle(sql: String, config: Config): StatementResult =
     try
       if isClientBeginTransaction(sql) then clientBeginTransaction(0, sql)
-      else processStatement(CCJSqlParserUtil.parse(sql), 0, config)
+      else
+        ParserInput.render(sql) match
+          case Left(reason) => StatementResult.ParseError(0, truncateSnippet(sql), reason)
+          case Right(input) => processStatement(CCJSqlParserUtil.parse(input.text), 0, config)
     catch
       case e: JSQLParserException =>
         val snippet = truncateSnippet(sql)

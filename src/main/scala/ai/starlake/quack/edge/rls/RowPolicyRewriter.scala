@@ -3,6 +3,7 @@ package ai.starlake.quack.edge.rls
 import ai.starlake.quack.model.StatementKind
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.state.RoleRowPolicy
+import ai.starlake.sql.ParserInput
 import com.typesafe.scalalogging.LazyLogging
 import net.sf.jsqlparser.expression.{Alias, Expression}
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
@@ -19,7 +20,7 @@ import net.sf.jsqlparser.statement.select.{
 }
 
 import scala.jdk.CollectionConverters._
-import scala.util.{Failure, Success, Try}
+import scala.util.Try
 
 /** Schema/catalog defaults in scope when the statement runs, used to qualify bare table references
   * (`customer` -> catalog `acme_tpch`, schema `tpch1`) so they match policies keyed on
@@ -150,14 +151,25 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
     else if kind != StatementKind.Select then Passthrough
     else if eff.rowPolicies.isEmpty then Passthrough
     else
-      Try(CCJSqlParserUtil.parse(sql)) match
-        case Failure(_)            => PassthroughParseFailed
-        case Success(stmt: Select) =>
+      // Parsed from the lexer-canonical rendering, never the raw text: JSqlParser tokenizes
+      // DuckDB's escape and dollar-quoted strings differently, and a table it cannot see is a
+      // table no row policy filters. A rendering refusal is input DuckDB rejects anyway.
+      val parsed = ParserInput
+        .render(sql)
+        .toOption
+        .flatMap(in => Try(CCJSqlParserUtil.parse(in.text)).toOption.map(_ -> in.exact))
+      parsed match
+        case None                        => PassthroughParseFailed
+        case Some((stmt: Select, exact)) =>
           val values  = tokenValues(eff)
           val changed = new java.util.concurrent.atomic.AtomicBoolean(false)
           try
             new DeepWalker(eff, ctx, values, changed).walk(stmt)
-            if changed.get() then Rewritten(stmt.toString) else Passthrough
+            // The rewrite is printed from the parser input; when that is not the caller's
+            // statement (ParserInput.Rendered.exact) shipping it would run a different one.
+            if !changed.get() then Passthrough
+            else if exact then Rewritten(stmt.toString)
+            else PassthroughParseFailed
           catch
             // A predicate that fails to apply at rewrite time (should never happen - the
             // create-time validator already parsed it) must not crash the request path, but it
@@ -172,7 +184,7 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
                 eff.user.username
               )
               Failed("row policy failed to apply")
-        case Success(_) => Passthrough
+        case Some(_) => Passthrough
 
   // ---------- table-occurrence walk ----------
 
