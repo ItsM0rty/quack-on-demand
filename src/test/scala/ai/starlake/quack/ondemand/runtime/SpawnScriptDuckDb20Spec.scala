@@ -3,8 +3,6 @@ package ai.starlake.quack.ondemand.runtime
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import scala.sys.process.*
-
 class SpawnScriptDuckDb20Spec extends AnyFlatSpec with Matchers with SpawnScriptTempDir:
 
   private def initSql(env: (String, String)*): String =
@@ -14,7 +12,7 @@ class SpawnScriptDuckDb20Spec extends AnyFlatSpec with Matchers with SpawnScript
       "catalogAlias"      -> "acme_lake",
       "dbName"            -> "acme_lake"
     )
-    Process(Seq("bash", "scripts/spawn-quack-node.sh", "21999", "t"), None, (base ++ env)*).!!
+    runSpawn(Seq("bash", "scripts/spawn-quack-node.sh", "21999"), base ++ env)
 
   private def ducklake(extra: (String, String)*): String =
     initSql(

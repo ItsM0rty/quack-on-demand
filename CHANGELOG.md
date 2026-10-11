@@ -66,6 +66,18 @@
     function calls are detected from its tokens (backtick and double-quoted names).
   - The edge screens lex the SQL before folding case (dollar-quote tags are case-sensitive in
     DuckDB), and the catalog write screen classifies the original statement text.
+  - No secret reaches a node process's environment or command line, on any backend: a node user
+    with SQL could read `getenv()` or `/proc/<pid>/environ` of duckdb and of its wrapper script.
+    The catalog password, the encryption key, the federation and object-store SQL, the node token
+    and the object-store credentials now reach the spawn script as files of a private directory
+    (`QOD_SECRETS_DIR`, 0700 / 0600, owner-only ACL on Windows) that the script deletes right after
+    reading (local and `qod fleet join`), or of a read-only Secret volume (mode 0400) on
+    Kubernetes, replacing every `secretKeyRef` env var. Local nodes no longer inherit the manager's
+    own credentials (`QOD_API_KEY`, the session JWT secret, passwords). BREAKING for custom node
+    images and launchers: the spawn script takes only the port, ignores secrets passed as env vars,
+    and the node image entrypoint no longer reads `QOD_NODE_TOKEN`; restart every K8s node after
+    upgrading. On Kubernetes the mounted files stay readable by a node user with unrestricted SQL
+    (superuser, or ACL off without lockdown).
 
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left

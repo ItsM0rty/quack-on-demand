@@ -213,7 +213,8 @@ storage:
 # --- Object-store credentials (S3-compatible) -------------------------------
 # Used when storage.dataPath starts with `s3://` (or s3a/r2). The chart renders
 # these into the manager's defaultMetastore env vars, which KubernetesQuackBackend
-# then forwards verbatim into every spawned Quack node pod. The node's
+# then forwards into every spawned Quack node pod (the credentials as files of
+# the node's read-only secrets volume, never env vars). The node's
 # spawn-quack-node.sh consumes `QOD_S3_*` to emit the matching DuckDB
 # `CREATE SECRET quack_s3 (...)` so httpfs can talk to the endpoint.
 #

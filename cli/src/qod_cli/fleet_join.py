@@ -13,10 +13,12 @@ import math
 import os
 import platform
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -48,7 +50,40 @@ _ENV_PASSTHROUGH = (
 )
 # Object-storage settings the spawn script reads.
 _ENV_PASSTHROUGH_PREFIXES = ("QOD_S3_", "QOD_AZURE_")
-_SQL_KEYS = ("dbInitSql", "objectStoreSql", "extraSetupSql", "lockdownSql")
+_SQL_KEYS = ("dbInitSql", "lockdownSql")
+# Sensitive values never sit in the node's environment or command line (a node user with SQL reads
+# both back through getenv() or /proc/<pid>/environ|cmdline): they go to a private directory, one
+# file per key, that the spawn script reads and deletes. Same list as SECRET_KEYS in
+# spawn-quack-node.sh and NodeSecretFiles.Keys on the manager.
+_SECRET_KEYS = ("pgPassword", "encryptionKey", "extraSetupSql", "objectStoreSql", "QOD_NODE_TOKEN",
+                "QOD_S3_ACCESS_KEY_ID", "QOD_S3_SECRET_ACCESS_KEY", "QOD_AZURE_CONNECTION_STRING",
+                "QOD_GCS_KEY_ID", "QOD_GCS_SECRET")
+_CLOUD_CRED_KEYS = _SECRET_KEYS[5:]
+SECRETS_DIR = "secrets"
+
+
+def _canonical_secret(name: str) -> str | None:
+    lower = name.lower()
+    return next((k for k in _SECRET_KEYS if k.lower() == lower), None)
+
+
+def write_secrets_dir(parent: Path, values: dict[str, str]) -> Path:
+    """A fresh directory under `parent`, 0700, holding one 0600 file per value. Removed again if
+    any write fails."""
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(parent, 0o700)
+    d = Path(tempfile.mkdtemp(prefix="node-", dir=parent))
+    try:
+        for key, value in values.items():
+            if _canonical_secret(key) != key:
+                raise ValueError(f"not a node secret key: {key}")
+            fd = os.open(d / key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(value)
+    except BaseException:
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    return d
 
 
 def _no_advertise_host(reason: str) -> SystemExit:
@@ -280,8 +315,11 @@ def status_hint(status: int, code: str | None, *, name: str, address: str) -> st
 
 
 class _Node:
-    def __init__(self, assignment: dict, proc, started_at: float):
+    def __init__(self, assignment: dict, proc, started_at: float, secrets_dir: Path | None = None):
         self.assignment, self.proc, self.started_at = assignment, proc, started_at
+        # The script deletes it after reading; the join process removes it too once the node is
+        # up, failed or stopped, so a script that died before reading cannot leave it behind.
+        self.secrets_dir = secrets_dir
         self.wall_started_at = time.time()
         self.state = "starting"
         self.error: str | None = None
@@ -299,6 +337,10 @@ class _Node:
 
     def tail(self) -> str:
         return "\n".join(self.stderr)
+
+    def drop_secrets(self) -> None:
+        if self.secrets_dir is not None:
+            shutil.rmtree(self.secrets_dir, ignore_errors=True)
 
     def exit_error(self) -> str:
         # The process is gone: give the drain thread a moment to read the last lines it wrote.
@@ -386,39 +428,66 @@ class FleetMember:
                 n.state, n.error = "failed", f"port {n.assignment['port']} not open after {START_GRACE_S}s: {n.tail()}"
         elif n.state == "running" and not alive:
             n.state, n.error = "failed", n.exit_error()
+        if n.state != "starting":
+            n.drop_secrets()
         return {"assignmentEpoch": n.assignment["epoch"], "nodeId": n.assignment["nodeId"], "state": n.state,
                 "pid": n.proc.pid if alive else None, "error": n.error,
                 "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(n.wall_started_at))}
 
     # ---- process control ----
-    def _launch_spec(self, assignment: dict) -> tuple[list[str], dict[str, str]]:
-        """Command and environment for `assignment`. Raises KeyError/TypeError on a malformed
-        assignment, before anything is stopped."""
+    def _launch_spec(self, assignment: dict) -> tuple[list[str], dict[str, str], dict[str, str]]:
+        """Command, environment and secret files for `assignment`. Raises KeyError/TypeError on a
+        malformed assignment, before anything is stopped."""
         env = {k: v for k, v in os.environ.items()
-               if k in _ENV_PASSTHROUGH or k.startswith(_ENV_PASSTHROUGH_PREFIXES)}
-        env.update({str(k): str(v) for k, v in assignment["env"].items()})
+               if (k in _ENV_PASSTHROUGH or k.startswith(_ENV_PASSTHROUGH_PREFIXES))
+               and _canonical_secret(k) is None}
+        secrets = {k: os.environ[k] for k in _CLOUD_CRED_KEYS if os.environ.get(k)}
+        for k, v in assignment["env"].items():
+            canonical = _canonical_secret(str(k))
+            if canonical is None:
+                env[str(k)] = str(v)
+            elif canonical == str(k) or canonical not in secrets or canonical in _CLOUD_CRED_KEYS:
+                # The exact spelling wins over a differently-cased one; the assignment wins over this
+                # process's own object-store credentials.
+                secrets[canonical] = str(v)
         env["kind"] = str(assignment["kind"])
         env["QOD_NODE_BIND"] = self.bind_host
         # Always from the assignment, empty when absent: a stray value in this process's environment
         # (a lockdownSql=... exported by hand) must never reach a node.
         for key in _SQL_KEYS:
             env[key] = str(assignment.get(key) or "")
+        for key in ("extraSetupSql", "objectStoreSql"):
+            if assignment.get(key):
+                secrets[key] = str(assignment[key])
+        secrets["QOD_NODE_TOKEN"] = str(assignment["token"])
         if self.duckdb_bin is not None:
             env["DUCKDB_BIN"] = str(self.duckdb_bin)
             env["PATH"] = str(Path(self.duckdb_bin).parent) + os.pathsep + env.get("PATH", "")
-        cmd = ["bash", str(self.spawn_script), str(int(assignment["port"])), str(assignment["token"])]
-        return cmd, env
+        env["QOD_SECRETS_DIR_EPHEMERAL"] = "1"
+        cmd = ["bash", str(self.spawn_script), str(int(assignment["port"]))]
+        return cmd, env, {k: v for k, v in secrets.items() if v}
 
-    def _start(self, assignment: dict, spec: tuple[list[str], dict[str, str]] | None = None) -> None:
-        cmd, env = spec or self._launch_spec(assignment)
+    @property
+    def secrets_root(self) -> Path:
+        return self.state_dir / SECRETS_DIR
+
+    def _start(self, assignment: dict,
+               spec: tuple[list[str], dict[str, str], dict[str, str]] | None = None) -> None:
+        cmd, env, secrets = spec or self._launch_spec(assignment)
+        secrets_dir = write_secrets_dir(self.secrets_root, secrets)
+        env = dict(env, QOD_SECRETS_DIR=str(secrets_dir))
         # Own session: a manager-side stop reaches the node through this process, never through a
         # terminal signal. The pidfile is what lets the NEXT join process find it if this one dies.
-        proc = self.popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                          start_new_session=True)
+        try:
+            proc = self.popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, start_new_session=True)
+        except BaseException:
+            shutil.rmtree(secrets_dir, ignore_errors=True)
+            raise
         # Track the child before any fallible bookkeeping: an untracked child would be spawned
         # again on the next heartbeat. A missing pidfile only degrades orphan reaping after a
         # join-process crash, so a write failure is a warning, not a failed start.
-        self.node = _Node(assignment, proc, self.clock())
+        self.node = _Node(assignment, proc, self.clock(), secrets_dir)
         try:
             self.pidfile.write_text(f"{proc.pid}\n")
         except OSError as exc:
@@ -445,6 +514,7 @@ class FleetMember:
             except OSError:
                 pass
         self.pidfile.unlink(missing_ok=True)
+        n.drop_secrets()
         self.last_report = {"assignmentEpoch": n.assignment["epoch"], "nodeId": n.assignment["nodeId"],
                             "state": "stopped", "pid": None, "error": None, "startedAt": None}
         self.node = None
@@ -536,8 +606,14 @@ class FleetMember:
             sys.stderr.write(f"qod fleet join: server '{self.name}' approved\n")
         self.approval = approval
 
+    def sweep_secrets(self) -> None:
+        """Remove secret directories a previous join process left behind (killed between writing one
+        and its script reading it). Only called while no node of this process runs."""
+        shutil.rmtree(self.secrets_root, ignore_errors=True)
+
     def run_forever(self) -> None:
         self.reap_orphan()
+        self.sweep_secrets()
         sys.stderr.write(f"qod fleet join: server '{self.name}', advertise host {self.advertise_host}, node binds "
                          f"{self.bind_host}:{self.node_port} (override with --advertise-host / --bind-host if "
                          f"this is not the data interface)\n")

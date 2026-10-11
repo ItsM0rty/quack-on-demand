@@ -7,10 +7,13 @@
 # spawn-quack-node.sh so the same boot script that LocalQuackBackend uses
 # also runs in K8s. Env-var contract:
 #
-#   QOD_NODE_PORT, QOD_NODE_TOKEN  - set by the manager's pod template
-#   pgHost / pgPort / pgUser / pgPassword / dbName / schemaName / dataPath
+#   QOD_NODE_PORT            - set by the manager's pod template
+#   QOD_SECRETS_DIR          - read-only Secret volume: token, pgPassword, encryptionKey,
+#                              federation / object-store SQL, object-store credentials
+#                              (one file per key; never env vars)
+#   pgHost / pgPort / pgUser / dbName / schemaName / dataPath
 #                            - merged from defaultMetastore + spec.metastore
-#   QOD_S3_* / QOD_AZURE_*   - optional object-store creds
+#   QOD_S3_ENDPOINT / _REGION / _URL_STYLE / _USE_SSL - optional object-store settings
 #   HTTP_PROXY / HTTPS_PROXY           - optional egress proxy
 #
 # Build: docker build -t starlakeai/quack-on-demand-node:local -f docker/quack-node/Dockerfile .

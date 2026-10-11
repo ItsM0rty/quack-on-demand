@@ -9,6 +9,7 @@ import java.security.SecureRandom
 import java.time.Instant
 import java.util.Base64
 import scala.collection.concurrent.TrieMap
+import scala.jdk.CollectionConverters.*
 
 final class LocalQuackBackend(
     min: Int,
@@ -26,15 +27,33 @@ final class LocalQuackBackend(
   // SIGTERM via ProcessHandle on stop().
   private val adoptedPids = TrieMap.empty[String, Long]
 
+  // A manager killed together with a node it was spawning can leave a secrets directory behind.
+  NodeSecretFiles.sweepStale()
+
   def start(spec: NodeSpec): IO[RunningNode] = IO.blocking {
     val port  = ports.lease().getOrElse(throw new RuntimeException(s"no free port in [$min, $max]"))
     val token = LocalQuackBackend.randomToken()
     val cmd   = commandFor(spec, port, token)
     val pb    = new JProcessBuilder(cmd*).inheritIO()
-    // Propagate metastore as environment variables to the spawned Quack node.
-    // Defaults from application.conf apply first; per-pool entries from
-    // CreatePoolRequest.metastore override them.
+    // Propagate the non-sensitive metastore as environment variables to the spawned Quack node.
     val env = pb.environment()
+    // Nothing secret may sit in the node's environment (or argv): a node user reads both back
+    // through getenv() / /proc/<pid>/environ. The sensitive values (NodeSecretFiles.Keys: metastore
+    // pgPassword / encryptionKey, federation and object-store SQL, the node token, the manager's
+    // own QOD_S3_* / QOD_AZURE_* credentials) go to a private directory the script reads and
+    // deletes; the manager's other credentials it inherited (QOD_API_KEY, the session JWT secret,
+    // passwords...) are dropped outright.
+    val inherited = env.asScala.toMap
+    val secrets   = NodeSecretFiles.collect(
+      spec.metastore,
+      spec.extraSetupSql,
+      spec.objectStoreSql,
+      token,
+      inherited
+    )
+    inherited.keys.foreach { k =>
+      if NodeSecretFiles.isKey(k) || NodeSecretFiles.isInheritedSecret(k) then env.remove(k)
+    }
     // When running from an installed app-image (QOD_APP_HOME set), prepend the bundled duckdb bin
     // so spawn-quack-node.sh's `command -v duckdb` resolves it. Additive: no-op in dev/source runs.
     LocalQuackBackend.duckdbPathPrefix(sys.env.get("QOD_APP_HOME")).foreach { prefix =>
@@ -52,9 +71,8 @@ final class LocalQuackBackend(
     // would resurrect a key `effectiveMetastoreFor` deliberately removed (e.g. the
     // bootstrap tenant-db's DuckLake directory reappearing as `dataPath` on a
     // pathless duckdb-file node, which then fails ATTACH with "Is a directory").
-    spec.metastore.foreach { case (k, v) => env.put(k, v) }
+    spec.metastore.foreach { case (k, v) => if !NodeSecretFiles.isKey(k) then env.put(k, v) }
     env.put("kind", spec.kindWire)
-    if spec.extraSetupSql.nonEmpty then env.put("extraSetupSql", spec.extraSetupSql)
     // Tenant-db initSql: spawn-quack-node.sh emits it after the proxy settings
     // and before `INSTALL quack; LOAD quack;`, unlike extraSetupSql which runs
     // after the catalog ATTACH.
@@ -63,10 +81,19 @@ final class LocalQuackBackend(
     // after extraSetupSql, right before quack_serve, so the value
     // restrictions are in effect before the node serves any tenant statement.
     if spec.lockdownSql.nonEmpty then env.put("lockdownSql", spec.lockdownSql)
-    // Per-database object-store secret (ObjectStoreSecret.sql). spawn-quack-node.sh runs it
-    // alongside the global STORAGE_SQL block, before the DuckLake catalog ATTACH.
-    if spec.objectStoreSql.nonEmpty then env.put("objectStoreSql", spec.objectStoreSql)
-    val proc = pb.start()
+    val secretsDir = NodeSecretFiles.writePrivateDir(secrets)
+    env.put(NodeSecretFiles.DirEnv, secretsDir.toString)
+    env.put(NodeSecretFiles.EphemeralEnv, "1")
+    val proc =
+      try pb.start()
+      catch
+        case e: Throwable =>
+          NodeSecretFiles.deleteQuietly(secretsDir)
+          ports.release(port)
+          throw e
+    // The script deletes the directory as soon as it has read it; this covers a script that dies
+    // first (bad kind, missing duckdb, a kill before it got that far).
+    proc.onExit().thenRun(() => NodeSecretFiles.deleteQuietly(secretsDir))
     processes.put(spec.nodeId, proc)
     tokens.put(spec.nodeId, token)
     nodePorts.put(spec.nodeId, port)
@@ -219,22 +246,23 @@ object LocalQuackBackend:
     sys.props.getOrElse("os.name", "").toLowerCase(Locale.ROOT).contains("win")
 
   /** Default command. Invokes `script` (the bundled spawn script in production), which starts
-    * DuckDB, attaches the DuckLake catalog, and calls `quack_serve(...)`.
+    * DuckDB, attaches the DuckLake catalog, and calls `quack_serve(...)`. The token is NOT on the
+    * command line (any local user reads argv): the script reads it from the secrets directory.
     */
   def defaultCommand(script: String): (NodeSpec, Int, String) => List[String] =
-    (_, port, token) => List(script, port.toString, token)
+    (_, port, _) => List(script, port.toString)
 
-  /** OS-aware default command. On Windows the child is
-    * `powershell.exe -File <winScript> <port> <token>` (the wrapper process the manager holds a
-    * `Process` handle for; its `duckdb.exe` grandchild is reaped via `taskkill /T`). On Unix it is
-    * the bash `<unixScript> <port> <token>` invocation, byte-identical to [[defaultCommand]].
+  /** OS-aware default command. On Windows the child is `powershell.exe -File <winScript> <port>`
+    * (the wrapper process the manager holds a `Process` handle for; its `duckdb.exe` grandchild is
+    * reaped via `taskkill /T`). On Unix it is the bash `<unixScript> <port>` invocation,
+    * byte-identical to [[defaultCommand]].
     */
   def defaultCommand(
       unixScript: String,
       winScript: String
   ): (NodeSpec, Int, String) => List[String] =
     if isWindows then
-      (_, port, token) =>
+      (_, port, _) =>
         List(
           "powershell.exe",
           "-NoProfile",
@@ -243,10 +271,9 @@ object LocalQuackBackend:
           "Bypass",
           "-File",
           winScript,
-          port.toString,
-          token
+          port.toString
         )
-    else (_, port, token) => List(unixScript, port.toString, token)
+    else (_, port, _) => List(unixScript, port.toString)
 
   /** Terminate a spawned node by pid. On Windows uses `taskkill /PID <pid> /T` (`/F` when `force`)
     * so the whole process tree — the PowerShell wrapper and its `duckdb.exe` child — is killed;

@@ -3,13 +3,13 @@
 # Spawn one Quack node - invoked by LocalQuackBackend.
 #
 # Usage:
-#   spawn-quack-node.sh <port> <token>
+#   spawn-quack-node.sh <port>
 #
-# The metastore connection details come from environment variables that
+# The non-sensitive metastore connection details come from environment variables that
 # LocalQuackBackend.start() sets from CreatePoolRequest.metastore. The
 # env-var keys match the UI form field names verbatim:
 #
-#   pgHost pgPort pgUser pgPassword   (Postgres for DuckLake catalog)
+#   pgHost pgPort pgUser               (Postgres for DuckLake catalog)
 #   dbName                             (Postgres DB; also the DuckDB catalog alias unless
 #                                       catalogAlias is set)
 #   catalogAlias                       (optional DuckDB catalog alias the database is ATTACHed
@@ -19,6 +19,14 @@
 #                                       MUST differ from the alias or 2-part identifiers
 #                                       like "$dbName"."customer" resolve as ambiguous.)
 #   dataPath                           (DuckLake data files directory)
+#
+# Sensitive values NEVER arrive through the environment or the command line: a node user with SQL
+# can read getenv() and /proc/<pid>/{environ,cmdline} of the duckdb process and of this script.
+# They arrive as one file per key in the directory $QOD_SECRETS_DIR (see SECRET_KEYS below; the
+# Scala twin is NodeSecretFiles.Keys). The local and fleet launchers create that directory private
+# to the current user (0700, files 0600) and set QOD_SECRETS_DIR_EPHEMERAL=1, and this script
+# deletes it as soon as the values are read. On Kubernetes it is a read-only Secret volume. A key
+# still present in the environment is ignored (with a warning) rather than used.
 #
 # DuckDB is kept alive after `quack_serve` returns via a FIFO held open
 # by this shell, so the background quack thread keeps serving until the
@@ -31,7 +39,37 @@ set -euo pipefail
 export DUCKDB_AGENT_MODE=0
 
 PORT="${1:?port required}"
-TOKEN="${2:?token required}"
+
+# Keep in sync with NodeSecretFiles.Keys (Scala), SECRET_KEYS in spawn-quack-node.ps1 and
+# _SECRET_KEYS in cli/src/qod_cli/fleet_join.py; NodeSecretFilesSpec pins all four.
+SECRET_KEYS=(pgPassword encryptionKey extraSetupSql objectStoreSql QOD_NODE_TOKEN
+  QOD_S3_ACCESS_KEY_ID QOD_S3_SECRET_ACCESS_KEY QOD_AZURE_CONNECTION_STRING QOD_GCS_KEY_ID
+  QOD_GCS_SECRET)
+for key in "${SECRET_KEYS[@]}"; do
+  if [[ -n "${!key+x}" ]]; then
+    echo "WARN: ignoring $key from the environment; secrets are read from \$QOD_SECRETS_DIR only" >&2
+    unset "$key"
+  fi
+done
+if [[ -n "${QOD_SECRETS_DIR:-}" ]]; then
+  for key in "${SECRET_KEYS[@]}"; do
+    if [[ -f "$QOD_SECRETS_DIR/$key" ]]; then
+      # read -d '' slurps the whole file (newlines included); it returns 1 at EOF by design.
+      IFS= read -r -d '' "$key" < "$QOD_SECRETS_DIR/$key" || true
+    fi
+  done
+  if [[ "${QOD_SECRETS_DIR_EPHEMERAL:-}" == "1" ]]; then
+    rm -rf -- "$QOD_SECRETS_DIR"
+  fi
+fi
+# Plain shell variables from here on: nothing below exports them, so neither duckdb nor psql
+# inherits them.
+export -n "${SECRET_KEYS[@]}" QOD_SECRETS_DIR QOD_SECRETS_DIR_EPHEMERAL 2>/dev/null || true
+TOKEN="${QOD_NODE_TOKEN:-}"
+if [[ -z "$TOKEN" ]]; then
+  echo "ERROR: no node token: \$QOD_SECRETS_DIR/QOD_NODE_TOKEN is missing or empty" >&2
+  exit 1
+fi
 
 pgHost="${pgHost:-localhost}"
 pgPort="${pgPort:-5432}"
@@ -147,15 +185,22 @@ fi
 # test's runtime depend on the test machine's network/resolver behavior.
 if [[ "$kind" == "ducklake" && "${QOD_SPAWN_DRY_RUN:-}" != "1" ]] && command -v psql >/dev/null 2>&1; then
   ADMIN_DB="${PG_ADMIN_DB:-postgres}"
-  EXISTS=$(PGPASSWORD="$pgPassword" psql -h "$pgHost" -p "$pgPort" -U "$pgUser" \
+  # The password reaches psql through a private passfile, never PGPASSWORD: psql's own
+  # environment is as readable as duckdb's while it runs.
+  PGPASS_DIR="$(mktemp -d -t qod-pgpass.XXXXXX)"
+  pgpass_escaped="${pgPassword//\\/\\\\}"
+  pgpass_escaped="${pgpass_escaped//:/\\:}"
+  (umask 077 && printf '*:*:*:*:%s\n' "$pgpass_escaped" > "$PGPASS_DIR/pgpass")
+  EXISTS=$(PGPASSFILE="$PGPASS_DIR/pgpass" psql -w -h "$pgHost" -p "$pgPort" -U "$pgUser" \
     -d "$ADMIN_DB" -tAc "SELECT 1 FROM pg_database WHERE datname = '$dbName'" 2>/dev/null || true)
   if [[ "$EXISTS" != "1" ]]; then
     echo "spawn: creating Postgres database $dbName"
-    PGPASSWORD="$pgPassword" psql -h "$pgHost" -p "$pgPort" -U "$pgUser" \
+    PGPASSFILE="$PGPASS_DIR/pgpass" psql -w -h "$pgHost" -p "$pgPort" -U "$pgUser" \
       -d "$ADMIN_DB" -tAc "CREATE DATABASE \"$dbName\"" >/dev/null || {
         echo "WARN: CREATE DATABASE $dbName failed; ATTACH below may fail" >&2
       }
   fi
+  rm -rf -- "$PGPASS_DIR"
 fi
 
 # Early guard: in dry-run mode we only want the assembled INIT_SQL (below), never a live

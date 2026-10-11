@@ -5,7 +5,7 @@ import cats.effect.unsafe.implicits.global
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-class LocalQuackBackendSpec extends AnyFlatSpec with Matchers:
+class LocalQuackBackendSpec extends AnyFlatSpec with Matchers with org.scalatest.OptionValues:
   import LocalQuackBackendSpec.{envDumpCmd, isWindows, sleepCmd}
 
   "LocalQuackBackend" should "start, lease a port, and register the node" in:
@@ -100,46 +100,68 @@ class LocalQuackBackendSpec extends AnyFlatSpec with Matchers:
       out should not include "dataPath="
     finally backend.stop(PoolKey("t", "t_default", "p"), "node-nodatapath").unsafeRunSync()
 
-  it should "emit objectStoreSql as an env var when the spec carries one, and omit it when empty" in:
-    val capture = java.io.File.createTempFile("env-capture-objsql-", ".txt")
+  it should "deliver every secret through a private secrets directory, never the env or argv" in:
+    val capture = java.io.File.createTempFile("env-capture-secrets-", ".txt")
     capture.deleteOnExit()
+    val argv    = new java.util.concurrent.atomic.AtomicReference[List[String]](Nil)
     val backend = new LocalQuackBackend(
       min = 23090,
       max = 23091,
-      commandFor = (_, _, _) => envDumpCmd(capture.getAbsolutePath, 5)
+      commandFor = (spec, port, token) =>
+        argv.set(LocalQuackBackend.defaultCommand("spawn.sh")(spec, port, token))
+        envDumpCmd(capture.getAbsolutePath, 5)
     )
-    val spec = NodeSpec(
+    val storeSql = "CREATE OR REPLACE SECRET qod_db_store (TYPE s3, SECRET 'store-secret');"
+    val spec     = NodeSpec(
       PoolKey("t", "t_default", "p"),
-      "node-objsql",
+      "node-secrets",
       Role.Dual,
-      metastore = Map.empty,
+      metastore = Map(
+        "pgHost"        -> "h",
+        "pgPassword"    -> "hunter2",
+        "encryptionKey" -> "c2VjcmV0",
+        "PgPassword"    -> "odd-case"
+      ),
       s3 = Map.empty,
-      objectStoreSql = "CREATE OR REPLACE SECRET qod_db_store (TYPE s3, SCOPE 's3://bucket/db');"
+      objectStoreSql = storeSql,
+      extraSetupSql = "ATTACH 'fed-secret' AS f;"
     )
-    backend.start(spec).unsafeRunSync()
+    val node = backend.start(spec).unsafeRunSync()
     try
       val deadline = System.currentTimeMillis() + 3000
       while capture.length() == 0 && System.currentTimeMillis() < deadline do Thread.sleep(50)
       val out = java.nio.file.Files.readString(capture.toPath)
-      out should include("objectStoreSql=CREATE OR REPLACE SECRET qod_db_store")
-    finally backend.stop(PoolKey("t", "t_default", "p"), "node-objsql").unsafeRunSync()
-
-    val capture2 = java.io.File.createTempFile("env-capture-objsql-empty-", ".txt")
-    capture2.deleteOnExit()
-    val backend2 = new LocalQuackBackend(
-      min = 23092,
-      max = 23093,
-      commandFor = (_, _, _) => envDumpCmd(capture2.getAbsolutePath, 5)
-    )
-    val emptySpec =
-      NodeSpec(PoolKey("t", "t_default", "p"), "node-noobjsql", Role.Dual, Map.empty, Map.empty)
-    backend2.start(emptySpec).unsafeRunSync()
-    try
-      val deadline2 = System.currentTimeMillis() + 3000
-      while capture2.length() == 0 && System.currentTimeMillis() < deadline2 do Thread.sleep(50)
-      val out2 = java.nio.file.Files.readString(capture2.toPath)
-      out2 should not include "objectStoreSql="
-    finally backend2.stop(PoolKey("t", "t_default", "p"), "node-noobjsql").unsafeRunSync()
+      Seq("hunter2", "c2VjcmV0", "odd-case", "store-secret", "fed-secret", node.token).foreach { v =>
+        withClue(v)(out should not include v)
+      }
+      argv.get() should not contain node.token
+      out should include("pgHost=h")
+      out should include(s"${NodeSecretFiles.EphemeralEnv}=1")
+      val dir = java.nio.file.Paths.get(
+        out.linesIterator
+          .find(_.startsWith(s"${NodeSecretFiles.DirEnv}="))
+          .value
+          .stripPrefix(s"${NodeSecretFiles.DirEnv}=")
+      )
+      def read(k: String) = java.nio.file.Files.readString(dir.resolve(k))
+      read("pgPassword") shouldBe "hunter2"
+      read("encryptionKey") shouldBe "c2VjcmV0"
+      read("objectStoreSql") shouldBe storeSql
+      read("extraSetupSql") shouldBe "ATTACH 'fed-secret' AS f;"
+      read(NodeSecretFiles.TokenKey) shouldBe node.token
+      if !isWindows then
+        java.nio.file.attribute.PosixFilePermissions
+          .toString(java.nio.file.Files.getPosixFilePermissions(dir)) shouldBe "rwx------"
+        java.nio.file.attribute.PosixFilePermissions
+          .toString(java.nio.file.Files.getPosixFilePermissions(dir.resolve("pgPassword"))) shouldBe
+          "rw-------"
+      backend.stop(PoolKey("t", "t_default", "p"), "node-secrets").unsafeRunSync()
+      // The launcher removes the directory once the process is gone (here the stand-in never
+      // read it, like a script that died before getting that far).
+      val gone = System.currentTimeMillis() + 5000
+      while java.nio.file.Files.exists(dir) && System.currentTimeMillis() < gone do Thread.sleep(50)
+      java.nio.file.Files.exists(dir) shouldBe false
+    finally backend.stop(PoolKey("t", "t_default", "p"), "node-secrets").unsafeRunSync()
 
   // Regression for issue #2 (Graceful JVM shutdown hook): cleanup()
   // must SIGTERM every tracked child, wait for them to exit (falling

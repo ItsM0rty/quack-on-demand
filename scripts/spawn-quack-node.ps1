@@ -4,13 +4,13 @@
 
 .DESCRIPTION
   PowerShell mirror of scripts/spawn-quack-node.sh. LocalQuackBackend wraps
-  this as `powershell.exe -File spawn-quack-node.ps1 <port> <token>`.
+  this as `powershell.exe -File spawn-quack-node.ps1 <port>`.
 
-  The metastore connection details arrive as environment variables that
-  LocalQuackBackend.start() sets from CreatePoolRequest.metastore. The
-  env-var keys match the UI form field names verbatim:
+  The non-sensitive metastore connection details arrive as environment
+  variables that LocalQuackBackend.start() sets from CreatePoolRequest.metastore.
+  The env-var keys match the UI form field names verbatim:
 
-    pgHost pgPort pgUser pgPassword   (Postgres for DuckLake catalog)
+    pgHost pgPort pgUser               (Postgres for DuckLake catalog)
     dbName                             (Postgres DB; also the DuckDB catalog alias unless
                                         catalogAlias is set)
     catalogAlias                       (optional DuckDB catalog alias the database is ATTACHed
@@ -21,11 +21,16 @@
                                         like "$dbName"."customer" resolve as ambiguous.)
     dataPath                           (DuckLake data files directory)
     kind                               (ducklake | duckdb-file | memory)
-    dbInitSql extraSetupSql            (optional per-db / per-pool init SQL)
+    dbInitSql                          (optional per-db init SQL)
     lockdownSql                        (optional engine lockdown SQL, NodeLockdown.scala; runs
                                         before quack_serve)
-    objectStoreSql                     (optional per-db object-store CREATE SECRET SQL,
-                                        ObjectStoreSecret.scala; runs before the DuckLake ATTACH)
+
+  Sensitive values (pgPassword, encryptionKey, extraSetupSql, objectStoreSql, the node token and
+  the object-store credentials, see $SecretKeys below) NEVER arrive through the environment or the
+  command line: another process of the same user can read both. They arrive as one file per key in
+  the directory $env:QOD_SECRETS_DIR, which LocalQuackBackend creates with an ACL granting only the
+  current user, and which this script deletes as soon as the values are read
+  (QOD_SECRETS_DIR_EPHEMERAL=1). A key still present in the environment is ignored with a warning.
 
   Unlike the bash version there is no FIFO: DuckDB is fed its init SQL over a
   redirected stdin that this script leaves OPEN, so the background quack
@@ -38,11 +43,48 @@
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true, Position = 0)] [int]    $Port,
-  [Parameter(Mandatory = $true, Position = 1)] [string] $Token
+  [Parameter(Mandatory = $true, Position = 0)] [int]    $Port
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Keep in sync with NodeSecretFiles.Keys (Scala) and SECRET_KEYS in spawn-quack-node.sh;
+# NodeSecretFilesSpec pins both.
+$SecretKeys = @('pgPassword', 'encryptionKey', 'extraSetupSql', 'objectStoreSql', 'QOD_NODE_TOKEN',
+  'QOD_S3_ACCESS_KEY_ID', 'QOD_S3_SECRET_ACCESS_KEY', 'QOD_AZURE_CONNECTION_STRING',
+  'QOD_GCS_KEY_ID', 'QOD_GCS_SECRET')
+$Secrets = @{}
+foreach ($k in $SecretKeys) {
+  if ($null -ne [Environment]::GetEnvironmentVariable($k)) {
+    [Console]::Error.WriteLine("WARN: ignoring $k from the environment; secrets are read from `$QOD_SECRETS_DIR only")
+  }
+  # Removed from this process's environment so the duckdb child never inherits it.
+  [Environment]::SetEnvironmentVariable($k, $null)
+}
+$secretsDir = [Environment]::GetEnvironmentVariable('QOD_SECRETS_DIR')
+if (-not [string]::IsNullOrEmpty($secretsDir)) {
+  foreach ($k in $SecretKeys) {
+    $f = Join-Path $secretsDir $k
+    if (Test-Path -LiteralPath $f -PathType Leaf) {
+      $Secrets[$k] = [System.IO.File]::ReadAllText($f)
+    }
+  }
+  if ([Environment]::GetEnvironmentVariable('QOD_SECRETS_DIR_EPHEMERAL') -eq '1') {
+    Remove-Item -LiteralPath $secretsDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+[Environment]::SetEnvironmentVariable('QOD_SECRETS_DIR', $null)
+[Environment]::SetEnvironmentVariable('QOD_SECRETS_DIR_EPHEMERAL', $null)
+
+function Secret-Or([string]$name, [string]$default) {
+  $v = $Secrets[$name]
+  if ([string]::IsNullOrEmpty($v)) { return $default } else { return $v }
+}
+
+$Token = Secret-Or 'QOD_NODE_TOKEN' ''
+if ([string]::IsNullOrEmpty($Token)) {
+  Write-Error "ERROR: no node token: `$QOD_SECRETS_DIR\QOD_NODE_TOKEN is missing or empty"; exit 1
+}
 
 # DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
 # (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal; pin the normal output format.
@@ -56,7 +98,7 @@ function Env-Or([string]$name, [string]$default) {
 $pgHost     = Env-Or 'pgHost'     'localhost'
 $pgPort     = Env-Or 'pgPort'     '5432'
 $pgUser     = Env-Or 'pgUser'     'postgres'
-$pgPassword = Env-Or 'pgPassword' 'azizam'
+$pgPassword = Secret-Or 'pgPassword' 'azizam'
 $dbName     = Env-Or 'dbName'     'db1'
 $catalogAlias = Env-Or 'catalogAlias' $dbName
 $schemaName = Env-Or 'schemaName' 'main'
@@ -90,8 +132,8 @@ switch -Regex ($dataPath) {
   '^(s3|s3a|gs|r2)://' {
     $isRemote = $true
     $storageSql = "INSTALL httpfs;`nLOAD httpfs;"
-    $s3Key = [Environment]::GetEnvironmentVariable('QOD_S3_ACCESS_KEY_ID')
-    $s3Sec = [Environment]::GetEnvironmentVariable('QOD_S3_SECRET_ACCESS_KEY')
+    $s3Key = Secret-Or 'QOD_S3_ACCESS_KEY_ID' ''
+    $s3Sec = Secret-Or 'QOD_S3_SECRET_ACCESS_KEY' ''
     if (-not [string]::IsNullOrEmpty($s3Key) -and -not [string]::IsNullOrEmpty($s3Sec)) {
       $ep = Env-Or 'QOD_S3_ENDPOINT' ''
       $ep = $ep -replace '^https?://', '' -replace '/$', ''
@@ -116,7 +158,7 @@ CREATE OR REPLACE SECRET quack_s3 (
   '^(az|azure|abfss)://' {
     $isRemote = $true
     $storageSql = "INSTALL azure;`nLOAD azure;"
-    $azConn = [Environment]::GetEnvironmentVariable('QOD_AZURE_CONNECTION_STRING')
+    $azConn = Secret-Or 'QOD_AZURE_CONNECTION_STRING' ''
     if (-not [string]::IsNullOrEmpty($azConn)) {
       $storageSql += @"
 
@@ -188,11 +230,11 @@ if (-not [string]::IsNullOrEmpty($proxyUrl)) {
 }
 
 $dbInitSql    = [Environment]::GetEnvironmentVariable('dbInitSql')
-$extraSetupSql = [Environment]::GetEnvironmentVariable('extraSetupSql')
+$extraSetupSql = Secret-Or 'extraSetupSql' ''
 $lockdownSql  = [Environment]::GetEnvironmentVariable('lockdownSql')
-$objectStoreSql = [Environment]::GetEnvironmentVariable('objectStoreSql')
+$objectStoreSql = Secret-Or 'objectStoreSql' ''
 $encrypted    = [Environment]::GetEnvironmentVariable('encrypted')
-$encryptionKey = [Environment]::GetEnvironmentVariable('encryptionKey')
+$encryptionKey = Secret-Or 'encryptionKey' ''
 
 # Build init SQL piecemeal based on $kind so memory / duckdb-file skip the
 # DuckLake-specific setup entirely. Mirrors spawn-quack-node.sh.

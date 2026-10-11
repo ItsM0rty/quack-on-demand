@@ -33,12 +33,30 @@ private trait SpawnScriptTempDir extends BeforeAndAfterEach:
       .reverse
       .foreach(Files.deleteIfExists)
 
+  /** Run a spawn script the way the launchers do: every [[NodeSecretFiles.Keys]] entry of `env`
+    * (plus a node token) goes to an ephemeral secrets directory, the rest to the environment.
+    */
+  protected def runSpawn(cmd: Seq[String], env: Seq[(String, String)]): String =
+    val (secret, plain) = env.partition { case (k, _) => NodeSecretFiles.isKey(k) }
+    val dir             = NodeSecretFiles.writePrivateDir(
+      (Seq(NodeSecretFiles.TokenKey -> "t") ++ secret).toMap,
+      Some(tempDir)
+    )
+    Process(
+      cmd,
+      None,
+      (plain ++ Seq(
+        NodeSecretFiles.DirEnv       -> dir.toString,
+        NodeSecretFiles.EphemeralEnv -> "1"
+      ))*
+    ).!!
+
 class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScriptTempDir:
 
   private val script = "scripts/spawn-quack-node.sh"
 
-  // PORT/TOKEN are passed positionally, exactly as LocalQuackBackend.defaultCommand invokes
-  // the script in production - the script's contract requires them as $1/$2, not env vars.
+  // PORT is passed positionally, exactly as LocalQuackBackend.defaultCommand invokes the script
+  // in production; the token and the other secrets come from the secrets directory.
   private def initSql(env: (String, String)*): String =
     val base = Seq(
       "QOD_SPAWN_DRY_RUN" -> "1",
@@ -46,7 +64,7 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "catalogAlias"      -> "acme_lake",
       "dbName"            -> "acme_lake"
     )
-    Process(Seq("bash", script, "21999", "t"), None, (base ++ env)*).!!
+    runSpawn(Seq("bash", script, "21999"), base ++ env)
 
   "the ducklake arm" should "omit ENCRYPTED when the flag is absent" in {
     val dataPath = tempDir.resolve("lake").toString
@@ -108,10 +126,10 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
 
   private val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
 
-  // PORT/TOKEN are passed positionally, exactly as LocalQuackBackend.defaultCommand invokes the
-  // script in production - the script's contract requires them as -Port/-Token positional
-  // parameters, not env vars (no env fallback: an inherited PORT silently binding the wrong port
-  // is a worse failure mode than requiring the caller to pass it explicitly).
+  // PORT is passed positionally, exactly as LocalQuackBackend.defaultCommand invokes the script in
+  // production (no env fallback: an inherited PORT silently binding the wrong port is a worse
+  // failure mode than requiring the caller to pass it explicitly); the token and the other
+  // secrets come from the secrets directory.
   private def initSql(env: (String, String)*): String =
     val base = Seq(
       "QOD_SPAWN_DRY_RUN" -> "1",
@@ -119,11 +137,7 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "catalogAlias"      -> "acme_lake",
       "dbName"            -> "acme_lake"
     )
-    Process(
-      Seq("powershell.exe", "-File", "scripts/spawn-quack-node.ps1", "21999", "t"),
-      None,
-      (base ++ env)*
-    ).!!
+    runSpawn(Seq("powershell.exe", "-File", "scripts/spawn-quack-node.ps1", "21999"), base ++ env)
 
   "the PowerShell ducklake arm" should "omit ENCRYPTED when the flag is absent" in {
     assume(isWindows, "spawn-quack-node.ps1 runs on Windows only")
