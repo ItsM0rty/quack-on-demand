@@ -339,3 +339,26 @@ class NodeWideSettingScreenSpec extends AnyFlatSpec with Matchers:
       "SELECT * FROM dbgen(sf = 1, catalog = 'other')"
     ) shouldBe defined
   }
+
+  // `file_search_path` makes a relative name resolve in any directory (`SET file_search_path =
+  // '/etc'; SELECT * FROM x.csv` read /etc/x.csv on 2.0), `home_directory` moves `~`, and
+  // `allow_asterisks_in_http_paths` turns `*` in a URL into a glob; the TLS settings decide whether
+  // the node trusts the servers it reads from. Each is GLOBAL on 2.0.
+  "the path-resolution and TLS settings" should "be reserved to superusers in every mode" in
+    List(
+      "file_search_path",
+      "home_directory",
+      "allow_asterisks_in_http_paths",
+      "ca_cert_file",
+      "enable_server_cert_verification",
+      "enable_curl_server_cert_verification"
+    ).foreach { name =>
+      withClue(name) {
+        NodeSettingScreen.screenNodeWide(s"SET $name = '/etc'") shouldBe
+          Some(NodeSettingScreen.NodeWideRefusal)
+        NodeSettingScreen.screenNodeWide(s"SET SESSION $name = '/etc'") shouldBe
+          Some(NodeSettingScreen.NodeWideRefusal)
+        NodeSettingScreen.screenNodeWide(s"RESET $name") shouldBe
+          Some(NodeSettingScreen.NodeWideRefusal)
+      }
+    }

@@ -2697,6 +2697,23 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  "SET file_search_path" should "be refused to a tenant user, ACL off or on, and open to a superuser" in:
+    Seq(StatementValidator.allowAll, wildcardAcl).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      withClue(v.toString) {
+        router
+          .execute("fsp-1", "alice", poolKey, "SET file_search_path = '/etc'", Some(wildcardAllSet))
+          .unsafeRunSync()
+          .swap
+          .toOption
+          .get shouldBe a[RouterFailure.AccessDenied]
+        captured() shouldBe ""
+        router
+          .execute("fsp-2", "alice", poolKey, "SET file_search_path = '/etc'", Some(superuserSet))
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+      }
+    }
+
   // ---- parser settings (DuckDB 2.0) ----
 
   "a parser setting" should "be refused for a regular user with acl disabled, lockdown off" in:

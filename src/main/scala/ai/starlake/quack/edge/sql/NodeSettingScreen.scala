@@ -194,6 +194,16 @@ object NodeSettingScreen:
     "allow_persistent_secrets",
     "default_secret_storage",
     "secret_directory",
+    // Path resolution: `file_search_path` makes a relative name resolve in any directory
+    // (`SET file_search_path = '/etc'; SELECT * FROM x.csv` read /etc/x.csv on 2.0),
+    // `home_directory` moves `~`, `allow_asterisks_in_http_paths` turns `*` in a URL into a glob.
+    "file_search_path",
+    "home_directory",
+    "allow_asterisks_in_http_paths",
+    // TLS trust for every server the node reads from.
+    "ca_cert_file",
+    "enable_server_cert_verification",
+    "enable_curl_server_cert_verification",
     // Logging and profiling: capture other sessions' statements, or write files.
     "enable_logging",
     "logging_level",
