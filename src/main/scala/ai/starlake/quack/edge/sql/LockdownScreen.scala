@@ -249,6 +249,24 @@ object LockdownScreen:
   // that FROM is the function's operand, not a table.
   private val FromSyntaxFunctions = Set("extract", "trim", "substring", "overlay")
 
+  // Words after which DuckDB 2.0 reads a table name, beside FROM and JOIN, each verified on the CLI
+  // to replacement-scan a literal there: SUMMARIZE / DESCRIBE / DESC / SHOW (`SHOW TABLE '<p>'`),
+  // TABLE (`TABLE '<p>'`, `DESCRIBE TABLE`, `INSERT INTO t TABLE`, `CREATE TABLE .. AS TABLE`), the
+  // PIVOT statements, and USING (`MERGE INTO t USING '<p>'`, `DELETE FROM t USING '<p>'`). A
+  // `JOIN .. USING (` column list is a parenthesis frame, whose names are words, not literals.
+  private val TableKeywords = Set(
+    "summarize",
+    "describe",
+    "desc",
+    "show",
+    "table",
+    "pivot",
+    "pivot_wider",
+    "pivot_longer",
+    "unpivot",
+    "using"
+  )
+
   // Words that end a FROM clause's table list at their depth: a comma after one no longer separates
   // tables. JOIN ... ON / USING do not end it (`FROM a JOIN b USING (id), c` is a comma join).
   private val FromListEnd = Set(
@@ -617,15 +635,16 @@ object LockdownScreen:
 
   /** Denies a string literal DuckDB may replacement-scan as a file: a literal in a TABLE position,
     * at any parenthesis depth, read from the lexer's tokens. A table position is right after a FROM
-    * or JOIN keyword, after a comma of a FROM clause's table list, or right after a `(` that itself
-    * sits in a table position (`FROM ('/a/t.csv')` and `FROM (('/a/t.csv'))` read the file on 2.0).
-    * A FROM inside the argument list of [[FromSyntaxFunctions]] (`trim(leading '/' from
-    * '/a/b.csv')`) is that function's syntax and opens no table position; a subquery inside such a
-    * call (`trim((FROM '/a/t.csv'))`) does. Every quoting form counts: a plain literal is judged by
-    * the path-shape heuristic, any other (escape, dollar-quoted, prefixed) is denied unless
-    * provably remote, since its escapes can encode a path no heuristic spots. A literal DuckDB
-    * folds into the previous one across a newline is judged alone and folded. A remote object-store
-    * literal is exempt unless it addresses a denied DuckLake bucket.
+    * or JOIN keyword or one of [[TableKeywords]] (SUMMARIZE, DESCRIBE, TABLE, PIVOT, USING, ...),
+    * after a comma of a FROM or USING table list, or right after a `(` that itself sits in a table
+    * position (`FROM ('/a/t.csv')` and `FROM (('/a/t.csv'))` read the file on 2.0). A FROM inside
+    * the argument list of [[FromSyntaxFunctions]] (`trim(leading '/' from '/a/b.csv')`) is that
+    * function's syntax and opens no table position; a subquery inside such a call (`trim((FROM
+    * '/a/t.csv'))`) does. Every quoting form counts: a plain literal is judged by the path-shape
+    * heuristic, any other (escape, dollar-quoted, prefixed) is denied unless provably remote, since
+    * its escapes can encode a path no heuristic spots. A literal DuckDB folds into the previous one
+    * across a newline is judged alone and folded. A remote object-store literal is exempt unless it
+    * addresses a denied DuckLake bucket.
     */
   private def replacementScans(stmt: String, deniedBuckets: Set[String]): Option[String] =
     val view                                    = SqlLexer.engineView(stmt)
@@ -643,7 +662,7 @@ object LockdownScreen:
     var prev: Option[SqlLexer.Token] = None
     var verdict: Option[String]      = None
     def tablePosition(p: SqlLexer.Token): Boolean =
-      word(p).contains("join") ||
+      word(p).contains("join") || word(p).exists(TableKeywords) ||
         (word(p).contains("from") && !frames.top.fromSyntax) ||
         (isPunct(view, p, ',') && frames.top.inFrom) ||
         (isPunct(view, p, '(') && frames.top.tablePos)
@@ -660,7 +679,7 @@ object LockdownScreen:
         else
           word(t) match
             case Some("from") if !frames.top.fromSyntax => frames.top.inFrom = true
-            case Some("join")                           => frames.top.inFrom = true
+            case Some("join") | Some("using")           => frames.top.inFrom = true
             case Some(w) if FromListEnd(w)              => frames.top.inFrom = false
             case _                                      => ()
         if isString(t) && prev.exists(tablePosition) then

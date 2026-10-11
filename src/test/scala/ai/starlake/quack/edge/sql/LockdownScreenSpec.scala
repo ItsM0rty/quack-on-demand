@@ -971,3 +971,54 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("CALL quack_serve('quack:localhost:9999')") shouldBe true
     denied("CALL quack_stop('quack:localhost:21900')") shouldBe true
   }
+
+  // ---- table positions outside FROM / JOIN / comma ---------------------------------------------
+  //
+  // Each statement below read a scratch CSV on the DuckDB 2.0 CLI through the literal.
+
+  "replacement scans" should "be judged in every table position DuckDB 2.0 accepts" in {
+    denied("SUMMARIZE '/data/s.csv'") shouldBe true
+    denied("DESCRIBE '/data/s.csv'") shouldBe true
+    denied("DESCRIBE TABLE '/data/s.csv'") shouldBe true
+    denied("DESC '/data/s.csv'") shouldBe true
+    denied("SHOW TABLE '/data/s.csv'") shouldBe true
+    denied("TABLE '/data/s.csv'") shouldBe true
+    denied("PIVOT '/data/s.csv' ON a USING sum(b)") shouldBe true
+    denied("SELECT * FROM (PIVOT '/data/s.csv' ON a USING sum(b))") shouldBe true
+    denied("PIVOT_WIDER '/data/s.csv' ON a USING sum(b)") shouldBe true
+    denied("PIVOT_LONGER '/data/s.csv' ON a INTO NAME k VALUE v") shouldBe true
+    denied("UNPIVOT '/data/s.csv' ON a INTO NAME k VALUE v") shouldBe true
+    denied(
+      "MERGE INTO t USING '/data/s.csv' AS s ON t.a = s.a " +
+        "WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)"
+    ) shouldBe true
+    denied(
+      "MERGE INTO t USING ('/data/s.csv') AS s ON t.a = s.a " +
+        "WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)"
+    ) shouldBe true
+    denied("DELETE FROM t USING '/data/s.csv' s WHERE t.a = s.a") shouldBe true
+    denied("DELETE FROM t USING u, '/data/s.csv' s WHERE t.a = s.a") shouldBe true
+    denied("INSERT INTO t TABLE '/data/s.csv'") shouldBe true
+    denied("CREATE TABLE t2 AS TABLE '/data/s.csv'") shouldBe true
+    denied("SELECT * FROM (TABLE '/data/s.csv')") shouldBe true
+    denied("SELECT * FROM (SUMMARIZE '/data/s.csv')") shouldBe true
+    denied("WITH c AS (TABLE '/data/s.csv') SELECT * FROM c") shouldBe true
+    denied("EXPLAIN TABLE '/data/s.csv'") shouldBe true
+    denied("SUMMARIZE e'/data/s.csv'") shouldBe true
+  }
+
+  it should "keep admitting those statements over tables and remote literals" in {
+    denied("SUMMARIZE t") shouldBe false
+    denied("DESCRIBE t") shouldBe false
+    denied("TABLE t") shouldBe false
+    denied("PIVOT t ON a USING sum(b)") shouldBe false
+    denied("SELECT * FROM t PIVOT (sum(b) FOR a IN ('/a/b.csv', 'x'))") shouldBe false
+    denied("MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET p = '/a/b.csv'") shouldBe
+      false
+    denied("DELETE FROM t USING u WHERE t.p = '/a/b.csv'") shouldBe false
+    denied("SELECT * FROM t JOIN u USING (id) WHERE p = '/a/b.csv'") shouldBe false
+    denied("SUMMARIZE 's3://b/x.parquet'") shouldBe false
+    denied("MERGE INTO t USING 's3://b/x.csv' s ON t.a = s.a WHEN MATCHED THEN DELETE") shouldBe
+      false
+    denied("SELECT * FROM t ORDER BY a DESC, 2") shouldBe false
+  }
