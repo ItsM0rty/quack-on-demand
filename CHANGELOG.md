@@ -161,12 +161,29 @@
     invisible to the ACL walk). The ACL and row-policy walks refuse an AST child of a type they
     have no rule for instead of skipping it, and the column-policy rewrite denies a statement in
     which a covered column sits where it cannot be masked (a MAP or list literal, a lambda, `->>`,
-    `TRIM`, a JOIN condition, ...) instead of forwarding it unmasked.
+    a `JOIN ... USING` list, ...) instead of forwarding it unmasked.
   - Lockdown judges file literals after `SUMMARIZE`, `DESCRIBE`, `TABLE`, the `PIVOT` / `UNPIVOT`
     statements and `USING` (`MERGE INTO .. USING`, `DELETE .. USING`), and protects the iceberg
     `unsafe_enable_version_guessing` setting.
   - A column- or row-policy rewrite refused for holding `//` says so instead of "could not parse
     statement".
+  - The column-policy rewrite masks a covered column in `IS [NOT] NULL`, `TRIM`, `QUALIFY`, an
+    aggregate `FILTER` and `JOIN ... ON` instead of denying the statement. It also stops denying a
+    CTE, a derived table or an `IN` / `EXISTS` / scalar subquery that reads a same-named column
+    from a table with no policy (a staging CTE joined to a masked table, common in dbt): a
+    covered-column check now binds unqualified names per query block, innermost first, as DuckDB
+    does. `JOIN ... USING` on a covered column stays denied.
+  - BREAKING for tables whose name holds a dot: a double-quoted or backtick-quoted identifier
+    containing a dot (`"a.b"`) is refused for ACL-checked users (QoD grants and OPA), users with
+    column or row policies, and every caller on a lockdown pool. DuckDB reads it as one table
+    name, `main."a.b"`, while the access check read schema `a`, table `b`, so a grant on schema
+    `a` reached `main."a.b"`. An alias (`AS "t.x"`) and a remote URL (`"s3://b/x.parquet"`) are
+    still accepted; rename such tables.
+  - `quack_active_connections()` (every session's running query text and connection id) and
+    `quack_server_list()` join the node-control calls reserved to superusers and refused to every
+    caller on a lockdown pool.
+  - The ACL walk scopes a CTE name to the query that declares it: a CTE inside `ARRAY(...)` or a
+    derived table is no longer gated as a table of that name.
 
 - **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
   open transaction's node connection too, so a statement after an idle pause longer than the
@@ -175,7 +192,8 @@
 - **Security: a batched `USE` or `SET search_path` no longer reaches tables outside a user's
   grants.** The access check resolves a bare table name against the pool's default schema, but a
   `USE`, `SET search_path`, `SET schema` (any spelling, including `SET SESSION`, `TO`, `PRAGMA
-  search_path` and `RESET`) in the same request moved the node elsewhere first, so
+  search_path`, `RESET`, a backtick-quoted name and the `SET` an `EXPLAIN ANALYZE` carries) in the
+  same request moved the node elsewhere first, so
   `SET search_path='db.other'; SELECT * FROM t` read `db.other.t` with a grant on the default
   schema's `t` only, over FlightSQL and the native front door alike. For ACL-checked users such a
   batch is now refused: send `USE` / `SET search_path` as its own statement, which works as
