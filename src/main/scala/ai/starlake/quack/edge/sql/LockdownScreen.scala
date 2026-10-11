@@ -252,32 +252,13 @@ object LockdownScreen:
   // ignored - a legit remote COPY with options is not over-denied.
   private val CopyPathLiteral = "(?<![a-zA-Z0-9_])(?:from|to)\\s*'([^']*)'".r
 
-  // The file extensions DuckDB 2.0's replacement scans recognize, used to spot a path-shaped name
-  // that carries a separator: read_csv's .csv / .tsv, the json extension's .json / .jsonl /
-  // .ndjson / .geojson / .geojsonl, parquet's .parquet, the core read_duckdb's .db / .ddb /
-  // .duckdb, and the suffixes that autoload an extension (`EXTENSION_FILE_POSTFIXES`): .xlsx,
-  // .avro, .shp, .gpkg, .fgb. Each scan also matches the extension followed by `?` anywhere in the
-  // name. Every scan but read_duckdb's drops a trailing .gz or .zst first; dropping it for all of
-  // them over-denies only a compressed DuckDB file name.
+  // The file extensions DuckDB 2.0's replacement scans recognize
+  // (TableExtractor.ReplacementScanExtensions), used to spot a path-shaped name that carries a
+  // separator. Each scan also matches the extension followed by `?` anywhere in the name. Every
+  // scan but read_duckdb's drops a trailing .gz or .zst first; dropping it for all of them
+  // over-denies only a compressed DuckDB file name.
   private val DataExtensions =
-    List(
-      ".parquet",
-      ".csv",
-      ".tsv",
-      ".json",
-      ".jsonl",
-      ".ndjson",
-      ".geojson",
-      ".geojsonl",
-      ".db",
-      ".ddb",
-      ".duckdb",
-      ".xlsx",
-      ".avro",
-      ".shp",
-      ".gpkg",
-      ".fgb"
-    )
+    ai.starlake.acl.parser.TableExtractor.ReplacementScanExtensions.toList.sorted.map("." + _)
 
   private val CompressionSuffixes = List(".gz", ".zst")
 

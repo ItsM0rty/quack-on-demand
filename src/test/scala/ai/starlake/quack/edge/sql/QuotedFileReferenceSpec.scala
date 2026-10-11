@@ -147,3 +147,50 @@ class QuotedFileReferenceSpec extends AnyFlatSpec with Matchers:
       defined
     LockdownScreen.screen("SELECT * FROM \"file:///data/x.csv\"", Set.empty) shouldBe defined
   }
+
+  // No quoting needed: DuckDB 2.0 replacement-scans `x.csv` (schema x, table csv, neither found)
+  // as the relative file x.csv under the node's working directory, `sub.x.parquet` as
+  // sub.x.parquet, `"x"."csv"` likewise (checked on the 2.0 CLI). A name whose last part is a
+  // replacement-scan extension is a file reference too.
+  private val extensionReads = List(
+    "SELECT * FROM x.csv",
+    "SELECT * FROM \"x\".\"csv\"",
+    "SELECT * FROM sub.x.parquet",
+    "SELECT * FROM x.JSON",
+    "SELECT * FROM x.ndjson",
+    "SELECT * FROM x.duckdb",
+    "SELECT * FROM x.csv.gz",
+    "SELECT * FROM t JOIN x.parquet ON true",
+    "INSERT INTO t SELECT * FROM x.csv",
+    "DESCRIBE x.csv",
+    "CREATE TABLE x.csv (a INT)",
+    "DROP TABLE x.parquet"
+  )
+
+  "AccessGate" should "refuse a name ending in a replacement-scan extension as a file reference" in
+    extensionReads.foreach { sql =>
+      withClue(sql) {
+        AccessGate.evaluate(
+          sql,
+          cfg,
+          "tpch",
+          filteredMetadata = true,
+          clientDataScans = false
+        ) match
+          case GateOutcome.Refuse(reason, coverable, _) =>
+            // `csv` is a JSqlParser keyword: `x.csv` is a parse error, refused the same way
+            reason should (include("file reference") or include("parse error"))
+            coverable shouldBe true
+          case other => fail(s"expected Refuse, got $other")
+        validate(sql, eff(perm("*", "*", "*", "RO"))) shouldBe a[Denied]
+      }
+    }
+
+  it should "gate a table whose name only looks like one" in
+    List("SELECT * FROM parquet", "SELECT * FROM main.csv_data", "SELECT * FROM main.json_events")
+      .foreach { sql =>
+        withClue(sql) {
+          AccessGate.evaluate(sql, cfg, "tpch", true, clientDataScans = false) shouldBe
+            a[GateOutcome.Gated]
+        }
+      }
