@@ -62,12 +62,12 @@ class SqlStatementSplitSpec extends AnyFlatSpec with Matchers:
       withClue(sql)(split(sql) should have size 3)
     }
 
-  it should "treat a dollar sign after a number or a parameter as no opener" in:
-    // DuckDB 1.5.6 and 2.0 reject each of these submissions as a syntax error, so nothing runs;
-    // reading more separators than the engine would is the safe direction.
+  it should "open a dollar quote after a number or a parameter" in:
+    // DuckDB 1.5.6 reads each `$$` here as the opener of a string running to the `$$` in the
+    // comment (its syntax error names that whole string), and rejects the submission.
     List("1$$", "1.5$$", "1e5$$", "1_000$$", "$1$$").foreach { lit =>
       val sql = "SELECT " + lit + trailer
-      withClue(sql)(split(sql) should have size 3)
+      withClue(sql)(split(sql) should have size 1)
     }
 
   it should "still open a dollar quote after a non-identifier character" in:
@@ -87,3 +87,91 @@ class SqlStatementSplitSpec extends AnyFlatSpec with Matchers:
     out should not include "/*"
     out should not include "--"
     out should include("FROM t")
+
+  // ---- parity with the DuckDB 1.5.6 engine, character class by character class ----
+  //
+  // Every expectation below comes from the DuckDB 1.5.6 engine: each submission was run through
+  // the 1.5.6 CLI on `:memory:` and its result sets counted (for the stripComments cases, the
+  // column name it returned was read). DuckDB's pre-pass turns the 18 characters of
+  // `duckDbSpaces` into ASCII spaces, so each ends a token; the characters of `identifierChars`
+  // are whitespace or format characters to Java but identifier characters to DuckDB.
+  private val duckDbSpaces: List[Char] =
+    List('\u00a0') ++ ('\u2000' to '\u200b') ++
+      List('\u202f', '\u205f', '\u2060', '\u3000', '\ufeff')
+
+  private val identifierChars: List[Char] =
+    List('\u00ad', '\u200c', '\u200d', '\u200e', '\u200f', '\u2028', '\u2029', '\u1680') ++
+      List('\u180e') ++ ('\u2061' to '\u2064') ++ ('\u2066' to '\u206f')
+
+  private def hex(c: Char): String = f"U+${c.toInt}%04X"
+
+  "the character lists" should "hold DuckDB's 18 space characters and 23 identifier characters" in:
+    duckDbSpaces.distinct should have size 18
+    identifierChars.distinct should have size 23
+    (duckDbSpaces intersect identifierChars) shouldBe empty
+
+  "splitStatements" should "open a dollar quote after each DuckDB space character" in:
+    duckDbSpaces.foreach { c =>
+      val sql = "SELECT 1 AS" + c + "$$; SELECT 2; SELECT 3; -- $$"
+      withClue(hex(c))(split(sql) should have size 1)
+    }
+
+  it should "continue an identifier through each other whitespace or format character" in:
+    identifierChars.foreach { c =>
+      val sql = "SELECT 1 AS" + c + "$$; SELECT 2; SELECT 3; -- $$"
+      withClue(hex(c))(split(sql) should have size 3)
+    }
+
+  it should "read a line comment and a separator after a character of either class" in:
+    (duckDbSpaces ++ identifierChars).foreach { c =>
+      withClue(hex(c)) {
+        split("SELECT 1 AS x" + c + "-- ; SELECT 2\n; SELECT 3") should have size 2
+        split("SELECT 1 AS x" + c + "; SELECT 2; SELECT 3") should have size 3
+      }
+    }
+
+  "stripComments" should "keep a comment marker inside a dollar quote after a DuckDB space" in:
+    // DuckDB names the column ` -- `: the marker is in the string.
+    duckDbSpaces.foreach { c =>
+      val sql = "SELECT 1 AS" + c + "$$ -- $$"
+      withClue(hex(c))(SqlCommentStripper.stripComments(sql) shouldBe sql)
+    }
+
+  it should "strip a comment after an identifier ending in an identifier character and $$" in:
+    // DuckDB names the column `AS<char>$$`: the rest of the line is a comment.
+    identifierChars.foreach { c =>
+      val sql = "SELECT 1 AS" + c + "$$ -- $$"
+      withClue(hex(c))(SqlCommentStripper.stripComments(sql) shouldBe "SELECT 1 AS" + c + "$$ ")
+    }
+
+  it should "strip a line comment after a character of either class" in:
+    (duckDbSpaces ++ identifierChars).foreach { c =>
+      withClue(hex(c)) {
+        SqlCommentStripper.stripComments("SELECT 1 AS x" + c + "-- c") shouldBe "SELECT 1 AS x" + c
+      }
+    }
+
+  // DuckDB's pre-pass keeps a space character it believes sits inside a literal, and its quote
+  // scan is simpler than the tokenizer's: the kept no-break space then continues the identifier.
+  "splitStatements" should "follow the pre-pass when a block comment holds a quote" in:
+    split("SELECT 1 /* ' */ AS\u00a0$$; SELECT 2; SELECT 3; -- ' $$") should have size 3
+    split("SELECT 1 AS\u00a0$$; SELECT 2; SELECT 3; -- ' $$") should have size 1
+
+  it should "follow the pre-pass when an identifier holds $$" in:
+    split("SELECT 1 AS x$$, 2 AS\u00a0$$; SELECT 2; SELECT 3; -- $$") should have size 3
+    split("SELECT 1 AS x, 2 AS\u00a0$$; SELECT 2; SELECT 3; -- $$") should have size 1
+
+  it should "follow the pre-pass when an escape string holds a backslash-escaped quote" in:
+    split("SELECT e'\\'' AS a, 1 AS\u00a0$$; SELECT 2; SELECT 3; -- ' $$") should have size 3
+    split("SELECT 'a' AS a, 1 AS\u00a0$$; SELECT 2; SELECT 3; -- ' $$") should have size 1
+
+  it should "keep original offsets when a space character converts" in:
+    val sql = "SELECT\u00a01;\u3000SELECT\u20002"
+    SqlCommentStripper.statementSpans(sql) shouldBe List((0, 8), (9, sql.length))
+    split(sql) shouldBe List("SELECT\u00a01", "\u3000SELECT\u20002")
+
+  // The lexer follows DuckDB 2.0, which accepts both forms below. DuckDB 1.5.6 rejects each
+  // submission as a syntax error, so nothing runs there whatever the count.
+  it should "count backtick identifiers and control characters in identifiers the 2.0 way" in:
+    split("SELECT 1 AS `a;b`; SELECT 2") should have size 2
+    split("SELECT 1 AS a\u0001$$; SELECT 2; -- $$") should have size 2

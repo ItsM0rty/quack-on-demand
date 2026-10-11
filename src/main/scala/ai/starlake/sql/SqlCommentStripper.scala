@@ -1,7 +1,8 @@
 package ai.starlake.sql
 
-/** Removes single-line (`--`) and multi-line (`/* ... */`) SQL comments from a query string,
-  * mirroring DuckDB's own lexer rather than approximating it.
+/** Removes single-line (`--`) and multi-line (`/* ... */`) SQL comments from a query string, and
+  * splits a submission into its top-level statements, mirroring DuckDB's own lexer rather than
+  * approximating it.
   *
   * Mirrors the implementation from the Starlake codebase (`ai.starlake.sql.SqlCommentStripper`) so
   * SQL-handling utilities stay consistent across projects; the lexer fidelity below is this
@@ -22,19 +23,20 @@ package ai.starlake.sql
   *      */ ANALYZE INSERT ...` reads as plain EXPLAIN, and DuckDB writes the row) and it breaks the
   *      keyword-argument adjacency the lockdown screen's regexes key on (`FROM/* a /* b */ c
   *      */'/etc/passwd.parquet'` reads the file). So the block arm tracks depth.
-  *   3. A comment opener inside a QUOTED region is not a comment. DuckDB has four quoting forms,
-  *      all of which accept a block-comment opener and `--` verbatim: plain strings `'...'` (`''`
-  *      doubles, a backslash is an ordinary character), escape strings `e'...'` / `E'...'` (`''`
-  *      doubles AND a backslash escapes whatever follows it, the closing quote included),
-  *      double-quoted identifiers `"..."` (`""` doubles) and dollar-quoted strings `$$...$$` /
-  *      `$tag$...$tag$`. Tracking only the first of the four -- which this scanner did until the
-  *      quoting forms were probed one at a time against the engine -- lets a block-comment opener
-  *      in a column alias open a comment that never closes and swallows the rest of the statement.
-  *      A SELECT whose alias is the four characters x, slash, star, y, reading /etc/passwd.csv
-  *      through read_csv, executes on DuckDB and reached every downstream screen as
-  *      `select 1 as "x` (the alias is spelled out rather than written inline because an unbalanced
-  *      opener would end this scaladoc; `SqlCommentStripperSpec` carries it verbatim as a string
-  *      literal).
+  *   3. A comment opener inside a QUOTED region is not a comment. DuckDB 1.5 has four quoting
+  *      forms, all of which accept a block-comment opener and `--` verbatim: plain strings `'...'`,
+  *      escape strings `e'...'` / `E'...'` (a backslash escapes whatever follows it), double-quoted
+  *      identifiers and dollar-quoted strings `$$...$$` / `$tag$...$tag$` (2.0 adds backtick
+  *      identifiers, which 1.5 rejects as a syntax error). Tracking only the first of them lets a
+  *      block-comment opener in a column alias open a comment that never closes and swallows the
+  *      rest of the statement. A SELECT whose alias is the four characters x, slash, star, y,
+  *      reading /etc/passwd.csv through read_csv, executes on DuckDB and reached every downstream
+  *      screen as `select 1 as "x` (the alias is spelled out rather than written inline because an
+  *      unbalanced opener would end this scaladoc; `SqlCommentStripperSpec` carries it verbatim as
+  *      a string literal). WHERE each quoted region opens and ends (which `$` and which `e` start
+  *      one, which characters a dollar tag holds, DuckDB's unicode-space pre-pass) is `SqlLexer`'s
+  *      job, ported from the DuckDB source and shared by the comment stripper and the statement
+  *      splitter.
   *
   * The result is for CLASSIFICATION and SCREENING. `PrepareStrategy` is the one caller that sends
   * derived text back to the engine, and every property above moves that path closer to the original
@@ -47,57 +49,33 @@ object SqlCommentStripper:
     if sql == null || sql.isEmpty then sql
     else
       val result = new StringBuilder()
-      val length = sql.length
-      var i      = 0
-
-      while i < length do
-        val c = sql.charAt(i)
-        if c == '/' && i + 1 < length && sql.charAt(i + 1) == '*' then
-          i = blockCommentEnd(sql, i)
+      // Every boundary decision comes from `SqlLexer`, the one reader shared with
+      // `statementSpans`, so this stripper can never disagree with the splitter (or with DuckDB)
+      // on where a literal or a comment ends.
+      SqlLexer.tokens(sql).foreach { t =>
+        t.kind match
           // A closed block comment becomes a single ASCII space, not nothing: DuckDB treats the
           // comment as a separator, so the two tokens it sat between must not weld together
           // (`INSERT/*x*/INTO` -> `INSERT INTO`, not `INSERTINTO`). Harmless when the comment
           // already sat next to real whitespace; load-bearing when it didn't.
-          result.append(' ')
-        else if c == '-' && i + 1 < length && sql.charAt(i + 1) == '-' then
-          i = lineCommentEnd(sql, i)
-          // The terminator itself is real whitespace and is kept, so it separates the two lines.
-          if i < length then
-            result.append(sql.charAt(i))
-            i += 1
-        else if c == '\'' then
-          val end = singleQuotedEnd(sql, i, isEscapeStringOpener(sql, i))
-          result.append(sql.substring(i, end))
-          i = end
-        else if c == '"' then
-          val end = doubleQuotedEnd(sql, i)
-          result.append(sql.substring(i, end))
-          i = end
-        else
-          // `$` opens a dollar-quoted string only at the start of a token, with a well-formed tag
-          // and its matching close; otherwise it is an ordinary character (a positional
-          // parameter, or the tail of an identifier such as `x$$`). See `dollarQuotedEnd`.
-          val dollar = if c == '$' then dollarQuotedEnd(sql, i) else None
-          dollar match
-            case Some(end) =>
-              result.append(sql.substring(i, end))
-              i = end
-            case None =>
-              result.append(c)
-              i += 1
-
+          case SqlLexer.Kind.BlockComment => result.append(' ')
+          // The terminator is not part of the token: it follows as whitespace and is kept, so it
+          // separates the two lines.
+          case SqlLexer.Kind.LineComment => ()
+          case _                         => result.append(sql.substring(t.start, t.end))
+      }
       removeEmptyLines(result.toString())
 
   /** The input split into its top-level statements, at every `;` DuckDB's lexer would treat as a
-    * separator and at no other. Built on the same scanners as [[stripComments]], so a `;` inside
-    * any of the four quoting forms or inside a (nested) comment never splits, and a quote that sits
-    * inside another quoting form never opens a string that would swallow a real separator:
-    * `SELECT $$'$$; USE x; SELECT 1` and `SELECT e'\''; USE x; SELECT 1` are three statements on
-    * DuckDB, and a tracker that only knows plain `'...'` strings reads each as one.
+    * separator and at no other. A `;` inside any quoting form or inside a (nested) comment never
+    * splits, and a quote that sits inside another quoting form never opens a string that would
+    * swallow a real separator: `SELECT $$'$$; USE x; SELECT 1` and `SELECT e'\''; USE x; SELECT 1`
+    * are three statements on DuckDB, and a tracker that only knows plain `'...'` strings reads each
+    * as one.
     *
     * Each fragment is the ORIGINAL text, comments and quoting intact. A fragment holding nothing
-    * but whitespace, trivia and comments is dropped, since DuckDB runs nothing for it, so `USE x;`
-    * and `USE x; -- done` are both one statement.
+    * but whitespace and comments is dropped, since DuckDB runs nothing for it, so `USE x;` and
+    * `USE x; -- done` are both one statement.
     */
   def splitStatements(sql: String): List[String] =
     statementSpans(sql).map((from, until) => sql.substring(from, until))
@@ -106,153 +84,26 @@ object SqlCommentStripper:
     * `until` stops before the separating `;`, so `sql.substring(from, until)` is the fragment, and
     * a caller can splice text into the ORIGINAL submission at a statement boundary instead of
     * rebuilding it from the fragments.
+    *
+    * Read from `SqlLexer.tokens`, which lexes DuckDB's `SqlLexer.engineView` of the input: the text
+    * after the unicode-space pre-pass, which keeps every offset (one UTF-16 unit per char), so a
+    * token's offsets index the original text too.
     */
   def statementSpans(sql: String): List[(Int, Int)] =
     if sql == null || sql.isEmpty then Nil
     else
-      val out    = List.newBuilder[(Int, Int)]
-      val length = sql.length
-      var start  = 0
-      var i      = 0
-      while i < length do
-        val c = sql.charAt(i)
-        if c == '/' && i + 1 < length && sql.charAt(i + 1) == '*' then i = blockCommentEnd(sql, i)
-        // Lands ON the terminator, which the next pass reads as an ordinary character.
-        else if c == '-' && i + 1 < length && sql.charAt(i + 1) == '-' then
-          i = lineCommentEnd(sql, i)
-        else if c == '\'' then i = singleQuotedEnd(sql, i, isEscapeStringOpener(sql, i))
-        else if c == '"' then i = doubleQuotedEnd(sql, i)
-        else if c == ';' then
-          out += ((start, i))
-          i += 1
-          start = i
-        else if c == '$' then i = dollarQuotedEnd(sql, i).getOrElse(i + 1)
-        else i += 1
-      out += ((start, length))
-      out.result().filter { (from, until) =>
-        val f = sql.substring(from, until)
-        SqlTrivia.normalize(stripComments(SqlTrivia.stripLeading(f))).trim.nonEmpty
+      val out         = List.newBuilder[(Int, Int)]
+      var start       = 0
+      var substantive = false
+      SqlLexer.tokens(sql).foreach { t =>
+        if t.kind == SqlLexer.Kind.Punct && sql.charAt(t.start) == ';' then
+          if substantive then out += ((start, t.start))
+          start = t.end
+          substantive = false
+        else if !t.isTrivia then substantive = true
       }
-
-  /** Index just past the marker closing the block comment that opens at `from`, tracking nesting
-    * depth the way DuckDB's lexer does. An unterminated comment consumes the rest of the input --
-    * DuckDB rejects such a statement outright, so nothing executable is being hidden.
-    */
-  private def blockCommentEnd(sql: String, from: Int): Int =
-    var i     = from + 2
-    var depth = 1
-    while i < sql.length && depth > 0 do
-      if i + 1 < sql.length && sql.charAt(i) == '/' && sql.charAt(i + 1) == '*' then
-        depth += 1
-        i += 2
-      else if i + 1 < sql.length && sql.charAt(i) == '*' && sql.charAt(i + 1) == '/' then
-        depth -= 1
-        i += 2
-      else i += 1
-    i
-
-  /** Index OF the terminator of the line comment opening at `from`, or `sql.length` when it is
-    * unterminated. DuckDB ends a `--` comment at a line feed OR at a bare carriage return, and at
-    * neither of the other line-ish characters (vertical tab, form feed, U+0085, U+2028, U+2029 all
-    * leave the comment open) -- each of the seven probed individually against DuckDB 1.5.4.
-    */
-  private def lineCommentEnd(sql: String, from: Int): Int =
-    var i = from + 2
-    while i < sql.length && sql.charAt(i) != '\n' && sql.charAt(i) != '\r' do i += 1
-    i
-
-  /** True when the `'` at `at` opens an escape string (`e'...'` / `E'...'`) rather than a plain
-    * one. The `e` must be a token of its own and must touch the quote: DuckDB reads `ze'a\'b'` as
-    * the identifier `ze` followed by a PLAIN string, and `e 'a\'b'` as the same, so any character
-    * that continues a token (`continuesToken`, the rule the dollar-quote opener follows too:
-    * `x$e'..'` is the identifier `x$e` and a plain string) disqualifies it, and so does any gap.
-    */
-  private def isEscapeStringOpener(sql: String, at: Int): Boolean =
-    at > 0 && (sql.charAt(at - 1) == 'e' || sql.charAt(at - 1) == 'E') &&
-      (at == 1 || !continuesToken(sql.charAt(at - 2)))
-
-  /** Index just past the quote closing the single-quoted literal that opens at `from`. `''` is an
-    * embedded quote in both forms. In an escape string a backslash additionally escapes whatever
-    * follows it, so `e'a\''` is the two-character `a'` and `e'a\\'` is `a\` with the quote closing;
-    * in a plain string a backslash is an ordinary character, so `'a\'` is the complete string `a\`.
-    */
-  private def singleQuotedEnd(sql: String, from: Int, escape: Boolean): Int =
-    var i      = from + 1
-    var closed = false
-    while i < sql.length && !closed do
-      val c = sql.charAt(i)
-      if escape && c == '\\' && i + 1 < sql.length then i += 2
-      else if c == '\'' then
-        if i + 1 < sql.length && sql.charAt(i + 1) == '\'' then i += 2
-        else
-          closed = true
-          i += 1
-      else i += 1
-    i
-
-  /** Index just past the quote closing the double-quoted identifier that opens at `from`, with `""`
-    * doubling. An unterminated identifier runs to the end of the input, which copies the remainder
-    * through verbatim -- the safe direction for a screening caller, and a statement DuckDB rejects.
-    */
-  private def doubleQuotedEnd(sql: String, from: Int): Int =
-    var i      = from + 1
-    var closed = false
-    while i < sql.length && !closed do
-      if sql.charAt(i) == '"' then
-        if i + 1 < sql.length && sql.charAt(i + 1) == '"' then i += 2
-        else
-          closed = true
-          i += 1
-      else i += 1
-    i
-
-  /** Index just past the closing tag of the dollar-quoted string opening at `from`, or None when
-    * the `$` there opens no such string. The tag follows unquoted-identifier rules and cannot start
-    * with a digit, which is what keeps a positional parameter out: DuckDB reads `$1$x$1$` as the
-    * parameter `$1` followed by an unterminated `$x$` string, not as `$1$...$1$`. An opener with no
-    * matching close is rejected too rather than swallowing the remainder -- DuckDB rejects that
-    * statement outright, and leaving the text visible is the safe direction for a screening caller.
-    *
-    * A `$` glued to the character before it opens nothing when that character continues a token:
-    * DuckDB's lexer continues an identifier through ASCII letters, digits, `_`, `$` and every
-    * non-ASCII character but its Unicode spaces (see `continuesToken`), so `x$$`, `x$a$` and an
-    * accented letter followed by `$$` are identifiers and the `$$` in them is not an opener (all
-    * verified on DuckDB 1.5.6 and 2.0). A `$` right after a digit is not one either: `0x1$$` lexes
-    * as `0` and the identifier `x1$$`, and `1$$` / `1.5$$` are syntax errors, so reading no opener
-    * there only ever exposes more separators. Reading an opener where DuckDB has an identifier
-    * would hide every separator up to the next matching tag, which can sit in a trailing comment.
-    *
-    * Tag characters follow DuckDB too: ASCII letters, `_` and every non-ASCII character, plus
-    * digits after the first.
-    */
-  private def dollarQuotedEnd(sql: String, from: Int): Option[Int] =
-    if from > 0 && continuesToken(sql.charAt(from - 1)) then None
-    else
-      var t = from + 1
-      while t < sql.length && isTagChar(sql.charAt(t), t == from + 1) do t += 1
-      if t >= sql.length || sql.charAt(t) != '$' then None
-      else
-        val tag   = sql.substring(from, t + 1)
-        val close = sql.indexOf(tag, t + 1)
-        if close < 0 then None else Some(close + tag.length)
-
-  private def isAsciiLetter(c: Char): Boolean = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-
-  private def isAsciiDigit(c: Char): Boolean = c >= '0' && c <= '9'
-
-  /** A character that continues an identifier or number token in DuckDB's lexer. DuckDB turns its
-    * Unicode space set into ASCII spaces before lexing, so those characters end a token rather than
-    * continue it (a dollar quote right after a no-break or ideographic space opens, verified on
-    * 1.5.6 and 2.0). `SqlTrivia.isTriviaSpace` is a superset of that set, which only moves the
-    * answer toward "a quote opens here": for `stripComments` that keeps the quoted body (and any
-    * comment marker in it) intact, the same reading it had before this rule existed.
-    */
-  private def continuesToken(c: Char): Boolean =
-    isAsciiLetter(c) || isAsciiDigit(c) || c == '_' || c == '$' ||
-      (c >= 0x80 && !SqlTrivia.isTriviaSpace(c))
-
-  private def isTagChar(c: Char, first: Boolean): Boolean =
-    isAsciiLetter(c) || c == '_' || c >= 0x80 || (!first && isAsciiDigit(c))
+      if substantive then out += ((start, sql.length))
+      out.result()
 
   def removeEmptyLines(input: String): String =
     val res = input.linesIterator.filter(_.trim.nonEmpty).mkString("\n")

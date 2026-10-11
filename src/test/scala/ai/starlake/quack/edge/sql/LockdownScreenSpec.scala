@@ -482,3 +482,10 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT\u3000$$--$$, * FROM read_csv('/tmp/x.csv')") shouldBe true
     deniedB("SELECT\u200b$$--$$, * FROM read_parquet('s3://lakebucket/x.parquet')") shouldBe true
   }
+
+  "a dollar sign after a soft hyphen" should "continue the identifier, as DuckDB 1.5.6 does" in {
+    // DuckDB names the column `AS<U+00AD>$$` and reads the rest of the line as a comment: the call
+    // never runs (run through the 1.5.6 CLI against a missing file, which it did not open).
+    denied("SELECT 1 AS\u00ad$$ -- $$, * FROM read_csv('/tmp/x.csv')") shouldBe false
+    denied("SELECT 1 AS\u00a0$$ -- $$, * FROM read_csv('/tmp/x.csv')") shouldBe true
+  }

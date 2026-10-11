@@ -105,6 +105,17 @@ class SessionScopeScreenSpec extends AnyFlatSpec with Matchers with OptionValues
       "SELECT * FROM useful; SELECT * FROM settings"
     ).foreach(sql => withClue(sql)(SessionScopeScreen.find(sql) shouldBe None))
 
+  // DuckDB 1.5.6 runs the first submission as ONE statement (U+00A0 is a space to its pre-pass, so
+  // the `$$` opens a string holding the SET) and the second as three (U+00AD continues the
+  // identifier `AS<U+00AD>$$`, so the SET runs): both run through the 1.5.6 CLI.
+  it should "split after a no-break space or a soft hyphen the way DuckDB does" in:
+    SessionScopeScreen.find(
+      "SELECT 1 AS\u00a0$$; SET search_path='db.other'; SELECT * FROM t; -- $$"
+    ) shouldBe None
+    SessionScopeScreen.find(
+      "SELECT 1 AS\u00ad$$; SET search_path='db.other'; SELECT * FROM t; -- $$"
+    ) shouldBe defined
+
   // ---- through the shared access gate -----------------------------------------------------------
 
   private val cfg = Config.forDuckDB(Some("db"), Some("def"), Set("db"))
