@@ -66,6 +66,23 @@
     function calls are detected from its tokens (backtick and double-quoted names).
   - The edge screens lex the SQL before folding case (dollar-quote tags are case-sensitive in
     DuckDB), and the catalog write screen classifies the original statement text.
+  - The ACL parser (and the protected-write guard, the metadata filter and the CLS / RLS
+    rewriters) reads lexer-canonical SQL: escape strings, dollar-quoted strings, `//` and a word
+    glued to a literal could hide a subquery from the ACL while DuckDB read the table. A rewrite
+    that cannot be shipped as the caller's statement (it holds `//` or a time-travel clause) is
+    refused instead.
+  - Time-travel clauses are found on lexer tokens: a clause shape inside a string literal or a
+    comment no longer deletes real SQL before the ACL parse.
+  - Four-part names also fail closed on `QOD_ACL_DIALECT=generic`.
+  - Lockdown denies `query()` / `query_table()` / `json_execute_serialized_sql()` for every caller,
+    judges replacement-scan literals at every depth (subqueries, JOIN, comma joins, parenthesized
+    table positions), and covers the avro and iceberg readers (`read_avro`, `avro_metadata`,
+    `iceberg_scan` and the other `iceberg_*` path readers), the iceberg table-maintenance
+    functions and `quack_serve` / `quack_stop`.
+
+- **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
+  open transaction's node connection too, so a statement after an idle pause longer than the
+  node lease no longer fails with "Connection heartbeat lease expired".
 
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left
