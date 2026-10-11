@@ -840,6 +840,11 @@ private[cls] object ResidualColumns:
     /** A NATURAL join: it compares, raw, every column its two sides share. */
     case NaturalJoin(left: List[Source], right: List[Source])
 
+    /** `t AS a(x, y)` over a base table: the list renames t's columns positionally, so a covered
+      * column is read under a name no policy holds.
+      */
+    case AliasColumns(table: String)
+
   private def isColumnsCall(f: net.sf.jsqlparser.expression.Function): Boolean =
     Option(f.getMultipartName).exists(_.size == 1) &&
       Option(f.getName).exists(n => unquote(n).equalsIgnoreCase("columns"))
@@ -950,7 +955,13 @@ private[cls] object ResidualColumns:
       if visited.add(node) then
         node match
           case c: Column => columns += (c -> scopes)
-          case t: Table  => tables += t
+          case t: Table  =>
+            tables += t
+            val name = Option(t.getName).map(n => lower(unquote(n)))
+            val cte  = t.getSchemaName == null && name.exists(ctes.contains)
+            val list = Option(t.getAlias).flatMap(a => Option(a.getAliasColumns)).filter(!_.isEmpty)
+            if list.isDefined && !cte then
+              name.foreach(n => forms += (Form.AliasColumns(n) -> scopes))
           case f: net.sf.jsqlparser.expression.Function
               if ai.starlake.acl.parser.TableExtractor.tableStatementSources(f).isDefined =>
             forms += (Form.TableStatement -> scopes)
@@ -1215,6 +1226,9 @@ private[cls] object ResidualColumns:
       case (Form.NaturalJoin(left, right), _) if naturalOverPolicy(left, right) =>
         "a NATURAL join over a column with a column policy compares it unmasked; join with ON " +
           "over the masked column instead"
+      case (Form.AliasColumns(table), _) if policyTable(table) =>
+        "an alias column list on a table with column policies renames a masked column out of " +
+          "the policy's reach; alias each column in the select list instead"
     }
     // DuckDB binds a name no source has as a column to a FROM binding of that name: the whole row
     // as a STRUCT (`SELECT c FROM customer c`, `main.customer`, `to_json(c)`), every column raw.

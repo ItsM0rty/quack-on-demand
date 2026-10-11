@@ -1258,6 +1258,28 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         }
       }
 
+  // `customer AS c(a, b, e)` renames c_email to `e`, which no policy names.
+  "an alias column list on a masked table" should "be denied before the node" in:
+    val (router, capturedSql, _) = setupWithRewriter(
+      new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+        new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+          Map(("memory", "main", "customer") -> List("c_id", "c_name", "c_email", "c_phone"))
+        ),
+        enabled = true
+      )
+    )
+    val out = router
+      .execute(
+        "cls-alias-cols",
+        "alice",
+        poolKey,
+        "SELECT e FROM customer AS c(a, b, e)",
+        Some(effWithPolicies(List(maskCustomerEmailCls)))
+      )
+      .unsafeRunSync()
+    out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    capturedSql() shouldBe ""
+
   // ---- ProtectedWriteGuard integration tests ----
   //
   // The InMemory pool hands the guard a session catalog of "memory" / schema "main",

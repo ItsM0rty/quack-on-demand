@@ -1023,6 +1023,55 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "deny an alias column list on a masked table, which renames the column raw" in
+    List(
+      "SELECT e FROM customer AS c(a, b, e)",
+      "SELECT e FROM customer c(a, b, e)",
+      "SELECT c.e FROM customer AS c(a, b, e)",
+      "SELECT a FROM customer AS c(a, b, e) WHERE e LIKE 'a%'",
+      "SELECT c_id FROM customer c(c_id, n, zz) NATURAL JOIN (SELECT 'alice@x' AS zz) g"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
+  it should "admit an alias column list on a table without a column policy" in {
+    val orders = new ColumnPolicyRewriter(
+      new ColumnCatalog.MapCatalog(
+        Map(
+          ("acme_tpch", "tpch1", "customer") -> List("c_id", "c_email"),
+          ("acme_tpch", "tpch1", "orders")   -> List("o_id", "c_id")
+        )
+      )
+    )
+    orders
+      .rewrite(
+        "SELECT a FROM orders AS o(a, b)",
+        StatementKind.Select,
+        eff(tenantUser, List(maskEmail)),
+        ctx
+      )
+      .unsafeRunSync() shouldBe Passthrough
+  }
+
+  it should "keep the mask under a column list on a derived table or CTE" in
+    List(
+      "SELECT e FROM (SELECT c_email FROM customer) AS d(e)",
+      "WITH d(e) AS (SELECT c_email FROM customer) SELECT e FROM d"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() match
+          case Rewritten(out) =>
+            out should include("'***'")
+            out should not include "SELECT c_email"
+          case Denied(_) | PassthroughParseFailed => succeed
+          case other => fail(s"expected the mask or a denial, got $other")
+      }
+    }
+
   it should "deny a NATURAL join that compares a masked column against a guess list" in {
     rw.rewrite(
       "SELECT g.c_phone, c_id FROM (SELECT '555-' || lpad(unnest(range(10000))::VARCHAR, 4, '0') " +

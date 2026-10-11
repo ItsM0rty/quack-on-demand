@@ -697,6 +697,44 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
     ) shouldBe RewriteOutcome.Passthrough
   }
 
+  // ---- alias column lists ------------------------------------------------------------------
+  //
+  // `customer AS c(a, b, e)` renames customer's columns positionally: `e` is c_email, raw (2.0
+  // CLI: `SELECT e FROM customer AS c(a, b, e)` returns `alice@x`), while every policy names
+  // c_email. Any alias column list on a table with a column policy is refused.
+
+  "an alias column list on a masked table" should "be denied" in
+    List(
+      "SELECT e FROM customer AS c(a, b, e)",
+      "SELECT e FROM customer c(a, b, e)",
+      "SELECT c.e FROM customer AS c(a, b, e)",
+      "SELECT a FROM customer AS c(a, b, e) WHERE e LIKE 'a%'",
+      "SELECT e FROM orders o JOIN customer c(a, b, e) ON o.c_id = c.a",
+      "SELECT c_id FROM customer c(c_id, n, zz) NATURAL JOIN (SELECT 'alice@x' AS zz) g",
+      "SELECT x FROM tpch1.customer AS c(x)",
+      "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM customer c(a, b, e) WHERE e = 'x')"
+    ).foreach(denied)
+
+  // A derived table or CTE carries values already masked inside it, so renaming its columns
+  // reveals nothing.
+  "a column list on a derived table or CTE over a masked column" should "keep the mask" in
+    List(
+      "SELECT e FROM (SELECT c_email FROM customer) AS d(e)",
+      "SELECT d.e FROM (SELECT c_id, c_email FROM customer) d(i, e)",
+      "WITH d(e) AS (SELECT c_email FROM customer) SELECT e FROM d",
+      "SELECT c_email FROM (SELECT c_email, c_id FROM customer) d(c_id, c_email)"
+    ).foreach { sql =>
+      withClue(sql) {
+        outcome(sql) match
+          case RewriteOutcome.Rewritten(out) =>
+            out should include("'***'")
+            out should not include "SELECT c_email"
+            out should not include "c_id, c_email FROM customer"
+          case RewriteOutcome.Denied(_) | RewriteOutcome.ParseFailed => succeed
+          case other => fail(s"expected the mask or a denial, got $other")
+      }
+    }
+
   "a FROM-first statement" should "fail closed instead of throwing" in {
     outcome("FROM customer") shouldBe RewriteOutcome.ParseFailed
   }
