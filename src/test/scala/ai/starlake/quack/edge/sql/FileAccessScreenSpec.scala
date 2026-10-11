@@ -74,6 +74,15 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
     "SELECT * FROM range(1) AS values, ('/etc/x.csv')",
     "SELECT * FROM (SELECT 1 AS \"order\") r JOIN (SELECT 1 AS \"order\") s " +
       "ON r.order = s.order, '/etc/x.csv'",
+    // 2.0 table macros whose body reads `query_table(source)`: any file or table by a string
+    "SELECT * FROM histogram('/etc/x.csv', b)",
+    "SELECT * FROM histogram_values('/etc/x.csv', b)",
+    "SELECT * FROM histogram(source := '/etc/x.csv', col_name := b)",
+    "SELECT * FROM histogram('/etc/x.csv', b, technique := 'sample')",
+    "SELECT * FROM histogram('customer', c_email)",
+    "SELECT * FROM orders o, histogram_values('s3://b/x.parquet', a) h",
+    "SELECT * FROM \"histogram\"('/etc/x.csv', b)",
+    "SELECT * FROM histogram('/etc/x.csv', b) set, t",
     // a quoted name holding a glob character reads every matching file (2.0 CLI); `csv` is a
     // JSqlParser keyword, so `"*".csv` does not parse
     "SELECT * FROM \"*\".csv",
@@ -98,6 +107,9 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
     "INSTALL httpfs",
     "INSERT INTO orders SELECT * FROM scan_data_from_quack_client(" +
       "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(a INTEGER), ordered := true)",
+    // the aggregate `histogram(expr)` shares the macro's name and reads no table
+    "SELECT histogram(o_total) FROM orders",
+    "SELECT o_id, histogram(o_total, [10, 100]) FROM orders GROUP BY o_id",
     // `IS [NOT] DISTINCT FROM` takes a value, not a table
     "SELECT * FROM orders WHERE o_comment IS DISTINCT FROM 'x'",
     "SELECT * FROM orders WHERE o_comment IS NOT DISTINCT FROM 'x'",

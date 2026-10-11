@@ -283,7 +283,13 @@ object LockdownScreen:
     */
   private def fileInTablePosition(sql: String, deniedBuckets: Set[String]): Option[String] =
     val extraction = FileReferences.extraction(sql)
-    if FileReferences.incomplete(extraction) then
+    val macroRead  = FileReferences
+      .readingTableMacro(sql, extraction)
+      .map(m =>
+        s"$m reads the file or table its string argument names; disabled on this deployment"
+      )
+    if macroRead.isDefined then macroRead
+    else if FileReferences.incomplete(extraction) then
       splitStatements(sql).iterator
         .flatMap { stmt =>
           conservativeLiterals(stmt).iterator

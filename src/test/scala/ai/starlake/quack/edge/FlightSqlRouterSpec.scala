@@ -3771,3 +3771,55 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         )
         .unsafeRunSync() shouldBe a[Right[?, ?]]
     }
+
+  // `histogram` / `histogram_values` are 2.0 table macros whose body reads `query_table(source)`.
+  "a query_table-reading table macro" should "never reach the node for a tenant, lockdown or RLS" in:
+    val sql = "SELECT * FROM histogram('/etc/x.csv', b)"
+    // QoD grants, *.*.* ALL, both edges
+    val (acl, aclCaptured, _) = setupWithRewriter(validator = wildcardAcl)
+    acl
+      .execute("hist-m1", "alice", poolKey, sql, Some(wildcardAllSet))
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+    acl
+      .executeWith(
+        "hist-m2",
+        "alice",
+        poolKey,
+        sql,
+        Some(wildcardAllSet),
+        okSend,
+        source = "quack",
+        clientDataScans = true
+      )
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+    aclCaptured() shouldBe ""
+    // lockdown with the ACL off
+    val (locked, lockedCaptured, _) = setupWithRewriter(lockdownFor = _ => true)
+    locked
+      .execute("hist-m3", "alice", poolKey, sql, Some(wildcardAllSet))
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+    lockedCaptured() shouldBe ""
+    // a row-policy principal: it read the protected table unfiltered
+    val (rls, rlsCaptured, _) = setupWithRewriter(protectedWriteGuard = guardKnowingCustomer)
+    rls
+      .execute(
+        "hist-m4",
+        "alice",
+        poolKey,
+        "SELECT * FROM histogram('customer', c_email)",
+        Some(effWithRowPolicies(List(rowPolicyCustomer)))
+      )
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+    rlsCaptured() shouldBe ""
+    // the aggregate of that name is a value
+    val (agg, aggCaptured, _) = setupWithRewriter(validator = wildcardAcl)
+    agg
+      .execute(
+        "hist-m5",
+        "alice",
+        poolKey,
+        "SELECT histogram(o_total) FROM orders",
+        Some(wildcardAllSet)
+      )
+      .unsafeRunSync() shouldBe a[Right[?, ?]]
+    aggCaptured() should include("histogram(o_total)")

@@ -89,7 +89,7 @@ class NodeStateJudgmentSpec extends AnyFlatSpec with Matchers:
     "duckdb_variables"           -> admitted("the caller's own session variables"),
     "duckdb_prepared_statements" -> admitted("the caller's own prepared statements"),
     "pg_prepared_statements"     -> admitted("view over duckdb_prepared_statements"),
-    "duckdb_profiling_settings"  -> admitted("the caller's own profiling configuration"),
+    "duckdb_profiling_settings" -> refused("table macro over duckdb_settings (judged by its body)"),
     // aggregates naming nothing
     "duckdb_memory"                -> admitted("byte counts per buffer tag"),
     "duckdb_connection_count"      -> admitted("a count of connections, no ids"),
@@ -130,21 +130,19 @@ class NodeStateJudgmentSpec extends AnyFlatSpec with Matchers:
     "pragma_table_info"         -> admitted("columns of a named table, ACL-gated table function"),
     "pragma_show"               -> admitted("columns of a named table, ACL-gated table function"),
     // generators, tokenizers, scans of an argument, test tables
-    "arrow_scan"                  -> admitted("Arrow pointer"),
-    "arrow_scan_dumb"             -> admitted("Arrow pointer"),
-    "check_peg_parser"            -> admitted("parses its argument"),
-    "sql_tokenize"                -> admitted("tokenizes its argument"),
-    "json_each"                   -> admitted("walks its JSON argument"),
-    "json_tree"                   -> admitted("walks its JSON argument"),
-    "generate_series"             -> admitted("generator"),
-    "range"                       -> admitted("generator"),
-    "repeat"                      -> admitted("generator"),
-    "repeat_row"                  -> admitted("generator"),
-    "unnest"                      -> admitted("unnests its argument"),
-    "summary"                     -> admitted("summarizes its input table"),
-    "histogram"                   -> admitted("histogram of its input"),
-    "histogram_values"            -> admitted("histogram of its input"),
-    "seq_scan"                    -> admitted("test scan"),
+    "arrow_scan"       -> admitted("Arrow pointer"),
+    "arrow_scan_dumb"  -> admitted("Arrow pointer"),
+    "check_peg_parser" -> admitted("parses its argument"),
+    "sql_tokenize"     -> admitted("tokenizes its argument"),
+    "json_each"        -> admitted("walks its JSON argument"),
+    "json_tree"        -> admitted("walks its JSON argument"),
+    "generate_series"  -> admitted("generator"),
+    "range"            -> admitted("generator"),
+    "repeat"           -> admitted("generator"),
+    "repeat_row"       -> admitted("generator"),
+    "unnest"           -> admitted("unnests its argument"),
+    "summary"  -> admitted("summarizes its TABLE input; a string argument is a constant (2.0 CLI)"),
+    "seq_scan" -> admitted("test scan"),
     "test_all_types"              -> admitted("static test table"),
     "test_vector_types"           -> admitted("test table of its argument"),
     "checkpoint"                  -> admitted("checkpoints a catalog, no output state"),
@@ -205,4 +203,92 @@ class NodeStateJudgmentSpec extends AnyFlatSpec with Matchers:
       "PRAGMA version",
       "SELECT * FROM orders"
     ).foreach(sql => withClue(sql)(NodeStateScreen.find(sql) shouldBe None))
+  }
+
+/** Every DuckDB 2.0 macro is judged by its body, not its name: the edge sees `histogram('x', b)`,
+  * never the `query_table(source)` the macro runs. The pinned derivation
+  * (`lockdown/duckdb-2.0-macros.csv`: each macro of the 2.0 CLI with every node extension loaded,
+  * and the functions its body calls) is checked against the bundled 2.0 DuckDB, so a new or changed
+  * core macro fails here until someone judges it. A table macro whose body reaches a refused
+  * function, directly or through another macro, must itself be refused; a scalar macro may reach
+  * none (none of 2.0's opens a file or runs a query: their bodies read the catalog introspection
+  * functions or compute values).
+  */
+class MacroJudgmentSpec extends AnyFlatSpec with Matchers:
+
+  private def callsOf(body: String): Set[String] =
+    "[A-Za-z_][A-Za-z0-9_]*\\(".r
+      .findAllIn(Option(body).getOrElse(""))
+      .map(_.dropRight(1).toLowerCase(java.util.Locale.ROOT))
+      .toSet
+
+  private val pinned: Map[(String, String), Set[String]] =
+    val src = Source.fromResource("lockdown/duckdb-2.0-macros.csv")
+    try
+      src
+        .getLines()
+        .filterNot(l => l.startsWith("#") || l.isBlank)
+        .map { line =>
+          val cols = line.split(',')
+          (cols(0), cols(1)) -> (if cols(2) == "-" then Set.empty[String]
+                                 else cols(2).split('|').toSet)
+        }
+        .toMap
+    finally src.close()
+
+  /** A name the tenant screens refuse outright, whatever its position. */
+  private def refusedByName(n: String): Boolean =
+    FileAccessScreen.FileFunctions(n) || CatalogReachingCalls.LockdownNames(n) ||
+      n.startsWith("ducklake_") || NodeSettingScreen.NodeWideCalls(n) ||
+      NodeSettingScreen.SecretCalls(n) || NodeStateScreen.Refused.contains(n) ||
+      n == "current_setting"
+
+  private def reachesRefused(name: String, seen: Set[String] = Set.empty): Boolean =
+    pinned.get(("table_macro", name)).orElse(pinned.get(("macro", name))) match
+      case None        => false
+      case Some(calls) =>
+        calls.exists { c =>
+          (c != name && refusedByName(c)) ||
+          (!seen(c) && c != name && pinned.contains(("table_macro", c)) &&
+            reachesRefused(c, seen + name))
+        }
+
+  "every 2.0 table macro" should "be refused when its body reaches a refused function" in {
+    val tableMacros = pinned.keySet.collect { case ("table_macro", n) => n }
+    tableMacros should contain allOf ("histogram", "histogram_values", "whoami")
+    tableMacros.foreach { m =>
+      withClue(m) {
+        val refused = refusedByName(m) || FileReferences.ReadingTableMacros.contains(m)
+        refused shouldBe reachesRefused(m)
+      }
+    }
+  }
+
+  "every 2.0 scalar macro" should "reach no refused function" in
+    pinned.collect { case (("macro", n), calls) => n -> calls }.foreach { (n, calls) =>
+      withClue(n)(calls.filter(refusedByName) shouldBe empty)
+    }
+
+  "the bundled 2.0 DuckDB's macros" should "all be pinned, bodies unchanged" in {
+    Class.forName("org.duckdb.DuckDBDriver")
+    val conn = DriverManager.getConnection("jdbc:duckdb:", InProcessDuckDb.properties)
+    try
+      val st = conn.createStatement()
+      val rs = st.executeQuery(
+        "SELECT function_type, function_name, macro_definition FROM duckdb_functions() " +
+          "WHERE function_type IN ('macro', 'table_macro')"
+      )
+      val live = Iterator
+        .continually(rs.next())
+        .takeWhile(identity)
+        .map(_ => (rs.getString(1), rs.getString(2)) -> callsOf(rs.getString(3)))
+        .toList
+        .groupMapReduce(_._1)(_._2)(_ ++ _)
+      rs.close()
+      st.close()
+      live should not be empty
+      live.foreach { (key, calls) =>
+        withClue(key)(pinned.get(key) shouldBe Some(calls))
+      }
+    finally conn.close()
   }

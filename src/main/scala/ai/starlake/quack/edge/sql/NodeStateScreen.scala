@@ -45,13 +45,15 @@ object NodeStateScreen:
 
   /** The refused names, each with what it shows. */
   val Refused: Map[String, String] = Map(
-    "duckdb_secrets"                -> "secret names, scopes, key ids, hosts, users and data paths",
-    "which_secret"                  -> "the secret serving a path",
-    "whoami"                        -> "the node's cloud identity, hostname and region",
-    "duckdb_settings"               -> "setting values, credentials and node directories included",
-    "pg_settings"                   -> "setting values, credentials and node directories included",
-    "duckdb_logs"                   -> "other sessions' logged statements",
-    "duckdb_logs_parsed"            -> "other sessions' logged statements",
+    "duckdb_secrets"     -> "secret names, scopes, key ids, hosts, users and data paths",
+    "which_secret"       -> "the secret serving a path",
+    "whoami"             -> "the node's cloud identity, hostname and region",
+    "duckdb_settings"    -> "setting values, credentials and node directories included",
+    "pg_settings"        -> "setting values, credentials and node directories included",
+    "duckdb_logs"        -> "other sessions' logged statements",
+    "duckdb_logs_parsed" -> "other sessions' logged statements",
+    // a table macro over duckdb_settings, judged by its body
+    "duckdb_profiling_settings"     -> "setting values (profiling settings, output path included)",
     "duckdb_log_contexts"           -> "other sessions' connection and query ids",
     "duckdb_external_file_cache"    -> "the path of every file any session read",
     "duckdb_temporary_files"        -> "the node's spill file paths",

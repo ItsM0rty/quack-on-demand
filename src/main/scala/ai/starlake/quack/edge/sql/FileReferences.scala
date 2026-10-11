@@ -3,6 +3,8 @@ package ai.starlake.quack.edge.sql
 import ai.starlake.acl.model.Config
 import ai.starlake.acl.parser.{ExtractionResult, SqlParser, StatementResult, TableExtractor}
 
+import java.util.Locale
+
 /** The parse tier shared by the two file screens ([[FileAccessScreen]] for tenant principals,
   * [[LockdownScreen]] on lockdown pools): what the access check's own walk says about the files a
   * statement names in a table position, and whether that walk can be trusted.
@@ -74,3 +76,41 @@ private[sql] object FileReferences:
       LockdownScreen.looksLikePath("'" + name + "'")
 
   private val GlobChars = List("*", "?", "[", "{")
+
+  /** DuckDB 2.0 table macros whose body reads a table or file named by a string argument, with the
+    * function in the body that does it. `histogram_values(source, col)` runs `query_table(source)`
+    * (`SELECT * FROM histogram_values('/etc/x.csv', b)` returned the CSV's values on the 2.0 CLI,
+    * and `histogram_values('customer', ..)` a policy table unfiltered), and `histogram` runs
+    * `histogram_values`. The edge sees only the macro's name, never its body, so it is judged by
+    * its body (FileAccessFunctionsSpec pins every 2.0 macro body).
+    */
+  val ReadingTableMacros: Map[String, String] =
+    Map("histogram" -> "histogram_values", "histogram_values" -> "query_table")
+
+  /** A [[ReadingTableMacros]] macro called in a table position: from the walk when it is complete
+    * (a FROM-item table function; the aggregate `histogram(expr)` in a select list shares the name
+    * and is a value), else any call of that name, lexically.
+    */
+  def readingTableMacro(sql: String, extraction: ExtractionResult): Option[String] =
+    if incomplete(extraction) then
+      FunctionCalls.scan(sql).calls.iterator.map(_.name).find(ReadingTableMacros.contains)
+    else
+      extraction.statements
+        .collect { case StatementResult.Extracted(_, _, _, _, markers) => markers }
+        .flatten
+        .flatMap(TableExtractor.tableFunctionName)
+        .map(callName)
+        .find(ReadingTableMacros.contains)
+
+  /** The function name of a table function call as the parser prints it: its last name part,
+    * unquoted and lowercased (`main."histogram"('x', b)` is `histogram`).
+    */
+  private def callName(call: String): String =
+    val head = call.takeWhile(_ != '(').trim
+    val last = if head.contains('.') then head.substring(head.lastIndexOf('.') + 1) else head
+    last
+      .stripPrefix("\"")
+      .stripSuffix("\"")
+      .stripPrefix("`")
+      .stripSuffix("`")
+      .toLowerCase(Locale.ROOT)

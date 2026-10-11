@@ -1086,3 +1086,14 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     deniedB("SELECT * FROM range(1) AS values, 's3://lakebucket/x.csv'") shouldBe true
     deniedB("SELECT * FROM \"s3://lakebucket/x.parquet\"") shouldBe true
   }
+
+  // 2.0 table macros whose body reads `query_table(source)`: `histogram('/etc/x.csv', b)` returned
+  // the CSV's values on the 2.0 CLI. Refused in table position; the aggregate stays admitted.
+  "a query_table-reading table macro" should "be denied in table position" in {
+    List(
+      "SELECT * FROM histogram('/etc/x.csv', b)",
+      "SELECT * FROM histogram_values('s3://staging/x.parquet', a)",
+      "SELECT * FROM histogram('/etc/x.csv', b) set, t"
+    ).foreach(sql => withClue(sql)(denied(sql) shouldBe true))
+    denied("SELECT histogram(o_total) FROM orders") shouldBe false
+  }

@@ -84,8 +84,6 @@ object FileAccessScreen:
     "check_peg_parser",
     "checkpoint",
     "generate_series",
-    "histogram",
-    "histogram_values",
     "iceberg_scan_tasks",
     "icu_calendar_names",
     "json_each",
@@ -121,7 +119,6 @@ object FileAccessScreen:
     "memory",
     "optimizers",
     "prepared_statements",
-    "profiling_settings",
     "schemas",
     "secret_type_parameters",
     "secret_types",
@@ -150,7 +147,8 @@ object FileAccessScreen:
   private[sql] def judged(name: String): Boolean =
     FileFunctions(name) || NoFileFunctions(name) || CatalogReachingCalls.LockdownNames(name) ||
       name.startsWith("ducklake_") || NodeSettingScreen.NodeWideCalls(name) ||
-      NodeSettingScreen.SecretCalls(name) || NodeStateScreen.Refused.contains(name)
+      NodeSettingScreen.SecretCalls(name) || NodeStateScreen.Refused.contains(name) ||
+      FileReferences.ReadingTableMacros.contains(name)
 
   /** Some(reason) when `sql` reads or writes a file directly. */
   def find(sql: String): Option[String] = find(sql, FileReferences.extraction(sql))
@@ -170,6 +168,11 @@ object FileAccessScreen:
           Option.when(scan.truncated)(reason("a statement nesting string literals too deeply"))
         )
         .orElse(LockdownScreen.splitStatements(sql).iterator.flatMap(statementVerb).nextOption())
+        .orElse(
+          FileReferences
+            .readingTableMacro(sql, extraction)
+            .map(m => reason(s"$m reads the file or table its string argument names"))
+        )
         .orElse(tablePositionFile(sql, extraction))
 
   /** A file in table position: from the walk when it is complete, else the lexical scan

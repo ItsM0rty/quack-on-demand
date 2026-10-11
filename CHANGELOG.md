@@ -297,6 +297,13 @@
     (`key_id`, hosts, users, unredacted `s3_secret_access_key`), other sessions' statements and
     file paths, and the node's own paths. `duckdb_settings()` is refused rather than filtered, its
     values being reachable through `current_setting()` with a computed name.
+  - DuckDB 2.0's `histogram()` / `histogram_values()` table macros run `query_table(source)` in
+    their body, so `SELECT * FROM histogram('/etc/x.csv', b)` read any file, and
+    `histogram('<table>', col)` any table (a row-policy table unfiltered), for a `*.*.* ALL` tenant
+    and on a lockdown pool with the ACL off. Every 2.0 macro is now judged by its body: these two
+    are refused in a table position (the aggregate `histogram(expr)` in a select list stays
+    admitted), and `duckdb_profiling_settings()` (a macro over `duckdb_settings`) is reserved to
+    superusers.
   - On a lockdown pool, a file in table position is judged like a tenant's: from the parse when the
     statement parses, conservatively otherwise. A keyword used as an alias no longer hides a local
     file after the next comma (`FROM range(1) AS values, '/etc/x.csv'`), and a relative path
