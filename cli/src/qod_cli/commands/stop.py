@@ -281,8 +281,10 @@ def _stop_manager_and_nodes():
 
     typer.echo(f"still running after {force_after}s; sending SIGKILL.", err=True)
     # Re-discover: the spawn scripts trap TERM, but their duckdb children can
-    # survive a killed wrapper; sweep both.
-    leftovers = pids | discover() | {int(p) for p in _pgrep("^duckdb") if p}
+    # survive a killed wrapper; sweep both. A node runs as
+    # `<abs path>/duckdb -init <tmp>/quack-node.XXX/init`, so match that argv (a bare `^duckdb`
+    # never matches the absolute path the spawn script now uses), and only this project's nodes.
+    leftovers = pids | discover() | {int(p) for p in _pgrep(r"duckdb .*-init .*quack-node\.") if p}
     _kill_all(leftovers, signal.SIGKILL)
     time.sleep(2)
     if discover():

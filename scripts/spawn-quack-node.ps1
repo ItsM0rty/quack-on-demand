@@ -432,14 +432,17 @@ if (-not [string]::IsNullOrEmpty($extraSetupSql)) { [void]$sb.AppendLine($extraS
 if (-not [string]::IsNullOrEmpty($lockdownSql)) { [void]$sb.AppendLine($lockdownSql) }
 
 # SELECT only listen_url (not the CALL's row) so the node token never reaches the inherited stdout.
-[void]$sb.AppendLine("SELECT listen_url FROM quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
-# Keep-alive: stdin is the null device, so the CLI would reach EOF and exit once -init is read; a
-# blocking last statement holds it instead (quack_serve's thread is already serving). A single huge
-# sleep_ms overflows on 1.x, so sleep in bounded steps over an effectively endless range. Mirrors
+# quack_serve is the last PAYLOAD statement; the keep-alive is a dot-command in the OUTER init file
+# (below), not a query, so it pins no DuckDB transaction and no scheduler task. Mirrors
 # spawn-quack-node.sh.
-[void]$sb.AppendLine("SELECT sum(sleep_ms(3600000)) FROM range(1000000000);")
+[void]$sb.AppendLine("SELECT listen_url FROM quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
 
-$initSql = $sb.ToString()
+$payloadSql = $sb.ToString()
+# What the dry-run seam prints: the SQL the node runs, plus the keep-alive tail, for parity with
+# spawn-quack-node.sh's dry run. The live launch below delivers it split (secrets file + outer
+# init) so the credentials never persist, which a content dry run does not need to show.
+$keepAlive = ".shell `"while kill -0 $PID 2>/dev/null; do sleep 1; done`"`n.exit`n"
+$initSql = $payloadSql + $keepAlive
 
 # Test seam, mirror of QOD_SPAWN_DRY_RUN in spawn-quack-node.sh: print the assembled init SQL
 # and exit without launching duckdb. Used by SpawnScriptEncryptionWindowsSpec to assert the
@@ -451,32 +454,47 @@ if ($dryRun) {
 }
 
 # stdout/stderr are inherited so node logs flow to the manager's console (LocalQuackBackend uses
-# inheritIO()). stdin is the null device: nothing is fed to the CLI, so no statement can be injected
-# on the node's own connection, and the 2.0 CLI records nothing in shell_history(). The node is kept
-# alive by a blocking last init statement (appended to $initSql above), the same as the bash twin.
+# inheritIO()). stdin is closed right after start: nothing is fed to the CLI, so no statement can be
+# injected on the node's own connection, and the 2.0 CLI records nothing in shell_history(). The
+# node is kept alive by the keep-alive dot-command at the end of the outer init file.
 #
-# The init SQL goes through `-init <file>`: the 2.0 CLI records every statement it reads from stdin
-# in shell_history(), and the init SQL carries the node token and the catalog / object-store /
-# federation credentials. Windows has no FIFO that -init accepts, so the file is the one carrier
-# that leaves disk; it sits in the private node directory (its ACL is current-user-only, set
-# explicitly below and inherited from the directory), and is deleted as soon as DuckDB has read it
-# (a retry loop that succeeds once the CLI closes the file, independent of the port probe, which
-# could see a stranger's listener). A node whose init file cannot be removed is killed rather than
-# left serving with its secrets on disk. A SIGKILL-equivalent (taskkill /F) that skips the cleanup
-# below still loses the file to the stale sweep of a later spawn. `-init` also stops the CLI from
-# running the user's ~/.duckdbrc.
-$initFile = Join-Path $nodeDir 'init.sql'
-[System.IO.File]::WriteAllText($initFile, $initSql)
+# The init SQL goes through `-init <file>` (the CLI records stdin in shell_history(), not -init).
+# Windows has no FIFO that -init accepts, so to keep the credentials off disk the init is SPLIT:
+#   - a secrets file holds the payload (token, catalog password, object-store / federation SQL);
+#   - the outer init file holds NO secrets - it `.read`s the secrets file, then has DuckDB itself
+#     delete it, then blocks on the keep-alive. DuckDB deletes the file the instant it has finished
+#     reading it (the `.read` returns after quack_serve), so there is no external delete race and no
+#     window after startup where the secrets sit on disk. A crash before `.read` leaves the secrets
+#     file for the stale sweep of a later spawn, no longer than that.
+# Both files are current-user-only (explicit ACL on Windows, 0600 elsewhere) inside the private node
+# directory. `-init` also stops the CLI from running the user's ~/.duckdbrc.
+$secretsFile = Join-Path $nodeDir 'secrets.sql'
+$initFile    = Join-Path $nodeDir 'init.sql'
+[System.IO.File]::WriteAllText($secretsFile, $payloadSql)
 if ($onWindows) {
-  $acl = New-Object System.Security.AccessControl.FileSecurity
-  $acl.SetAccessRuleProtection($true, $false)
-  $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-  $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-    $me, 'FullControl', 'Allow')))
-  Set-Acl -LiteralPath $initFile -AclObject $acl
+  $delCmd  = "cmd /c del /f /q `"$secretsFile`""
+  $waitCmd = "powershell -NoProfile -Command `"Wait-Process -Id $PID -ErrorAction SilentlyContinue`""
 } else {
-  & chmod 600 $initFile
+  $delCmd  = "rm -f '$secretsFile'"
+  $waitCmd = "while kill -0 $PID 2>/dev/null; do sleep 1; done"
 }
+# The outer init: read the secrets, delete them (DuckDB itself), keep alive, exit.
+$outer = ".bail off`n.read `"$secretsFile`"`n.shell `"$delCmd`"`n.shell `"$waitCmd`"`n.exit`n"
+[System.IO.File]::WriteAllText($initFile, $outer)
+function Restrict-ToCurrentUser([string]$file) {
+  if ($onWindows) {
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+      $me, 'FullControl', 'Allow')))
+    Set-Acl -LiteralPath $file -AclObject $acl
+  } else {
+    & chmod 600 $file
+  }
+}
+Restrict-ToCurrentUser $secretsFile
+Restrict-ToCurrentUser $initFile
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName               = $duckdbBin
 $psi.Arguments              = '-init "' + $initFile + '"'
@@ -488,41 +506,8 @@ $psi.WorkingDirectory       = $workDir
 
 try {
   $proc = [System.Diagnostics.Process]::Start($psi)
-  # stdin carries nothing; closing it is harmless because the blocking init statement, not stdin,
-  # keeps the process alive. duckdb reads -init at startup and closes the file; a delete then
-  # succeeds (on Windows it fails with a sharing violation until that close, so the retry waits for
-  # exactly the read, not the port). If it never succeeds the init file would linger with its
-  # secrets, so the node is killed.
+  # stdin carries nothing; the keep-alive dot-command, not stdin, holds the process open.
   $proc.StandardInput.Close()
-  if ($onWindows) {
-    # Windows refuses to delete a file another process holds open (no FILE_SHARE_DELETE), so the
-    # loop deletes the moment DuckDB closes it after reading -init: that is the "has read it"
-    # signal, independent of the port (which a stray listener could answer). A file that can never
-    # be removed would keep the node's secrets on disk, so the node is killed. (POSIX unlink would
-    # instead succeed before DuckDB had opened it and break -init, so the eager delete is Windows
-    # only; off Windows the ps1 is not a production path and the file goes with the node dir in the
-    # finally below.)
-    $deleted  = $false
-    $deadline = [DateTime]::UtcNow.AddSeconds(60)
-    while (-not $deleted -and [DateTime]::UtcNow -lt $deadline) {
-      try {
-        Remove-Item -LiteralPath $initFile -Force -ErrorAction Stop
-        $deleted = $true
-      } catch {
-        if (-not (Test-Path -LiteralPath $initFile)) { $deleted = $true }
-        else { Start-Sleep -Milliseconds 200 }
-      }
-      if (-not $deleted -and $proc.HasExited) {
-        Remove-Item -LiteralPath $initFile -Force -ErrorAction SilentlyContinue
-        $deleted = -not (Test-Path -LiteralPath $initFile)
-        break
-      }
-    }
-    if (-not $deleted) {
-      [Console]::Error.WriteLine("ERROR: could not delete the init file $initFile; killing the node so its secrets do not linger on disk")
-      try { $proc.Kill() } catch {}
-    }
-  }
   $proc.WaitForExit()
   $exitCode = $proc.ExitCode
 } finally {

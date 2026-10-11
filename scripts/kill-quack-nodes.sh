@@ -51,8 +51,9 @@ for pid in $remaining; do
 done
 
 # Sweep any orphaned duckdb children whose parent script died before its
-# trap could fire.
-orphan_duck=$(pgrep -f '^duckdb' 2>/dev/null || true)
+# trap could fire. Nodes run as `<abs path>/duckdb -init <tmp>/quack-node.XXX/init`, so match that
+# argv (a bare `^duckdb` never matches the absolute path this script now always uses).
+orphan_duck=$(pgrep -f 'duckdb .*-init .*quack-node\.' 2>/dev/null || true)
 for pid in $orphan_duck; do
   kill -9 "$pid" 2>/dev/null || true
 done

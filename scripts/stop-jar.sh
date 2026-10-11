@@ -68,7 +68,9 @@ done
 
 # Re-discover (PIDs may have died but spawned new replacements unlikely)
 remaining_spawn=$(pgrep -f spawn-quack-node 2>/dev/null || true)
-remaining_duck=$(pgrep -f '^duckdb' 2>/dev/null || true)
+# Nodes run as `<abs path>/duckdb -init <tmp>/quack-node.XXX/init`, so match that argv, not a bare
+# `^duckdb` (which the absolute path never matches). The pattern is specific to this script's nodes.
+remaining_duck=$(pgrep -f 'duckdb .*-init .*quack-node\.' 2>/dev/null || true)
 for pid in $remaining_spawn $remaining_duck; do
   kill -9 "$pid" 2>/dev/null || true
 done

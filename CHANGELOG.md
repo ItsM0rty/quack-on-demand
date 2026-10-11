@@ -36,14 +36,16 @@
   every statement it reads from stdin, and the spawn scripts fed the node's whole init SQL that way,
   so `SELECT * FROM shell_history()` on a node returned it: the node token, the catalog Postgres
   password, and the object-store and federation credentials. The init SQL now reaches duckdb through
-  `-init` (a FIFO on Linux and macOS, a current-user-only file in the private node directory on
-  Windows, deleted as soon as DuckDB has read it), which the CLI does not record. The node's stdin
-  is now the null device, so no statement or dot-command can be injected on the node's own
-  connection and there is no reopenable keep-alive pipe in the working directory; the node is kept
-  alive by a blocking final init statement instead. On Windows the init file briefly holds the
-  secrets on disk (user-only, removed once read, and a node whose init file cannot be removed is
-  killed); a later spawn sweeps any file a forced kill left behind. A failing init statement still
-  does not stop the node. `-init` also means a node no longer runs the OS user's
+  `-init` (a FIFO on Linux and macOS; on Windows a current-user-only secrets file that DuckDB itself
+  deletes the instant it has read it, named from a no-secrets outer init file), which the CLI does
+  not record. The node's stdin is the null device, so no statement or dot-command can be injected on
+  the node's own connection. The node is kept alive by a `.shell` dot-command that waits for the
+  wrapper process to exit, not by a query: a query pinned a DuckDB transaction (blocking CHECKPOINT
+  on a duckdb-file node and holding a catalog Postgres session idle-in-transaction on a DuckLake
+  node) and on 2.0 could spin a CPU core for the node's life. The wait also means a node no longer
+  outlives a forced kill of its wrapper. A crash before the Windows secrets file is read leaves it
+  only until a later spawn's sweep. A failing init statement still does not stop the node. `-init`
+  also means a node no longer runs the OS user's
   `~/.duckdbrc`. The CLI only keeps this history in memory when stdin is not a terminal (nothing was
   written to `~/.duckdb_history`), and 1.x CLIs have no `shell_history()`. If you ran DuckDB 2.0
   nodes before this release, rotate what they could read: the catalog Postgres passwords, the

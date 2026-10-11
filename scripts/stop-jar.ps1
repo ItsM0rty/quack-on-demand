@@ -66,8 +66,11 @@ for ($i = 0; $i -lt $ForceAfter; $i++) {
 # ---- Force: taskkill /T /F ----
 Write-Host "still running after ${ForceAfter}s; force-killing."
 foreach ($p in $pids) { & taskkill /PID $p /T /F *> $null }
-# Sweep any orphaned duckdb.exe left behind.
-Get-Process duckdb -ErrorAction SilentlyContinue | ForEach-Object { & taskkill /PID $_.Id /T /F *> $null }
+# Sweep any orphaned node duckdb.exe left behind. Match this script's nodes only (their command
+# line runs `duckdb ... -init <...>\quack-node.XXX\init`), not an unrelated duckdb.exe.
+Get-CimInstance Win32_Process -Filter "Name='duckdb.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -match 'quack-node\.' } |
+  ForEach-Object { & taskkill /PID $_.ProcessId /T /F *> $null }
 
 Start-Sleep -Seconds 2
 if ((Get-ListenerPid $MgrPort) -or (Get-ListenerPid $EdgePort)) {

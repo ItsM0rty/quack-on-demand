@@ -306,7 +306,8 @@ fi
 if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
   # The init SQL is handed to duckdb through -init on a FIFO (never on disk, never recorded in
   # shell_history()). stdin is /dev/null, so no statement can be injected on the node's own
-  # connection; the node is kept alive by a blocking last init statement instead (appended below).
+  # connection; the node is kept alive by a `.shell` dot-command at the end of the init that waits
+  # on this wrapper's pid (see the keep-alive note below).
   INIT_FIFO="$NODE_DIR/init"
   mkfifo "$INIT_FIFO"
 
@@ -506,11 +507,15 @@ NODE_BIND="${QOD_NODE_BIND:-0.0.0.0}"
 # SELECT only listen_url (not the CALL's row), so the node token never reaches the inherited stdout
 # (the manager console locally, `kubectl logs` on K8s).
 INIT_SQL+="SELECT listen_url FROM quack_serve('quack:${NODE_BIND}:$PORT', token := '$TOKEN', allow_other_hostname := true, disable_ssl := true);"$'\n'
-# Keep-alive: with stdin on /dev/null the CLI would reach EOF and exit once the init is read, so the
-# last init statement blocks forever. quack_serve has already started its serving thread; this runs
-# on the main connection, holds no lock the served sessions need, and ends on SIGTERM. A single
-# huge sleep_ms overflows on 1.x, so sleep in bounded steps over an effectively endless range.
-INIT_SQL+=$'SELECT sum(sleep_ms(3600000)) FROM range(1000000000);\n'
+# Keep-alive: with stdin on /dev/null the CLI would reach EOF and exit once -init is read. Hold it
+# with a dot-command, NOT a query: a query would pin a DuckDB transaction (blocking CHECKPOINT on a
+# duckdb-file node and holding a catalog Postgres session "idle in transaction" on a DuckLake node),
+# and on 2.0 its worker/main-thread handshake can spin a core for the node's life. `.shell` holds no
+# transaction and no scheduler task: it waits for this wrapper's pid ($$) to disappear, so a SIGKILL
+# of the wrapper (which skips the trap) ends the loop, `.shell` returns, the CLI reads EOF from
+# /dev/null and exits - the node no longer outlives its wrapper. `.exit` right after keeps any bytes
+# a later writer could append to the init pipe from ever being read.
+INIT_SQL+=$'.shell "while kill -0 '"$$"$' 2>/dev/null; do sleep 1; done"\n.exit\n'
 
 # Test seam: print the assembled init SQL and exit without launching duckdb.
 # Used by SpawnScriptEncryptionSpec to assert the emitted SQL, which is the only
