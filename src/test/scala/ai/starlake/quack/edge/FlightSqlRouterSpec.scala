@@ -1410,6 +1410,22 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .isRight shouldBe true
     openCaptured() should include("__ducklake_metadata_lake")
 
+  it should "refuse json_execute_serialized_sql to every non-superuser, never to a superuser" in:
+    val plan    = "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))"
+    val refusal = ai.starlake.quack.edge.sql.CatalogInternalsScreen.SerializedPlanRefusal
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      val out                   = router
+        .execute("dlm-13", "alice", poolKey, plan, effectiveSet = Some(wildcardAllSet))
+        .unsafeRunSync()
+      out.swap.toOption.get.reason shouldBe s"access denied: catalog: $refusal"
+      captured() shouldBe ""
+    }
+    val (open, openCaptured, _) = setupWithRewriter()
+    val admitted                = open.execute("dlm-14", "alice", poolKey, plan, Some(superuserSet))
+    admitted.unsafeRunSync().isRight shouldBe true
+    openCaptured() should include("json_execute_serialized_sql")
+
   "the Iceberg catalog functions" should "be refused to *.*.* ALL under QoD and OPA, not su" in:
     val calls = Seq(
       "SELECT * FROM duckdb_table_sample('memory.main.t')",

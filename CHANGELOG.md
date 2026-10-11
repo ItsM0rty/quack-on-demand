@@ -76,9 +76,11 @@
     target (`query_table('__duck' || 'lake...')`, `SET search_path = <expression>`, the
     `postgres_query` / `query` family with a non-constant argument) is refused for the same
     callers. The string-named table carriers (`query_table('<name>')`, `query('<sql>')`,
-    `json_execute_serialized_sql`, `duckdb_table_sample('<table>')`) have their literal screened
-    for the metadata catalog and are refused with any non-literal argument. The data tables
-    themselves and the other DuckLake functions are unchanged.
+    `duckdb_table_sample('<table>')`) have their literal screened for the metadata catalog and are
+    refused with any non-literal argument. `json_execute_serialized_sql` (table function and
+    pragma) is refused outright to the same callers: a serialized plan names its catalogs in JSON
+    strings DuckDB decodes after the screen reads them. The data tables themselves and the other
+    DuckLake functions are unchanged.
   - `duckdb_table_sample` (new in 2.0; reads the table its string names) and the Iceberg catalog
     functions that act on a table or schema named by a string outside every table grant
     (`iceberg_rewrite_data_files`, `iceberg_rollback_to_snapshot`, `iceberg_to_ducklake`,

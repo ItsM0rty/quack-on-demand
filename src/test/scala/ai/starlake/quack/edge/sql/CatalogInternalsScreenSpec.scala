@@ -41,6 +41,30 @@ class CatalogInternalsScreenSpec extends AnyFlatSpec with Matchers:
       "SELECT * FROM query('SELECT * FROM ducklake_list_files(''lake'', ''t'')')"
     ).foreach(sql => withClue(sql)(refused(sql) shouldBe true))
 
+  it should "refuse json_execute_serialized_sql outright, whatever plan it carries" in {
+    // A serialized plan names its catalogs inside JSON strings, which DuckDB decodes (`\u005f`
+    // escapes included) after the screen has read them: no lexical read of the literal is sound.
+    Seq(
+      "SELECT * FROM json_execute_serialized_sql('{\"catalog_name\":" +
+        "\"\\u005f_ducklake_metadata_lake\"}')",
+      "SELECT * FROM json_execute_serialized_sql('{}')",
+      "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))",
+      "SELECT * FROM \"JSON_EXECUTE_SERIALIZED_SQL\"('{}')",
+      "SELECT * FROM system.main.json_execute_serialized_sql('{}')",
+      "PRAGMA json_execute_serialized_sql('{}')",
+      "EXPLAIN ANALYZE SELECT * FROM json_execute_serialized_sql('{}')",
+      "SELECT * FROM query('SELECT * FROM json_execute_serialized_sql(''{}'')')"
+    ).foreach { sql =>
+      withClue(sql)(
+        CatalogInternalsScreen.screen(sql) shouldBe Some(
+          CatalogInternalsScreen.SerializedPlanRefusal
+        )
+      )
+    }
+    // Serializing is harmless: it returns text and executes nothing.
+    refused("SELECT json_serialize_sql('SELECT 1')") shouldBe false
+  }
+
   it should "refuse a run-time-computed target" in
     Seq(
       "SELECT * FROM query_table('__duck' || 'lake_metadata_lake.ducklake_data_file')",

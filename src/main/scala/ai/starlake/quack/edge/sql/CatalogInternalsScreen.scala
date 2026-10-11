@@ -24,9 +24,14 @@ import java.util.Locale
   *     The other `ducklake_*` functions (snapshots, table_info, settings, options, table changes,
   *     maintenance) return no key and stay admitted here; [[CatalogReachingCalls]] still denies the
   *     whole family to tenant-scoped principals when the ACL validates.
+  *   - `json_execute_serialized_sql` (table function and pragma), whatever its argument: a
+  *     serialized plan names its catalogs inside JSON strings that DuckDB decodes after the screen
+  *     read them (`\u005f_ducklake_metadata_x` runs, verified on 2.0), so no lexical read of the
+  *     literal is sound. Nothing QoD ships or documents sends it (the codebase never builds one);
+  *     `json_serialize_sql` returns text and stays admitted.
   *   - a string-named carrier (`query_table('<name>')`, `query('<sql>')`,
-  *     `json_execute_serialized_sql`, `duckdb_table_sample('<table>')`) reaches a table named
-  *     inside a string: its literal argument is scanned by the first rule above, and
+  *     `duckdb_table_sample('<table>')`) reaches a table named inside a string: its literal
+  *     argument is scanned by the first rule above, and
   *   - a run-time-computed target, which a lexical screen cannot read: a call of
   *     [[RunTimeTargetCalls]] (`query_table('__duck' || 'lake_metadata_x...')` reaches the catalog)
   *     or a `SET search_path` / `SET schema` (verified on 2.0: `SET search_path = '__duck' ||
@@ -43,11 +48,13 @@ object CatalogInternalsScreen:
   /** DuckLake functions returning file encryption keys or raw catalog rows (2.0 CLI). */
   val KeyFunctions: Set[String] = Set("ducklake_list_files", "ducklake_commit")
 
+  /** Calls that execute a serialized plan, refused whatever the argument (see the scaladoc). */
+  val SerializedPlanCalls: Set[String] = Set("json_execute_serialized_sql")
+
   /** Calls whose target (a catalog, a table name, SQL text, an invoked function) is a value. */
   val RunTimeTargetCalls: Set[String] = Set(
     "query",
     "query_table",
-    "json_execute_serialized_sql",
     "duckdb_table_sample",
     "postgres_query",
     "postgres_execute",
@@ -74,6 +81,10 @@ object CatalogInternalsScreen:
     s"$name with a computed argument cannot be screened for DuckLake catalog internals " +
       "and is disabled"
 
+  val SerializedPlanRefusal: String =
+    "json_execute_serialized_sql runs a plan whose catalog names the gateway cannot screen " +
+      "and is disabled"
+
   val NestingRefusal: String =
     "statement nests string literals too deeply to screen and is disabled"
 
@@ -85,7 +96,8 @@ object CatalogInternalsScreen:
     else
       scan.calls
         .collectFirst {
-          case c if KeyFunctions(c.name) => keyFunctionRefusal(c.name)
+          case c if KeyFunctions(c.name)        => keyFunctionRefusal(c.name)
+          case c if SerializedPlanCalls(c.name) => SerializedPlanRefusal
           case c if RunTimeTargetCalls(c.name) && !FunctionCalls.constantArguments(c) =>
             computedRefusal(c.name)
         }
