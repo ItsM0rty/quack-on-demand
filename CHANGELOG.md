@@ -23,6 +23,21 @@
   Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
   unhealthy, draining, quarantined or at its `maxConcurrent` cap.
 
+- **Nodes run in an empty private working directory.** DuckDB 2.0 reads a file named by an
+  unquoted dotted table name when no such schema exists (`SELECT * FROM x.csv` read `./x.csv` from
+  the manager's own working directory). Every node, on every runtime (local, Windows, fleet,
+  Kubernetes), now starts duckdb in a fresh, empty, per-node directory private to its user, removed
+  when the node stops. A relative local dataPath (the bundled `./ducklake/tpch` default is one) is
+  resolved against the directory the node used to run in and attached with `OVERRIDE_DATA_PATH`,
+  since DuckLake recorded the relative spelling; the override applies to that attach only. Each
+  node now spills to its own `temp_directory` (a per-node directory under `/duckdb-tmp` on
+  Kubernetes, under `.tmp` of the starting directory elsewhere) instead of a `.tmp` shared by every
+  node of the host. An operator's `SET temp_directory` in the database or pool init SQL still wins.
+  Branches of a database with a relative dataPath now record the parent's files by absolute path,
+  and the merge node attaches the branch by its absolute path. Upgrading: a branch cloned before
+  this release from such a database cannot read the parent's files any more; discard and recreate
+  it.
+
 - **Native client lease.** The manager-to-node native client heartbeats each node connection
   under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).
   Node connections are released on error and on cancel. New `QOD_DUCKDB_EXTENSION_DIR` points the
