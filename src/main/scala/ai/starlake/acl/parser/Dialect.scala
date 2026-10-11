@@ -19,6 +19,16 @@ object DialectMapper:
 private[parser] object AnsiDialectMapper extends DialectMapper:
 
   def toTableRef(table: Table, config: Config): Either[DenyReason, TableRef] =
+    // A name of more than three parts (a nested schema, or a server prefix) has no grantable
+    // reading: refused on every dialect, not only DuckDB's, or the extra part is dropped and the
+    // rest qualifies as a three-part ref some grant may cover. JSqlParser 5.4 leaves
+    // `getDatabase.getServer` null for a four-part name (the extra part only shows in the
+    // name-part list), so count the parts instead.
+    if table.getNameParts.size > 3 then
+      Left(DenyReason.NestedSchemaRef(table.getFullyQualifiedName))
+    else qualify(table, config)
+
+  private def qualify(table: Table, config: Config): Either[DenyReason, TableRef] =
     val tableName  = table.getUnquotedName
     val schemaName = Option(table.getUnquotedSchemaName)
     val dbName     = Option(table.getUnquotedDatabaseName)
@@ -72,17 +82,14 @@ private[parser] object DuckDBDialectMapper extends DialectMapper:
     val tableName  = table.getUnquotedName
     val schemaName = Option(table.getUnquotedSchemaName)
     val dbName     = Option(table.getUnquotedDatabaseName)
-    // JSqlParser 5.4 leaves `getDatabase.getServer` null for a four-part name (the extra part only
-    // shows in the name-part list), so count the parts instead.
-    val hasServerPart = table.getNameParts.size > 3
-    if hasServerPart then Left(DenyReason.NestedSchemaRef(table.getFullyQualifiedName))
-    else
-      (dbName, schemaName) match
-        case (None, Some(head))
-            if config.normalizedAttachedCatalogs.contains(head.toLowerCase(Locale.ROOT)) =>
-          Left(DenyReason.AmbiguousCatalogRef(s"$head.$tableName", head))
-        case _ =>
-          AnsiDialectMapper.toTableRef(table, config)
+    // More than three parts: refused by the ANSI mapper (NestedSchemaRef), ahead of this check.
+    (dbName, schemaName) match
+      case (None, Some(head))
+          if table.getNameParts.size <= 3 &&
+            config.normalizedAttachedCatalogs.contains(head.toLowerCase(Locale.ROOT)) =>
+        Left(DenyReason.AmbiguousCatalogRef(s"$head.$tableName", head))
+      case _ =>
+        AnsiDialectMapper.toTableRef(table, config)
 
   /** Check whether a JSqlParser Table represents a string-literal file reference. The caller should
     * use this to filter before calling toTableRef.
