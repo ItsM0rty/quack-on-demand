@@ -172,25 +172,22 @@ final class ColumnPolicyRewriter(
           .map(_.flatten.toMap)
       case Success(_) => IO.pure(Map.empty)
 
-  /** Every physical table referenced ANYWHERE in the statement, keyed by its raw (bare) name.
-    * [[net.sf.jsqlparser.util.TablesNamesFinder]] walks FROM items, joins, CTE bodies, set-op arms
-    * AND expression subqueries (EXISTS / IN / ANY / scalar) while excluding CTE names - the
-    * hand-rolled FROM-walker this replaces missed expression-nested subqueries, which left their
-    * tables out of the schema map entirely (the root of the subquery fail-open gap: a table the map
-    * never mentions can neither resolve nor deny).
+  /** Every physical table referenced ANYWHERE in the statement, keyed by its raw (bare) name: the
+    * ACL parser's walk ([[TableExtractor]]), which reaches FROM items, joins, CTE bodies, set-op
+    * arms AND expression subqueries (a table the map never mentions can neither resolve nor deny),
+    * and binds CTE names as DuckDB does. JSqlParser's own TablesNamesFinder dropped every table
+    * named like a CTE of the statement, so the dbt shape `WITH customer AS (SELECT * FROM customer)
+    * SELECT c_email FROM customer`, whose body reads the real table, could not be resolved and was
+    * denied.
     */
   private def collectTables(
       stmt: Select,
       ctx: SchemaContext
   ): Map[String, (String, String, String)] =
-    val names =
-      Try {
-        val finder = new net.sf.jsqlparser.util.TablesNamesFinder()
-        finder.getTableList(stmt: net.sf.jsqlparser.statement.Statement).asScala.toList
-      }.getOrElse(Nil)
+    val tables             = Try(TableExtractor.extract(stmt).tables).getOrElse(Nil)
     def unquote(s: String) = s.stripPrefix("\"").stripSuffix("\"")
-    names.flatMap { raw =>
-      raw.split('.').toList.map(unquote) match
+    tables.flatMap { t =>
+      t.getNameParts.asScala.toList.reverse.map(unquote) match
         case tab :: Nil =>
           Some(tab -> (ctx.defaultDatabase.getOrElse(""), ctx.defaultSchema.getOrElse(""), tab))
         case sch :: tab :: Nil =>

@@ -1072,6 +1072,27 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "mask the dbt self-named CTE, whose body reads the real table" in {
+    // DuckDB binds the body's `customer` to the real table, the main query's to the CTE.
+    rw.rewrite(
+      "WITH customer AS (SELECT * FROM customer) SELECT c_email FROM customer",
+      StatementKind.Select,
+      eff(tenantUser, List(maskEmail)),
+      ctx
+    ).unsafeRunSync() match
+      case Rewritten(out) =>
+        out should include("'***'")
+        out should not include "SELECT c_email"
+      case other => fail(s"expected Rewritten, got $other")
+    // a three-part name still reaches the catalog as (catalog, schema, table)
+    rw.rewrite(
+      "SELECT c_email FROM acme_tpch.tpch1.customer",
+      StatementKind.Select,
+      eff(tenantUser, List(maskEmail)),
+      ctx
+    ).unsafeRunSync() shouldBe Rewritten("SELECT '***' AS c_email FROM acme_tpch.tpch1.customer")
+  }
+
   it should "deny a NATURAL join that compares a masked column against a guess list" in {
     rw.rewrite(
       "SELECT g.c_phone, c_id FROM (SELECT '555-' || lpad(unnest(range(10000))::VARCHAR, 4, '0') " +
