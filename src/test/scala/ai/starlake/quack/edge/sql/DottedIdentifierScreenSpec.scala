@@ -90,3 +90,47 @@ class DottedIdentifierScreenSpec extends AnyFlatSpec with Matchers:
       withClue(sql)(LockdownScreen.screen(sql, Set.empty) shouldBe defined)
     }
     LockdownScreen.screen("SELECT v AS \"t.v\" FROM \"main\".\"t\"", Set.empty) shouldBe None
+
+  // JSqlParser also splits a quoted name at an `@` (an Oracle database link: `"secret@x"` is gated
+  // as table `secret`), and keeps an escaped quote doubled (`"secret""x"` is gated as `secret""x`
+  // while DuckDB reads `secret"x`). Every other printable ASCII and unicode character was probed in
+  // both quoting styles and reaches the check as the name DuckDB 2.0 reads.
+  private val refusedSeparators = List(
+    "SELECT * FROM \"secret@x\"",
+    s"SELECT * FROM ${B}secret@x$B",
+    "SELECT * FROM lake.main.\"secret@x\"",
+    "SELECT * FROM t JOIN \"secret@x\" ON true",
+    "INSERT INTO \"secret@x\" VALUES (1)",
+    "DELETE FROM \"secret@x\"",
+    "DROP TABLE \"secret@x\"",
+    "CREATE TABLE \"t@x\" (a INT)",
+    "SELECT * FROM \"secret\"\"x\"",
+    s"SELECT * FROM ${B}secret$B${B}x$B",
+    "INSERT INTO \"a\"\"b\" VALUES (1)",
+    // a `://` that is not a URL scheme is no exception
+    "SELECT * FROM \"other.x://\""
+  )
+
+  private val admittedSeparators = List(
+    "SELECT v AS \"a@b\" FROM t",
+    "SELECT * FROM t AS \"a@b\"",
+    "SELECT 'secret@x' FROM t",
+    "SELECT * FROM \"s3://user@bucket/x.parquet\"",
+    "SELECT * FROM \"secret#x\", \"secret:x\", \"secret$x\", \"secret/x\""
+  )
+
+  "DottedIdentifierScreen" should "refuse a quoted name holding an @ or an escaped quote" in:
+    refusedSeparators.foreach { sql =>
+      withClue(sql)(DottedIdentifierScreen.find(sql) shouldBe Some(DottedIdentifierScreen.Reason))
+    }
+    refusedSeparators.foreach { sql =>
+      withClue(sql) {
+        AccessGate.evaluate(sql, cfg, "lake", false, clientDataScans = false) shouldBe a[
+          GateOutcome.Refuse
+        ]
+        LockdownScreen.screen(sql, Set.empty) shouldBe defined
+      }
+    }
+
+  it should "admit them as aliases, literals and URL paths, and the other separators" in:
+    admittedSeparators.foreach(sql => withClue(sql)(DottedIdentifierScreen.find(sql) shouldBe None))
