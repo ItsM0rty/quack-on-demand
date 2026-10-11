@@ -304,6 +304,10 @@
     are refused in a table position (the aggregate `histogram(expr)` in a select list stays
     admitted), and `duckdb_profiling_settings()` (a macro over `duckdb_settings`) is reserved to
     superusers.
+  - `pg_get_viewdef(oid)` and `pg_get_constraintdef(oid)` (DuckDB 2.0 macros over
+    `duckdb_views()` / `duckdb_constraints()`, outside the metadata filter) printed the SQL of every
+    view and every CHECK expression of the node to any principal enumerating oids. They now need the
+    unrestricted `*.*.* ALL` grant, like a direct read of those listings (refused under OPA).
   - On a lockdown pool, a file in table position is judged like a tenant's: from the parse when the
     statement parses, conservatively otherwise. A keyword used as an alias no longer hides a local
     file after the next comma (`FROM range(1) AS values, '/etc/x.csv'`), and a relative path

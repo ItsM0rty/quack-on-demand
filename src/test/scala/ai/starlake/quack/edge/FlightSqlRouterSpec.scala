@@ -3823,3 +3823,18 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       )
       .unsafeRunSync() shouldBe a[Right[?, ?]]
     aggCaptured() should include("histogram(o_total)")
+
+  "pg_get_viewdef / pg_get_constraintdef" should "need the unrestricted *.*.* ALL grant" in:
+    val (router, captured, _) = setupWithRewriter(validator = wildcardAcl)
+    List("SELECT pg_get_viewdef(o_id) FROM orders", "SELECT pg_get_constraintdef(1)").foreach {
+      sql =>
+        withClue(sql) {
+          router
+            .execute("pgdef-1", "alice", poolKey, sql, Some(ordersWriter))
+            .unsafeRunSync() shouldBe a[Left[?, ?]]
+          captured() should not include sql
+          router
+            .execute("pgdef-2", "alice", poolKey, sql, Some(wildcardAllSet))
+            .unsafeRunSync() shouldBe a[Right[?, ?]]
+        }
+    }

@@ -82,7 +82,14 @@ object AccessGate:
       .orElse(SessionScopeScreen.find(statement)) match
       case Some(reason) => GateOutcome.Refuse(reason, false, "")
       case None         =>
-        evaluateParsed(extraction, config, sessionCatalog, filteredMetadata, clientDataScans)
+        evaluateParsed(
+          statement,
+          extraction,
+          config,
+          sessionCatalog,
+          filteredMetadata,
+          clientDataScans
+        )
 
   /** Some(reason) when `rewritten`, a statement an edge rewriter (column policies, row policies,
     * metadata filter) printed from `original`, needs a grant on a table, or a verb, the original
@@ -126,6 +133,7 @@ object AccessGate:
     }
 
   private def evaluateParsed(
+      statement: String,
       extraction: ExtractionResult,
       config: Config,
       sessionCatalog: String,
@@ -162,12 +170,15 @@ object AccessGate:
       case StatementResult.Extracted(_, _, a, _, u) if u.nonEmpty =>
         TableExtractor.gatedUnsupported(a, u, clientDataScans)
     }.flatten
-    val (catalogFunctions, unsupported) =
+    val (catalogFunctions, parsedUnsupported) =
       if filteredMetadata then
         allUnsupported.partition(u =>
           TableExtractor.tableFunctionName(u).flatMap(TableExtractor.catalogFunctionCall).isDefined
         )
       else (Nil, allUnsupported)
+    // A scalar call returning another object's definition by oid (`pg_get_viewdef`), outside the
+    // metadata filter: unsupported like the listing it reads (CatalogDefinitionCalls).
+    val unsupported = parsedUnsupported ++ CatalogDefinitionCalls.markers(statement)
     // Qualification errors were previously ignored, silently DROPPING the
     // offending ref from the access set (fail-open). AmbiguousCatalogRef denies
     // unconditionally: admitting it under the wildcard would reopen the
