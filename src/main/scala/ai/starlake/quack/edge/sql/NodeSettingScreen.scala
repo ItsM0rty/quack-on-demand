@@ -10,6 +10,9 @@ package ai.starlake.quack.edge.sql
   * one session's SET also changes how every other session's statements parse on that node. No
   * caller may hold that switch: a superuser setting it breaks the ACL for everyone on the pool.
   *
+  * `shell_history()` prints the node CLI's history, which holds the node's init SQL and so its
+  * credentials ([[SecretCalls]]).
+  *
   * `redact_http_logs = false` writes HTTP header values unredacted into the node's log (verified on
   * 2.0: with an http secret carrying `Authorization: Bearer ...`, a read logs the bearer token in
   * `duckdb_logs`), so node-held credentials (federation and catalog bearer tokens, S3 session
@@ -43,6 +46,9 @@ object NodeSettingScreen:
   val SecretRefusalMessage =
     "settings that expose node credentials cannot be changed through the gateway"
 
+  val SecretCallRefusalMessage =
+    "shell_history() holds the node's init SQL, credentials included, and is disabled"
+
   val ImportRefusalMessage =
     "IMPORT DATABASE replays SQL the gateway cannot screen and is disabled"
 
@@ -62,6 +68,14 @@ object NodeSettingScreen:
 
   /** The settings that would print node credentials in clear. */
   val SecretSettings: Set[String] = Set("redact_http_logs", "allow_unredacted_secrets")
+
+  /** Calls that print node credentials. `shell_history()` returns the node CLI's shell history, and
+    * a node's init SQL reaches its CLI through stdin, so the history holds every line of it:
+    * `CREATE SECRET` with the object-store keys, the `ATTACH` carrying the catalog password,
+    * `quack_serve` with the node token (a quack client's `SELECT * FROM shell_history()` printed
+    * them on the 2.0 CLI). It takes no argument, so no path-based list ever judged it.
+    */
+  val SecretCalls: Set[String] = Set("shell_history")
 
   /** Every setting this screen refuses. */
   val Settings: Set[String] = ParserSettings ++ SecretSettings
@@ -297,6 +311,7 @@ object NodeSettingScreen:
       .orElse {
         val scan = FunctionCalls.scan(sql)
         if scan.calls.exists(_.name == "import_database") then Some(ImportRefusalMessage)
+        else if scan.calls.exists(c => SecretCalls(c.name)) then Some(SecretCallRefusalMessage)
         else if scan.truncated then Some(NestingRefusalMessage)
         else None
       }

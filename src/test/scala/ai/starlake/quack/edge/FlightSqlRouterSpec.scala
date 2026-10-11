@@ -2666,6 +2666,37 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
     out.swap.toOption.get.reason should startWith("access denied: lockdown:")
 
+  // ---- the node CLI's shell history holds its init SQL, credentials included ----
+
+  "shell_history()" should "be refused to a superuser and to a *.*.* ALL tenant, both edges" in:
+    Seq(superuserSet, wildcardAllSet).foreach { eff =>
+      val (router, captured, _) = setupWithRewriter(validator = wildcardAcl)
+      withClue(eff.user.kind) {
+        router
+          .execute("hist-1", "alice", poolKey, "SELECT * FROM shell_history()", Some(eff))
+          .unsafeRunSync()
+          .swap
+          .toOption
+          .get
+          .reason should include(
+          ai.starlake.quack.edge.sql.NodeSettingScreen.SecretCallRefusalMessage
+        )
+        router
+          .executeWith(
+            "hist-2",
+            "alice",
+            poolKey,
+            "SELECT * FROM shell_history()",
+            Some(eff),
+            okSend,
+            source = "quack",
+            clientDataScans = true
+          )
+          .unsafeRunSync() shouldBe a[Left[?, ?]]
+        captured() shouldBe ""
+      }
+    }
+
   // ---- parser settings (DuckDB 2.0) ----
 
   "a parser setting" should "be refused for a regular user with acl disabled, lockdown off" in:

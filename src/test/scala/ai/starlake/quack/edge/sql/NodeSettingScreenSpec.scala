@@ -305,3 +305,28 @@ class NodeWideSettingScreenSpec extends AnyFlatSpec with Matchers:
   "NodeWideSettings" should "not overlap the settings refused for every caller" in {
     NodeSettingScreen.NodeWideSettings.intersect(NodeSettingScreen.Settings) shouldBe empty
   }
+
+  // A node's init SQL reaches its DuckDB CLI through stdin, so every line lands in the CLI's shell
+  // history: CREATE SECRET with the object-store keys, the ATTACH carrying the catalog password,
+  // quack_serve with the node token. On the 2.0 CLI a quack client's
+  // `quack_query(.., 'SELECT id, sql FROM shell_history()')` printed all of them.
+  "shell_history" should "be refused to every caller, in every spelling" in
+    List(
+      "SELECT * FROM shell_history()",
+      "SELECT sql FROM SHELL_HISTORY() WHERE sql ILIKE '%secret%'",
+      "SELECT * FROM \"shell_history\"()",
+      "SELECT * FROM `shell_history`()",
+      "SELECT * FROM system.main.shell_history()",
+      "SELECT 1; FROM shell_history()",
+      "EXPLAIN ANALYZE SELECT * FROM shell_history()",
+      "SELECT (SELECT max(sql) FROM shell_history())"
+    ).foreach { sql =>
+      withClue(sql) {
+        NodeSettingScreen.screen(sql) shouldBe Some(NodeSettingScreen.SecretCallRefusalMessage)
+      }
+    }
+
+  // A literal body is scanned as SQL too (`query('..')` runs one), so `'shell_history()'` over-denies.
+  it should "leave a column of that name alone" in {
+    NodeSettingScreen.screen("SELECT shell_history FROM t") shouldBe None
+  }
