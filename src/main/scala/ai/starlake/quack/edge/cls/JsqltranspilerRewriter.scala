@@ -7,6 +7,8 @@ import net.sf.jsqlparser.expression.Expression
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.statement.select.{PlainSelect, Select, SelectItem}
 
+import scala.jdk.CollectionConverters._
+
 final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
 
   import RewriteOutcome._
@@ -299,6 +301,26 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
           val nxt = visitor.visit(h)
           if nxt ne h then { ps.setHaving(nxt); changed.set(true) }
         }
+        // QUALIFY filters on window results like HAVING filters on aggregates: a predicate over
+        // the masked values.
+        Option(ps.getQualify).foreach { q =>
+          val nxt = visitor.visit(q)
+          if nxt ne q then { ps.setQualify(nxt); changed.set(true) }
+        }
+        // JOIN ... ON: a predicate over the joined rows, masked like WHERE, so the join behaves as
+        // it would over a view exposing the masked values (an outer join included). The visitor's
+        // FROM scope above already holds every joined table, so a qualified reference resolves to
+        // its own side. A JOIN ... USING list names columns, not values, and cannot be masked: the
+        // residual check denies it.
+        Option(ps.getJoins).foreach(_.forEach { j =>
+          Option(j.getOnExpressions).foreach { ons =>
+            val before = ons.asScala.toList
+            val after  = before.map(visitor.visit)
+            if after.lazyZip(before).exists(_ ne _) then
+              j.setOnExpressions(after.asJava)
+              changed.set(true)
+          }
+        })
         Option(ps.getGroupBy).foreach { gb =>
           val gbList = gb.getGroupByExpressionList
           if gbList != null then
@@ -503,8 +525,39 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
               val nxt = visit(ob.getExpression)
               if nxt ne ob.getExpression then ob.setExpression(nxt)
           }
+          // `count(*) FILTER (WHERE c_email IS NOT NULL)`: the filter is a predicate like WHERE.
+          Option(ae.getFilterExpression).foreach { f =>
+            val nxt = visit(f)
+            if nxt ne f then ae.setFilterExpression(nxt)
+          }
           topLevelOverride = saved
           ae
+
+        case isNull: net.sf.jsqlparser.expression.operators.relational.IsNullExpression =>
+          // `c_email IS [NOT] NULL` tests the masked value, like `c_email = 'x'` does, so it
+          // reveals no more than projecting the masked column would.
+          val saved = topLevelOverride
+          topLevelOverride = None
+          val nxt = visit(isNull.getLeftExpression)
+          if nxt ne isNull.getLeftExpression then isNull.setLeftExpression(nxt)
+          topLevelOverride = saved
+          isNull
+
+        case trim: net.sf.jsqlparser.expression.TrimFunction =>
+          // `trim([LEADING|TRAILING|BOTH] [chars FROM] c_email)`: an ordinary function of its
+          // arguments, masked like any other function call.
+          val saved = topLevelOverride
+          topLevelOverride = None
+          Option(trim.getExpression).foreach { e =>
+            val nxt = visit(e)
+            if nxt ne e then trim.setExpression(nxt)
+          }
+          Option(trim.getFromExpression).foreach { e =>
+            val nxt = visit(e)
+            if nxt ne e then trim.setFromExpression(nxt)
+          }
+          topLevelOverride = saved
+          trim
 
         case ex: net.sf.jsqlparser.expression.ExtractExpression =>
           val saved = topLevelOverride
@@ -645,9 +698,9 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
     }
 
 /** The fail-closed backstop behind [[JsqltranspilerRewriter]]'s masking visitor, which models a
-  * fixed set of expression types (columns, functions, CASE, CAST, IN, ...) and returns any other
-  * node untouched. A covered column inside such a node (a MAP or list literal, a lambda, `->>`,
-  * TRIM, a JOIN condition, a struct_pack named argument, ...) was forwarded unmasked.
+  * fixed set of expression types (columns, functions, CASE, CAST, IN, IS NULL, TRIM, ...) and
+  * returns any other node untouched. A covered column inside such a node (a MAP or list literal, a
+  * lambda, `->>`, a struct_pack named argument, a JOIN ... USING list, ...) was forwarded unmasked.
   *
   * Rather than enumerate those types, the check is structural: before the rewrite, every column
   * reference a policy could cover is noted by node identity ([[suspects]]); the visitor replaces
@@ -656,26 +709,54 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
   * the shared reflective child access ([[AstChildren]]), so a MAP literal's entries and a JSON
   * pair's halves are seen; a child of a type it has no rule for denies too.
   *
-  * Coverage mirrors the visitor's own match (policy table and column name, `*` for any table): a
-  * qualified reference resolves its qualifier through the statement's table aliases; an unqualified
-  * one is covered when its own select, or an enclosing one, reads a policy table directly and that
-  * table has the column (or its columns are unknown). The check can only add denials.
+  * Coverage mirrors how DuckDB binds a name, per query block. Each select contributes one scope:
+  * the sources its FROM / JOIN reads, a base table (with its catalog columns when known) or a
+  * derived table / CTE reference (with its output column names when they can be read). A CTE body
+  * sees the scopes ENCLOSING the select that declares it, not that select's own FROM (DuckDB:
+  * "Referenced column not found"); a derived table in FROM sees its own select's scope too (DuckDB
+  * joins one implicitly LATERAL), and a subquery in an expression sees every enclosing scope. An
+  * unqualified reference binds innermost-first: the first scope holding a source that has the
+  * column decides, and the reference is covered only if a policy table is among that scope's
+  * candidates; a source whose columns are unknown never ends the search (the name may bind there or
+  * further out), so ambiguity stays covered. A derived table or CTE carries values already masked
+  * inside it, so a reference binding there is not a base read. A qualified reference resolves its
+  * qualifier the same way, innermost-first, falling back to every alias of the statement when no
+  * scope names it. The check can only add denials.
   */
 private[cls] object ResidualColumns:
   import scala.jdk.CollectionConverters._
   import ai.starlake.acl.parser.AstChildren
   import net.sf.jsqlparser.schema.{Column, Table}
+  import net.sf.jsqlparser.statement.select.{
+    AllColumns,
+    FromItem,
+    ParenthesedFromItem,
+    ParenthesedSelect,
+    SetOperationList
+  }
 
   final class Suspects private[ResidualColumns] (
       val columns: java.util.Set[Column],
       val unwalkable: Option[String]
   )
 
-  /** Every column reference with the FROM scopes it sits in (innermost first, each the bare table
-    * names its select reads directly), every table node, and the first child of an unknown type.
+  /** One source a select reads: the lowercased names it is referenced by, its base table (None for
+    * a derived table or a CTE reference), and its output columns when they can be read (a derived
+    * table or CTE; a base table's come from the catalog).
+    */
+  private final case class Source(
+      names: Set[String],
+      table: Option[String],
+      outputs: Option[Set[String]]
+  )
+
+  private type Scope = List[Source]
+
+  /** Every column reference with the scopes it sits in (innermost first), every table node, and the
+    * first child of an unknown type.
     */
   private final case class Scan(
-      columns: List[(Column, List[Set[String]])],
+      columns: List[(Column, List[Scope])],
       tables: List[Table],
       unknown: Option[String]
   )
@@ -684,60 +765,126 @@ private[cls] object ResidualColumns:
 
   private def lower(s: String): String = s.toLowerCase(java.util.Locale.ROOT)
 
-  /** The bare names of the tables a FROM item reads directly (a parenthesized join included). */
-  private def fromItemTables(item: Any): Set[String] =
+  /** The output column names of a query, lowercased, when every one can be read: a column projects
+    * its name, an aliased item its alias; an unaliased expression projects its own text, which no
+    * bare identifier can name, so it is skipped. A star or an unreadable shape: None.
+    */
+  private def outputsOf(sel: Any): Option[Set[String]] =
+    sel match
+      case ps: PlainSelect =>
+        val items = Option(ps.getSelectItems).toList.flatMap(_.asScala)
+        if items.exists(_.getExpression.isInstanceOf[AllColumns]) then None
+        else
+          Some(items.flatMap { si =>
+            Option(si.getAlias).map(a => lower(unquote(a.getName))).orElse {
+              si.getExpression match
+                case c: Column => Option(c.getColumnName).map(n => lower(unquote(n)))
+                case _         => None
+            }
+          }.toSet)
+      case sol: SetOperationList =>
+        Option(sol.getSelects).flatMap(_.asScala.headOption).flatMap(outputsOf)
+      case psel: ParenthesedSelect => outputsOf(psel.getSelect)
+      case _                       => None
+
+  /** A derived table's output names: its alias column list when given, else its query's. */
+  private def derivedOutputs(psel: ParenthesedSelect): Option[Set[String]] =
+    Option(psel.getAlias)
+      .flatMap(a => Option(a.getAliasColumns))
+      .filter(!_.isEmpty)
+      .map(_.asScala.map(c => lower(unquote(c.name))).toSet)
+      .orElse(outputsOf(psel.getSelect))
+
+  /** The sources a FROM item reads (a parenthesized join included), CTE references resolved against
+    * the CTEs in scope.
+    */
+  private def sourcesOf(item: Any, ctes: Map[String, Option[Set[String]]]): List[Source] =
     item match
       case t: Table =>
-        Option(t.getName).map(n => lower(unquote(n))).toSet
-      case pfi: net.sf.jsqlparser.statement.select.ParenthesedFromItem =>
-        fromItemTables(pfi.getFromItem) ++
-          Option(pfi.getJoins).toList.flatMap(_.asScala).flatMap(j => fromItemTables(j.getFromItem))
-      case _ => Set.empty
+        Option(t.getName).map(n => lower(unquote(n))).toList.map { name =>
+          val alias = Option(t.getAlias).map(a => lower(unquote(a.getName)))
+          val names = alias.toSet + name
+          val cte   = Option.when(t.getSchemaName == null)(ctes.get(name)).flatten
+          cte match
+            case Some(outputs) => Source(alias.map(Set(_)).getOrElse(Set(name)), None, outputs)
+            case None          => Source(names, Some(name), None)
+        }
+      case psel: ParenthesedSelect =>
+        List(
+          Source(
+            Option(psel.getAlias).map(a => lower(unquote(a.getName))).toSet,
+            None,
+            derivedOutputs(psel)
+          )
+        )
+      case pfi: ParenthesedFromItem =>
+        sourcesOf(pfi.getFromItem, ctes) ++
+          Option(pfi.getJoins).toList
+            .flatMap(_.asScala)
+            .flatMap(j => sourcesOf(j.getFromItem, ctes))
+      case other =>
+        // A table function, VALUES, PIVOT, ...: columns unknown, never a policy table.
+        val alias = other match
+          case fi: FromItem => Option(fi.getAlias).map(a => lower(unquote(a.getName))).toSet
+          case _            => Set.empty[String]
+        List(Source(alias, None, None))
 
-  private def scopeOf(node: AnyRef): Option[Set[String]] =
+  private def fromItemsOf(node: AnyRef): List[Any] =
     node match
       case ps: PlainSelect =>
-        Some(
-          fromItemTables(ps.getFromItem) ++
-            Option(ps.getJoins).toList
-              .flatMap(_.asScala)
-              .flatMap(j => fromItemTables(j.getFromItem))
-        )
-      case fq: net.sf.jsqlparser.statement.piped.FromQuery => Some(fromItemTables(fq.getFromItem))
-      case _                                               => None
+        ps.getFromItem :: Option(ps.getJoins).toList.flatMap(_.asScala).map(_.getFromItem)
+      case fq: net.sf.jsqlparser.statement.piped.FromQuery =>
+        fq.getFromItem :: Option(fq.getJoins).toList.flatMap(_.asScala).map(_.getFromItem)
+      case _ => Nil
 
   private def scan(root: AnyRef): Scan =
     val visited = java.util.Collections.newSetFromMap(
       new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
     )
-    val columns = scala.collection.mutable.ListBuffer.empty[(Column, List[Set[String]])]
+    val columns = scala.collection.mutable.ListBuffer.empty[(Column, List[Scope])]
     val tables  = scala.collection.mutable.ListBuffer.empty[Table]
     var unknown = Option.empty[String]
-    def walk(node: AnyRef, scopes: List[Set[String]]): Unit =
+    def walk(node: AnyRef, scopes: List[Scope], ctes: Map[String, Option[Set[String]]]): Unit =
       if visited.add(node) then
         node match
           case c: Column => columns += (c -> scopes)
           case t: Table  => tables += t
           case _         => ()
-        val inner = scopeOf(node).map(_ :: scopes).getOrElse(scopes)
+        // A WITH clause: its names are in scope for the whole select (and, for a recursive CTE,
+        // its own body), and each body is walked with the scopes ENCLOSING this select.
+        val withItems = node match
+          case sel: Select => Option(sel.getWithItemsList).toList.flatMap(_.asScala)
+          case _           => Nil
+        val inCtes = ctes ++ withItems.flatMap { wi =>
+          Option(wi.getUnquotedAliasName).map(n =>
+            lower(n) -> (Option(wi.getWithItemList)
+              .filter(!_.isEmpty)
+              .map(_.asScala.map(i => lower(unquote(String.valueOf(i.getExpression)))).toSet)
+              .orElse(outputsOf(wi.getParenthesedStatement)))
+          )
+        }
+        withItems.foreach(wi => walk(wi, scopes, inCtes))
+        val inner = fromItemsOf(node) match
+          case Nil   => scopes
+          case items => items.filter(_ != null).flatMap(sourcesOf(_, inCtes)) :: scopes
         AstChildren.accessors(node.getClass).foreach { m =>
           AstChildren.read(m, node) match
             // A column's qualifier is not a table the statement reads.
             case _: Table if node.isInstanceOf[Column] => ()
-            case value                                 => route(value, inner)
+            case value                                 => route(value, inner, inCtes)
         }
-    def route(value: Any, scopes: List[Set[String]]): Unit =
+    def route(value: Any, scopes: List[Scope], ctes: Map[String, Option[Set[String]]]): Unit =
       value match
         case null                         => ()
-        case it: java.lang.Iterable[?]    => it.forEach(route(_, scopes))
-        case arr: Array[?]                => arr.foreach(route(_, scopes))
+        case it: java.lang.Iterable[?]    => it.forEach(route(_, scopes, ctes))
+        case arr: Array[?]                => arr.foreach(route(_, scopes, ctes))
         case e: java.util.Map.Entry[?, ?] =>
-          route(e.getKey, scopes); route(e.getValue, scopes)
-        case m: java.util.Map[?, ?]                => m.entrySet.forEach(route(_, scopes))
-        case n: AnyRef if AstChildren.isAstNode(n) => walk(n, scopes)
+          route(e.getKey, scopes, ctes); route(e.getValue, scopes, ctes)
+        case m: java.util.Map[?, ?]                => m.entrySet.forEach(route(_, scopes, ctes))
+        case n: AnyRef if AstChildren.isAstNode(n) => walk(n, scopes, ctes)
         case leaf if AstChildren.isLeaf(leaf)      => ()
         case other => unknown = unknown.orElse(Some(other.getClass.getName))
-    walk(root, Nil)
+    walk(root, Nil, Map.empty)
     Scan(columns.toList, tables.toList, unknown)
 
   /** The column references in `sel` a policy could cover, noted before the rewrite. */
@@ -749,27 +896,49 @@ private[cls] object ResidualColumns:
     val before  = scan(sel)
     val aliases = before.tables.flatMap { t =>
       Option(t.getAlias).map(a => lower(unquote(a.getName)) -> unquote(t.getName))
-    }.toMap
+    }
     def columnsOf(table: String): Option[List[String]] =
       schema.find(_._1.equalsIgnoreCase(table)).map(_._2).filter(_.nonEmpty)
-    def covered(col: Column, scopes: List[Set[String]]): Boolean =
+    def isPolicyTable(table: String, byName: List[RoleColumnPolicy]): Boolean =
+      byName.exists(p =>
+        p.tableName == RoleColumnPolicy.Wildcard || p.tableName.equalsIgnoreCase(table)
+      )
+
+    /** Whether `src` has the column: Some(true / false) when known, None when it cannot be told. */
+    def has(src: Source, name: String): Option[Boolean] =
+      src.table match
+        case Some(t) => columnsOf(t).map(_.exists(_.equalsIgnoreCase(name)))
+        case None    => src.outputs.map(_.contains(lower(name)))
+
+    /** Innermost-first binding of an unqualified `name`. */
+    def unqualifiedCovered(
+        name: String,
+        scopes: List[Scope],
+        byName: List[RoleColumnPolicy]
+    ): Boolean =
+      scopes match
+        case Nil           => false
+        case scope :: rest =>
+          val candidates = scope.filter(src => !has(src, name).contains(false))
+          val definite   = scope.exists(src => has(src, name).contains(true))
+          if candidates.exists(_.table.exists(isPolicyTable(_, byName))) then true
+          else if definite then false
+          else unqualifiedCovered(name, rest, byName)
+    def covered(col: Column, scopes: List[Scope]): Boolean =
       val name   = unquote(Option(col.getColumnName).getOrElse(""))
       val byName = policies.filter(_.columnName.equalsIgnoreCase(name))
-      Option(col.getTable).flatMap(t => Option(t.getName)).map(unquote) match
-        case Some(q) =>
-          val table = aliases.getOrElse(lower(q), q)
-          byName.exists(p =>
-            p.tableName == RoleColumnPolicy.Wildcard || p.tableName.equalsIgnoreCase(table)
-          )
-        case None =>
-          // Unqualified: a base read only when a select it sits in (its own, or an enclosing one
-          // for a correlated reference) reads the policy table directly and that table has the
-          // column. Through a CTE or a derived table it reads values already masked inside.
-          byName.exists(p =>
-            p.tableName == RoleColumnPolicy.Wildcard ||
-              (scopes.exists(_.contains(lower(p.tableName))) &&
-                columnsOf(p.tableName).forall(_.exists(_.equalsIgnoreCase(name))))
-          )
+      if byName.isEmpty then false
+      else if byName.exists(_.tableName == RoleColumnPolicy.Wildcard) then true
+      else
+        Option(col.getTable).flatMap(t => Option(t.getName)).map(unquote) match
+          case Some(q) =>
+            scopes.iterator.map(_.filter(_.names.contains(lower(q)))).find(_.nonEmpty) match
+              case Some(bound) => bound.exists(_.table.exists(isPolicyTable(_, byName)))
+              case None        =>
+                // Not named by any scope: any table the qualifier aliases anywhere, or itself.
+                val targets = aliases.collect { case (a, t) if a == lower(q) => t } :+ q
+                targets.exists(isPolicyTable(_, byName))
+          case None => unqualifiedCovered(name, scopes, byName)
     val noted = java.util.Collections.newSetFromMap(
       new java.util.IdentityHashMap[Column, java.lang.Boolean]()
     )

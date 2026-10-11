@@ -371,3 +371,72 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
     )
     out shouldBe RewriteOutcome.Passthrough
   }
+
+  // ---- the residual check binds an unqualified column per query block, innermost first --------
+  //
+  // `orders` has its own `c_email`, with no policy. DuckDB binds an unqualified name to the
+  // innermost select that has it, and a CTE body cannot see the FROM of the select declaring it,
+  // so each of these reads orders.c_email; they were denied as if they read customer.c_email.
+
+  private val withOrders = Map(
+    "customer" -> List("c_id", "c_name", "c_email", "c_phone"),
+    "orders"   -> List("o_id", "c_id", "c_email", "o_total"),
+    "lineitem" -> List("l_id", "o_id")
+  )
+
+  private def outcome(sql: String): RewriteOutcome =
+    rw.rewrite(sql, withOrders, List(maskEmail), Some("acme_tpch"), Some("tpch1"))
+
+  "the residual check" should "admit a same-named column read in a CTE, derived table, subquery" in
+    List(
+      "WITH o AS (SELECT c_id, c_email FROM orders) " +
+        "SELECT c.c_name FROM customer c JOIN o ON o.c_id = c.c_id",
+      "SELECT c.c_name FROM customer c JOIN " +
+        "(SELECT c_id, max(c_email) m FROM orders GROUP BY c_id) x USING (c_id)",
+      "SELECT c_name FROM customer WHERE c_id IN (SELECT c_id FROM orders WHERE c_email = 'x')",
+      "SELECT c_name FROM customer WHERE EXISTS (SELECT 1 FROM orders WHERE c_email = 'x')",
+      "SELECT c_name, (SELECT max(c_email) FROM orders) FROM customer",
+      "WITH o AS (SELECT [c_email] AS l FROM orders) SELECT c_name FROM customer, o",
+      "SELECT [x.c_email] FROM orders x WHERE EXISTS (SELECT 1 FROM customer x)"
+    ).foreach(sql => withClue(sql)(outcome(sql) shouldBe RewriteOutcome.Passthrough))
+
+  it should "still deny a correlated reference the inner select cannot bind" in {
+    // lineitem has no c_email, so DuckDB binds it to the outer customer.
+    outcome(
+      "SELECT c_name FROM customer WHERE EXISTS (SELECT 1 FROM lineitem WHERE c_email = 'x')"
+    ) shouldBe a[RewriteOutcome.Denied]
+    // An unknown-column table never ends the search: the name may bind further out.
+    notForwardedUnmasked("SELECT [c_email] FROM orders, customer")
+  }
+
+  it should "resolve a qualifier through the innermost select that names it" in
+    // The outer `c` is customer: the inner `orders c` shadows it only inside EXISTS.
+    notForwardedUnmasked("SELECT [c.c_email] FROM customer c WHERE EXISTS (SELECT 1 FROM orders c)")
+
+  // ---- positions the visitor masks rather than deny ---------------------------------------------
+
+  private def masked(sql: String): Unit =
+    outcome(sql) match
+      case RewriteOutcome.Rewritten(out) =>
+        out should include("'***'")
+        out.toLowerCase should not include "c.c_email"
+        out.toLowerCase.replace("o.c_email", "") should not include "c_email"
+      case other => fail(s"expected a masked rewrite, got $other for: $sql")
+
+  "the masking visitor" should "mask IS [NOT] NULL, TRIM, QUALIFY, FILTER and JOIN ON" in {
+    masked("SELECT c_email IS NULL FROM customer")
+    masked("SELECT c_id FROM customer WHERE c_email IS NOT NULL")
+    masked("SELECT count(*) FILTER (WHERE c_email IS NOT NULL) FROM customer")
+    masked("SELECT trim(c_email) FROM customer")
+    masked("SELECT trim(BOTH 'x' FROM c_email) FROM customer")
+    masked("SELECT c_id FROM customer QUALIFY row_number() OVER (PARTITION BY c_email) = 1")
+    masked("SELECT c.c_id FROM customer c JOIN orders o ON c.c_email = o.c_email")
+    masked(
+      "SELECT c.c_id FROM customer c LEFT JOIN orders o ON o.c_id = c.c_id AND c.c_email IS NULL"
+    )
+  }
+
+  it should "keep denying JOIN ... USING on a covered column (it names a column)" in {
+    outcome("SELECT c.c_id FROM customer c JOIN orders o USING (c_email)") shouldBe
+      a[RewriteOutcome.Denied]
+  }
