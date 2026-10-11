@@ -219,7 +219,7 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
     // filterable reference collapses the statement into an opaque tail that no longer mentions
     // it - while the validator, parsing the stripped text, has already admitted the read.
     ai.starlake.sql.ParserInput
-      .render(ai.starlake.acl.parser.SqlParser.stripTimeTravelClauses(sql))
+      .renderWithoutTimeTravel(sql)
       .toOption
       .flatMap { input =>
         Try(

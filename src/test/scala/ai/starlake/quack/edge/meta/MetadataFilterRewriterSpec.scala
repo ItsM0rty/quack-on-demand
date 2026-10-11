@@ -460,6 +460,22 @@ class MetadataFilterRewriterSpec extends AnyFlatSpec with Matchers:
       case other     => fail(s"expected Rewritten or Denied, got $other")
   }
 
+  it should "filter a metadata read behind a time-travel shape in a dollar-quoted string" in {
+    // The shape is not a clause on DuckDB's tokens; stripping it deleted the subquery from what
+    // this filter parsed, so the node read information_schema unfiltered.
+    go(
+      "SELECT $$ at (VERSION => $$ || (SELECT count(*) FROM information_schema.tables) || $$ ) $$",
+      eff(tenantUser, grant("acme_tpch", "tpch1", "customer"))
+    ) should not be Passthrough
+  }
+
+  it should "deny rather than ship a filtered rewrite that would drop a time-travel clause" in {
+    go(
+      "SELECT it.* FROM information_schema.tables it, tpch1.customer AT (VERSION => 1) c",
+      eff(tenantUser, grant("acme_tpch", "tpch1", "customer"))
+    ) should matchPattern { case Denied(_) => }
+  }
+
   it should "deny an unparseable statement that names a filterable table" in {
     // Two arms: text the parser rejects outright, and text it swallows into an opaque
     // statement that serializes to nothing.

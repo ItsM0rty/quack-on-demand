@@ -175,12 +175,11 @@ final class ProtectedWriteGuard(
     * into its statement list, or None on any rendering or parse failure.
     */
   private def parseAsts(sql: String): Option[List[Statement]] =
-    ai.starlake.sql.ParserInput.render(SqlParser.stripTimeTravelClauses(sql)).toOption.flatMap {
-      input =>
-        try
-          val stmts = CCJSqlParserUtil.parseStatements(input.text, configure)
-          Option(stmts.getStatements).map(_.asScala.toList)
-        catch case _: Throwable => None
+    ai.starlake.sql.ParserInput.renderWithoutTimeTravel(sql).toOption.flatMap { input =>
+      try
+        val stmts = CCJSqlParserUtil.parseStatements(input.text, configure)
+        Option(stmts.getStatements).map(_.asScala.toList)
+      catch case _: Throwable => None
     }
 
   private val configure: java.util.function.Consumer[CCJSqlParser] =

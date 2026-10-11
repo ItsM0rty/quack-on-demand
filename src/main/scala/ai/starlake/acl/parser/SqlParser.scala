@@ -46,78 +46,13 @@ import scala.jdk.CollectionConverters.*
 object SqlParser:
 
   /** DuckLake time-travel clauses (`AT (VERSION => n)` / `AT (TIMESTAMP => expr)`) are not in
-    * JSqlParser's grammar (verified on the pinned fork 5.3.218: any statement carrying one is a
-    * ParseException, which the validator denies fail-closed). For ACL purposes a time-travel read
-    * of a table is exactly a read of that table, so the clause is removed before parsing. Public
-    * because the edge metadata filter must strip EXACTLY the same clauses before its own parse: the
-    * two parsing the same text is what keeps the validator from admitting a statement the filter
-    * never got to see. The scan is quote-aware: single-quoted literals and double-quoted
-    * identifiers are copied verbatim; the AT keyword must be a standalone word whose parenthesized
-    * group starts with VERSION or TIMESTAMP followed by =>; parens inside the group are balanced,
-    * and single-quoted literals or double-quoted identifiers inside the group may contain parens
-    * without desyncing the depth counter.
+    * JSqlParser's grammar (any statement carrying one is a ParseException, which the validator
+    * denies fail-closed). For ACL purposes a time-travel read of a table is exactly a read of that
+    * table, so the clause is removed before parsing. The clause is found on DuckDB's own tokens
+    * ([[ParserInput.stripTimeTravel]], the same pass [[extract]] parses through), so a clause shape
+    * inside a string literal or a comment is left alone.
     */
-  def stripTimeTravelClauses(sql: String): String =
-    val out                           = new StringBuilder
-    var i                             = 0
-    val n                             = sql.length
-    def isWordChar(c: Char)           = c.isLetterOrDigit || c == '_'
-    def copyQuoted(quote: Char): Unit =
-      out.append(sql(i)); i += 1
-      var closed = false
-      while i < n && !closed do
-        out.append(sql(i))
-        if sql(i) == quote then
-          if i + 1 < n && sql(i + 1) == quote then
-            out.append(sql(i + 1)); i += 1
-          else closed = true
-        i += 1
-    def timeTravelGroup(openParen: Int): Boolean =
-      // does the group starting at sql(openParen) == '(' begin with VERSION|TIMESTAMP =>
-      var k = openParen + 1
-      while k < n && sql(k).isWhitespace do k += 1
-      var w = k
-      while w < n && isWordChar(sql(w)) do w += 1
-      val kw = sql.substring(k, w).toUpperCase(Locale.ROOT)
-      if kw != "VERSION" && kw != "TIMESTAMP" then false
-      else
-        var a = w
-        while a < n && sql(a).isWhitespace do a += 1
-        a + 1 < n && sql(a) == '=' && sql(a + 1) == '>'
-    def skipGroup(openParen: Int): Int =
-      // index just past the balanced close paren, skipping quoted literals and identifiers
-      var depth                         = 1
-      var p                             = openParen + 1
-      def skipQuoted(quote: Char): Unit =
-        p += 1
-        var closed = false
-        while p < n && !closed do
-          if sql(p) == quote then if p + 1 < n && sql(p + 1) == quote then p += 1 else closed = true
-          if !closed then p += 1
-      while p < n && depth > 0 do
-        sql(p) match
-          case '('              => depth += 1
-          case ')'              => depth -= 1
-          case q @ ('\'' | '"') => skipQuoted(q)
-          case _                => ()
-        p += 1
-      p
-    while i < n do
-      val c = sql(i)
-      if c == '\'' || c == '"' then copyQuoted(c)
-      else if (c == 'a' || c == 'A')
-        && (i == 0 || !isWordChar(sql(i - 1)))
-        && i + 1 < n && (sql(i + 1) == 't' || sql(i + 1) == 'T')
-        && (i + 2 >= n || !isWordChar(sql(i + 2)))
-      then
-        var j = i + 2
-        while j < n && sql(j).isWhitespace do j += 1
-        if j < n && sql(j) == '(' && timeTravelGroup(j) then i = skipGroup(j)
-        else
-          out.append(c); i += 1
-      else
-        out.append(c); i += 1
-    out.toString
+  def stripTimeTravelClauses(sql: String): String = ParserInput.stripTimeTravel(sql)
 
   /** Extract table references from a SQL string that may contain multiple statements.
     *
@@ -159,12 +94,12 @@ object SqlParser:
     StatementResult.ControlFlow(index, truncateSnippet(sql.trim), "BeginTransaction")
 
   /** Parses `sql` as JSqlParser must read it for an access decision: from its lexer-canonical
-    * rendering ([[ParserInput.render]]), never from the raw text, whose escape strings,
-    * dollar-quoted strings and `//` JSqlParser tokenizes differently from DuckDB. A rendering
-    * refusal (input DuckDB rejects outright) is a parse error.
+    * rendering ([[ParserInput.renderWithoutTimeTravel]]), never from the raw text, whose escape
+    * strings, dollar-quoted strings and `//` JSqlParser tokenizes differently from DuckDB. A
+    * rendering refusal (input DuckDB rejects outright) is a parse error.
     */
   private def extractParsed(sql: String, config: Config): ExtractionResult =
-    ParserInput.render(stripTimeTravelClauses(sql)) match
+    ParserInput.renderWithoutTimeTravel(sql) match
       case Left(reason) =>
         ExtractionResult.fromStatements(
           List(StatementResult.ParseError(0, truncateSnippet(sql), reason))

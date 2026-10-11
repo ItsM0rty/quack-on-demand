@@ -79,3 +79,39 @@ class SqlParserTimeTravelSpec extends AnyFlatSpec with Matchers:
       "testdb.public.t" -> Verb.Read
     )
   }
+
+  // The clause is found on DuckDB's own tokens: a time-travel shape inside a string literal or a
+  // comment is not a clause, so stripping it there deleted real SQL up to the next balanced paren.
+
+  "stripTimeTravelClauses" should "leave a clause shape inside a dollar-quoted string alone" in {
+    val sql = "SELECT $$ at (VERSION => $$ || (SELECT v FROM secret) || $$ ) $$"
+    SqlParser.stripTimeTravelClauses(sql) shouldBe sql
+  }
+
+  it should "leave a clause shape inside a comment or an escape string alone" in {
+    val comment = "SELECT 1 -- at (VERSION => (\n , (SELECT v FROM secret), $$))$$"
+    SqlParser.stripTimeTravelClauses(comment) shouldBe comment
+    val escape = "SELECT E'\\' at (VERSION => 1) ' , (SELECT v FROM secret) AS x"
+    SqlParser.stripTimeTravelClauses(escape) shouldBe escape
+  }
+
+  it should "balance the group on parenthesis tokens only" in {
+    SqlParser.stripTimeTravelClauses(
+      "SELECT * FROM t AT (VERSION => $$)$$ /* ) */) UNION SELECT * FROM secret"
+    ) shouldBe "SELECT * FROM t  UNION SELECT * FROM secret"
+    SqlParser.stripTimeTravelClauses(
+      "SELECT * FROM t at/* c */(\nversion=>`a)b`) WHERE x = 1"
+    ) shouldBe "SELECT * FROM t  WHERE x = 1"
+  }
+
+  "extract" should "see a table behind a clause shape in a dollar-quoted string" in {
+    headExtracted(
+      "SELECT $$ at (VERSION => $$ || (SELECT v FROM secret) || $$ ) $$"
+    ) shouldBe Set("testdb.public.secret" -> Verb.Read)
+  }
+
+  it should "see a table behind a clause shape in a comment" in {
+    headExtracted(
+      "SELECT 1 -- at (VERSION => (\n , (SELECT v FROM secret), $$))$$"
+    ) shouldBe Set("testdb.public.secret" -> Verb.Read)
+  }

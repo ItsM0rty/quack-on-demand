@@ -44,16 +44,86 @@ private[starlake] object ParserInput:
     */
   final case class Rendered(text: String, exact: Boolean)
 
-  def render(sql: String): Either[String, Rendered] =
+  /** The parser input for `sql`, time-travel clauses kept (JSqlParser then refuses them). */
+  def render(sql: String): Either[String, Rendered] = renderWith(sql, stripTimeTravel = false)
+
+  /** [[render]] with every DuckLake time-travel clause removed (see [[stripTimeTravel]]): the input
+    * of the ACL parse and of every parse that must read a statement exactly as the ACL does. A
+    * removed clause makes the rendering inexact.
+    */
+  def renderWithoutTimeTravel(sql: String): Either[String, Rendered] =
+    renderWith(sql, stripTimeTravel = true)
+
+  private def renderWith(sql: String, stripTimeTravel: Boolean): Either[String, Rendered] =
     if sql == null then Right(Rendered(sql, exact = true))
     else
       val view = SqlLexer.engineView(sql)
       // Token text is read from the pre-pass output: a unicode space DuckDB converted is a space,
       // one it kept is itself (in a value, as DuckDB reads it; in a word, as part of the word).
       val text = SqlLexer.keptSpacesRestored(view)
-      new Renderer(text, view, SqlLexer.tokens(sql)).run()
+      new Renderer(text, view, SqlLexer.tokens(sql), stripTimeTravel).run()
 
-  private final class Renderer(text: String, view: String, toks: Vector[Token]):
+  /** `sql` with every DuckLake time-travel clause (`AT (VERSION => n)` / `AT (TIMESTAMP => expr)`)
+    * removed and everything else copied verbatim. JSqlParser's grammar has no such clause, and for
+    * an access decision a time-travel read of a table is a read of that table. The clause is found
+    * on DuckDB's own tokens, never on characters: a word `at` (not quoted), then past any trivia a
+    * `(`, the word `version` or `timestamp` and an operator starting with `=>`; the group ends at
+    * the `(` token's balancing `)` token. So a clause shape inside a string literal, a quoted
+    * identifier or a comment is not a clause, and a parenthesis inside one does not count; an
+    * unbalanced group runs to the end of the input (DuckDB rejects it).
+    */
+  def stripTimeTravel(sql: String): String =
+    if sql == null then sql
+    else
+      val view = SqlLexer.engineView(sql)
+      val toks = SqlLexer.tokens(sql)
+      val out  = new StringBuilder
+      var i    = 0
+      while i < toks.length do
+        timeTravelEnd(view, toks, i) match
+          case Some(next) => i = next
+          case None       =>
+            out.append(sql.substring(toks(i).start, toks(i).end))
+            i += 1
+      out.toString
+
+  /** When token `i` opens a time-travel clause, the index of the first token after it. */
+  private def timeTravelEnd(view: String, toks: Vector[Token], i: Int): Option[Int] =
+    def slice(k: Int): String = view.substring(toks(k).start, toks(k).end)
+    def next(from: Int): Int  =
+      var k = from
+      while k < toks.length && toks(k).isTrivia do k += 1
+      k
+    def isWord(k: Int, words: String*): Boolean =
+      k < toks.length && toks(k).kind == Kind.Word && words.exists(slice(k).equalsIgnoreCase)
+    def isPunct(k: Int, p: String): Boolean =
+      k < toks.length && toks(k).kind == Kind.Punct && slice(k) == p
+    if !isWord(i, "at") then None
+    else
+      val open     = next(i + 1)
+      val word     = next(open + 1)
+      val arrow    = next(word + 1)
+      val isClause = isPunct(open, "(") && isWord(word, "version", "timestamp") &&
+        arrow < toks.length && toks(arrow).kind == Kind.Operator && slice(arrow).startsWith("=>")
+      if !isClause then None
+      else
+        var depth = 0
+        var k     = open
+        var end   = toks.length
+        while k < toks.length && end == toks.length do
+          if isPunct(k, "(") then depth += 1
+          else if isPunct(k, ")") then
+            depth -= 1
+            if depth == 0 then end = k + 1
+          k += 1
+        Some(end)
+
+  private final class Renderer(
+      text: String,
+      view: String,
+      toks: Vector[Token],
+      stripTimeTravel: Boolean
+  ):
     private val out                   = new StringBuilder
     private val pending               = new StringBuilder
     private var exact                 = true
@@ -72,8 +142,16 @@ private[starlake] object ParserInput:
           i += 1
         else if isString(t) then i = string(i)
         else
-          emit(token(t), string = false)
-          i += 1
+          val clauseEnd = if stripTimeTravel then timeTravelEnd(view, toks, i) else None
+          clauseEnd match
+            case Some(next) =>
+              // the clause is not the caller's statement: a rewrite printed from here would drop it
+              exact = false
+              pending.append(' ')
+              i = next
+            case None =>
+              emit(token(t), string = false)
+              i += 1
       out.append(pending)
       error match
         case Some(reason) => Left(reason)
