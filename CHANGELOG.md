@@ -16,6 +16,12 @@
   (FlightSQL is unaffected). `VARIANT` columns reach FlightSQL clients as the Arrow
   `arrow.parquet.variant` extension type, a struct of two binary fields to a client that does not
   know it: cast to JSON for those clients.
+  Fixed: native front door catalog sync on multi-node pools. A DuckDB client attaching a pool with
+  more than one read-capable node could get an attached catalog with every schema and no table
+  ("Table with name ... does not exist!"): its schema and table listings, joined on node-local
+  oids, were routed to different nodes. A session's catalog reads now stay on one node. A FlightSQL
+  Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
+  unhealthy, draining, quarantined or at its `maxConcurrent` cap.
 
 - **Native client lease.** The manager-to-node native client heartbeats each node connection
   under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).
@@ -125,6 +131,39 @@
     `METADATA_PARAMETERS`) and drop the secret right after attaching, so no session can reuse it.
     Restart every node to pick it up. Federation sources you wrote yourself keep whatever their
     `setupSql` says: use the same pattern for a Postgres or MySQL source.
+  - The ACL parser (and the protected-write guard, the metadata filter and the CLS / RLS
+    rewriters) reads lexer-canonical SQL: escape strings, dollar-quoted strings, `//` and a word
+    glued to a literal could hide a subquery from the ACL while DuckDB read the table. A rewrite
+    that cannot be shipped as the caller's statement (it holds `//` or a time-travel clause) is
+    refused instead.
+  - Time-travel clauses are found on lexer tokens: a clause shape inside a string literal or a
+    comment no longer deletes real SQL before the ACL parse.
+  - Four-part names also fail closed on `QOD_ACL_DIALECT=generic`.
+  - Lockdown denies `query()` / `query_table()` / `json_execute_serialized_sql()` for every caller,
+    judges replacement-scan literals at every depth (subqueries, JOIN, comma joins, parenthesized
+    table positions), and covers the avro and iceberg readers (`read_avro`, `avro_metadata`,
+    `iceberg_scan` and the other `iceberg_*` path readers), the iceberg table-maintenance
+    functions and `quack_serve` / `quack_stop`.
+  - The ACL gates the table `SUMMARIZE <table>` reads (it was admitted as table-free while
+    returning per-column statistics), the query of `DESCRIBE <query>`, and the table named by a
+    parenthesized statement in table position (`(SUMMARIZE t)`, `(TABLE t)`, `(DESCRIBE t)`,
+    `(SHOW t)`), which used to gate the keyword instead. A string literal in those positions is a
+    file reference. The row-policy rewrite refuses a parenthesized statement reading a policy
+    table, and the protected-write guard denies `SUMMARIZE` of one.
+  - A subquery inside a MAP literal or a `json_object` argument is gated and row-filtered (it was
+    invisible to the ACL walk). The ACL and row-policy walks refuse an AST child of a type they
+    have no rule for instead of skipping it, and the column-policy rewrite denies a statement in
+    which a covered column sits where it cannot be masked (a MAP or list literal, a lambda, `->>`,
+    `TRIM`, a JOIN condition, ...) instead of forwarding it unmasked.
+  - Lockdown judges file literals after `SUMMARIZE`, `DESCRIBE`, `TABLE`, the `PIVOT` / `UNPIVOT`
+    statements and `USING` (`MERGE INTO .. USING`, `DELETE .. USING`), and protects the iceberg
+    `unsafe_enable_version_guessing` setting.
+  - A column- or row-policy rewrite refused for holding `//` says so instead of "could not parse
+    statement".
+
+- **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
+  open transaction's node connection too, so a statement after an idle pause longer than the
+  node lease no longer fails with "Connection heartbeat lease expired".
 
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left

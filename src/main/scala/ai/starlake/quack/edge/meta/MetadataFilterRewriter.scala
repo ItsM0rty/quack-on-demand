@@ -105,7 +105,7 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
             // the ACL validator configures it (SqlParser.extract), so the two see the same
             // statement list: a shape one of them splits and the other does not is a gap
             // between them.
-            Try(parseBatch(sql)).toOption match
+            parseBatch(sql) match
               case None =>
                 // Unparseable. Forwarding it used to rest on the validator denying it upstream,
                 // which held only while the two parsers read the statement identically - the
@@ -114,7 +114,7 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
                 // rather than forwarded on trust. Text naming none still passes, so an ordinary
                 // unsupported statement is unaffected.
                 if textualRefCount(sql) > 0 then Denied(AnalysisRefusal) else Passthrough
-              case Some(stmts) =>
+              case Some((stmts, exact)) =>
                 val parts = stmts.getStatements.asScala.toList.map(processOne(_, grants, ctx))
                 parts.collectFirst { case StmtOutcome.Refused(reason) => reason } match
                   // One refused statement denies the batch: the node executes it whole.
@@ -129,6 +129,10 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
                     // printer. Otherwise re-serialize every statement in order, which is also
                     // what keeps the trailing ones from being dropped.
                     if !changed then Passthrough
+                    // The re-serialization is printed from the parser input, which differs from
+                    // the caller's statement here (ParserInput.Rendered.exact): forwarding it
+                    // would run a different statement.
+                    else if !exact then Denied(InexactRefusal)
                     else
                       Rewritten(
                         parts
@@ -204,25 +208,34 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
   /** Parse the caller's text as a batch, with `allowUnsupportedStatements` on so the statements the
     * grammar does not model (`USE db.schema`, dialect-specific forms) come back as opaque nodes
     * instead of failing the whole parse and blinding the filter. Mirrors `SqlParser.extract`
-    * exactly - same time-travel strip, same feature configuration - because any difference in how
-    * the validator and this filter read a statement is a statement one of them admits and the other
-    * never sees.
+    * exactly - same time-travel strip, same lexer-canonical input, same feature configuration -
+    * because any difference in how the validator and this filter read a statement is a statement
+    * one of them admits and the other never sees. None when the input cannot be rendered or parsed;
+    * otherwise the statements and whether their re-serialization is the caller's statement
+    * (`ParserInput.Rendered.exact`).
     */
-  private def parseBatch(sql: String): net.sf.jsqlparser.statement.Statements =
-    CCJSqlParserUtil.parseStatements(
-      // DuckLake's `AT (VERSION => n)` is not in the grammar, and a clause sitting AFTER a
-      // filterable reference collapses the statement into an opaque tail that no longer mentions
-      // it - while the validator, parsing the stripped text, has already admitted the read.
-      ai.starlake.acl.parser.SqlParser.stripTimeTravelClauses(sql),
-      (parser: net.sf.jsqlparser.parser.CCJSqlParser) => {
-        val featureConfig = new net.sf.jsqlparser.parser.feature.FeatureConfiguration()
-        featureConfig.setValue(
-          net.sf.jsqlparser.parser.feature.Feature.allowUnsupportedStatements,
-          true
-        ): Unit
-        parser.withConfiguration(featureConfig): Unit
+  private def parseBatch(sql: String): Option[(net.sf.jsqlparser.statement.Statements, Boolean)] =
+    // DuckLake's `AT (VERSION => n)` is not in the grammar, and a clause sitting AFTER a
+    // filterable reference collapses the statement into an opaque tail that no longer mentions
+    // it - while the validator, parsing the stripped text, has already admitted the read.
+    ai.starlake.sql.ParserInput
+      .renderWithoutTimeTravel(sql)
+      .toOption
+      .flatMap { input =>
+        Try(
+          CCJSqlParserUtil.parseStatements(
+            input.text,
+            (parser: net.sf.jsqlparser.parser.CCJSqlParser) => {
+              val featureConfig = new net.sf.jsqlparser.parser.feature.FeatureConfiguration()
+              featureConfig.setValue(
+                net.sf.jsqlparser.parser.feature.Feature.allowUnsupportedStatements,
+                true
+              ): Unit
+              parser.withConfiguration(featureConfig): Unit
+            }
+          )
+        ).toOption.map(_ -> input.exact)
       }
-    )
 
   /** Session-catalog Read-covering grants: verb RO/RW/ALL and catalog wildcard-or-equal to the
     * session database.
@@ -405,6 +418,10 @@ object MetadataFilterRewriter:
 
   private[meta] val AnalysisRefusal: String =
     "cannot analyse the system-catalog references in this statement"
+
+  private[meta] val InexactRefusal: String =
+    "a filtered system-catalog query cannot also use integer division (//) or a time-travel " +
+      "clause; split the statement"
 
   private[meta] val FunctionShapeRefusal: String =
     "a duckdb_* catalog function is filtered only as an unqualified call without arguments " +

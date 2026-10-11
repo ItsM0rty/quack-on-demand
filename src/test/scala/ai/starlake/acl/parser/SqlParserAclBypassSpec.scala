@@ -365,3 +365,33 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
       DenyReason.NestedSchemaRef("db.finance.reports.r")
     )
   }
+
+  // QOD_ACL_DIALECT=generic maps names through the ANSI mapper: the guard must hold there too, or
+  // a four-part name qualifies as some three-part ref the grants may cover.
+  private val genericConfig = Config.forGeneric("db", "main")
+
+  private def extractedGeneric(sql: String): StatementResult.Extracted =
+    SqlParser.extract(sql, genericConfig).statements.head match
+      case e: StatementResult.Extracted => e
+      case other => fail(s"expected Extracted, got ${other.getClass.getSimpleName}: $other")
+
+  test("a four-part name is a qualification error on the generic dialect") {
+    val e = extractedGeneric("SELECT * FROM db.finance.reports.r")
+    e.qualificationErrors should contain(DenyReason.NestedSchemaRef("db.finance.reports.r"))
+    e.accesses shouldBe empty
+  }
+
+  test("a four-part DML target is a qualification error on the generic dialect") {
+    val e = extractedGeneric("INSERT INTO db.finance.reports.r SELECT * FROM db.main.t")
+    e.qualificationErrors should contain(DenyReason.NestedSchemaRef("db.finance.reports.r"))
+    e.accesses.map(_.table) should not contain TableRef("finance", "reports", "r")
+  }
+
+  test("three-part and shorter names still qualify on the generic dialect") {
+    extractedGeneric("SELECT * FROM db.main.t JOIN s.u ON true JOIN v ON true").accesses
+      .map(_.table) shouldBe Set(
+      TableRef("db", "main", "t"),
+      TableRef("db", "s", "u"),
+      TableRef("db", "main", "v")
+    )
+  }

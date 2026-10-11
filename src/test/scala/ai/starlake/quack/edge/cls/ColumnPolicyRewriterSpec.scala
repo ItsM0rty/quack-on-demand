@@ -77,6 +77,18 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
   private val maskEmail =
     RoleColumnPolicy("cp-1", "r-1", "*", "tpch1", "customer", "c_email", "mask", Some("'***'"))
 
+  it should "deny a rewrite it cannot print as the caller's statement, saying why" in {
+    // `//` reaches JSqlParser as `/`: a rewrite printed from that would divide differently
+    rw.rewrite(
+      "SELECT c_email, c_id // 2 FROM customer",
+      StatementKind.Select,
+      eff(tenantUser, List(maskEmail)),
+      ctx
+    ).unsafeRunSync() match
+      case Denied(reason) => reason should include("//")
+      case other          => fail(s"expected Denied, got $other")
+  }
+
   // ---- statements that read no physical table (issue #114, second report) -----------------
   //
   // The quack client's ATTACH syncs the remote catalog with `duckdb_tables() UNION ALL

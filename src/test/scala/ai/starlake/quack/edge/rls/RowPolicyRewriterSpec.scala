@@ -51,6 +51,7 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       case Passthrough            => s"$sql  [passthrough]"
       case PassthroughParseFailed => s"$sql  [parse-failed]"
       case Failed(reason)         => s"$sql  [failed: $reason]"
+      case Refused(reason)        => s"$sql  [refused: $reason]"
     info(s"original:  $sql")
     info(s"predicate: ${if preds.isEmpty then "(none)" else preds.mkString("  ;  ")}")
     info(s"result:    $result")
@@ -336,4 +337,73 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       rewritten(go("SELECT #1, #2 FROM customer", eff(tenantUser, List(policy("c_region = 'EU'")))))
     out should include("c_region = 'eu'")
     out should include("#1, #2")
+  }
+
+  // ---- lexer-canonical parser input -------------------------------------------------------
+
+  "a statement whose literals JSqlParser lexes differently from DuckDB" should
+    "still have its policy table filtered" in {
+      // DuckDB reads one escape-string literal, then the subquery; JSqlParser's own lexer read the
+      // subquery as part of a string and left it unfiltered
+      val out = rewritten(
+        go(
+          "SELECT E'\\'' AS a, (SELECT count(*) FROM customer) AS n --'",
+          eff(tenantUser, List(policy("c_region = 'EU'")))
+        )
+      )
+      out should include("c_region = 'eu'")
+    }
+
+  it should "ship a rewrite that keeps each literal's value" in {
+    val out = rewritten(
+      go(
+        "SELECT E'it\\'s' AS a, $$x'y$$ AS b FROM customer",
+        eff(tenantUser, List(policy("c_region = 'EU'")))
+      )
+    )
+    out should include("'it''s' as a")
+    out should include("'x''y' as b")
+  }
+
+  it should "refuse rather than ship a rewrite whose parser input is not the statement" in {
+    // `//` reaches JSqlParser as `/`: a rewrite printed from that would divide differently
+    go(
+      "SELECT c_custkey // 2 FROM customer",
+      eff(tenantUser, List(policy("c_region = 'EU'")))
+    ) match
+      case Refused(reason) => reason should include("//")
+      case other           => fail(s"expected Refused, got $other")
+    go("SELECT 7 // 2", eff(tenantUser, List(policy("c_region = 'EU'")))) shouldBe Passthrough
+  }
+
+  // ---- statements in table position -------------------------------------------------------
+
+  "a parenthesized statement naming a policy table" should "be refused, not passed through" in {
+    // JSqlParser reads `(TABLE customer)` as a table named TABLE aliased customer: no slot to wrap,
+    // while DuckDB returns every row of customer
+    val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
+    go("SELECT * FROM (TABLE customer)", effSet) shouldBe a[Refused]
+    go("SELECT * FROM (SUMMARIZE customer)", effSet) shouldBe a[Refused]
+    go("SELECT * FROM orders JOIN (TABLE \"customer\") c ON true", effSet) shouldBe a[Refused]
+  }
+
+  it should "pass through when the named table carries no policy" in {
+    go(
+      "SELECT * FROM (TABLE orders)",
+      eff(tenantUser, List(policy("c_region = 'EU'")))
+    ) shouldBe Passthrough
+  }
+
+  // ---- expression positions outside JSqlParser's node types --------------------------------
+
+  "a policy table read in a MAP literal or a json_object argument" should "be filtered" in {
+    val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
+    rewritten(go("SELECT map {'a': (SELECT count(*) FROM customer)}", effSet)) should include(
+      "c_region = 'eu'"
+    )
+    rewritten(go("SELECT MAP {(SELECT max(c_id) FROM customer): 1}", effSet)) should include(
+      "c_region = 'eu'"
+    )
+    rewritten(go("SELECT json_object('a', (SELECT count(*) FROM customer))", effSet)) should
+      include("c_region = 'eu'")
   }

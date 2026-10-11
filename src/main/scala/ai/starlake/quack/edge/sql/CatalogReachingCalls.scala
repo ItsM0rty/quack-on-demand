@@ -123,9 +123,11 @@ object CatalogReachingCalls:
       "not available to tenant-scoped principals (deny, fail-closed)"
 
   /** The names refused for every caller under lockdown too; [[LockdownScreen]] reads this so the
-    * lockdown and ACL-validates paths can never drift apart.
+    * lockdown and ACL-validates paths can never drift apart. The run-time-target trio is in it:
+    * with lockdown on and the ACL off, `query(<computed text>)` ran any reader the lockdown denies
+    * by name (a concatenation spells the name), and `query_table('<path>')` read a local file.
     */
-  val LockdownNames: Set[String] = NodeEscaping
+  val LockdownNames: Set[String] = NodeEscaping ++ Fixed
 
   /** Sentinel returned when a statement nests string literals too deeply to screen
     * ([[FunctionCalls.MaxDepth]]); not a real function name, so it never collides with one.

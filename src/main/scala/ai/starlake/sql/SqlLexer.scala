@@ -84,7 +84,10 @@ private[starlake] object SqlLexer:
   /** Index just past the block comment opening at `from` (slash, star), tracking nesting depth. An
     * unterminated comment consumes the rest of the input (DuckDB rejects it).
     */
-  def blockCommentEnd(sql: String, from: Int): Int =
+  def blockCommentEnd(sql: String, from: Int): Int = blockCommentScan(sql, from)._1
+
+  /** [[blockCommentEnd]] and whether the outermost comment was closed. */
+  private def blockCommentScan(sql: String, from: Int): (Int, Boolean) =
     var i     = from + 2
     var depth = 1
     while i < sql.length && depth > 0 do
@@ -95,7 +98,23 @@ private[starlake] object SqlLexer:
         depth -= 1
         i += 2
       else i += 1
-    i
+    (i, depth == 0)
+
+  /** Whether `t`, a token of [[tokens]] over `sql`, is a quote or a block comment that runs to the
+    * end of the input without its closing delimiter. DuckDB rejects such an input outright; a
+    * reader that must not guess at the rest of it refuses it too. A dollar-quoted string is never
+    * unterminated here (an opener with no closing tag is a lone `$`).
+    */
+  def unterminated(sql: String, t: Token): Boolean =
+    t.end == sql.length && (t.kind match
+      case Kind.BlockComment => !blockCommentScan(sql, t.start)._2
+      case Kind.Literal      =>
+        val c = sql.charAt(t.start)
+        if c == '\'' then !stringScan(sql, t.start + 1, escape = false)._2
+        else if c == '"' || c == '`' then !quotedIdentScan(sql, t.start)._2
+        else if c == '$' then false
+        else !stringScan(sql, t.start + 2, escape = c == 'e' || c == 'E')._2
+      case _ => false)
 
   /** Index OF the terminator of the line comment opening at `from` (`--`), or `sql.length`. DuckDB
     * ends one at a line feed or a carriage return and at nothing else.
@@ -161,6 +180,10 @@ private[starlake] object SqlLexer:
     * escape string a backslash also escapes the character after it. Unterminated: end of input.
     */
   private def stringEnd(s: String, from: Int, escape: Boolean): Int =
+    stringScan(s, from, escape)._1
+
+  /** [[stringEnd]] and whether the closing quote was found. */
+  private def stringScan(s: String, from: Int, escape: Boolean): (Int, Boolean) =
     var i      = from
     var closed = false
     while i < s.length && !closed do
@@ -172,12 +195,15 @@ private[starlake] object SqlLexer:
           closed = true
           i += 1
       else i += 1
-    i
+    (i, closed)
 
   /** Index just past the delimiter closing the `"` or backtick identifier opening at `from`, the
     * delimiter doubling. Unterminated: end of input.
     */
-  private def quotedIdentEnd(s: String, from: Int): Int =
+  private def quotedIdentEnd(s: String, from: Int): Int = quotedIdentScan(s, from)._1
+
+  /** [[quotedIdentEnd]] and whether the closing delimiter was found. */
+  private def quotedIdentScan(s: String, from: Int): (Int, Boolean) =
     val d      = s.charAt(from)
     var i      = from + 1
     var closed = false
@@ -188,7 +214,7 @@ private[starlake] object SqlLexer:
           closed = true
           i += 1
       else i += 1
-    i
+    (i, closed)
 
   /** Index just past the closing tag of the dollar-quoted string opening at the token-initial `$`
     * at `from`, or None: `$` followed by a digit is a parameter, a tag broken by a non-tag

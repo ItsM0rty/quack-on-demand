@@ -46,6 +46,9 @@ object LockdownScreen:
   // one list both screens read, refused to non-superusers whatever the lockdown flag and to every
   // caller under lockdown.
   private val ProtectedSettings = Set(
+    // iceberg: lets iceberg_scan guess a table's metadata version by listing its directory, which
+    // reads what sits beside the table rather than the version its catalog pins.
+    "unsafe_enable_version_guessing",
     // Local files read or written by path.
     "home_directory",
     "file_search_path",
@@ -71,6 +74,10 @@ object LockdownScreen:
   // (pointers, not a path); which_secret (matches a path against secrets, opens no file);
   // ducklake_add_data_files (path is the THIRD argument, in NoPathFunctions below); the write-side
   // enable_logging / enable_profiling (NoPathFunctions). read_single_*_file are new in 2.0.
+  // Derived with every extension a node installs LOADED, not just the ones a fresh CLI has: avro
+  // and iceberg autoload on a node (autoinstall off, autoload on), and their readers open a
+  // caller-named path like any core reader. LockdownTableFunctionsSpec pins the derivation: a table
+  // function with a string first argument that no list here judges fails it.
   private val FileReadFunctions = Set(
     "read_text",
     "read_blob",
@@ -98,7 +105,16 @@ object LockdownScreen:
     "read_ndjson_objects",
     "read_duckdb",
     "read_postgres_binary",
-    "ducklake_scan"
+    "ducklake_scan",
+    "read_avro",
+    "avro_metadata",
+    "iceberg_scan",
+    "iceberg_metadata",
+    "iceberg_snapshots",
+    "iceberg_column_stats",
+    "iceberg_partition_stats",
+    "iceberg_scan_plan",
+    "iceberg_load_table_response"
   )
 
   // Functions that run raw SQL elsewhere, open a connection to a caller-chosen target, or read the
@@ -111,11 +127,69 @@ object LockdownScreen:
   // enable_profiling (save_location) write a file; ducklake_add_data_files registers a local Parquet
   // file named in its third argument; sql_auto_complete lists a local directory's contents from a
   // `FROM '<dir>/` prefix, the same capability as the denied glob. (postgres_configure_pool is in
-  // NodeEscapingFunctions, refused for tenant principals under the ACL too.)
-  private val NoPathFunctions =
-    Set("enable_logging", "enable_profiling", "ducklake_add_data_files", "sql_auto_complete")
+  // NodeEscapingFunctions, refused for tenant principals under the ACL too.) The iceberg table
+  // maintenance functions name an attached Iceberg table by a string and mostly rewrite it
+  // (rollback, rewrite, property changes, conversion to DuckLake); quack_serve / quack_stop start
+  // or stop a quack server on the node itself.
+  private val NoPathFunctions = Set(
+    "enable_logging",
+    "enable_profiling",
+    "ducklake_add_data_files",
+    "sql_auto_complete",
+    "iceberg_rewrite_data_files",
+    "iceberg_rollback_to_snapshot",
+    "iceberg_table_properties",
+    "iceberg_schema_properties",
+    "set_iceberg_table_properties",
+    "set_iceberg_schema_properties",
+    "remove_iceberg_table_properties",
+    "remove_iceberg_schema_properties",
+    "iceberg_to_ducklake",
+    "quack_serve",
+    "quack_stop"
+  )
 
   private val DeniedFunctions = FileReadFunctions ++ NodeEscapingFunctions ++ NoPathFunctions
+
+  // Table functions with a string-like first argument that lockdown ADMITS, each judged: none opens
+  // a caller-named file or connection or runs caller SQL. Parse or tokenize text only
+  // (check_peg_parser, sql_tokenize, json_each, json_tree); name a catalog object, not a file, the
+  // ACL gating catalog access (checkpoint, force_checkpoint, the pragma_* table introspection
+  // functions; the ducklake_* catalog functions are admitted by family below, except ducklake_scan
+  // and ducklake_add_data_files, denied above; duckdb_table_sample is denied through
+  // CatalogReachingCalls.LockdownNames); act on the client side of an attached quack catalog
+  // (quack_cancel, quack_identify: this screen opens no file or connection for them, but
+  // NodeSettingScreen.NodeWideCalls refuses both, with force_checkpoint, to non-superusers and to
+  // every caller under lockdown); read the front door's own client stream
+  // (scan_data_from_quack_client); match a path against secrets without opening it (which_secret);
+  // take an arbitrary value (repeat, unnest, test_vector_types).
+  private val AdmittedTableFunctions = Set(
+    "check_peg_parser",
+    "sql_tokenize",
+    "json_each",
+    "json_tree",
+    "checkpoint",
+    "force_checkpoint",
+    "pragma_metadata_info",
+    "pragma_show",
+    "pragma_storage_info",
+    "pragma_table_info",
+    "quack_cancel",
+    "quack_identify",
+    "scan_data_from_quack_client",
+    "which_secret",
+    "repeat",
+    "unnest",
+    "test_vector_types"
+  )
+
+  /** Whether this screen has judged the table function `name`: denied (wholesale or over a local
+    * path) or admitted on purpose. LockdownTableFunctionsSpec requires it of every table function
+    * with a string-like first argument.
+    */
+  private[sql] def judged(name: String): Boolean =
+    DeniedFunctions.contains(name) || AdmittedTableFunctions.contains(name) ||
+      name.startsWith("ducklake_")
 
   // Only the file-read functions may exempt on a remote URL literal, and glob never does. Every
   // other denied function takes no path (or a DSN, not a path), so a remote literal must not admit
@@ -130,18 +204,48 @@ object LockdownScreen:
   private val ExtensionRepositoryDdl =
     "^(?:create(?:\\s+or\\s+replace)?|drop)\\s+extension\\s+repository\\b".r
 
-  // A single-quoted literal immediately following the FROM keyword (replacement-scan position). The
-  // negative lookbehind keeps `from` a standalone keyword, not the tail of an identifier. `\s*`
-  // (not `\s+`) so `FROM'/etc/x.parquet'` with no space still matches.
-  private val FromLiteral = "(?<![a-zA-Z0-9_])from\\s*'([^']*)'".r
+  // Functions whose argument syntax uses the FROM keyword itself (`EXTRACT(year FROM d)`,
+  // `TRIM(BOTH FROM s)`, `SUBSTRING(s FROM 2)`, `OVERLAY(s PLACING x FROM 1)`): a literal after
+  // that FROM is the function's operand, not a table.
+  private val FromSyntaxFunctions = Set("extract", "trim", "substring", "overlay")
 
-  // DuckDB's replacement scan also accepts escape-string (e'...') and dollar-quoted
-  // ($$...$$ / $tag$...$tag$) literals in FROM position. Both are screened FAIL-CLOSED (denied
-  // unless provably remote): they have no legitimate non-path use there, and e-string escapes
-  // can encode a path (e'\x2fetc\x2fpasswd') that no path-shape heuristic would spot. `\s+`
-  // on the e-form keeps an identifier ending in `e` from misreading as FROM + e-string.
-  private val FromEscapeLiteral = "(?<![a-zA-Z0-9_])from\\s+e'((?:\\\\.|[^'\\\\])*)'".r
-  private val FromDollarLiteral = "(?<![a-zA-Z0-9_])from\\s*\\$([a-z0-9_]*)\\$(.*?)\\$\\1\\$".r
+  // Words after which DuckDB 2.0 reads a table name, beside FROM and JOIN, each verified on the CLI
+  // to replacement-scan a literal there: SUMMARIZE / DESCRIBE / DESC / SHOW (`SHOW TABLE '<p>'`),
+  // TABLE (`TABLE '<p>'`, `DESCRIBE TABLE`, `INSERT INTO t TABLE`, `CREATE TABLE .. AS TABLE`), the
+  // PIVOT statements, and USING (`MERGE INTO t USING '<p>'`, `DELETE FROM t USING '<p>'`). A
+  // `JOIN .. USING (` column list is a parenthesis frame, whose names are words, not literals.
+  private val TableKeywords = Set(
+    "summarize",
+    "describe",
+    "desc",
+    "show",
+    "table",
+    "pivot",
+    "pivot_wider",
+    "pivot_longer",
+    "unpivot",
+    "using"
+  )
+
+  // Words that end a FROM clause's table list at their depth: a comma after one no longer separates
+  // tables. JOIN ... ON / USING do not end it (`FROM a JOIN b USING (id), c` is a comma join).
+  private val FromListEnd = Set(
+    "where",
+    "group",
+    "having",
+    "qualify",
+    "window",
+    "order",
+    "limit",
+    "offset",
+    "union",
+    "intersect",
+    "except",
+    "returning",
+    "select",
+    "values",
+    "set"
+  )
 
   // The PATH-position literal of a COPY statement: the token right after FROM or TO. Option literals
   // in the trailing `( ... )` (e.g. DELIMITER '|') are never in from/to position, so they are
@@ -202,12 +306,10 @@ object LockdownScreen:
     //      DuckDB treats a comment as a SEPARATOR, not a weld -- confirmed against a real DuckDB
     //      1.5.4, `SELECT * FROM/*x*/'/etc/passwd.parquet'` and `read_csv/*x*/('/etc/x.parquet')`
     //      both execute and return the target file's rows -- and a closed block comment is
-    //      replaced by a single ASCII space rather than nothing. For the two regexes that use
-    //      `\s*` (`FromLiteral`, `CopyPathLiteral`) the space is
-    //      not what makes them match, since they already match `from'...'`: what matters there is
-    //      that the comment is GONE. The space is load-bearing for `FromEscapeLiteral`, which uses
-    //      `\s+`; `SELECT * FROM/*x*/e'/tmp/x.csv'` executes on DuckDB and is admitted without the
-    //      space, denied with it, and `LockdownScreenSpec` carries that witness.
+    //      replaced by a single ASCII space rather than nothing. For `CopyPathLiteral`, which uses
+    //      `\s*`, the space is not what makes it match: what matters is that the comment is GONE.
+    //      (Replacement scans in FROM position are read from the lexer's tokens instead, see
+    //      `replacementScans`, where a comment is trivia like any space.)
     //   3. `SqlTrivia.normalize` collapses every remaining trivia character (unicode space /
     //      format, see `SqlTrivia.isTriviaSpace`) to an ASCII space across the whole statement,
     //      matching what DuckDB's own parser front end does before tokenizing. It runs LAST
@@ -249,12 +351,12 @@ object LockdownScreen:
         val copyHit =
           if first.contains("copy") then copyLocalPath(lower, deniedBuckets) else None
         // Settings statements still get the function scan: a denied function inside a
-        // SET value must not slip through. The bare-path FROM check catches replacement scans
+        // SET value must not slip through. The replacement-scan check catches literals
         // (SELECT * FROM '/etc/passwd.parquet') that carry no read-function call.
         settingHit
           .orElse(copyHit)
           .orElse(deniedFunctionIn(stmt, deniedBuckets))
-          .orElse(barePathFrom(lower, deniedBuckets))
+          .orElse(replacementScans(stmt, deniedBuckets))
           .orElse(quotedPathFrom(stmt, deniedBuckets))
 
   /** Splits the input on top-level semicolons: a semicolon inside any of DuckDB's quoting forms
@@ -491,23 +593,106 @@ object LockdownScreen:
       }
       .nextOption()
 
-  /** Denies a bare filesystem path in FROM position (DuckDB replacement scan). Anchored to a
-    * literal that immediately follows the FROM keyword AT STATEMENT LEVEL (paren depth 0), so
-    * ordinary string literals in WHERE / VALUES, and a `from '<literal>'` inside a function call
-    * (e.g. `trim(leading '/' from '/a/b.csv')`), stay admitted. A remote object-store literal is
-    * exempt unless it addresses a denied DuckLake bucket.
+  /** Denies a string literal DuckDB may replacement-scan as a file: a literal in a TABLE position,
+    * at any parenthesis depth, read from the lexer's tokens. A table position is right after a FROM
+    * or JOIN keyword or one of [[TableKeywords]] (SUMMARIZE, DESCRIBE, TABLE, PIVOT, USING, ...),
+    * after a comma of a FROM or USING table list, or right after a `(` that itself sits in a table
+    * position (`FROM ('/a/t.csv')` and `FROM (('/a/t.csv'))` read the file on 2.0). A FROM inside
+    * the argument list of [[FromSyntaxFunctions]] (`trim(leading '/' from '/a/b.csv')`) is that
+    * function's syntax and opens no table position; a subquery inside such a call (`trim((FROM
+    * '/a/t.csv'))`) does. Every quoting form counts: a plain literal is judged by the path-shape
+    * heuristic, any other (escape, dollar-quoted, prefixed) is denied unless provably remote, since
+    * its escapes can encode a path no heuristic spots. A literal DuckDB folds into the previous one
+    * across a newline is judged alone and folded. A remote object-store literal is exempt unless it
+    * addresses a denied DuckLake bucket.
     */
-  private def barePathFrom(lower: String, deniedBuckets: Set[String]): Option[String] =
-    // (inner text, strict): strict literal forms deny whenever they are not provably remote,
-    // the plain single-quote form keeps the looksLikePath heuristic so ordinary non-path
-    // literals stay admitted.
-    val plain  = FromLiteral.findAllMatchIn(lower).map(m => (m.start, m.group(1), false))
-    val esc    = FromEscapeLiteral.findAllMatchIn(lower).map(m => (m.start, m.group(1), true))
-    val dollar = FromDollarLiteral.findAllMatchIn(lower).map(m => (m.start, m.group(2), true))
-    (plain ++ esc ++ dollar)
-      .filter { case (start, _, _) => parenDepthBefore(lower, start) == 0 }
-      .flatMap { case (_, inner, strict) => fromPathVerdict(inner, strict, deniedBuckets) }
-      .nextOption()
+  private def replacementScans(stmt: String, deniedBuckets: Set[String]): Option[String] =
+    val view                                    = SqlLexer.engineView(stmt)
+    val toks                                    = SqlLexer.tokens(view)
+    def text(t: SqlLexer.Token): String         = view.substring(t.start, t.end)
+    def word(t: SqlLexer.Token): Option[String] =
+      if t.kind == SqlLexer.Kind.Word then Some(text(t).toLowerCase(Locale.ROOT)) else None
+    def isString(t: SqlLexer.Token): Boolean =
+      t.kind == SqlLexer.Kind.Literal && view.charAt(t.start) != '"' &&
+        view.charAt(t.start) != '`'
+    // one frame per open parenthesis (the bottom one is the statement level)
+    final class Frame(val fromSyntax: Boolean, val tablePos: Boolean):
+      var inFrom: Boolean = false
+    val frames                       = scala.collection.mutable.Stack(new Frame(false, false))
+    var prev: Option[SqlLexer.Token] = None
+    var verdict: Option[String]      = None
+    def tablePosition(p: SqlLexer.Token): Boolean =
+      word(p).contains("join") || word(p).exists(TableKeywords) ||
+        (word(p).contains("from") && !frames.top.fromSyntax) ||
+        (isPunct(view, p, ',') && frames.top.inFrom) ||
+        (isPunct(view, p, '(') && frames.top.tablePos)
+    var i = 0
+    while i < toks.length && verdict.isEmpty do
+      val t = toks(i)
+      if t.isTrivia then i += 1
+      else
+        if isPunct(view, t, '(') then
+          val fromSyntax = prev.flatMap(word).exists(FromSyntaxFunctions)
+          val tablePos   = prev.exists(tablePosition)
+          frames.push(new Frame(fromSyntax, tablePos))
+        else if isPunct(view, t, ')') then { if frames.size > 1 then frames.pop(): Unit }
+        else
+          word(t) match
+            case Some("from") if !frames.top.fromSyntax => frames.top.inFrom = true
+            case Some("join") | Some("using")           => frames.top.inFrom = true
+            case Some(w) if FromListEnd(w)              => frames.top.inFrom = false
+            case _                                      => ()
+        if isString(t) && prev.exists(tablePosition) then
+          val (parts, next) = continued(view, toks, i)
+          val names         = if parts.size > 1 then parts :+ parts.mkString else parts
+          val strict        = view.charAt(t.start) != '\''
+          verdict = names.iterator
+            .flatMap(n => fromPathVerdict(n.toLowerCase(Locale.ROOT), strict, deniedBuckets))
+            .nextOption()
+          prev = Some(toks(next - 1))
+          i = next
+        else
+          prev = Some(t)
+          i += 1
+    verdict
+
+  /** The body of the string literal at token `i` and of every plain literal DuckDB folds into it (a
+    * newline and no block comment in between), with the index after the last one. A plain body has
+    * its doubled quotes undone; any other form keeps its raw body (it is judged strictly).
+    */
+  private def continued(
+      view: String,
+      toks: Vector[SqlLexer.Token],
+      i: Int
+  ): (List[String], Int) =
+    def body(t: SqlLexer.Token): String =
+      val s = view.substring(t.start, t.end)
+      if s.startsWith("'") then s.stripPrefix("'").stripSuffix("'").replace("''", "'")
+      else if s.startsWith("$") then
+        val tag = s.substring(0, s.indexOf('$', 1) + 1)
+        s.substring(tag.length, math.max(tag.length, s.length - tag.length))
+      else s.drop(2).stripSuffix("'")
+    val parts = ListBuffer(body(toks(i)))
+    var next  = i + 1
+    var more  = view.charAt(toks(i).start) != '$'
+    while more do
+      var k       = next
+      var newline = false
+      var block   = false
+      while k < toks.length && toks(k).isTrivia do
+        if toks(k).kind == SqlLexer.Kind.BlockComment then block = true
+        else if toks(k).kind == SqlLexer.Kind.Space then
+          newline = newline || view
+            .substring(toks(k).start, toks(k).end)
+            .exists(c => c == '\n' || c == '\r')
+        k += 1
+      if k < toks.length && newline && !block && toks(k).kind == SqlLexer.Kind.Literal &&
+        view.charAt(toks(k).start) == '\''
+      then
+        parts += body(toks(k))
+        next = k + 1
+      else more = false
+    (parts.toList, next)
 
   /** The verdict on a name DuckDB may replacement-scan as a file: a denied bucket, else admitted
     * when remote, else denied when `strict` or when it looks like a local path.
@@ -534,11 +719,11 @@ object LockdownScreen:
     * the file too (each verified on the 2.0 CLI). So EVERY quoted identifier is judged, read from
     * the lexer's tokens at any depth, a qualified name (any of whose parts is quoted) joined with
     * dots: an identifier shaped like a local file path is not a shape ordinary SQL takes, unlike
-    * the `trim(leading '/' from '/a')` literal that keeps [[barePathFrom]] at statement level. The
-    * name gets the plain literal's verdict (remote exemption, denied buckets, the path-shape
-    * heuristic), so `"orders"`, `"main"."orders"` and a remote name stay admitted. Identifiers
-    * inside a string literal body are not judged: a literal holding a JSON document with a path
-    * value is ordinary SQL.
+    * the `trim(leading '/' from '/a')` literal that [[replacementScans]] must tell apart. The name
+    * gets the plain literal's verdict (remote exemption, denied buckets, the path-shape heuristic),
+    * so `"orders"`, `"main"."orders"` and a remote name stay admitted. Identifiers inside a string
+    * literal body are not judged: a literal holding a JSON document with a path value is ordinary
+    * SQL.
     */
   private def quotedPathFrom(stmt: String, deniedBuckets: Set[String]): Option[String] =
     val view  = SqlLexer.engineView(stmt)
@@ -564,27 +749,6 @@ object LockdownScreen:
       if quoted then names += parts.mkString(".")
       i = math.max(j, i + 1)
     names.iterator.flatMap(fromPathVerdict(_, strict = false, deniedBuckets)).nextOption()
-
-  /** Net open-paren depth in `lower[0, index)`, ignoring parens inside single-quoted strings. Used
-    * to prove a FROM keyword sits at statement level, not inside a function-call argument list.
-    */
-  private def parenDepthBefore(lower: String, index: Int): Int =
-    var depth    = 0
-    var inString = false
-    var i        = 0
-    while i < index do
-      val c = lower(i)
-      if inString then
-        (if c == '\'' then inString = false
-      )
-      else
-        c match
-          case '\'' => inString = true
-          case '('  => depth += 1
-          case ')'  => if depth > 0 then depth -= 1
-          case _    => ()
-      i += 1
-    depth
 
   /** True when the (quoted) literal looks like a local filesystem path: it starts with an absolute
     * or relative path prefix or a drive letter, or it contains a path separator AND carries a data

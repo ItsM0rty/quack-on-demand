@@ -151,8 +151,9 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_serializeConnectionR
   try {
     auto token = jstring_to_std(env, token_j);
     // v3 handshake: the client id groups the manager's connections server-side; the lease is
-    // renewed by every request and, once it lapses, the server interrupts the running statement,
-    // so the Scala side sends HEARTBEAT_REQUESTs at a third of it.
+    // renewed by every request and checked only when the next message for the connection arrives
+    // (a lapsed lease fails that message; it does not interrupt a running statement by itself),
+    // so the Scala side sends HEARTBEAT_REQUESTs at a third of it to keep the connection usable.
     duckdb::ConnectionRequestMessage msg(token, "quack-on-demand",
                                          static_cast<duckdb::idx_t>(heartbeat_timeout_j));
     duckdb::MemoryStream stream;

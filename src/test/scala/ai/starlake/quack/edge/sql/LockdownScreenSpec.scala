@@ -27,6 +27,9 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("RESET enable_external_access") shouldBe true
     denied("PRAGMA temp_directory = '/tmp/x'") shouldBe true
     denied("SET allowed_directories = ['/']") shouldBe true
+    // iceberg: lets a scan guess the metadata version by listing the table's directory
+    denied("SET unsafe_enable_version_guessing = true") shouldBe true
+    denied("RESET unsafe_enable_version_guessing") shouldBe true
     denied("SET schema = 'tpch1'") shouldBe false
     denied("PRAGMA table_info('t')") shouldBe false
   }
@@ -906,4 +909,125 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT * FROM 'd/t.xlsx'") shouldBe true
     denied("SELECT * FROM 'd/t.csv?v=1'") shouldBe true
     denied("SELECT * FROM 'a/b'") shouldBe false
+  }
+
+  // ---- run-time-SQL table functions (2026-10-11 ruling: these gaps ship fixed with 2.0) ------
+
+  "query / query_table / json_execute_serialized_sql" should "be denied under lockdown" in {
+    // A computed argument runs SQL no lexical screen sees: a concatenation spells a denied reader.
+    denied("SELECT * FROM query('SELECT * FROM read' || '_text(''/etc/hosts'')')") shouldBe true
+    denied("SELECT * FROM query('SELECT 1')") shouldBe true
+    denied("SELECT * FROM query_table('/abs/t.csv')") shouldBe true
+    denied("SELECT * FROM query_table(['orders'])") shouldBe true
+    denied("SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))") shouldBe
+      true
+  }
+
+  "duckdb_table_sample" should "be denied under lockdown (it reads the table its string names)" in {
+    denied("SELECT * FROM duckdb_table_sample('memory.main.t')") shouldBe true
+    LockdownScreen.judged("duckdb_table_sample") shouldBe true
+  }
+
+  // ---- replacement scans below the top level --------------------------------------------------
+
+  "replacement scans" should "be judged at every depth and after a join or a comma" in {
+    denied("SELECT * FROM (FROM '/data/s.parquet')") shouldBe true
+    denied("SELECT * FROM (SELECT * FROM '/data/s.parquet') x") shouldBe true
+    denied("SELECT * FROM t JOIN '/data/s.csv' x ON true") shouldBe true
+    denied("SELECT * FROM t LEFT JOIN (FROM '/data/s.csv') x ON true") shouldBe true
+    denied("FROM range(1), '/data/s.parquet'") shouldBe true
+    denied("SELECT * FROM t JOIN u USING (id), '/data/s.parquet'") shouldBe true
+    denied("WITH c AS (SELECT * FROM '/data/s.csv') SELECT * FROM c") shouldBe true
+    denied("SELECT * FROM t WHERE x IN (SELECT a FROM e'/data/s.csv')") shouldBe true
+    denied("SELECT * FROM t WHERE x IN (SELECT a FROM $$/data/s.csv$$)") shouldBe true
+    denied("SELECT ARRAY(SELECT a FROM '/data/s.csv')") shouldBe true
+    denied("SELECT * FROM trim((FROM '/data/s.csv'))") shouldBe true
+    // DuckDB folds a newline-separated literal into the first: judged as the folded name
+    denied("SELECT * FROM 'x'\n'/../data/s.csv'") shouldBe true
+    denied("SELECT * FROM t, /* c */ '/data/s.csv'") shouldBe true
+  }
+
+  it should "admit literals that are not in a table position" in {
+    denied("SELECT * FROM (FROM 's3://b/x.parquet')") shouldBe false
+    denied("SELECT extract(year FROM '2020-01-01'::DATE)") shouldBe false
+    denied("SELECT substring('/a/b.csv' FROM 2)") shouldBe false
+    denied("SELECT trim(both FROM '/a/b.csv'), overlay('/a.csv' PLACING 'x' FROM 1)") shouldBe false
+    denied("SELECT 'a', '/a/b.csv' FROM t") shouldBe false
+    denied("SELECT * FROM t WHERE c IN ('/a/b.csv', '/c/d.csv')") shouldBe false
+    denied("SELECT * FROM t WHERE c = '/a/b.csv' ORDER BY 1") shouldBe false
+    denied("INSERT INTO t VALUES ('/a/b.csv'), ('/c/d.csv')") shouldBe false
+    denied("SELECT * FROM t x, u y WHERE x.p = '/a/b.csv'") shouldBe false
+  }
+
+  // ---- extension readers autoloadable on a node ------------------------------------------------
+
+  "avro and iceberg readers" should "be denied over local paths and admitted on remote ones" in {
+    denied("SELECT * FROM read_avro('/data/x.avro')") shouldBe true
+    denied("SELECT * FROM avro_metadata('/data/x.avro')") shouldBe true
+    denied("SELECT * FROM iceberg_scan('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_metadata('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_snapshots('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_column_stats('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_load_table_response('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM read_avro('s3://b/x.avro')") shouldBe false
+    denied("SELECT * FROM iceberg_scan('s3://b/warehouse/t')") shouldBe false
+  }
+
+  "iceberg table maintenance and quack server control" should "be denied" in {
+    denied("SELECT * FROM iceberg_rollback_to_snapshot('cat.s.t', 1)") shouldBe true
+    denied("CALL set_iceberg_table_properties('cat.s.t', {'k': 'v'})") shouldBe true
+    denied("CALL iceberg_to_ducklake('ice', 'lake')") shouldBe true
+    denied("CALL quack_serve('quack:localhost:9999')") shouldBe true
+    denied("CALL quack_stop('quack:localhost:21900')") shouldBe true
+  }
+
+  // ---- table positions outside FROM / JOIN / comma ---------------------------------------------
+  //
+  // Each statement below read a scratch CSV on the DuckDB 2.0 CLI through the literal.
+
+  "replacement scans" should "be judged in every table position DuckDB 2.0 accepts" in {
+    denied("SUMMARIZE '/data/s.csv'") shouldBe true
+    denied("DESCRIBE '/data/s.csv'") shouldBe true
+    denied("DESCRIBE TABLE '/data/s.csv'") shouldBe true
+    denied("DESC '/data/s.csv'") shouldBe true
+    denied("SHOW TABLE '/data/s.csv'") shouldBe true
+    denied("TABLE '/data/s.csv'") shouldBe true
+    denied("PIVOT '/data/s.csv' ON a USING sum(b)") shouldBe true
+    denied("SELECT * FROM (PIVOT '/data/s.csv' ON a USING sum(b))") shouldBe true
+    denied("PIVOT_WIDER '/data/s.csv' ON a USING sum(b)") shouldBe true
+    denied("PIVOT_LONGER '/data/s.csv' ON a INTO NAME k VALUE v") shouldBe true
+    denied("UNPIVOT '/data/s.csv' ON a INTO NAME k VALUE v") shouldBe true
+    denied(
+      "MERGE INTO t USING '/data/s.csv' AS s ON t.a = s.a " +
+        "WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)"
+    ) shouldBe true
+    denied(
+      "MERGE INTO t USING ('/data/s.csv') AS s ON t.a = s.a " +
+        "WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)"
+    ) shouldBe true
+    denied("DELETE FROM t USING '/data/s.csv' s WHERE t.a = s.a") shouldBe true
+    denied("DELETE FROM t USING u, '/data/s.csv' s WHERE t.a = s.a") shouldBe true
+    denied("INSERT INTO t TABLE '/data/s.csv'") shouldBe true
+    denied("CREATE TABLE t2 AS TABLE '/data/s.csv'") shouldBe true
+    denied("SELECT * FROM (TABLE '/data/s.csv')") shouldBe true
+    denied("SELECT * FROM (SUMMARIZE '/data/s.csv')") shouldBe true
+    denied("WITH c AS (TABLE '/data/s.csv') SELECT * FROM c") shouldBe true
+    denied("EXPLAIN TABLE '/data/s.csv'") shouldBe true
+    denied("SUMMARIZE e'/data/s.csv'") shouldBe true
+  }
+
+  it should "keep admitting those statements over tables and remote literals" in {
+    denied("SUMMARIZE t") shouldBe false
+    denied("DESCRIBE t") shouldBe false
+    denied("TABLE t") shouldBe false
+    denied("PIVOT t ON a USING sum(b)") shouldBe false
+    denied("SELECT * FROM t PIVOT (sum(b) FOR a IN ('/a/b.csv', 'x'))") shouldBe false
+    denied("MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET p = '/a/b.csv'") shouldBe
+      false
+    denied("DELETE FROM t USING u WHERE t.p = '/a/b.csv'") shouldBe false
+    denied("SELECT * FROM t JOIN u USING (id) WHERE p = '/a/b.csv'") shouldBe false
+    denied("SUMMARIZE 's3://b/x.parquet'") shouldBe false
+    denied("MERGE INTO t USING 's3://b/x.csv' s ON t.a = s.a WHEN MATCHED THEN DELETE") shouldBe
+      false
+    denied("SELECT * FROM t ORDER BY a DESC, 2") shouldBe false
   }

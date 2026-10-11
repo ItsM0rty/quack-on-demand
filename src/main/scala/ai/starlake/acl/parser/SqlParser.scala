@@ -2,6 +2,7 @@ package ai.starlake.acl.parser
 
 import java.util.Locale
 import ai.starlake.acl.model.Config
+import ai.starlake.sql.ParserInput
 import net.sf.jsqlparser.JSQLParserException
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.parser.feature.{Feature, FeatureConfiguration}
@@ -45,78 +46,13 @@ import scala.jdk.CollectionConverters.*
 object SqlParser:
 
   /** DuckLake time-travel clauses (`AT (VERSION => n)` / `AT (TIMESTAMP => expr)`) are not in
-    * JSqlParser's grammar (verified on the pinned fork 5.3.218: any statement carrying one is a
-    * ParseException, which the validator denies fail-closed). For ACL purposes a time-travel read
-    * of a table is exactly a read of that table, so the clause is removed before parsing. Public
-    * because the edge metadata filter must strip EXACTLY the same clauses before its own parse: the
-    * two parsing the same text is what keeps the validator from admitting a statement the filter
-    * never got to see. The scan is quote-aware: single-quoted literals and double-quoted
-    * identifiers are copied verbatim; the AT keyword must be a standalone word whose parenthesized
-    * group starts with VERSION or TIMESTAMP followed by =>; parens inside the group are balanced,
-    * and single-quoted literals or double-quoted identifiers inside the group may contain parens
-    * without desyncing the depth counter.
+    * JSqlParser's grammar (any statement carrying one is a ParseException, which the validator
+    * denies fail-closed). For ACL purposes a time-travel read of a table is exactly a read of that
+    * table, so the clause is removed before parsing. The clause is found on DuckDB's own tokens
+    * ([[ParserInput.stripTimeTravel]], the same pass [[extract]] parses through), so a clause shape
+    * inside a string literal or a comment is left alone.
     */
-  def stripTimeTravelClauses(sql: String): String =
-    val out                           = new StringBuilder
-    var i                             = 0
-    val n                             = sql.length
-    def isWordChar(c: Char)           = c.isLetterOrDigit || c == '_'
-    def copyQuoted(quote: Char): Unit =
-      out.append(sql(i)); i += 1
-      var closed = false
-      while i < n && !closed do
-        out.append(sql(i))
-        if sql(i) == quote then
-          if i + 1 < n && sql(i + 1) == quote then
-            out.append(sql(i + 1)); i += 1
-          else closed = true
-        i += 1
-    def timeTravelGroup(openParen: Int): Boolean =
-      // does the group starting at sql(openParen) == '(' begin with VERSION|TIMESTAMP =>
-      var k = openParen + 1
-      while k < n && sql(k).isWhitespace do k += 1
-      var w = k
-      while w < n && isWordChar(sql(w)) do w += 1
-      val kw = sql.substring(k, w).toUpperCase(Locale.ROOT)
-      if kw != "VERSION" && kw != "TIMESTAMP" then false
-      else
-        var a = w
-        while a < n && sql(a).isWhitespace do a += 1
-        a + 1 < n && sql(a) == '=' && sql(a + 1) == '>'
-    def skipGroup(openParen: Int): Int =
-      // index just past the balanced close paren, skipping quoted literals and identifiers
-      var depth                         = 1
-      var p                             = openParen + 1
-      def skipQuoted(quote: Char): Unit =
-        p += 1
-        var closed = false
-        while p < n && !closed do
-          if sql(p) == quote then if p + 1 < n && sql(p + 1) == quote then p += 1 else closed = true
-          if !closed then p += 1
-      while p < n && depth > 0 do
-        sql(p) match
-          case '('              => depth += 1
-          case ')'              => depth -= 1
-          case q @ ('\'' | '"') => skipQuoted(q)
-          case _                => ()
-        p += 1
-      p
-    while i < n do
-      val c = sql(i)
-      if c == '\'' || c == '"' then copyQuoted(c)
-      else if (c == 'a' || c == 'A')
-        && (i == 0 || !isWordChar(sql(i - 1)))
-        && i + 1 < n && (sql(i + 1) == 't' || sql(i + 1) == 'T')
-        && (i + 2 >= n || !isWordChar(sql(i + 2)))
-      then
-        var j = i + 2
-        while j < n && sql(j).isWhitespace do j += 1
-        if j < n && sql(j) == '(' && timeTravelGroup(j) then i = skipGroup(j)
-        else
-          out.append(c); i += 1
-      else
-        out.append(c); i += 1
-    out.toString
+  def stripTimeTravelClauses(sql: String): String = ParserInput.stripTimeTravel(sql)
 
   /** Extract table references from a SQL string that may contain multiple statements.
     *
@@ -157,33 +93,44 @@ object SqlParser:
   private def clientBeginTransaction(index: Int, sql: String): StatementResult =
     StatementResult.ControlFlow(index, truncateSnippet(sql.trim), "BeginTransaction")
 
+  /** Parses `sql` as JSqlParser must read it for an access decision: from its lexer-canonical
+    * rendering ([[ParserInput.renderWithoutTimeTravel]]), never from the raw text, whose escape
+    * strings, dollar-quoted strings and `//` JSqlParser tokenizes differently from DuckDB. A
+    * rendering refusal (input DuckDB rejects outright) is a parse error.
+    */
   private def extractParsed(sql: String, config: Config): ExtractionResult =
-    try
-      val stmts: Statements = CCJSqlParserUtil.parseStatements(
-        stripTimeTravelClauses(sql),
-        (parser: net.sf.jsqlparser.parser.CCJSqlParser) => {
-          val featureConfig = new FeatureConfiguration()
-          featureConfig.setValue(Feature.allowUnsupportedStatements, true): Unit
-          parser.withConfiguration(featureConfig): Unit
-        }
-      )
-
-      val statements =
-        try stmts.asScala.toList
-        catch case _: NullPointerException => Nil
-      val results = statements.zipWithIndex.map { case (stmt, idx) =>
-        processStatement(stmt, idx, config)
-      }
-
-      ExtractionResult.fromStatements(results)
-    catch
-      case e: JSQLParserException =>
-        // Entire input is unparseable
-        val snippet = truncateSnippet(sql)
-        val message = Option(e.getMessage).getOrElse("Unknown parse error")
+    ParserInput.renderWithoutTimeTravel(sql) match
+      case Left(reason) =>
         ExtractionResult.fromStatements(
-          List(StatementResult.ParseError(0, snippet, message))
+          List(StatementResult.ParseError(0, truncateSnippet(sql), reason))
         )
+      case Right(input) =>
+        try
+          val stmts: Statements = CCJSqlParserUtil.parseStatements(
+            input.text,
+            (parser: net.sf.jsqlparser.parser.CCJSqlParser) => {
+              val featureConfig = new FeatureConfiguration()
+              featureConfig.setValue(Feature.allowUnsupportedStatements, true): Unit
+              parser.withConfiguration(featureConfig): Unit
+            }
+          )
+
+          val statements =
+            try stmts.asScala.toList
+            catch case _: NullPointerException => Nil
+          val results = statements.zipWithIndex.map { case (stmt, idx) =>
+            analysed(stmt, idx, config)
+          }
+
+          ExtractionResult.fromStatements(results)
+        catch
+          case e: JSQLParserException =>
+            // Entire input is unparseable
+            val snippet = truncateSnippet(sql)
+            val message = Option(e.getMessage).getOrElse("Unknown parse error")
+            ExtractionResult.fromStatements(
+              List(StatementResult.ParseError(0, snippet, message))
+            )
 
   /** Extract table references from a single SQL statement.
     *
@@ -200,12 +147,29 @@ object SqlParser:
   def extractSingle(sql: String, config: Config): StatementResult =
     try
       if isClientBeginTransaction(sql) then clientBeginTransaction(0, sql)
-      else processStatement(CCJSqlParserUtil.parse(sql), 0, config)
+      else
+        ParserInput.render(sql) match
+          case Left(reason) => StatementResult.ParseError(0, truncateSnippet(sql), reason)
+          case Right(input) => analysed(CCJSqlParserUtil.parse(input.text), 0, config)
     catch
       case e: JSQLParserException =>
         val snippet = truncateSnippet(sql)
         val message = Option(e.getMessage).getOrElse("Unknown parse error")
         StatementResult.ParseError(0, snippet, message)
+
+  /** [[processStatement]], with a failure of the analysis itself (a walk meeting a shape it cannot
+    * follow) turned into a parse error, which the validators deny, rather than an exception that
+    * escapes the gate.
+    */
+  private def analysed(stmt: Statement, index: Int, config: Config): StatementResult =
+    try processStatement(stmt, index, config)
+    catch
+      case scala.util.control.NonFatal(e) =>
+        StatementResult.ParseError(
+          index,
+          truncateSnippet(String.valueOf(stmt)),
+          s"statement could not be analysed (${e.getClass.getSimpleName}); denied (fail-closed)"
+        )
 
   /** Shared tail of every write/DDL arm: qualify the read sources and the single target table,
     * grant `targetVerb` on the target plus Read on every source, and carry the qualification errors
@@ -231,6 +195,48 @@ object SqlParser:
     */
   private def selectReads(select: Option[Select]): TableExtraction =
     select.map(TableExtractor.extract).getOrElse(TableExtraction(Nil, Nil))
+
+  /** An inner statement's result re-attributed to the statement that carries it (EXPLAIN,
+    * SUMMARIZE, DESCRIBE of a query): same accesses, the outer index and snippet.
+    */
+  private def asOuter(inner: StatementResult, index: Int, snippet: String): StatementResult =
+    inner match
+      case StatementResult.Extracted(_, _, accesses, errs, unsup) =>
+        StatementResult.Extracted(index, snippet, accesses, errs, unsup)
+      case StatementResult.ParseError(_, _, msg) =>
+        StatementResult.ParseError(index, snippet, msg)
+      case StatementResult.ControlFlow(_, _, t) =>
+        StatementResult.ControlFlow(index, snippet, s"EXPLAIN $t")
+
+  /** `SELECT * FROM <table>`: the read a statement naming a bare table performs on it. */
+  private def selectAllFrom(table: Table): Select =
+    val select = new net.sf.jsqlparser.statement.select.PlainSelect()
+    select.addSelectItem(new net.sf.jsqlparser.statement.select.AllColumns())
+    select.setFromItem(table)
+    select
+
+  /** Read on the one table a DESCRIBE / SHOW names, which reveals its shape. A string literal there
+    * is a file the node reads (a replacement scan), so it is a file reference with no table to
+    * grant on, as in FROM.
+    */
+  private def namedTableRead(
+      table: Table,
+      index: Int,
+      snippet: String,
+      config: Config
+  ): StatementResult =
+    if DuckDBDialectMapper.isFileReference(table) then
+      StatementResult.Extracted(
+        index,
+        snippet,
+        Set.empty,
+        Nil,
+        List(s"file reference ${table.getName}")
+      )
+    else
+      val (qTgt, errs) = TableQualifier.qualify(List(table), config)
+      StatementResult
+        .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
 
   // SHOW <keyword> forms that jsqlparser also parses as ShowStatement but that name
   // no table: they stay ControlFlow (v1 defers filtering them; see the spec).
@@ -354,17 +360,18 @@ object SqlParser:
       // `EXPLAIN ANALYZE <dml>` EXECUTES the inner statement. Classify by the
       // inner statement so an EXPLAIN ANALYZE DELETE is authorized as the DELETE
       // it really runs, not admitted as a table-free control-flow verb.
+      //
+      // SUMMARIZE parses to the same node. `SUMMARIZE <query>` carries the query as the inner
+      // statement; `SUMMARIZE <table>` carries no inner statement but the table, and returns its
+      // per-column min / max / quantiles: a read of every value, gated exactly like a
+      // `SELECT * FROM <table>` (a string literal there is a file the node reads, and a bare
+      // system-view name the view, both handled by the same FROM-item walk).
       case ex: ExplainStatement =>
-        Option(ex.getStatement) match
-          case Some(inner) =>
-            processStatement(inner, index, config) match
-              case StatementResult.Extracted(_, _, accesses, errs, unsup) =>
-                StatementResult.Extracted(index, snippet, accesses, errs, unsup)
-              case StatementResult.ParseError(_, _, msg) =>
-                StatementResult.ParseError(index, snippet, msg)
-              case StatementResult.ControlFlow(_, _, t) =>
-                StatementResult.ControlFlow(index, snippet, s"EXPLAIN $t")
-          case None =>
+        (Option(ex.getStatement), Option(ex.getTable)) match
+          case (Some(inner), _) => asOuter(processStatement(inner, index, config), index, snippet)
+          case (None, Some(table)) =>
+            asOuter(processStatement(selectAllFrom(table), index, config), index, snippet)
+          case (None, None) =>
             // Bare EXPLAIN with no inner statement carries no table refs.
             StatementResult.ControlFlow(index, snippet, "ExplainStatement")
 
@@ -377,10 +384,12 @@ object SqlParser:
       // SELECT. Plain SHOW TABLES stays ControlFlow and is replaced or denied by the
       // edge metadata filter downstream; SHOW ALL TABLES never parses (denied
       // fail-closed).
+      // `DESCRIBE <query>` (also `DESCRIBE FROM t`) carries the query instead of a table: its
+      // reads are the query's. A string literal in table position is a file the node reads.
       case d: DescribeStatement =>
-        val (qTgt, errs) = TableQualifier.qualify(List(d.getTable), config)
-        StatementResult
-          .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
+        Option(d.getSelect) match
+          case Some(select) => asOuter(processStatement(select, index, config), index, snippet)
+          case None         => namedTableRead(d.getTable, index, snippet, config)
       case sc: ShowColumnsStatement =>
         // Only the unqualified form reaches here; `SHOW COLUMNS FROM x.y` is not in
         // the grammar and already fails closed on the parse-error arm.
@@ -389,9 +398,10 @@ object SqlParser:
           .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
       case sh: ShowStatement
           if !ShowKeywordForms.contains(sh.getName.trim.toUpperCase(Locale.ROOT)) =>
-        val (qTgt, errs) = TableQualifier.qualify(List(new Table(sh.getName)), config)
-        StatementResult
-          .Extracted(index, snippet, qTgt.map(t => TableAccess(t, Verb.Read)), errs)
+        TableExtractor.asFromTable(sh.getName) match
+          case Some(t) => namedTableRead(t, index, snippet, config)
+          case None    =>
+            StatementResult.ParseError(index, snippet, s"unreadable SHOW target ${sh.getName}")
 
       // Explicit allowlist of statement types that provably carry no grantable
       // table reference. Admitted unconditionally as ControlFlow. Anything NOT

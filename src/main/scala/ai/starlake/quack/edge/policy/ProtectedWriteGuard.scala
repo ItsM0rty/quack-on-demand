@@ -171,12 +171,16 @@ final class ProtectedWriteGuard(
       case v: CreateView  => Option(v.getSelect)
       case _              => None
 
-  /** Re-parse the whole (stripped) input into its statement list, or None on any parse failure. */
+  /** Re-parse the whole (stripped, lexer-canonical: the input `SqlParser.extract` parses) input
+    * into its statement list, or None on any rendering or parse failure.
+    */
   private def parseAsts(sql: String): Option[List[Statement]] =
-    try
-      val stmts = CCJSqlParserUtil.parseStatements(SqlParser.stripTimeTravelClauses(sql), configure)
-      Option(stmts.getStatements).map(_.asScala.toList)
-    catch case _: Throwable => None
+    ai.starlake.sql.ParserInput.renderWithoutTimeTravel(sql).toOption.flatMap { input =>
+      try
+        val stmts = CCJSqlParserUtil.parseStatements(input.text, configure)
+        Option(stmts.getStatements).map(_.asScala.toList)
+      catch case _: Throwable => None
+    }
 
   private val configure: java.util.function.Consumer[CCJSqlParser] =
     (parser: CCJSqlParser) =>

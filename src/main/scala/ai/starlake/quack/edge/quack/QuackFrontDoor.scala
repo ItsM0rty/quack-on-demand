@@ -93,10 +93,16 @@ final class QuackFrontDoor(
       case Type.CancelRequest | Type.Acknowledgement =>
         forwardToCurrent(s, f, encodeSuccess())
       case Type.HeartbeatRequest =>
-        // Keep the node's own lease fresh while the client pauses; failures do not matter here.
-        s.current.get() match
-          case Some(st) => st.link.forward(f).attempt.as(encodeSuccess())
-          case None     => IO.pure(encodeSuccess())
+        // Keep the node's own lease fresh while the client pauses, on every node connection the
+        // session holds: the running statement's and an open transaction's (once a statement in
+        // the transaction drains, only `txLink` holds the node connection, and the node checks its
+        // lease when the next statement arrives). Each link once, by identity. Failures do not
+        // matter here.
+        val links = (s.current.get().map(_.link).toList ++ s.txLink.get().map(_._2).toList)
+          .foldLeft(List.empty[QuackNodeLink])((acc, l) =>
+            if acc.exists(_ eq l) then acc else acc :+ l
+          )
+        links.traverse_(_.forward(f).attempt.void).as(encodeSuccess())
       case Type.Disconnect =>
         s.mutex.lock.surround(finishCurrent(s, commit = false) *> releaseTx(s)) *>
           IO(unbind(s)).as(encodeSuccess())
@@ -209,6 +215,14 @@ final class QuackFrontDoor(
       reopenTx: Boolean = false
   ): IO[Array[Byte]] =
     val cq = f.header.clientQueryId
+    // Catalog reads stay on one node per session: the client joins its schema and table listings
+    // on node-local oids (see QuackSession.catalogNode). The pin holds over the node's
+    // maxConcurrent cap, and a transient retry onto another node re-pins the session there (the
+    // node recorded below is the one that actually served), so a retried first listing still
+    // pairs. Residual: when the pinned node turns unroutable, or fails transiently on the SECOND
+    // listing, between the two listings, that listing runs elsewhere and the client's catalog
+    // comes up without tables until its next refresh (a new ATTACH, or the refresh after a DDL).
+    val catalogRead = QuackFrontDoor.readsCatalog(prep.sql)
     router
       .executeWith[PrepareOutcome](
         s.connectionId,
@@ -218,6 +232,8 @@ final class QuackFrontDoor(
         Some(s.bound.effectiveSet),
         relaySend(s, cq, prep, reopenTx),
         source = "quack",
+        preferredNode = if catalogRead then s.catalogNode.get() else None,
+        softPinOverCapacity = catalogRead,
         // The one edge that relays SEND_DATA on the statement's own node connection, so the
         // one edge where a 2.0 client's scan_data_from_quack_client can ever be fed.
         clientDataScans = true
@@ -225,6 +241,7 @@ final class QuackFrontDoor(
       .flatMap {
         case Left(fail)    => IO.pure(encodeError(fail.reason))
         case Right(routed) =>
+          if catalogRead then s.catalogNode.set(Some(routed.nodeId))
           // A failed recovery keeps the fence: the client is still inside its dead transaction.
           if reopenTx then s.txAborted.set(false)
           afterPrepare(s, cq, prep.sql, routed)
@@ -603,6 +620,37 @@ object QuackFrontDoor:
   def clientVersionMessage(hello: QuackWire.ConnectionRequest): String =
     s"quack-on-demand requires a DuckDB 2.0 client (Quack protocol $ProtocolVersion); this " +
       s"client (${hello.clientDuckdbVersion}) speaks ${hello.minVersion}..${hello.maxVersion}"
+
+  /** True when `sql` names one of DuckDB's catalog table functions (`duckdb_schemas()`,
+    * `duckdb_tables()`, ...), whose `oid` columns are allocated per DuckDB process and therefore
+    * differ from node to node. The DuckDB client's ATTACH-time (and post-DDL) catalog sync is two
+    * such statements joined on those oids; routed to two different nodes they match nothing and the
+    * attached catalog shows every schema but no table.
+    *
+    * Read from the shared [[ai.starlake.sql.SqlLexer]] tokens, so string literals and comments
+    * never count, while a quoted name (`"duckdb_tables"()`), a qualified one
+    * (`main.duckdb_tables()`), a comment before the parenthesis and the parenless table form DuckDB
+    * also resolves to the function (`FROM duckdb_tables`) all do: any `duckdb_*` word or quoted
+    * identifier that is the last segment of a name. A false positive (a column so named) costs only
+    * node affinity.
+    */
+  def readsCatalog(sql: String): Boolean =
+    if sql == null || sql.isEmpty then false
+    else
+      val view = ai.starlake.sql.SqlLexer.engineView(sql)
+      val toks = ai.starlake.sql.SqlLexer.tokens(view).filterNot(_.isTrivia)
+      def name(t: ai.starlake.sql.SqlLexer.Token): Option[String] =
+        val text = view.substring(t.start, t.end)
+        t.kind match
+          case ai.starlake.sql.SqlLexer.Kind.Word                             => Some(text)
+          case ai.starlake.sql.SqlLexer.Kind.Literal if text.startsWith("\"") =>
+            Some(text.drop(1).stripSuffix("\"").replace("\"\"", "\""))
+          case _ => None
+      // The lexer reads a lone `.` as a Number token, so test the character, not the kind.
+      def qualifies(i: Int): Boolean = toks.lift(i + 1).exists(n => view.charAt(n.start) == '.')
+      toks.indices.exists { i =>
+        name(toks(i)).exists(_.toLowerCase(Locale.ROOT).startsWith("duckdb_")) && !qualifies(i)
+      }
 
   /** Answer to every statement a client sends inside a transaction an admin kill tore down. */
   val TxKilledMessage: String =

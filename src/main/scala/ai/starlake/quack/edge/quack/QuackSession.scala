@@ -51,6 +51,15 @@ final class QuackSession(
     */
   val txAborted: AtomicBoolean = new AtomicBoolean(false)
 
+  /** The node that served this session's last catalog read (a statement calling a `duckdb_*()`
+    * catalog function, see [[QuackFrontDoor.readsCatalog]]). The client builds its view of the
+    * attached catalog from two separate statements, a schema listing and a table listing, and joins
+    * them on `oid` / `schema_oid`. Those ids are allocated per DuckDB process, so the two listings
+    * are only coherent when they come from the same node; the next catalog read is soft-pinned here
+    * for that reason.
+    */
+  val catalogNode: AtomicReference[Option[String]] = new AtomicReference(None)
+
   @volatile private var leaseDeadline: Option[Instant] =
     if heartbeatSec > 0 then Some(Instant.now().plusSeconds(heartbeatSec)) else None
 
