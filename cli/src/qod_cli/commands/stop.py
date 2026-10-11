@@ -272,6 +272,14 @@ def _stop_manager_and_nodes():
         pids = {_listening_pid(mgr_port), _listening_pid(edge_port), *_pgrep(spawn_re)}
         return {int(p) for p in pids if p}
 
+    # Unmarked nodes (a manager older than the marker) are left alone, as stop-jar.sh does; say so.
+    unmarked = [p for p in _pgrep(r"spawn-quack-node\.sh [0-9]+$") if p]
+    if unmarked:
+        typer.echo(
+            f"note: leaving {len(unmarked)} unmarked spawn-quack-node.sh process(es) alone "
+            "(an older manager's; scripts/kill-quack-nodes.sh --unmarked stops them)."
+        )
+
     pids = discover()
     if not pids:
         typer.echo(

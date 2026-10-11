@@ -40,6 +40,7 @@ def _fake_duckdb(path: pathlib.Path) -> pathlib.Path:
 
 
 def _spawn(tmp_path, name, node_port, marker, duckdb):
+    """Start the real spawn script; `marker=None` starts an unmarked node (an older manager's)."""
     from qod_cli.fleet_join import write_secrets_dir
     secrets = write_secrets_dir(tmp_path / f"secrets-{name}", {"QOD_NODE_TOKEN": "tok-scope"})
     tmpdir = tmp_path / "tmpdir"
@@ -49,7 +50,8 @@ def _spawn(tmp_path, name, node_port, marker, duckdb):
            "QOD_SECRETS_DIR_EPHEMERAL": "1"}
     start = tmp_path / f"start-{name}"
     start.mkdir()
-    return subprocess.Popen(["bash", str(SPAWN), str(node_port), marker], cwd=start, env=env,
+    argv = ["bash", str(SPAWN), str(node_port)] + ([marker] if marker else [])
+    return subprocess.Popen(argv, cwd=start, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -58,6 +60,11 @@ def _wait_for(pred, timeout=20.0):
     while not pred() and time.monotonic() < deadline:
         time.sleep(0.1)
     return pred()
+
+
+def _stop_patterns(seen):
+    # Every pattern `qod stop` uses to find what to STOP; the unmarked one only counts for a note.
+    return [p for p in seen if not p.endswith("[0-9]+$")]
 
 
 def _pgrep(pattern):
@@ -119,7 +126,8 @@ def test_qod_stop_matches_only_its_managers_nodes(monkeypatch):
     monkeypatch.setattr(stop_cmd, "_pgrep", lambda pattern: seen.append(pattern) or [])
     monkeypatch.setenv("QOD_ON_DEMAND_PORT", "29993")
     stop_cmd._stop_manager_and_nodes()
-    assert seen and all("29993-" in p for p in seen), seen
+    stops = _stop_patterns(seen)
+    assert stops and all("29993-" in p for p in stops), seen
 
 
 def test_qod_stop_uses_the_port_qod_setup_saved(monkeypatch):
@@ -135,8 +143,9 @@ def test_qod_stop_uses_the_port_qod_setup_saved(monkeypatch):
     monkeypatch.setattr(stop_cmd, "_pgrep", lambda pattern: seen.append(pattern) or [])
     stop_cmd._stop_manager_and_nodes()
     assert set(listened) == {29995, 31495}
-    assert seen and all("29995-" in p for p in seen), seen
-    assert not any("20900" in p for p in seen)
+    stops = _stop_patterns(seen)
+    assert stops and all("29995-" in p for p in stops), seen
+    assert not any("20900" in p for p in stops)
 
 
 def test_qod_stop_prefers_the_environment_over_the_saved_port(monkeypatch):
@@ -147,4 +156,50 @@ def test_qod_stop_prefers_the_environment_over_the_saved_port(monkeypatch):
     monkeypatch.setattr(stop_cmd, "_listening_pid", lambda port: None)
     monkeypatch.setattr(stop_cmd, "_pgrep", lambda pattern: seen.append(pattern) or [])
     stop_cmd._stop_manager_and_nodes()
-    assert seen and all("29996-" in p for p in seen), seen
+    stops = _stop_patterns(seen)
+    assert stops and all("29996-" in p for p in stops), seen
+
+
+def test_kill_quack_nodes_unmarked_stops_only_unmarked_nodes(tmp_path):
+    duckdb = _fake_duckdb(tmp_path / "bin" / "duckdb")
+    marked = _spawn(tmp_path, "marked", 23471, MARK_A, duckdb)
+    unmarked = _spawn(tmp_path, "unmarked", 23472, None, duckdb)
+    try:
+        assert _wait_for(lambda: _pgrep(rf"duckdb -init .*quack-node\.{MARK_A}\.")
+                         and _pgrep(r"duckdb -init .*quack-node\.[A-Za-z0-9]{6}/init"))
+        # --unmarked matches every unmarked node on the host: run it only when the only one is ours.
+        others = _pgrep(r"spawn-quack-node\.sh [0-9]+$") - {unmarked.pid}
+        if others:
+            pytest.skip(f"other unmarked spawn-quack-node processes on this host: {sorted(others)}")
+        res = subprocess.run(["bash", str(KILL), "--unmarked"], capture_output=True, text=True,
+                             env={"PATH": os.environ["PATH"], "FORCE_AFTER": "5"}, timeout=60)
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert unmarked.wait(timeout=20) is not None
+        assert marked.poll() is None, "a marked node was stopped by --unmarked"
+        assert not _pgrep(r"duckdb -init .*quack-node\.[A-Za-z0-9]{6}/init")
+    finally:
+        for p in (marked, unmarked):
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=20)
+
+
+def test_kill_quack_nodes_refuses_conflicting_modes():
+    # Exits on argument parsing, before any process lookup.
+    res = subprocess.run(["bash", str(KILL), "--port", "1", "--unmarked"], capture_output=True,
+                         text=True, timeout=30)
+    assert res.returncode == 2 and "mutually exclusive" in res.stderr
+
+
+def test_qod_stop_reports_unmarked_nodes_and_leaves_them(monkeypatch, capsys):
+    from qod_cli.commands import stop as stop_cmd
+    killed = []
+    monkeypatch.setattr(stop_cmd, "load_start_env", lambda: {})
+    monkeypatch.setenv("QOD_ON_DEMAND_PORT", "29997")
+    monkeypatch.setattr(stop_cmd, "_listening_pid", lambda port: None)
+    monkeypatch.setattr(stop_cmd, "_pgrep",
+                        lambda pattern: ["4242"] if pattern.endswith("[0-9]+$") else [])
+    monkeypatch.setattr(stop_cmd, "_kill_all", lambda pids, sig: killed.append(set(pids)))
+    stop_cmd._stop_manager_and_nodes()
+    assert "leaving 1 unmarked" in capsys.readouterr().out
+    assert all(4242 not in k for k in killed)

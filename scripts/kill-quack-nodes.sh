@@ -6,9 +6,11 @@
 #
 # By default it only touches the nodes of the manager on QOD_ON_DEMAND_PORT (default 20900): each
 # node's wrapper argv and node directory carry that manager's marker `<rest-port>-<boot id>`, so the
-# nodes of another manager on this host (an isolated test stack) are left alone. `--all` sweeps every
-# node on the host, whichever manager started it, including unmarked nodes from a manager older
-# than the marker; it is the old blunt reset and must be asked for explicitly.
+# nodes of another manager on this host (an isolated test stack) are left alone. `--unmarked` stops
+# only nodes with no marker: those of a manager older than the marker, which stop-jar.sh and
+# `qod stop` leave alone (it would also catch a `qod fleet join` node on this host, which carries no
+# marker either). `--all` sweeps every node on the host, whichever manager started it; it is the
+# old blunt reset and must be asked for explicitly.
 #
 # SIGTERM first so the script's `trap` tears down the duckdb child cleanly; SIGKILL after
 # FORCE_AFTER seconds for anything still alive.
@@ -20,19 +22,31 @@
 # Usage:
 #   ./scripts/kill-quack-nodes.sh                 # this manager's nodes (QOD_ON_DEMAND_PORT)
 #   ./scripts/kill-quack-nodes.sh --port 20960    # the nodes of the manager on REST port 20960
+#   ./scripts/kill-quack-nodes.sh --unmarked      # only nodes with no manager marker
 #   ./scripts/kill-quack-nodes.sh --all           # every node on the host, every manager
 
 set -euo pipefail
 
 FORCE_AFTER="${FORCE_AFTER:-5}"
 MGR_PORT="${QOD_ON_DEMAND_PORT:-20900}"
-ALL=0
+MODE=port
+MODE_SET=""
+
+set_mode() {
+  if [[ -n "$MODE_SET" && "$MODE_SET" != "$1" ]]; then
+    echo "--port, --unmarked and --all are mutually exclusive" >&2
+    exit 2
+  fi
+  MODE_SET="$1"
+  MODE="$1"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --all) ALL=1; shift ;;
-    --port) MGR_PORT="${2:?--port needs a REST port}"; shift 2 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    --all) set_mode all; shift ;;
+    --unmarked) set_mode unmarked; shift ;;
+    --port) set_mode port; MGR_PORT="${2:?--port needs a REST port}"; shift 2 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -41,12 +55,19 @@ if [[ ! "$MGR_PORT" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-if [[ "$ALL" == "1" ]]; then
+if [[ "$MODE" == all ]]; then
   # Match the literal script name so we don't grab unrelated `quack-node` matches (e.g. log lines
   # piped through `tee`).
   SPAWN_RE='spawn-quack-node\.sh'
   DUCK_RE='duckdb .*-init .*quack-node\.'
   scope="every manager"
+elif [[ "$MODE" == unmarked ]]; then
+  # No marker: the wrapper argv ends at the node port, and the node directory is
+  # `quack-node.XXXXXX` (mktemp's six characters) with no `<port>-<id>.` in front. A node of a
+  # manager older than this branch has no -init at all; it dies with its wrapper.
+  SPAWN_RE='spawn-quack-node\.sh [0-9]+$'
+  DUCK_RE='duckdb .*-init .*quack-node\.[A-Za-z0-9]{6}/init'
+  scope="unmarked nodes"
 else
   SPAWN_RE="spawn-quack-node\\.sh [0-9]+ ${MGR_PORT}-[0-9a-f]+"
   DUCK_RE="duckdb .*-init .*quack-node\\.${MGR_PORT}-[0-9a-f]+\\."

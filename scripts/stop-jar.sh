@@ -7,7 +7,7 @@
 # manager's marker `<rest-port>-<boot id>` (LocalQuackBackend.managerMarker).
 # Nodes of another manager on this host (a different REST port) are never
 # touched, and nor are unmarked nodes from a manager older than the marker
-# (`kill-quack-nodes.sh --all` sweeps those). Sends SIGTERM
+# (`kill-quack-nodes.sh --unmarked` stops those). Sends SIGTERM
 # first for graceful shutdown; escalates to SIGKILL after FORCE_AFTER
 # seconds if anything is still listening.
 #
@@ -40,7 +40,7 @@ spawn_pids=$(pgrep -f "$SPAWN_RE" 2>/dev/null || true)
 unmarked=$(pgrep -f 'spawn-quack-node\.sh [0-9]+$' 2>/dev/null | wc -l | tr -d ' ')
 if [[ "$unmarked" != "0" ]]; then
   echo "note: leaving $unmarked unmarked spawn-quack-node.sh process(es) alone (an older manager's;" \
-    "kill-quack-nodes.sh --all sweeps them)."
+    "kill-quack-nodes.sh --unmarked stops them)."
 fi
 
 if [[ -z "$mgr_pid" && -z "$edge_pid" && -z "$spawn_pids" ]]; then
