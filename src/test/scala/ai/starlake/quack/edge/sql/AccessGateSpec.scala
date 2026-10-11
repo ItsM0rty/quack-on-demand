@@ -46,6 +46,26 @@ class AccessGateSpec extends AnyFlatSpec with Matchers:
       case GateOutcome.Refuse(_, false, _) => succeed
       case other                           => fail(other.toString)
 
+  it should "refuse duckdb_table_sample and the Iceberg catalog functions as not wildcard-coverable" in:
+    Seq(
+      "SELECT * FROM duckdb_table_sample('orders')",
+      "SELECT * FROM iceberg_rewrite_data_files('ice.db.t')",
+      "SELECT * FROM iceberg_rollback_to_snapshot('ice.db.t', 1)",
+      "SELECT * FROM iceberg_to_ducklake('ice', 'lake')",
+      "SELECT * FROM iceberg_table_properties('ice.db.t')",
+      "SELECT * FROM iceberg_schema_properties('ice.db')",
+      "SELECT * FROM set_iceberg_table_properties('ice.db.t', {'k': 'v'})",
+      "SELECT * FROM remove_iceberg_table_properties('ice.db.t', ['k'])",
+      "SELECT * FROM set_iceberg_schema_properties('ice.db', {'k': 'v'})",
+      "SELECT * FROM remove_iceberg_schema_properties('ice.db', ['k'])"
+    ).foreach { sql =>
+      withClue(sql) {
+        eval(sql) match
+          case GateOutcome.Refuse(_, false, _) => succeed
+          case other                           => fail(other.toString)
+      }
+    }
+
   it should "find a catalog-reaching call behind dollar-quote tags differing only in case" in:
     // DuckDB 2.0 compares dollar tags case-sensitively: $A$ is not closed by $a$, so the call after
     // the block-comment opener runs. Folding case before lexing read it as a comment.

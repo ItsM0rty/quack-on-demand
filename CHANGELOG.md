@@ -75,7 +75,16 @@
     `SET search_path`, string arguments and `query()` bodies are covered; a run-time-computed
     target (`query_table('__duck' || 'lake...')`, `SET search_path = <expression>`, the
     `postgres_query` / `query` family with a non-constant argument) is refused for the same
-    callers. The data tables themselves and the other DuckLake functions are unchanged.
+    callers. The string-named table carriers (`query_table('<name>')`, `query('<sql>')`,
+    `json_execute_serialized_sql`, `duckdb_table_sample('<table>')`) have their literal screened
+    for the metadata catalog and are refused with any non-literal argument. The data tables
+    themselves and the other DuckLake functions are unchanged.
+  - `duckdb_table_sample` (new in 2.0; reads the table its string names) and the Iceberg catalog
+    functions that act on a table or schema named by a string outside every table grant
+    (`iceberg_rewrite_data_files`, `iceberg_rollback_to_snapshot`, `iceberg_to_ducklake`,
+    `iceberg_table_properties` / `iceberg_schema_properties` and their `set_` / `remove_` forms) join
+    `query_table` in the tenant-ACL class: refused to tenant-scoped principals under QoD grants and
+    OPA, never covered by the `*.*.* ALL` wildcard.
   - BREAKING for non-superusers who set these: node-wide settings are reserved to superusers,
     whatever the ACL mode and the grants, and refused to every caller on a pool under lockdown:
     in any `SET` / `RESET` / `PRAGMA` form (glued quotes, behind `EXPLAIN` / `PREPARE`), threads

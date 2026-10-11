@@ -38,8 +38,28 @@ package ai.starlake.quack.edge.sql
   */
 object CatalogReachingCalls:
 
-  /** Table functions whose target is a run-time string the ACL never sees. */
-  private val Fixed = Set("query", "query_table", "json_execute_serialized_sql")
+  /** Table functions whose target is a run-time string the ACL never sees. `duckdb_table_sample`
+    * (new in 2.0) reads the table named by its string argument, like `query_table`. The Iceberg
+    * catalog functions (listed from the 2.0 CLI with iceberg loaded) rewrite, roll back, migrate or
+    * read and change the properties of a table or schema named by a string, outside every table
+    * grant; the path-based `iceberg_scan` / `iceberg_metadata` / `iceberg_snapshots` ... are file
+    * reads, lockdown's concern.
+    */
+  private val Fixed = Set(
+    "query",
+    "query_table",
+    "json_execute_serialized_sql",
+    "duckdb_table_sample",
+    "iceberg_rewrite_data_files",
+    "iceberg_rollback_to_snapshot",
+    "iceberg_to_ducklake",
+    "iceberg_table_properties",
+    "iceberg_schema_properties",
+    "set_iceberg_table_properties",
+    "remove_iceberg_table_properties",
+    "set_iceberg_schema_properties",
+    "remove_iceberg_schema_properties"
+  )
 
   /** Calls that run raw SQL elsewhere, open an arbitrary connection, read node env vars, or invoke
     * a table function named at run time. The postgres / quack entries and `getenv` were verified on

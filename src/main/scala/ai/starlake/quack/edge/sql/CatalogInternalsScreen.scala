@@ -24,6 +24,9 @@ import java.util.Locale
   *     The other `ducklake_*` functions (snapshots, table_info, settings, options, table changes,
   *     maintenance) return no key and stay admitted here; [[CatalogReachingCalls]] still denies the
   *     whole family to tenant-scoped principals when the ACL validates.
+  *   - a string-named carrier (`query_table('<name>')`, `query('<sql>')`,
+  *     `json_execute_serialized_sql`, `duckdb_table_sample('<table>')`) reaches a table named
+  *     inside a string: its literal argument is scanned by the first rule above, and
   *   - a run-time-computed target, which a lexical screen cannot read: a call of
   *     [[RunTimeTargetCalls]] (`query_table('__duck' || 'lake_metadata_x...')` reaches the catalog)
   *     or a `SET search_path` / `SET schema` (verified on 2.0: `SET search_path = '__duck' ||
@@ -45,6 +48,7 @@ object CatalogInternalsScreen:
     "query",
     "query_table",
     "json_execute_serialized_sql",
+    "duckdb_table_sample",
     "postgres_query",
     "postgres_execute",
     "postgres_scan",

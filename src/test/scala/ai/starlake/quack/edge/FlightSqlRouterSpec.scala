@@ -1367,6 +1367,70 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out.isRight shouldBe true
     captured() should include("memory.main.t")
 
+  it should "be refused through the string-named carriers to every non-superuser" in:
+    val carriers = Seq(
+      "SELECT * FROM query_table('__ducklake_metadata_lake.ducklake_data_file')",
+      "SELECT * FROM duckdb_table_sample('__ducklake_metadata_lake.ducklake_data_file')",
+      "SELECT * FROM query('SELECT * FROM __ducklake_metadata_lake.ducklake_data_file')"
+    )
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      carriers.foreach { sql =>
+        withClue(sql)(
+          catalogDenied(
+            router
+              .execute("dlm-9", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+              .unsafeRunSync(),
+            captured
+          )
+        )
+      }
+      val computed = router
+        .execute(
+          "dlm-10",
+          "alice",
+          poolKey,
+          "SELECT * FROM duckdb_table_sample('__duck' || 'lake_metadata_lake.ducklake_data_file')",
+          effectiveSet = Some(wildcardAllSet)
+        )
+        .unsafeRunSync()
+      computed.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    }
+    val (locked, lockedCaptured, _) = setupWithRewriter(lockdownFor = _ => true)
+    carriers.foreach { sql =>
+      catalogDenied(
+        locked.execute("dlm-11", "alice", poolKey, sql, Some(superuserSet)).unsafeRunSync(),
+        lockedCaptured
+      )
+    }
+    val (open, openCaptured, _) = setupWithRewriter()
+    open
+      .execute("dlm-12", "alice", poolKey, carriers.head, Some(superuserSet))
+      .unsafeRunSync()
+      .isRight shouldBe true
+    openCaptured() should include("__ducklake_metadata_lake")
+
+  "the Iceberg catalog functions" should "be refused to *.*.* ALL under QoD and OPA, not su" in:
+    val calls = Seq(
+      "SELECT * FROM duckdb_table_sample('memory.main.t')",
+      "SELECT * FROM iceberg_rollback_to_snapshot('ice.db.t', 1)",
+      "SELECT * FROM set_iceberg_table_properties('ice.db.t', {'k': 'v'})"
+    )
+    Seq(wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      calls.foreach { sql =>
+        val out = router
+          .execute("ice-1", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+          .unsafeRunSync()
+        withClue(sql)(out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied])
+      }
+      captured() shouldBe ""
+      val su = router
+        .execute("ice-2", "alice", poolKey, calls(1), effectiveSet = Some(superuserSet))
+        .unsafeRunSync()
+      su.isRight shouldBe true
+    }
+
   // ---- node-wide settings (superuser-only, every ACL mode, never wildcard-coverable) ----
 
   private val nodeWideRefusal =
@@ -1417,6 +1481,30 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     out.swap.toOption.get.reason shouldBe nodeWideRefusal
     captured() shouldBe ""
+
+  "quack_serve and quack_stop" should "be refused to non-superusers and under lockdown" in:
+    val calls = Seq(
+      "SELECT * FROM quack_stop('quack:0.0.0.0:21900')",
+      "CALL quack_serve('quack:0.0.0.0:9999', token := 'x', disable_ssl := true)"
+    )
+    def refusedIn(router: FlightSqlRouter, eff: ai.starlake.quack.ondemand.rbac.EffectiveSet) =
+      calls.foreach { sql =>
+        val out = router.execute("qs-1", "alice", poolKey, sql, Some(eff)).unsafeRunSync()
+        withClue(sql)(out.swap.toOption.get.reason should include("reserved to superusers"))
+      }
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      refusedIn(router, wildcardAllSet)
+      captured() shouldBe ""
+    }
+    val (locked, lockedCaptured, _) = setupWithRewriter(lockdownFor = _ => true)
+    refusedIn(locked, superuserSet)
+    lockedCaptured() shouldBe ""
+    val (open, _, _) = setupWithRewriter()
+    open
+      .execute("qs-2", "alice", poolKey, calls.head, Some(superuserSet))
+      .unsafeRunSync()
+      .isRight shouldBe true
 
   it should "leave the allowlisted session settings to a non-superuser, ACL on or off" in:
     Seq(StatementValidator.allowAll, wildcardAcl).foreach { v =>
