@@ -57,8 +57,11 @@ object AccessGate:
     // backtick pair can hide separators and calls from both screens after it (see BacktickScreen).
     // A SET of a SQL-valued setting is control flow to the parser, but its value runs later on the
     // catalog Postgres or as the node's auth callback, outside every grant.
+    // A quoted name holding a dot is one identifier to DuckDB and a qualified name to the parser
+    // (see DottedIdentifierScreen), so the grant checked would not be the table read.
     BacktickScreen
       .find(statement)
+      .orElse(DottedIdentifierScreen.find(statement))
       .orElse(CatalogReachingCalls.find(statement).map(CatalogReachingCalls.denyReason))
       .orElse(
         CatalogReachingCalls.sqlValuedSetting(statement).map(CatalogReachingCalls.settingDenyReason)

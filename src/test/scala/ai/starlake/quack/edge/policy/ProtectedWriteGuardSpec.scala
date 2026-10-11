@@ -385,6 +385,21 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
     ) shouldBe Allow
   }
 
+  it should "deny a quoted name holding a dot, which the rewriters would match as a.b" in
+    // A row policy on main."a.b" is keyed on that one name; the rewriter sees schema a, table b.
+    List("SELECT * FROM \"a.b\"", "DELETE FROM \"a.b\"").foreach { sql =>
+      withClue(sql) {
+        guardWithCls().check(
+          sql,
+          StatementKind.Select,
+          eff(tenantUser, rows = List(rowPolicy)),
+          ctx
+        ) match
+          case Deny(reason) => reason should include("quoted identifier containing a dot")
+          case other        => fail(s"expected Deny, got $other")
+      }
+    }
+
   it should "leave an ordinary SELECT to the rewriters" in {
     guardWithCls().check(
       "SELECT * FROM tpch1.customer",

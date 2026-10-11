@@ -886,7 +886,9 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
 
   it should "admit ordinary and remote quoted identifiers anywhere" in {
     denied("SELECT \"orders\".\"id\" AS \"Order Id\" FROM \"main\".\"orders\"") shouldBe false
-    denied("SELECT 1 AS \"a/b\", `x.csv` FROM t, \"main\".\"orders\"") shouldBe false
+    denied("SELECT 1 AS \"a/b\", `x/csv` FROM t, \"main\".\"orders\"") shouldBe false
+    // A quoted name holding a dot is refused wherever it sits (DottedIdentifierScreen).
+    denied("SELECT `x.csv` FROM t") shouldBe true
     denied("SUMMARIZE `s3://b/x.parquet`") shouldBe false
     deniedB("SUMMARIZE `s3://lakebucket/x.parquet`") shouldBe true
   }

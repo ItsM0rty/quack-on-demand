@@ -2,7 +2,7 @@ package ai.starlake.quack.edge.policy
 
 import ai.starlake.acl.model.{Config, TableRef}
 import ai.starlake.acl.parser.{SqlParser, StatementResult, TableExtractor, Verb}
-import ai.starlake.quack.edge.sql.{BacktickScreen, CatalogReachingCalls}
+import ai.starlake.quack.edge.sql.{BacktickScreen, CatalogReachingCalls, DottedIdentifierScreen}
 import ai.starlake.quack.edge.cls.{
   ColumnCatalog,
   ColumnPolicyRewriter,
@@ -71,8 +71,11 @@ final class ProtectedWriteGuard(
       // Every kind, a plain SELECT included: a table named in a string is invisible to the
       // rewriters, so the read would come back unfiltered and unmasked. The backtick screen goes
       // first: on a DuckDB 1.x engine a backtick pair hides a call from CatalogReachingCalls.
+      // A quoted name holding a dot is matched by the rewriters as a qualified name, not as the
+      // one table DuckDB reads (DottedIdentifierScreen).
       BacktickScreen
         .find(sql)
+        .orElse(DottedIdentifierScreen.find(sql))
         .orElse(CatalogReachingCalls.find(sql).map(CatalogReachingCalls.denyReason)) match
         case Some(reason)                         => Deny(s"access denied: $reason")
         case None if kind == StatementKind.Select => Allow

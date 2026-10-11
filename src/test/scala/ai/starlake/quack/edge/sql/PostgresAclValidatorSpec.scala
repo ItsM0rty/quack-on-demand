@@ -103,6 +103,30 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     validator.validate(mkCtx("SELECT ARRAY(SELECT l FROM lineitem)", eff)) shouldBe Allowed
   }
 
+  it should "deny a quoted name holding a dot, even to a holder of the schema it splits into" in {
+    // DuckDB reads `"a.b"` as the table main."a.b"; JSqlParser read schema a, table b, so a grant
+    // on tpch.a.* (or the tenant-wide wildcard) let the user read, write and alter main."a.b".
+    List(
+      effectiveWith(permissions = List(perm("tpch", "a", "*", "ALL"))),
+      effectiveWith(permissions = List(perm("*", "*", "*", "ALL")))
+    ).foreach { eff =>
+      List(
+        "SELECT * FROM \"a.b\"",
+        "INSERT INTO \"a.b\" VALUES (1)",
+        "CREATE TABLE \"a.c\" (x INT)",
+        "ALTER TABLE \"a.b\" ADD COLUMN y INT"
+      ).foreach { sql =>
+        withClue(sql) {
+          validator.validate(mkCtx(sql, eff)) match
+            case Denied(msg, _, _) => msg should include("quoted identifier containing a dot")
+            case other             => fail(s"expected Denied, got $other")
+        }
+      }
+    }
+    val holder = effectiveWith(permissions = List(perm("tpch", "a", "*", "ALL")))
+    validator.validate(mkCtx("SELECT * FROM tpch.\"a\".\"b\"", holder)) shouldBe Allowed
+  }
+
   it should "deny SELECT against a federated alias when no grant exists" in {
     val eff = effectiveWith(permissions = Nil)
     val ctx = mkCtx("SELECT * FROM fedpg.public.orders", eff)

@@ -289,9 +289,12 @@ object LockdownScreen:
     * bypasses per-table grants and can corrupt catalog-referenced data files).
     */
   def screen(sql: String, deniedBuckets: Set[String]): Option[String] =
-    // First: on a DuckDB 1.x engine a backtick pair can hide a call from every check below.
+    // First: on a DuckDB 1.x engine a backtick pair can hide a call from every check below. A
+    // quoted name holding a dot is one identifier to DuckDB and a qualified name to every
+    // parser-based check (DottedIdentifierScreen).
     BacktickScreen
       .find(sql)
+      .orElse(DottedIdentifierScreen.find(sql))
       .orElse(splitStatements(sql).iterator.flatMap(screenOne(_, deniedBuckets)).nextOption())
 
   private def screenOne(stmt: String, deniedBuckets: Set[String]): Option[String] =

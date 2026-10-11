@@ -1,0 +1,92 @@
+package ai.starlake.quack.edge.sql
+
+import ai.starlake.acl.model.Config
+import org.scalatest.flatspec.AnyFlatSpec
+import org.scalatest.matchers.should.Matchers
+
+/** DuckDB reads `"a.b"` as one identifier (a table literally named `a.b` in the default schema),
+  * while JSqlParser splits it into schema `a`, table `b`. On the 2.0 CLI, with both `a.b` and
+  * `main."a.b"` present, each statement below acts on `main."a.b"` (or creates `main."a.c"`) while
+  * the access check gated `lake.a.b` (or `lake.a.*`).
+  */
+class DottedIdentifierScreenSpec extends AnyFlatSpec with Matchers:
+
+  private val B = "`"
+
+  private val refusedForms = List(
+    // reads
+    "SELECT * FROM \"a.b\"",
+    "SELECT * FROM t JOIN \"a.b\" ON true",
+    "SELECT * FROM t, \"a.b\"",
+    "SELECT (SELECT v FROM \"a.b\")",
+    "WITH c AS (SELECT * FROM \"a.b\") SELECT * FROM c",
+    "SUMMARIZE \"a.b\"",
+    "DESCRIBE \"a.b\"",
+    "SELECT * FROM \"a.b.c\"",
+    s"SELECT * FROM ${B}a.b$B",
+    "SELECT * FROM lake.main.\"a.b\"",
+    "SELECT \"a.b\".v FROM t",
+    // writes
+    "INSERT INTO \"a.b\" VALUES (1)",
+    "UPDATE \"a.b\" SET v = 1",
+    "DELETE FROM \"a.b\"",
+    "MERGE INTO \"a.b\" t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+    "TRUNCATE \"a.b\"",
+    "COPY \"a.b\" FROM 's3://b/x.csv'",
+    // DDL
+    "CREATE TABLE \"a.c\" (x INT)",
+    "CREATE TABLE \"a.c\" AS SELECT 1",
+    "CREATE VIEW \"a.v\" AS SELECT 1",
+    "ALTER TABLE \"a.b\" ADD COLUMN y INT",
+    "ALTER TABLE t RENAME TO \"a.b\"",
+    "DROP TABLE \"a.b\"",
+    // in a batch, behind EXPLAIN
+    "SELECT 1; SELECT * FROM \"a.b\"",
+    "EXPLAIN ANALYZE SELECT * FROM \"a.b\""
+  )
+
+  private val admittedForms = List(
+    "SELECT * FROM \"a\".\"b\"",
+    "SELECT * FROM lake.\"main\".\"orders\"",
+    "SELECT v AS \"t.v\" FROM t",
+    "SELECT v \"x\" FROM t AS \"a.b\"",
+    s"SELECT v AS ${B}orders.total$B FROM t",
+    "SELECT 'a.b', \"col\" FROM t",
+    "SELECT 1 -- \"a.b\"\nFROM t",
+    "SELECT 1 /* \"a.b\" */ FROM t",
+    "SELECT $$\"a.b\"$$ FROM t",
+    "SELECT * FROM \"s3://b/x.parquet\"",
+    "SELECT 1.5, t.v FROM main.t"
+  )
+
+  "DottedIdentifierScreen" should "refuse a quoted name holding a dot in every table position" in:
+    refusedForms.foreach { sql =>
+      withClue(sql)(DottedIdentifierScreen.find(sql) shouldBe Some(DottedIdentifierScreen.Reason))
+    }
+
+  it should "admit separate quoted parts, aliases, and dots in literals or comments" in:
+    admittedForms.foreach(sql => withClue(sql)(DottedIdentifierScreen.find(sql) shouldBe None))
+
+  private val cfg = Config.forDuckDB(Some("lake"), Some("main"), Set("lake"))
+
+  "AccessGate" should "refuse it as not wildcard-coverable, for QoD and OPA alike" in:
+    refusedForms.foreach { sql =>
+      withClue(sql) {
+        AccessGate.evaluate(sql, cfg, "lake", false, clientDataScans = false) match
+          case GateOutcome.Refuse(reason, coverable, _) =>
+            reason shouldBe DottedIdentifierScreen.Reason
+            coverable shouldBe false
+          case other => fail(s"expected Refuse, got $other")
+      }
+    }
+
+  it should "still gate separate quoted parts as the table they name" in:
+    AccessGate.evaluate("SELECT * FROM \"a\".\"b\"", cfg, "lake", false, false) match
+      case GateOutcome.Gated(g, _) => g.map(_.table.canonical) shouldBe Set("lake.a.b")
+      case other                   => fail(s"expected Gated, got $other")
+
+  "LockdownScreen" should "refuse it" in:
+    refusedForms.foreach { sql =>
+      withClue(sql)(LockdownScreen.screen(sql, Set.empty) shouldBe defined)
+    }
+    LockdownScreen.screen("SELECT v AS \"t.v\" FROM \"main\".\"t\"", Set.empty) shouldBe None
