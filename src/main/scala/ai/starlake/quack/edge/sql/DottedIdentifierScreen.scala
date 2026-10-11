@@ -29,8 +29,10 @@ import java.util.Locale
   * followed by a table reference, so an alias names no table the check could misread. A name that
   * starts with a URL scheme (`FROM "s3://b/x.parquet"`, the scheme holding no dot) is a remote
   * replacement scan reading the object, judged as a path by [[LockdownScreen]]; split on its dots
-  * it yields a schema holding `://`, which no grant names. A `://` anywhere else is no exception
-  * (`"other.x://"` would be checked as schema `other`).
+  * its first part holds the `://`, so the access check refuses it as the file reference it is
+  * (`DuckDBDialectMapper.isFileReference`: only a wildcard ALL grant covers it, like `FROM
+  * 's3://b/x.parquet'`). A `://` anywhere else is no exception (`"other.x://"` would be checked as
+  * schema `other`).
   *
   * Runs for callers the ACL checks (QoD grants and OPA, through [[AccessGate]]), for principals
   * with column or row policies (the protected-write guard), and on lockdown pools (every caller).

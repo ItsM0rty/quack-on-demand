@@ -4,6 +4,8 @@ import java.util.Locale
 import ai.starlake.acl.model.{Config, DenyReason, TableRef}
 import net.sf.jsqlparser.schema.Table
 
+import scala.jdk.CollectionConverters.*
+
 trait DialectMapper:
   def toTableRef(table: Table, config: Config): Either[DenyReason, TableRef]
 
@@ -91,8 +93,25 @@ private[parser] object DuckDBDialectMapper extends DialectMapper:
       case _ =>
         AnsiDialectMapper.toTableRef(table, config)
 
-  /** Check whether a JSqlParser Table represents a string-literal file reference. The caller should
+  /** Check whether DuckDB reads a JSqlParser Table as a file rather than a table. The caller should
     * use this to filter before calling toTableRef.
+    *
+    * A string literal (`FROM 'x.parquet'`) is one. So is a name with a part holding a path
+    * separator (a URL's `://` included) or a glob character: DuckDB 2.0 replacement-scans a name it
+    * cannot resolve, its parts joined with dots, so `FROM "s3://b/x.parquet"`, `` FROM
+    * `file:///d/x.csv` ``, `FROM "/d/x"."csv"` and `FROM "s3://b/x"."parquet"` read the object or
+    * file exactly as the literal does (checked on the 2.0 CLI), with the node's credentials. Read
+    * as a table, the name would be admitted by a wildcard grant on its schema.
     */
   def isFileReference(table: Table): Boolean =
-    table.getName != null && table.getName.startsWith("'")
+    (table.getName != null && table.getName.startsWith("'")) ||
+      Option(table.getNameParts).exists(
+        _.asScala.exists(p => p != null && FileNameMarks.exists(p.contains))
+      )
+
+  // A path separator (a URL scheme's `://` holds one) or a glob character.
+  private val FileNameMarks = List("/", "\\", "*", "?", "[", "{")
+
+  /** The `unsupported` marker of a file reference ([[isFileReference]]). */
+  def fileReferenceMarker(table: Table): String =
+    s"file reference ${table.getFullyQualifiedName}"

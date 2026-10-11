@@ -1396,6 +1396,39 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "refuse a quoted URL table name to an RLS principal holding a wildcard read grant" in:
+    // DuckDB replacement-scans `"s3://..."` as a file: every row of the table's data files, raw,
+    // while `FROM customer` is wrapped in the row filter.
+    val acl = new ai.starlake.quack.edge.sql.PostgresAclValidator(
+      tenantCatalogs = _ => Set("memory"),
+      filteredMetadata = true
+    )
+    val wildcardRo = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser,
+      Nil,
+      Nil,
+      List(ai.starlake.quack.ondemand.state.RolePermission("p-1", "r-1", "*", "*", "*", "RO")),
+      Nil,
+      rowPolicies = List(rowPolicyCustomer)
+    )
+    val (router, capturedSql, _) = setupWithRewriter(validator = acl)
+    List(
+      "SELECT * FROM \"s3://bucket/*/main/customer/*.parquet\"",
+      "SELECT * FROM `file:///data/main/customer/x.parquet`"
+    ).foreach { sql =>
+      withClue(sql) {
+        val out = router
+          .execute("rls-url", "alice", poolKey, sql, effectiveSet = Some(wildcardRo))
+          .unsafeRunSync()
+        out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+        capturedSql() shouldBe ""
+      }
+    }
+    router
+      .execute("rls-url", "alice", poolKey, "SELECT c_id FROM customer", Some(wildcardRo))
+      .unsafeRunSync() shouldBe a[Right[?, ?]]
+    capturedSql() should include("c_region = 'X'")
+
   it should "deny a tenant wildcard-ALL principal reading a sibling catalog via query_table" in:
     val acl = new ai.starlake.quack.edge.sql.PostgresAclValidator(tenantCatalogs =
       t => if t == "acme" then Set("memory") else Set.empty

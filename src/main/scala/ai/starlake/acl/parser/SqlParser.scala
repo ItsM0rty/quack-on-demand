@@ -188,7 +188,19 @@ object SqlParser:
     val (qTgt, e2) = TableQualifier.qualify(List(target), config)
     val accesses   = qTgt.map(t => TableAccess(t, targetVerb)).toSet ++
       qSrc.map(t => TableAccess(t, Verb.Read)).toSet
-    StatementResult.Extracted(index, snippet, accesses, e1 ++ e2, reads.unsupported)
+    StatementResult.Extracted(
+      index,
+      snippet,
+      accesses,
+      e1 ++ e2,
+      reads.unsupported ++ fileTargets(List(target))
+    )
+
+  /** The markers of the targets DuckDB reads as a file (`INSERT INTO "s3://b/t"`), refused like a
+    * file read: the name is no table a grant on its schema could stand for.
+    */
+  private def fileTargets(targets: List[Table]): List[String] =
+    targets.filter(DuckDBDialectMapper.isFileReference).map(DuckDBDialectMapper.fileReferenceMarker)
 
   /** Read sources of a CTAS-style statement: the extraction of its SELECT when present, empty
     * otherwise (plain INSERT VALUES, bare CREATE TABLE).
@@ -231,7 +243,7 @@ object SqlParser:
         snippet,
         Set.empty,
         Nil,
-        List(s"file reference ${table.getName}")
+        List(DuckDBDialectMapper.fileReferenceMarker(table))
       )
     else
       val (qTgt, errs) = TableQualifier.qualify(List(table), config)
@@ -351,14 +363,14 @@ object SqlParser:
         val targets: List[Table] = Option(dr.getName).toList
         val (qTgt, errs)         = TableQualifier.qualify(targets, config)
         val accesses             = qTgt.map(t => TableAccess(t, Verb.Ddl)).toSet
-        StatementResult.Extracted(index, snippet, accesses, errs)
+        StatementResult.Extracted(index, snippet, accesses, errs, fileTargets(targets))
 
       // parser-8: ALTER TABLE
       case al: Alter =>
         val target       = al.getTable
         val (qTgt, errs) = TableQualifier.qualify(List(target), config)
         val accesses     = qTgt.map(t => TableAccess(t, Verb.Ddl)).toSet
-        StatementResult.Extracted(index, snippet, accesses, errs)
+        StatementResult.Extracted(index, snippet, accesses, errs, fileTargets(List(target)))
 
       // parser-8: TRUNCATE
       case tr: Truncate =>
@@ -366,7 +378,7 @@ object SqlParser:
         val (qTgt, errs) = TableQualifier.qualify(List(target), config)
         // Truncate is a mass-delete; treat as Write so a WRITE grant covers it.
         val accesses = qTgt.map(t => TableAccess(t, Verb.Write)).toSet
-        StatementResult.Extracted(index, snippet, accesses, errs)
+        StatementResult.Extracted(index, snippet, accesses, errs, fileTargets(List(target)))
 
       // parser-9: EXPLAIN. `EXPLAIN <stmt>` is read-only, but DuckDB's
       // `EXPLAIN ANALYZE <dml>` EXECUTES the inner statement. Classify by the

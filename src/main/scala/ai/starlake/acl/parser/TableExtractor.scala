@@ -538,7 +538,7 @@ private[parser] class TableExtractorVisitor:
           val isQualified = table.getSchemaName != null ||
             (table.getDatabase != null && table.getDatabase.getDatabaseName != null)
           val isCteName = !isQualified && cteNames.contains(name.toLowerCase(Locale.ROOT))
-          val isFileRef = table.getName != null && table.getName.startsWith("'")
+          val isFileRef = DuckDBDialectMapper.isFileReference(table)
           // `FROM sqlite_master`, `FROM pg_class`, `FROM duckdb_tables`: DuckDB resolves a bare
           // name to its default view in system.main / system.pg_catalog unless a table shadows
           // it, for the unqualified, `main`-qualified and `system`-qualified spellings.
@@ -557,7 +557,7 @@ private[parser] class TableExtractorVisitor:
           if isFileRef then
             // DuckDB `FROM 'file.parquet'` reads straight from storage, escaping
             // the tenant-catalog boundary; there is no table to grant on.
-            unsupported += s"file reference ${table.getName}"
+            unsupported += DuckDBDialectMapper.fileReferenceMarker(table)
           else if isBareCatalogFn then
             unsupported += TableExtractor.bareSystemViewMarker(name.toLowerCase(Locale.ROOT))
           else if !isCteName then tables += table
