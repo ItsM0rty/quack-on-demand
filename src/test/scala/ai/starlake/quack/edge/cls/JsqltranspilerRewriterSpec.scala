@@ -651,6 +651,28 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
     denied("SELECT c.c_email.x FROM customer c")
   }
 
+  // `c.to_json()` is `to_json(c)`: DuckDB binds the receiver to the FROM binding `c`, the whole row
+  // as a STRUCT, every column raw (2.0 CLI: `{"c_id":1,..,"c_email":"alice@x",..}`).
+  "a method call on a masked table's binding (the whole row)" should "be denied" in
+    List(
+      "SELECT c.to_json() FROM customer c",
+      "SELECT customer.to_json() FROM customer",
+      "SELECT tpch1.customer.to_json() FROM customer",
+      "SELECT c.list() FROM customer c",
+      "SELECT c.struct_extract('c_email') FROM customer c",
+      "SELECT \"c\".to_json() FROM customer c",
+      "SELECT c.json_extract_string('$.c_email') FROM customer c",
+      "SELECT c_id FROM customer c WHERE c.to_json()::VARCHAR LIKE '%alice%'",
+      "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM customer c WHERE c.to_json() IS NULL)",
+      "SELECT list_transform([1], x -> c.to_json()) FROM customer c",
+      "SELECT c.to_json().lower() FROM customer c"
+    ).foreach(denied)
+
+  it should "leave a method call on another table's binding alone" in {
+    outcome("SELECT o.to_json() FROM orders o") shouldBe RewriteOutcome.Passthrough
+    outcome("SELECT c.c_name.lower() FROM customer c") shouldBe RewriteOutcome.Passthrough
+  }
+
   // ---- NATURAL JOIN -----------------------------------------------------------------------
   //
   // A NATURAL join compares the columns both sides share, raw, with no column node: a guess list

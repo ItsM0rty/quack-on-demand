@@ -1130,11 +1130,8 @@ private[cls] object ResidualColumns:
     val before   = scan(sel)
     val coverage = new Coverage(before, policies, schema)
     val refusals = before.methodCalls.flatMap { (f, scopes) =>
-      val parts    = f.getMultipartName.asScala.toList
-      val receiver = parts.init
-      val column   =
-        if receiver.size == 1 then new Column(receiver.head)
-        else new Column(new Table(receiver.init.asJava), receiver.last)
+      val parts  = f.getMultipartName.asScala.toList
+      val column = receiverOf(f)
       if !coverage.covered(column, scopes) then None
       else if f.getNamedParameters != null || f.getKeywordArguments != null || f.isDistinct ||
         f.isAllColumns || f.getChainedParameters != null || f.getExtraKeyword != null
@@ -1154,6 +1151,14 @@ private[cls] object ResidualColumns:
         None
     }
     refusals.headOption
+
+  /** The receiver of the method call `[.., x, f]`, read as a column reference: `[c_email, lower]`
+    * is `c_email`, `[c, c_email, upper]` is `c.c_email`, `[c, to_json]` is `c`.
+    */
+  private def receiverOf(f: net.sf.jsqlparser.expression.Function): Column =
+    val receiver = f.getMultipartName.asScala.toList.init
+    if receiver.size == 1 then new Column(receiver.head)
+    else new Column(new Table(receiver.init.asJava), receiver.last)
 
   /** The column references in `sel` a policy could cover, noted before the rewrite. */
   def suspects(
@@ -1218,7 +1223,10 @@ private[cls] object ResidualColumns:
       val sources = scopes.flatten
       sources.exists(src => src.table.exists(policyTable) && src.names.contains(name)) &&
       !sources.exists(src => has(src, name).contains(true))
-    val wholeRowRefusal = before.columns.collectFirst {
+    // `c.to_json()` is `to_json(c)`: a method call's receiver binds like any column reference, so
+    // a receiver naming a policy table's binding hands the whole row to the function.
+    val receivers       = before.methodCalls.map((f, scopes) => receiverOf(f) -> scopes)
+    val wholeRowRefusal = (before.columns ++ receivers).collectFirst {
       case (c, scopes) if wholeRow(c, scopes) =>
         "a table referenced as a column (the whole row as a struct) cannot be masked under " +
           "column policies; name the columns instead"

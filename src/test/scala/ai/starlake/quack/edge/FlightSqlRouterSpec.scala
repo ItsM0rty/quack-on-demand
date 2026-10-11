@@ -1231,6 +1231,33 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     capturedSql() should include("SELECT a FROM t")
     capturedSql() should not include "main.t"
 
+  // `c.to_json()` is `to_json(c)`: the whole row of customer, c_email raw.
+  "a method call on a masked table's binding" should "be denied before the node" in:
+    val (router, capturedSql, _) = setupWithRewriter(
+      new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+        new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+          Map(("memory", "main", "customer") -> List("c_id", "c_name", "c_email", "c_phone"))
+        ),
+        enabled = true
+      )
+    )
+    List("SELECT c.to_json() FROM customer c", "SELECT customer.to_json() FROM customer")
+      .foreach { sql =>
+        withClue(sql) {
+          val out = router
+            .execute(
+              "cls-row",
+              "alice",
+              poolKey,
+              sql,
+              Some(effWithPolicies(List(maskCustomerEmailCls)))
+            )
+            .unsafeRunSync()
+          out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+          capturedSql() shouldBe ""
+        }
+      }
+
   // ---- ProtectedWriteGuard integration tests ----
   //
   // The InMemory pool hands the guard a session catalog of "memory" / schema "main",

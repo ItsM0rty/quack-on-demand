@@ -1007,6 +1007,22 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync() shouldBe a[Denied]
   }
 
+  it should "deny a method call on a masked table's binding, which reads the whole row" in
+    List(
+      "SELECT c.to_json() FROM customer c",
+      "SELECT customer.to_json() FROM customer",
+      "SELECT tpch1.customer.to_json() FROM customer",
+      "SELECT c.list() FROM customer c",
+      "SELECT c.struct_extract('c_email') FROM customer c",
+      "SELECT c_id FROM customer c WHERE c.to_json()::VARCHAR LIKE '%alice%'",
+      "SELECT list_transform([1], x -> c.to_json()) FROM customer c"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
   it should "deny a NATURAL join that compares a masked column against a guess list" in {
     rw.rewrite(
       "SELECT g.c_phone, c_id FROM (SELECT '555-' || lpad(unnest(range(10000))::VARCHAR, 4, '0') " +
