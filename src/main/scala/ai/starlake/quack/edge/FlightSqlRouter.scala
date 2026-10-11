@@ -5,6 +5,7 @@ import ai.starlake.acl.parser.TableAccess
 import ai.starlake.quack.edge.adapter._
 import ai.starlake.quack.edge.sql.{
   Allowed,
+  CatalogInternalsScreen,
   CatalogWriteScreen,
   Denied,
   LockdownScreen,
@@ -513,10 +514,17 @@ final class FlightSqlRouter(
     // Node lockdown, resolved per pool (tri-state: pool override else global default).
     // Runs BEFORE the ACL gate so a denied statement never reaches the SQL parser;
     // effectiveSet = None screens as non-superuser (fail closed).
+    val isSuperuser    = effectiveSet.exists(_.user.tenant.isEmpty)
+    val lockedDown     = lockdownFor(poolKey)
     val lockdownDenial =
-      if lockdownFor(poolKey) && !effectiveSet.exists(_.user.tenant.isEmpty) then
-        LockdownScreen.screen(sql, deniedBuckets())
+      if lockedDown && !isSuperuser then LockdownScreen.screen(sql, deniedBuckets())
       else None
+    // Superuser-only, whatever the ACL mode and the grants, and nobody's under lockdown (the
+    // screens' scaladocs have the why): the DuckLake metadata catalog and the key-returning
+    // DuckLake functions.
+    val restrictedDenial =
+      if isSuperuser && !lockedDown then None
+      else CatalogInternalsScreen.screen(sql).map(r => s"catalog: $r")
 
     // Trigger DDL is reserved to superusers and the pool tenant's admins, whatever the ACL mode
     // and the lockdown flag (TriggerScreen's scaladoc has the why). The screen runs first so the
@@ -541,6 +549,7 @@ final class FlightSqlRouter(
         .map(r => s"lockdown: $r")
         .orElse(triggerDenial.map(r => s"trigger: $r"))
         .orElse(settingDenial.map(r => s"node: $r"))
+        .orElse(restrictedDenial)
 
     val aclCheck: Either[RouterFailure, Unit] = preGateDenial match
       case Some(reason) =>

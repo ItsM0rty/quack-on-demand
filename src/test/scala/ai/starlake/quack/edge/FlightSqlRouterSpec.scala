@@ -928,7 +928,8 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       readers: Int = 1,
       stub: () => QuackResponse = defaultStub,
       protectedWriteGuard: ai.starlake.quack.edge.policy.ProtectedWriteGuard =
-        ai.starlake.quack.edge.policy.ProtectedWriteGuard.disabled
+        ai.starlake.quack.edge.policy.ProtectedWriteGuard.disabled,
+      lockdownFor: PoolKey => Boolean = _ => false
   ) =
     val backend = new ai.starlake.quack.ondemand.runtime.QuackBackend:
       private val n          = TrieMap.empty[String, RunningNode]
@@ -982,7 +983,8 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       validator = validator,
       columnPolicyRewriter = rewriter,
       metadataFilterRewriter = metadataFilter,
-      protectedWriteGuard = protectedWriteGuard
+      protectedWriteGuard = protectedWriteGuard,
+      lockdownFor = lockdownFor
     )
     (router, () => capturedSql, node)
 
@@ -1230,6 +1232,140 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       }
     }
     capturedSql() shouldBe ""
+
+  // ---- DuckLake catalog internals (superuser-only, every ACL mode, never wildcard-coverable) ----
+
+  private val metadataRead =
+    "SELECT data_file_id, encryption_key FROM __ducklake_metadata_lake.ducklake_data_file"
+
+  private val superuserSet = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+    tenantUser.copy(tenant = None, kind = "admin"),
+    Nil,
+    Nil,
+    Nil,
+    Nil
+  )
+
+  private val wildcardAllSet = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+    tenantUser,
+    Nil,
+    Nil,
+    List(ai.starlake.quack.ondemand.state.RolePermission("p-1", "r-1", "*", "*", "*", "ALL")),
+    Nil
+  )
+
+  private def wildcardAcl = new ai.starlake.quack.edge.sql.PostgresAclValidator(tenantCatalogs =
+    t => if t == "acme" then Set("memory") else Set.empty
+  )
+
+  /** An OPA tenant whose policy allows everything: only the pre-gate screen can refuse. */
+  private def allowAllOpa =
+    val auth = new ai.starlake.quack.edge.opa.OpaAuthorizer(
+      ai.starlake.quack.edge.config.OpaConfig.default,
+      new ai.starlake.quack.edge.opa.OpaClient(
+        1000,
+        (_, _, _) => Right((200, """{"result":{"allow":true}}"""))
+      ),
+      new ai.starlake.quack.edge.opa.OpaDecisionCache(0),
+      ai.starlake.quack.observability.metrics.OpaInstruments.noop
+    )
+    val tenant = ai.starlake.quack.model.Tenant(
+      poolKey.tenant,
+      acl = ai.starlake.quack.model.TenantAcl(Some("opa"), Some("http://opa"))
+    )
+    new ai.starlake.quack.edge.opa.OpaValidator(
+      auth,
+      t => Option.when(t == poolKey.tenant)(tenant),
+      _ => Nil,
+      "memory",
+      "main",
+      "duckdb",
+      false
+    )
+
+  private def catalogDenied(
+      out: Either[RouterFailure, ?],
+      captured: () => String
+  ): Unit =
+    out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    out.swap.toOption.get.reason shouldBe
+      s"access denied: catalog: ${ai.starlake.quack.edge.sql.CatalogInternalsScreen.MetadataRefusal}"
+    captured() shouldBe ""
+
+  "the DuckLake metadata catalog" should "be admitted for a superuser, lockdown off" in:
+    val (router, captured, _) = setupWithRewriter()
+    val out                   = router
+      .execute("dlm-1", "alice", poolKey, metadataRead, effectiveSet = Some(superuserSet))
+      .unsafeRunSync()
+    out.isRight shouldBe true
+    captured() should include("__ducklake_metadata_lake")
+
+  it should "be refused to a tenant user holding *.*.* ALL under QoD grants" in:
+    val (router, captured, _) = setupWithRewriter(validator = wildcardAcl)
+    val out                   = router
+      .execute("dlm-2", "alice", poolKey, metadataRead, effectiveSet = Some(wildcardAllSet))
+      .unsafeRunSync()
+    catalogDenied(out, captured)
+
+  it should "be refused to a tenant user under OPA, even with an allow-all policy" in:
+    val (router, captured, _) = setupWithRewriter(validator = allowAllOpa)
+    val out                   = router
+      .execute("dlm-3", "alice", poolKey, metadataRead, effectiveSet = Some(wildcardAllSet))
+      .unsafeRunSync()
+    catalogDenied(out, captured)
+
+  it should "be refused to a non-superuser with the ACL off, and with no principal bound" in:
+    val (router, captured, _) = setupWithRewriter() // validator = allowAll: ACL off
+    catalogDenied(
+      router
+        .execute("dlm-4", "alice", poolKey, metadataRead, effectiveSet = Some(wildcardAllSet))
+        .unsafeRunSync(),
+      captured
+    )
+    catalogDenied(
+      router.execute("dlm-5", "alice", poolKey, metadataRead, effectiveSet = None).unsafeRunSync(),
+      captured
+    )
+    val keys = router
+      .execute(
+        "dlm-6",
+        "alice",
+        poolKey,
+        "SELECT * FROM ducklake_list_files('lake', 't')",
+        effectiveSet = Some(wildcardAllSet)
+      )
+      .unsafeRunSync()
+    keys.swap.toOption.get.reason should include("ducklake_list_files")
+
+  it should "be refused to a superuser on a pool under lockdown" in:
+    val (router, captured, _) = setupWithRewriter(lockdownFor = _ => true)
+    val out                   = router
+      .execute("dlm-7", "alice", poolKey, metadataRead, effectiveSet = Some(superuserSet))
+      .unsafeRunSync()
+    catalogDenied(out, captured)
+
+  it should "leave the DuckLake data tables readable with an ordinary grant" in:
+    val reader = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser,
+      Nil,
+      Nil,
+      List(
+        ai.starlake.quack.ondemand.state.RolePermission("p-2", "r-2", "memory", "main", "t", "RO")
+      ),
+      Nil
+    )
+    val (router, captured, _) = setupWithRewriter(validator = wildcardAcl)
+    val out                   = router
+      .execute(
+        "dlm-8",
+        "alice",
+        poolKey,
+        "SELECT * FROM memory.main.t",
+        effectiveSet = Some(reader)
+      )
+      .unsafeRunSync()
+    out.isRight shouldBe true
+    captured() should include("memory.main.t")
 
   it should "deny (not forward) a plain read when a stored row policy fails to apply at rewrite time" in:
     // Simulates a row policy stored before RowPredicateValidator rejected splice-unsafe

@@ -44,19 +44,26 @@ private[quack] object FunctionCalls:
   final case class Call(name: String, text: String, argsFrom: Int)
 
   /** Every call found, top level first; `truncated` when a string literal nested deeper than
-    * [[MaxDepth]] was left unscanned.
+    * [[MaxDepth]] was left unscanned. `texts` holds every text scanned: the engine view of the
+    * statement, then of each decoded literal body, for a screen that looks for a name anywhere.
     */
-  final case class Scan(calls: Vector[Call], truncated: Boolean)
+  final case class Scan(
+      calls: Vector[Call],
+      truncated: Boolean,
+      texts: Vector[String] = Vector.empty
+  )
 
   val MaxDepth = 8
 
   def scan(sql: String): Scan =
     val calls     = Vector.newBuilder[Call]
+    val texts     = Vector.newBuilder[String]
     val pending   = mutable.Queue((Option(sql).getOrElse(""), 0))
     var truncated = false
     while pending.nonEmpty do
       val (text, depth) = pending.dequeue()
       val view          = SqlLexer.engineView(text)
+      texts += view
       // literal values are read from the characters DuckDB's pre-pass kept, not the stand-ins
       val values = SqlLexer.keptSpacesRestored(view)
       val toks   = SqlLexer.tokens(view).filterNot(_.isTrivia)
@@ -70,7 +77,7 @@ private[quack] object FunctionCalls:
           else truncated = true
         }
         i += 1
-    Scan(calls.result(), truncated)
+    Scan(calls.result(), truncated, texts.result())
 
   /** The unquoted, lowercased name of an identifier token (bare word, double-quoted or
     * backtick-quoted), or None for any other token.
@@ -88,6 +95,43 @@ private[quack] object FunctionCalls:
     if t.kind == SqlLexer.Kind.Literal && (d == '"' || d == '`') then
       Some(undoubled(view, t.start + 1, t.end, d).toLowerCase(Locale.ROOT))
     else None
+
+  /** True when every argument of `call` is a constant the screens can read: a literal, a number, a
+    * `true` / `false` / `null` keyword, a list of those, or a named parameter (`name := value`,
+    * `name => value`) with such a value. Anything else (a `||` concatenation, a cast, a nested
+    * call, a column, a subquery) computes the value at run time, where no lexical screen sees it.
+    */
+  def constantArguments(call: Call): Boolean =
+    val toks  = SqlLexer.tokens(call.text).filter(t => !t.isTrivia && t.start >= call.argsFrom)
+    val text  = call.text
+    var depth = 0
+    var i     = 0
+    var ok    = true
+    var done  = false
+    def punct(t: SqlLexer.Token, c: Char) =
+      t.kind == SqlLexer.Kind.Punct && text.charAt(t.start) == c
+    while i < toks.length && ok && !done do
+      val t = toks(i)
+      if punct(t, ')') && depth == 0 then done = true
+      else if punct(t, '[') then depth += 1
+      else if punct(t, ']') then depth -= 1
+      else if punct(t, ',') then ()
+      else if t.kind == SqlLexer.Kind.Number then ()
+      else if t.kind == SqlLexer.Kind.Literal then
+        // A quoted identifier is a column reference, not a constant.
+        ok = quotedIdentifier(text, t).isEmpty
+      else if t.kind == SqlLexer.Kind.Word then
+        val w    = text.substring(t.start, t.end).toLowerCase(Locale.ROOT)
+        val next = toks.lift(i + 1).map(n => text.substring(n.start, n.end))
+        if next.exists(n => n == ":=" || n == "=>") then i += 1 // a named parameter
+        else ok = ConstantWords(w)
+      else if t.kind == SqlLexer.Kind.Operator && text.substring(t.start, t.end) == "-" then
+        ok = toks.lift(i + 1).exists(_.kind == SqlLexer.Kind.Number)
+      else ok = false
+      i += 1
+    ok && done
+
+  private val ConstantWords = Set("true", "false", "null")
 
   private def isOpenParen(view: String, t: SqlLexer.Token): Boolean =
     t.kind == SqlLexer.Kind.Punct && view.charAt(t.start) == '('

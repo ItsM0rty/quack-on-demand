@@ -66,6 +66,16 @@
     function calls are detected from its tokens (backtick and double-quoted names).
   - The edge screens lex the SQL before folding case (dollar-quote tags are case-sensitive in
     DuckDB), and the catalog write screen classifies the original statement text.
+  - BREAKING: the DuckLake metadata catalog (`__ducklake_metadata_<alias>`, whose
+    `ducklake_data_file` / `ducklake_delete_file` hold every per-file encryption key of an
+    encrypted database) and the key-returning DuckLake functions (`ducklake_list_files`,
+    `ducklake_commit`) are refused to every caller who is not a superuser, whatever the ACL mode
+    (QoD grants, OPA, ACL off) and the grants (the built-in `qod_all_tables` `*.*.* ALL` no longer
+    reaches them), and to every caller on a pool under lockdown. Any quoting, `USE`,
+    `SET search_path`, string arguments and `query()` bodies are covered; a run-time-computed
+    target (`query_table('__duck' || 'lake...')`, `SET search_path = <expression>`, the
+    `postgres_query` / `query` family with a non-constant argument) is refused for the same
+    callers. The data tables themselves and the other DuckLake functions are unchanged.
   - No secret reaches a node process's environment or command line, on any backend: a node user
     with SQL could read `getenv()` or `/proc/<pid>/environ` of duckdb and of its wrapper script.
     The catalog password, the encryption key, the federation and object-store SQL, the node token
