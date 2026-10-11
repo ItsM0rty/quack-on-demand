@@ -630,6 +630,8 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT * FROM destroy_external_resource('read' || '_text', '/x')") shouldBe true
     denied("SELECT * FROM create_external_resource('t', {}, 'r')") shouldBe true
     denied("SELECT * FROM register_external_resource('t', 'n', 'h')") shouldBe true
+    denied("SELECT * FROM register_external_resource_type('n', 'k')") shouldBe true
+    denied("SELECT * FROM deregister_external_resource('n')") shouldBe true
     LockdownScreen.screen("SELECT * FROM postgres_query('c', 'x')", Set.empty) match
       case Some(m) => m should not include "over local paths"
       case None    => fail("expected a refusal")
@@ -666,6 +668,24 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("SELECT * FROM read_csv('s3://x' || '/etc/passwd')") shouldBe true
     denied("SELECT * FROM read_text('s3://staging/ok.csv')") shouldBe false
     denied("SELECT * FROM read_text('s3://staging/it''s.csv')") shouldBe false
+  }
+
+  it should "parse a path LIST from the lexer, not a raw ] scan, and require terminated literals" in {
+    // A ] inside the first literal must not cut the list, and an unterminated element (trailing
+    // doubled quote) must not pass as a lone remote literal hiding a local path after it.
+    denied("SELECT * FROM read_text(['http://h/f.txt?x='']', '/proc/self/environ'])") shouldBe true
+    denied("SELECT * FROM read_text(['s3://a'']', '/etc/passwd'])") shouldBe true
+    denied("SELECT * FROM read_csv(['s3://staging/a.csv', '/etc/passwd'])") shouldBe true
+    denied("SELECT * FROM read_parquet(['s3://staging/a.parquet'])") shouldBe false
+    denied("SELECT * FROM read_csv(['s3://staging/a.csv', 's3://staging/b.csv'])") shouldBe false
+    deniedB("SELECT * FROM read_parquet(['s3://lakebucket/a.parquet'])") shouldBe true
+  }
+
+  it should "deny sql_auto_complete, which lists a local directory like glob" in {
+    // Verified on 2.0: sql_auto_complete('SELECT * FROM ''/etc/pas') suggests local file names.
+    denied("SELECT * FROM sql_auto_complete('SELECT * FROM ''/etc/pas')") shouldBe true
+    denied("CALL sql_auto_complete('x')") shouldBe true
+    denied("SELECT * FROM `sql_auto_complete`('x')") shouldBe true
   }
 
   it should "deny the write-side and third-argument-path functions (no path exemption)" in {

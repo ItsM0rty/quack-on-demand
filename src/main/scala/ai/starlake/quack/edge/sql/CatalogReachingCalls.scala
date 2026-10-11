@@ -51,11 +51,13 @@ object CatalogReachingCalls:
     * The `*_external_resource` family (new in 2.0) invokes a table function whose NAME is a value:
     * `destroy_external_resource('read' || '_text', '/x')` ran `read_text` on 2.0, so the name
     * defeats a lexical screen; refusing the invokers themselves closes it, since they cannot be
-    * named indirectly. `postgres_configure_pool` sets `health_check_query` (run on every pool
-    * acquire), the function twin of the protected `pg_pool_health_check_query`; `quack_query` /
-    * `quack_query_by_name` send raw SQL to a quack endpoint. A DuckDB client's own `quack_query`
-    * runs client-side and never reaches the edge as node SQL (QuackCompatibilitySpec), so refusing
-    * it in node-bound SQL breaks no federation path.
+    * named indirectly. (`list_aggregate` / `aggregate` / `array_aggr` also take a function name as
+    * a value, but resolve only aggregate functions, none of which reads a file or runs SQL, so they
+    * are not an escape and are not listed.) `postgres_configure_pool` sets `health_check_query`
+    * (run on every pool acquire), the function twin of the protected `pg_pool_health_check_query`;
+    * `quack_query` / `quack_query_by_name` send raw SQL to a quack endpoint. A DuckDB client's own
+    * `quack_query` runs client-side and never reaches the edge as node SQL
+    * (QuackCompatibilitySpec), so refusing it in node-bound SQL breaks no federation path.
     */
   private val NodeEscaping = Set(
     "postgres_query",

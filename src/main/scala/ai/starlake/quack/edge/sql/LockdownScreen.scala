@@ -152,13 +152,13 @@ object LockdownScreen:
   // / mysql / sqlite connection functions + getenv) so the two paths never drift.
   private val NodeEscapingFunctions = CatalogReachingCalls.LockdownNames
 
-  // Lockdown-only denials whose caller-named local path is NOT the first argument, so the
-  // first-argument remote exemption must never apply: enable_logging (storage_path) and
-  // enable_profiling (save_location) write a file; ducklake_add_data_files registers a local
-  // Parquet file named in its third argument. (postgres_configure_pool is in NodeEscapingFunctions,
-  // refused for tenant principals under the ACL as well, matching pg_pool_health_check_query.)
+  // Lockdown-only denials with no first-argument path to exempt: enable_logging (storage_path) and
+  // enable_profiling (save_location) write a file; ducklake_add_data_files registers a local Parquet
+  // file named in its third argument; sql_auto_complete lists a local directory's contents from a
+  // `FROM '<dir>/` prefix, the same capability as the denied glob. (postgres_configure_pool is in
+  // NodeEscapingFunctions, refused for tenant principals under the ACL too.)
   private val NoPathFunctions =
-    Set("enable_logging", "enable_profiling", "ducklake_add_data_files")
+    Set("enable_logging", "enable_profiling", "ducklake_add_data_files", "sql_auto_complete")
 
   private val DeniedFunctions = FileReadFunctions ++ NodeEscapingFunctions ++ NoPathFunctions
 
@@ -406,28 +406,60 @@ object LockdownScreen:
     * unterminated strings) answers Local (deny).
     */
   private def argsVerdict(rest: String, deniedBuckets: Set[String]): LitVerdict =
-    val trimmed = rest.dropWhile(_.isWhitespace)
-    if trimmed.startsWith("[") then
-      val closing = trimmed.indexOf(']')
-      if closing < 0 then LitVerdict.Local
-      else
-        val inner    = trimmed.substring(1, closing)
-        val elems    = splitTopLevel(inner)
-        val verdicts = elems.map(e => literalVerdict(e.trim, deniedBuckets))
-        if verdicts.isEmpty then LitVerdict.Local
-        else
-          verdicts
-            .collectFirst { case b: LitVerdict.Bucket => b }
-            .getOrElse(
-              if verdicts.forall(_ == LitVerdict.Safe) then LitVerdict.Safe else LitVerdict.Local
-            )
+    // Boundaries come from the shared lexer's tokens, never indexOf: a `]` or `,` inside a string
+    // literal is part of that literal's token, so it cannot cut a list early or split an element.
+    val view = SqlLexer.engineView(rest)
+    val toks = SqlLexer.tokens(view).filterNot(_.isTrivia)
+    toks.headOption match
+      case None                             => LitVerdict.Local
+      case Some(h) if isPunct(view, h, '[') => listVerdict(view, toks, deniedBuckets)
+      case Some(h)                          =>
+        // Bare first argument: a single string literal, ended by a top-level comma or the closing
+        // paren. Anything else as the first token (an operator, a bracket, a second token of a
+        // concat) fails closed. `literalVerdict` re-checks that it is one TERMINATED literal.
+        val endsArg =
+          toks.lift(1).forall(n => isPunct(view, n, ',') || isPunct(view, n, ')'))
+        if h.kind == SqlLexer.Kind.Literal && endsArg then
+          literalVerdict(view.substring(h.start, h.end), deniedBuckets)
+        else LitVerdict.Local
+
+  /** A `[ 'lit' (, 'lit')* ]` list from the lexer tokens starting at the `[`: Safe only when it is
+    * closed and every element is a single terminated remote literal on a non-denied bucket. Any
+    * non-literal element, a missing close (an unterminated literal swallows the `]`), or anything
+    * other than literals and top-level commas inside, is Local.
+    */
+  private def listVerdict(
+      view: String,
+      toks: Vector[SqlLexer.Token],
+      deniedBuckets: Set[String]
+  ): LitVerdict =
+    val elems         = ListBuffer.empty[String]
+    var i             = 1
+    var expectLiteral = true
+    var closed        = false
+    var bad           = false
+    while i < toks.length && !closed && !bad do
+      val t = toks(i)
+      if isPunct(view, t, ']') then closed = true
+      else if expectLiteral then
+        if t.kind == SqlLexer.Kind.Literal then
+          elems += view.substring(t.start, t.end)
+          expectLiteral = false
+        else bad = true
+      else if isPunct(view, t, ',') then expectLiteral = true
+      else bad = true
+      i += 1
+    if bad || !closed || elems.isEmpty then LitVerdict.Local
     else
-      // Bare first argument: it must itself be a safe remote string literal. Anything after it
-      // (further positional args, or named args like `header = true`) doesn't matter for the
-      // path-safety proof, but if the first thing isn't a quoted literal at all, fail closed.
-      firstArg(trimmed) match
-        case Some(lit) => literalVerdict(lit.trim, deniedBuckets)
-        case None      => LitVerdict.Local
+      val verdicts = elems.toList.map(e => literalVerdict(e, deniedBuckets))
+      verdicts
+        .collectFirst { case b: LitVerdict.Bucket => b }
+        .getOrElse(
+          if verdicts.forall(_ == LitVerdict.Safe) then LitVerdict.Safe else LitVerdict.Local
+        )
+
+  private def isPunct(view: String, t: SqlLexer.Token, c: Char): Boolean =
+    t.kind == SqlLexer.Kind.Punct && view.charAt(t.start) == c
 
   private def literalVerdict(quoted: String, deniedBuckets: Set[String]): LitVerdict =
     // The argument must be exactly ONE string-literal token before the scheme test, so an
@@ -440,14 +472,24 @@ object LockdownScreen:
         case None    => LitVerdict.Safe
 
   /** True when `s` lexes, under the shared DuckDB 2.0 lexer, as a single single-quoted string
-    * literal and nothing else (`'it''s'` stays one token). Any operator, bracket, concat or second
-    * token makes it false, so a computed argument never earns the remote exemption.
+    * literal that is TERMINATED and nothing else (`'it''s'` stays one token). Any operator,
+    * bracket, concat or second token makes it false, so a computed argument never earns the remote
+    * exemption; and an unterminated literal (`'http://h/f?x=''`, which the lexer runs to end of
+    * input) is rejected, so a `]`-bearing remote literal cannot hide a second path after it.
     */
   private def isSingleStringLiteral(s: String): Boolean =
     val trimmed = s.trim
-    val toks    = SqlLexer.tokens(SqlLexer.engineView(trimmed)).filterNot(_.isTrivia)
-    toks.length == 1 && toks.head.kind == SqlLexer.Kind.Literal &&
-    trimmed.nonEmpty && trimmed.charAt(0) == '\''
+    if trimmed.isEmpty || trimmed.charAt(0) != '\'' then false
+    else
+      def nonTrivia(x: String): Vector[SqlLexer.Token] =
+        SqlLexer.tokens(SqlLexer.engineView(x)).filterNot(_.isTrivia)
+      val base = nonTrivia(trimmed)
+      // Appending a sentinel word reveals termination: a terminated literal yields [Literal, Word]
+      // ending at the same offset; an unterminated one swallows the sentinel and stays one token.
+      val probed = nonTrivia(trimmed + " x")
+      base.length == 1 && base.head.kind == SqlLexer.Kind.Literal &&
+      probed.length == 2 && probed.head.kind == SqlLexer.Kind.Literal &&
+      probed.head.end == base.head.end
 
   /** The denied bucket a remote literal addresses, if any. Object-store schemes match on the
     * BucketKeys authority; http(s) literals match a denied bucket appearing as the first path
@@ -470,53 +512,6 @@ object LockdownScreen:
 
   private def bucketMessage(bucket: String): String =
     s"bucket '$bucket' holds DuckLake-managed data and is not directly addressable on this deployment"
-
-  /** Extracts the first top-level, comma-separated argument text (up to the matching close-paren or
-    * the first top-level comma), or None if the argument list is empty/unparseable.
-    */
-  private def firstArg(s: String): Option[String] =
-    if s.isEmpty || s.startsWith(")") then None
-    else
-      val parts = splitTopLevel(s)
-      parts.headOption
-
-  /** Splits a comma-separated argument/element list on top-level commas only (commas inside a
-    * quoted string, or inside nested brackets/parens, don't count). Stops at the first unmatched
-    * closing paren/bracket (the end of the enclosing argument list).
-    */
-  private def splitTopLevel(s: String): List[String] =
-    val buf      = new StringBuilder
-    val out      = ListBuffer.empty[String]
-    var depth    = 0
-    var inString = false
-    var i        = 0
-    var stop     = false
-    while i < s.length && !stop do
-      val c = s(i)
-      if inString then
-        buf.append(c)
-        if c == '\'' then inString = false
-      else
-        c match
-          case '\'' =>
-            inString = true
-            buf.append(c)
-          case '(' | '[' =>
-            depth += 1
-            buf.append(c)
-          case ')' | ']' =>
-            if depth == 0 then stop = true
-            else
-              depth -= 1
-              buf.append(c)
-          case ',' if depth == 0 =>
-            out += buf.toString
-            buf.clear()
-          case _ =>
-            buf.append(c)
-      i += 1
-    if buf.nonEmpty || out.nonEmpty then out += buf.toString
-    out.toList.filter(_.trim.nonEmpty)
 
   private def isRemoteLiteral(s: String): Boolean =
     s.startsWith("'") && s.endsWith("'") && s.length >= 2 &&
