@@ -32,7 +32,41 @@ class RouterSpec extends AnyFlatSpec with Matchers:
     Router.pick(s, StatementKind.Select, pinned = Some("gone")) shouldBe
       RoutingDecision.PinnedNodeGone("gone")
 
-  it should "pick the least-loaded role-compatible node" in:
+  "Router.softPinUsable" should "accept a routable, role-compatible node with capacity" in:
+    Router.softPinUsable(snap(List(ro1, d1)), StatementKind.Select, "ro1") shouldBe true
+
+  it should "refuse a node that left the pool" in:
+    Router.softPinUsable(snap(List(ro1)), StatementKind.Select, "ro2") shouldBe false
+
+  it should "refuse a node that is unhealthy, draining or quarantined" in:
+    val nodes = List(ro1, ro2, d1)
+    val loads = Map(
+      "ro1" -> NodeLoad(0, 0, healthy = false),
+      "ro2" -> NodeLoad(0, 0, draining = true),
+      "d1"  -> NodeLoad(0, 0, quarantined = true)
+    )
+    for id <- List("ro1", "ro2", "d1") do
+      Router.softPinUsable(snap(nodes, loads), StatementKind.Select, id) shouldBe false
+
+  it should "refuse a node whose role the statement does not accept" in:
+    // A DDL that happens to read a catalog function must never be soft-pinned to a reader.
+    Router.softPinUsable(snap(List(ro1, d1)), StatementKind.Ddl, "ro1") shouldBe false
+    Router.softPinUsable(snap(List(ro1, d1)), StatementKind.Ddl, "d1") shouldBe true
+
+  it should "refuse a node at its concurrency cap" in:
+    val capped = ro1.copy(maxConcurrent = 2)
+    Router.softPinUsable(
+      snap(List(capped), Map("ro1" -> NodeLoad(2, 0))),
+      StatementKind.Select,
+      "ro1"
+    ) shouldBe false
+    Router.softPinUsable(
+      snap(List(capped), Map("ro1" -> NodeLoad(1, 0))),
+      StatementKind.Select,
+      "ro1"
+    ) shouldBe true
+
+  "Router" should "pick the least-loaded role-compatible node" in:
     val loads = Map("ro1" -> NodeLoad(inFlight = 3, ewmaMs = 100), "ro2" -> NodeLoad(2, 100))
     Router.pick(snap(List(ro1, ro2), loads), StatementKind.Select, None) shouldBe
       RoutingDecision.Use("ro2")

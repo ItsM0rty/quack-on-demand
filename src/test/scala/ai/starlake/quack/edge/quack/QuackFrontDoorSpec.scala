@@ -52,6 +52,7 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     @volatile var prepareError: Option[String] = None
     @volatile var fetchChunksBeforeEnd: Int    = 1
     val posted: ArrayBuffer[Frame]             = ArrayBuffer.empty
+    val prepareUris: ArrayBuffer[URI]          = ArrayBuffer.empty
     private val connections                    = new AtomicInteger(0)
     private var fetchesServed                  = 0
     def types: List[Int]                       = posted.toList.map(_.header.msgType)
@@ -67,6 +68,7 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
       f.header.msgType match
         case Type.ConnectionRequest => connResp(s"NODE${connections.incrementAndGet()}")
         case Type.PrepareRequest    =>
+          posted.synchronized(prepareUris += uri)
           fetchesServed = 0
           prepareError.map(encodeError).getOrElse(prepareResp(prepareNeedsMore))
         case Type.FetchRequest =>
@@ -85,7 +87,8 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
       journal: EventJournal,
       store: RecordingTelemetryStore,
       events: ArrayBuffer[ManagerEvent],
-      nodes: List[RunningNode]
+      nodes: List[RunningNode],
+      tracker: NodeLoadTracker
   )
 
   private def setup(
@@ -152,7 +155,17 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     val transport = new ScriptedTransport
     val sessions  = new QuackSessionRegistry(sessionTtlSec = ttlSec, maxHeartbeatSec = 3600)
     val door      = new QuackFrontDoor(router, handshake, sessions, transport, sink, "test")
-    Fixture(door, router, transport, sessions, journal, store, events, sup.get(poolKey).get.nodes)
+    Fixture(
+      door,
+      router,
+      transport,
+      sessions,
+      journal,
+      store,
+      events,
+      sup.get(poolKey).get.nodes,
+      tracker
+    )
 
   private def hello(token: String) =
     ConnectionRequest(token, "v2.0.0", "osx_arm64", 3L, 3L, "qod-test", 0L)
@@ -501,3 +514,67 @@ class QuackFrontDoorSpec extends AnyFlatSpec with Matchers:
     routerSession.txOpen shouldBe false
     routerSession.pinnedNodeId shouldBe None
     fx.router.sessions.inTransactionCount shouldBe 0
+
+  // The DuckDB 2.0 client's catalog sync (duckdb-quack QuackSchemaSet / QuackTableSet
+  // GetLoadQuery, abridged): two statements the client joins on node-local oids.
+  private val SchemaSync =
+    "WITH RECURSIVE schema_tree AS (SELECT oid, database_name, [schema_name] AS schema_path " +
+      "FROM duckdb_schemas() WHERE parent_schema_oid IS NULL) " +
+      "SELECT oid, database_name, schema_path, current_database() FROM schema_tree"
+  private val TableSync =
+    "SELECT schema_oid, sql, 'table' FROM duckdb_tables() " +
+      "UNION ALL SELECT schema_oid, view_name, 'view' FROM duckdb_views()"
+
+  private def lastPrepareNode(fx: Fixture): String =
+    val port = fx.transport.prepareUris.last.getPort
+    fx.nodes.find(_.port == port).map(_.nodeId).getOrElse(fail(s"no node on port $port"))
+
+  "a catalog sync" should "list schemas and tables on the same node even when load moves" in:
+    val fx     = setup()
+    val connId = connect(fx)
+    prepare(fx, connId, SchemaSync) shouldBe prepareResp(false)
+    val first = lastPrepareNode(fx)
+    val other = fx.nodes.map(_.nodeId).find(_ != first).getOrElse(fail("need two nodes"))
+    // Load moves off the node that listed the schemas, so a load-aware pick now prefers the
+    // other node: an ordinary read goes there...
+    fx.tracker.onStart(first)
+    prepare(fx, connId, "SELECT 42") shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe other
+    // ...but the table listing must not: its schema_oid values would match none of the oids the
+    // client holds, and the attached catalog would show every schema and no table.
+    prepare(fx, connId, TableSync) shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe first
+
+  it should "move to another node when its node stops being routable, then stay there" in:
+    val fx     = setup()
+    val connId = connect(fx)
+    prepare(fx, connId, SchemaSync) shouldBe prepareResp(false)
+    val first = lastPrepareNode(fx)
+    val other = fx.nodes.map(_.nodeId).find(_ != first).getOrElse(fail("need two nodes"))
+    fx.tracker.setHealthy(first, false)
+    prepare(fx, connId, SchemaSync) shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe other
+    // The first node is back and now the less loaded one; the next listing still pairs with
+    // the previous one.
+    fx.tracker.setHealthy(first, true)
+    fx.tracker.onStart(other)
+    prepare(fx, connId, TableSync) shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe other
+
+  it should "not tie one session's catalog node to another session" in:
+    val fx = setup()
+    val a  = connect(fx)
+    prepare(fx, a, SchemaSync) shouldBe prepareResp(false)
+    val first = lastPrepareNode(fx)
+    val other = fx.nodes.map(_.nodeId).find(_ != first).getOrElse(fail("need two nodes"))
+    fx.tracker.onStart(first)
+    val b = connect(fx)
+    prepare(fx, b, SchemaSync) shouldBe prepareResp(false)
+    lastPrepareNode(fx) shouldBe other
+
+  "QuackFrontDoor.readsCatalog" should "spot a duckdb_* catalog function call only" in:
+    QuackFrontDoor.readsCatalog(SchemaSync) shouldBe true
+    QuackFrontDoor.readsCatalog(TableSync) shouldBe true
+    QuackFrontDoor.readsCatalog("select * from main.DUCKDB_TABLES ()") shouldBe true
+    QuackFrontDoor.readsCatalog("SELECT count(*) FROM tpch1.lineitem") shouldBe false
+    QuackFrontDoor.readsCatalog("SELECT my_duckdb_tables() FROM t") shouldBe false

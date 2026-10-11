@@ -209,6 +209,9 @@ final class QuackFrontDoor(
       reopenTx: Boolean = false
   ): IO[Array[Byte]] =
     val cq = f.header.clientQueryId
+    // Catalog reads stay on one node per session: the client joins its schema and table listings
+    // on node-local oids (see QuackSession.catalogNode).
+    val catalogRead = QuackFrontDoor.readsCatalog(prep.sql)
     router
       .executeWith[PrepareOutcome](
         s.connectionId,
@@ -218,6 +221,7 @@ final class QuackFrontDoor(
         Some(s.bound.effectiveSet),
         relaySend(s, cq, prep, reopenTx),
         source = "quack",
+        preferredNode = if catalogRead then s.catalogNode.get() else None,
         // The one edge that relays SEND_DATA on the statement's own node connection, so the
         // one edge where a 2.0 client's scan_data_from_quack_client can ever be fed.
         clientDataScans = true
@@ -225,6 +229,7 @@ final class QuackFrontDoor(
       .flatMap {
         case Left(fail)    => IO.pure(encodeError(fail.reason))
         case Right(routed) =>
+          if catalogRead then s.catalogNode.set(Some(routed.nodeId))
           // A failed recovery keeps the fence: the client is still inside its dead transaction.
           if reopenTx then s.txAborted.set(false)
           afterPrepare(s, cq, prep.sql, routed)
@@ -603,6 +608,17 @@ object QuackFrontDoor:
   def clientVersionMessage(hello: QuackWire.ConnectionRequest): String =
     s"quack-on-demand requires a DuckDB 2.0 client (Quack protocol $ProtocolVersion); this " +
       s"client (${hello.clientDuckdbVersion}) speaks ${hello.minVersion}..${hello.maxVersion}"
+
+  private val CatalogFunctionCall = """(?i)\bduckdb_[a-z_]+\s*\(""".r
+
+  /** True when `sql` calls one of DuckDB's catalog table functions (`duckdb_schemas()`,
+    * `duckdb_tables()`, ...), whose `oid` columns are allocated per DuckDB process and therefore
+    * differ from node to node. The DuckDB client's ATTACH-time (and post-DDL) catalog sync is two
+    * such statements joined on those oids; routed to two different nodes they match nothing and the
+    * attached catalog shows every schema but no table. A false positive costs only node affinity,
+    * so the check is textual.
+    */
+  def readsCatalog(sql: String): Boolean = CatalogFunctionCall.findFirstIn(sql).isDefined
 
   /** Answer to every statement a client sends inside a transaction an admin kill tore down. */
   val TxKilledMessage: String =
