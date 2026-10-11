@@ -71,6 +71,47 @@ object AccessGate:
       case None         =>
         evaluateParsed(statement, config, sessionCatalog, filteredMetadata, clientDataScans)
 
+  /** Some(reason) when `rewritten`, a statement an edge rewriter (column policies, row policies,
+    * metadata filter) printed from `original`, needs a grant on a table, or a verb, the original
+    * did not, or can no longer be authorized table by table while the original could. The router
+    * authorized `original` and runs `rewritten`: a rewrite that reaches another table (a CTE
+    * reference printed schema-qualified becomes a read of the real table of that name) would run a
+    * read nobody checked. Both are evaluated under the same `config`, so an unqualified name
+    * qualifies identically on both sides.
+    *
+    * Only the accesses that need a grant are compared: the session catalog's filterable metadata
+    * reads and catalog functions are answered by the metadata filter, which has already run on
+    * `rewritten` (it is the rewriter that introduces them, for SHOW TABLES). An original that is
+    * itself refused (admitted by a wildcard grant) cannot be compared here; the router re-validates
+    * every rewrite anyway.
+    */
+  def rewriteReachesBeyond(
+      original: String,
+      rewritten: String,
+      config: Config,
+      sessionCatalog: String,
+      clientDataScans: Boolean
+  ): Option[String] =
+    def gatedOf(o: GateOutcome): Option[Set[TableAccess]] = o match
+      case GateOutcome.Refuse(_, _, _)    => None
+      case GateOutcome.NothingGated(_, _) => Some(Set.empty)
+      case GateOutcome.Gated(gated, _)    => Some(gated)
+    def eval(sql: String) =
+      evaluate(sql, config, sessionCatalog, filteredMetadata = true, clientDataScans)
+    gatedOf(eval(original)).flatMap { authorized =>
+      eval(rewritten) match
+        case GateOutcome.Refuse(message, _, _) =>
+          Some(s"the rewritten statement cannot be authorized ($message)")
+        case other =>
+          gatedOf(other).flatMap { needed =>
+            val extra = (needed -- authorized).map(a => s"${a.table.canonical} (${a.verb})")
+            Option.when(extra.nonEmpty)(
+              "the rewritten statement reaches what the original did not: " +
+                extra.toList.sorted.mkString(", ")
+            )
+          }
+    }
+
   private def evaluateParsed(
       statement: String,
       config: Config,

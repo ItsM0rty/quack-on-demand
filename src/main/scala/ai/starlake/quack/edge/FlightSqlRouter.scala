@@ -4,6 +4,7 @@ import java.util.Locale
 import ai.starlake.acl.parser.TableAccess
 import ai.starlake.quack.edge.adapter._
 import ai.starlake.quack.edge.sql.{
+  AccessGate,
   Allowed,
   CatalogInternalsScreen,
   CatalogWriteScreen,
@@ -751,15 +752,55 @@ final class FlightSqlRouter(
               maybeRecord(nodeId = "-", durationMs = 0, status = "denied", error = Some(reason))
               Left(f)
 
-    // ACL -> catalog read-only screen -> CLS -> RLS -> metadata-filter pipeline; every denial
-    // arm has already journaled itself. Bound to resultIO so one flatTap below emits exactly
-    // one StatementExecuted event on every exit path, including the denial arms.
+    // Defense in depth behind the three rewriters: each prints a NEW statement, and the node runs
+    // that one, not the one the ACL gate authorized. A rewrite that reaches a table the original
+    // did not (the column policy rewrite once schema-qualified a CTE reference, turning it into a
+    // read of the real table of that name) would run a read nobody checked. So the rewritten
+    // statement must reach nothing beyond the original's tables, verbs and catalog functions, and
+    // is re-validated for the same principal in the same ACL mode; anything else denies.
+    def rewriteRevalidated(rewrittenSql: String): Either[RouterFailure, String] =
+      if rewrittenSql == sql then Right(rewrittenSql)
+      else
+        def denied(reason: String): Either[RouterFailure, String] =
+          maybeRecord(nodeId = "-", durationMs = 0, status = "denied", error = Some(reason))
+          Left(RouterFailure.AccessDenied(s"access denied: $reason"))
+        val parserCfg = ai.starlake.acl.model.Config.forDuckDB(
+          ctx.defaultDatabase,
+          ctx.defaultSchema,
+          ctx.attachedCatalogs
+        )
+        AccessGate.rewriteReachesBeyond(
+          sql,
+          rewrittenSql,
+          parserCfg,
+          ctx.defaultDatabase.getOrElse(""),
+          clientDataScans
+        ) match
+          case Some(reason) => denied(s"policy rewrite: $reason")
+          case None         =>
+            validator.validate(ctx.copy(statement = rewrittenSql)) match
+              case Allowed                      => Right(rewrittenSql)
+              case Denied(reason, _, _)         => denied(s"policy rewrite: $reason")
+              case ValidatorUnavailable(reason) =>
+                maybeRecord(
+                  nodeId = "-",
+                  durationMs = 0,
+                  status = "transient",
+                  error = Some(reason)
+                )
+                Left(RouterFailure.Unavailable(s"authorization service unavailable: $reason"))
+
+    // ACL -> catalog read-only screen -> CLS -> RLS -> metadata-filter -> re-validation
+    // pipeline; every denial arm has already journaled itself. Bound to resultIO so one flatTap
+    // below emits exactly one StatementExecuted event on every exit path, including the denial
+    // arms.
     val resultIO: IO[Either[RouterFailure, Routed[A]]] =
       catalogDenial
         .flatMap(_ => protectedWrite())
         .flatMap(_ => clsRewritten())
         .flatMap(rlsRewritten)
-        .flatMap(metadataFiltered) match
+        .flatMap(metadataFiltered)
+        .flatMap(rewriteRevalidated) match
         case Left(f)         => IO.pure(Left(f))
         case Right(finalSql) =>
           resolveSnapshot(poolKey).flatMap {

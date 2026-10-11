@@ -71,7 +71,7 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
       // `JSQLDataException` umbrella; it raises one of the table/column/schema/catalog-not-
       // found exceptions under `ai.starlake.transpiler.*`.
       val resolveAttempt: Either[RewriteOutcome, String] =
-        try Right(resolver.getResolvedStatementText(sql))
+        try Right(resolvedText(resolver, metaData, sql))
         catch
           case e: ai.starlake.transpiler.TableNotFoundException    => Left(Denied(e.getMessage))
           case e: ai.starlake.transpiler.TableNotDeclaredException => Left(Denied(e.getMessage))
@@ -125,6 +125,36 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
                       catch case e: DenyException => Denied(e.reason)
                 case _ =>
                   Passthrough
+
+  /** The resolver's rewrite of `sql` (star expansion, column lineage) with every table name the
+    * caller wrote printed exactly as written. `JSQLColumResolver.getResolvedStatementText` also
+    * schema-qualifies every bare table reference, a CTE reference included, and a qualified name
+    * never binds to a CTE: `WITH t AS (..) SELECT .. FROM t` became `.. FROM tpch1.t`, a read of
+    * the real table `t` that the ACL gate never checked (it saw the CTE). The router runs the
+    * statement under the session's default catalog and schema, so the caller's own spelling already
+    * resolves where the gate assumed; the rewrite must change nothing but the masked expressions.
+    */
+  private def resolvedText(
+      resolver: JSQLColumResolver,
+      metaData: JdbcMetaData,
+      sql: String
+  ): String =
+    val statement = CCJSqlParserUtil.parse(sql)
+    statement match
+      case select: Select =>
+        val written =
+          ResidualColumns.tablesOf(select).map(t => t -> new java.util.ArrayList(t.getNameParts))
+        select.accept(
+          resolver: net.sf.jsqlparser.statement.select.SelectVisitor[
+            ai.starlake.transpiler.schema.JdbcResultSetMetaData
+          ],
+          JdbcMetaData.copyOf(metaData)
+        )
+        written.foreach((t, parts) => t.setNameParts(parts))
+      case _ => ()
+    val builder = new java.lang.StringBuilder()
+    statement.accept(new net.sf.jsqlparser.util.deparser.StatementDeParser(builder))
+    builder.toString
 
   /** First table reference, at ANY depth, that neither the caller-provided schema nor the
     * system-schema seeds know. CTE names are excluded by [[TablesNamesFinder]] itself. Matching is
@@ -908,6 +938,9 @@ private[cls] object ResidualColumns:
         case other => unknown = unknown.orElse(Some(other.getClass.getName))
     walk(root, Nil, Map.empty)
     Scan(columns.toList, tables.toList, unknown, tableStatements.toList)
+
+  /** Every table node of `root` except column qualifiers, by identity. */
+  def tablesOf(root: AnyRef): List[Table] = scan(root).tables
 
   /** The column references in `sel` a policy could cover, noted before the rewrite. */
   def suspects(

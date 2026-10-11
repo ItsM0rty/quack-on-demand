@@ -472,3 +472,33 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
         "SELECT l FROM customer WHERE false) SELECT l FROM customer"
     )
   }
+
+  // ---- the rewrite keeps every table name as the caller wrote it -------------------------------
+  //
+  // The resolver schema-qualified every table reference, CTE references included, and a qualified
+  // name never binds to a CTE: `WITH t AS (..) SELECT .. FROM t` became `.. FROM tpch1.t`, a read
+  // of the real table t the ACL gate never checked.
+
+  "a column policy rewrite" should "leave a CTE reference unqualified" in {
+    outcome(
+      "WITH t AS (SELECT c_id AS a FROM customer WHERE c_email LIKE '%') SELECT a FROM t"
+    ) shouldBe RewriteOutcome.Rewritten(
+      "WITH t AS (SELECT c_id AS a FROM customer WHERE '***' LIKE '%') SELECT a FROM t"
+    )
+    outcome(
+      "WITH orders AS (SELECT c_id, c_email FROM customer) SELECT c_email FROM orders"
+    ) match
+      case RewriteOutcome.Rewritten(sql) =>
+        sql should include("FROM orders")
+        sql should not include "tpch1.orders"
+      case other => fail(s"expected Rewritten, got $other")
+  }
+
+  it should "print every table name exactly as written" in {
+    outcome("SELECT c_email FROM customer") shouldBe
+      RewriteOutcome.Rewritten("SELECT '***' AS c_email FROM customer")
+    outcome("SELECT c_email FROM tpch1.customer") shouldBe
+      RewriteOutcome.Rewritten("SELECT '***' AS c_email FROM tpch1.customer")
+    outcome("SELECT c_email FROM acme_tpch.tpch1.customer") shouldBe
+      RewriteOutcome.Rewritten("SELECT '***' AS c_email FROM acme_tpch.tpch1.customer")
+  }

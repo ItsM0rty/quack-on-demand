@@ -1123,6 +1123,114 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     failure shouldBe a[RouterFailure.AccessDenied]
     failure.reason should include("access denied")
 
+  // ---- a rewrite never reaches beyond what the gate authorized ----
+  //
+  // The column policy rewrite once printed a CTE reference schema-qualified (`FROM t` became
+  // `FROM main.t`), and a qualified name never binds to a CTE: the node read the real table `t`,
+  // which the ACL gate never saw. The router now refuses any rewrite that reaches a table the
+  // original did not, and re-validates the rewrite for the same principal.
+
+  private val maskCustomerEmailCls =
+    ai.starlake.quack.ondemand.state.RoleColumnPolicy(
+      "cp-cte",
+      "r-1",
+      "*",
+      "main",
+      "customer",
+      "c_email",
+      "mask",
+      Some("'***'")
+    )
+
+  /** A column policy rewrite that schema-qualifies every `FROM t`, as the old resolver did. */
+  private def qualifyingRewriter(qualified: String) =
+    new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+      new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(Map.empty),
+      inner = new ai.starlake.quack.edge.cls.SchemaAwareSqlRewriter:
+        def rewrite(
+            sql: String,
+            schema: Map[String, List[String]],
+            policies: List[ai.starlake.quack.ondemand.state.RoleColumnPolicy],
+            defaultCatalog: Option[String],
+            defaultSchema: Option[String],
+            unresolvedMode: ai.starlake.quack.edge.cls.UnresolvedMode
+        ) = ai.starlake.quack.edge.cls.RewriteOutcome.Rewritten(qualified)
+      ,
+      enabled = true
+    )
+
+  "a policy rewrite" should "be refused when it reaches a table the original statement did not" in:
+    val sql = "WITH secret AS (SELECT c_id AS v FROM customer WHERE c_email LIKE '%') " +
+      "SELECT v FROM secret"
+    val (router, capturedSql, _) = setupWithRewriter(
+      qualifyingRewriter(
+        "WITH secret AS (SELECT c_id AS v FROM customer WHERE '***' LIKE '%') " +
+          "SELECT v FROM main.secret"
+      )
+    )
+    val out = router
+      .execute(
+        "cls-cte-1",
+        "alice",
+        poolKey,
+        sql,
+        Some(effWithPolicies(List(maskCustomerEmailCls)))
+      )
+      .unsafeRunSync()
+    out shouldBe a[Left[?, ?]]
+    out.left.get shouldBe a[RouterFailure.AccessDenied]
+    out.left.get.reason should include("memory.main.secret")
+    capturedSql() shouldBe ""
+
+  it should "be re-validated for the same principal" in:
+    // A validator that admits only statements free of the masked literal: the original passes,
+    // the rewrite does not, so the router must ask again.
+    val validator = new StatementValidator:
+      def validate(c: ValidationContext): ValidationResult =
+        if c.statement.contains("'***'") then Denied("no masked literal", Set.empty)
+        else Allowed
+    val (router, capturedSql, _) = setupWithRewriter(
+      new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+        new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+          Map(("memory", "main", "customer") -> List("c_id", "c_email"))
+        ),
+        enabled = true
+      ),
+      validator = validator
+    )
+    router
+      .execute(
+        "cls-cte-2",
+        "alice",
+        poolKey,
+        "SELECT c_email FROM customer",
+        Some(effWithPolicies(List(maskCustomerEmailCls)))
+      )
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+    capturedSql() shouldBe ""
+
+  it should "run an ordinary CTE query of a policy holder, the CTE reference left unqualified" in:
+    val (router, capturedSql, _) = setupWithRewriter(
+      new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+        new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+          Map(("memory", "main", "customer") -> List("c_id", "c_email"))
+        ),
+        enabled = true
+      )
+    )
+    router
+      .execute(
+        "cls-cte-3",
+        "alice",
+        poolKey,
+        "WITH t AS (SELECT c_id AS a FROM customer WHERE c_email LIKE '%') SELECT a FROM t",
+        Some(effWithPolicies(List(maskCustomerEmailCls)))
+      )
+      .unsafeRunSync() shouldBe a[Right[?, ?]]
+    capturedSql() should include("'***' LIKE '%'")
+    capturedSql() should include("SELECT a FROM t")
+    capturedSql() should not include "main.t"
+
   // ---- ProtectedWriteGuard integration tests ----
   //
   // The InMemory pool hands the guard a session catalog of "memory" / schema "main",
