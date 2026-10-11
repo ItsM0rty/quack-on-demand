@@ -102,7 +102,11 @@ class NodeSecretFilesSpec extends AnyFlatSpec with Matchers with SpawnScriptTemp
     assume(!isWindows, "bash script")
     val envOut = tempDir.resolve("duckdb.env")
     val fake   = tempDir.resolve("fake-duckdb")
-    Files.writeString(fake, s"#!/usr/bin/env bash\nenv > '$envOut'\nsleep 0.5\n")
+    // Answers the spawn script's `.shell` probe (-no-init), then records its environment and exits.
+    Files.writeString(
+      fake,
+      s"#!/usr/bin/env bash\n[ \"$$1\" = -no-init ] && { echo qod-shell-ok; exit 0; }\nenv > '$envOut'\nsleep 0.5\n"
+    )
     fake.toFile.setExecutable(true)
     val secrets = Map(
       "pgPassword"               -> "hunter2-file",
@@ -127,7 +131,9 @@ class NodeSecretFilesSpec extends AnyFlatSpec with Matchers with SpawnScriptTemp
       // A secret still handed over the environment is ignored, not exported.
       "pgPassword" -> "hunter2-env"
     ).!(ProcessLogger(_ => (), l => stderr.append(l).append('\n')))
-    withClue(stderr.toString)(exit shouldBe 0)
+    // The fake node exits on its own while the wrapper is alive, which the wrapper reports.
+    withClue(stderr.toString)(exit shouldBe 1)
+    stderr.toString should include("while its wrapper was still running")
     Files.exists(dir) shouldBe false
     val duckEnv = Files.readString(envOut)
     (secrets.values.toSeq :+ "hunter2-env").foreach { v =>

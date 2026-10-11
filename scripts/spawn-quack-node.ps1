@@ -244,6 +244,17 @@ if ([string]::IsNullOrEmpty($duckdbBin)) {
   if ($null -ne $cmd -and -not [string]::IsNullOrEmpty($cmd.Source)) { $duckdbBin = $cmd.Source }
   else { $duckdbBin = [System.IO.Path]::GetFullPath((Join-Path $startDir $duckdbBin)) }
 }
+# The node is held open by a `.shell` dot-command (the keep-alive below). A CLI without it would go
+# straight to `.exit` after starting to serve, a silent crash loop; refuse up front instead. One
+# duckdb start with no init file (-no-init: never the user's ~/.duckdbrc). Mirrors the bash twin.
+if (-not $dryRun) {
+  $probe = ''
+  try { $probe = (& $duckdbBin -no-init -noheader -c ".shell 'echo qod-shell-ok'" 2>$null | Out-String) } catch {}
+  if ($probe -notmatch 'qod-shell-ok') {
+    [Console]::Error.WriteLine("ERROR: $duckdbBin cannot run the .shell dot-command the node keep-alive needs")
+    exit 1
+  }
+}
 
 $onWindows = ($env:OS -eq 'Windows_NT')
 
@@ -535,7 +546,11 @@ try {
   }
   Remove-Item -LiteralPath $secretsFile -Force -ErrorAction SilentlyContinue
   $proc.WaitForExit()
-  $exitCode = $proc.ExitCode
+  # A normal stop kills this wrapper with the node (taskkill /T), so reaching here means duckdb ended
+  # on its own while the wrapper is alive: the keep-alive only returns once the wrapper is gone. Say
+  # so and exit non-zero rather than vanishing; the manager then sees the node down.
+  [Console]::Error.WriteLine("ERROR: the node's duckdb exited (status $($proc.ExitCode)) while its wrapper was still running; see the node output above")
+  $exitCode = 1
 } finally {
   Remove-NodeDirectory $nodeDir
 }

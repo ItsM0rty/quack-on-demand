@@ -113,14 +113,15 @@ class SpawnScriptWorkDirSpec extends AnyFlatSpec with Matchers with SpawnScriptT
     )
   }
 
-  /** A stand-in duckdb that records where it runs and its init SQL (`-init <fifo>`, argv position 2),
-    * then blocks until SIGTERM like the real node (whose stdin is /dev/null).
+  /** A stand-in duckdb that records where it runs and its init SQL (`-init <fifo>`, argv position
+    * 2), then blocks until SIGTERM like the real node (whose stdin is /dev/null).
     */
   private def fakeDuckdb(at: Path, probe: Path): Path =
     Files.createDirectories(at.getParent)
     Files.writeString(
       at,
       s"""#!/bin/sh
+         |[ "$$1" = -no-init ] && { echo qod-shell-ok; exit 0; }
          |pwd -P > '$probe/cwd.part'
          |ls -A | wc -l | tr -d ' ' > '$probe/entries'
          |(stat -f %Lp . 2>/dev/null || stat -c %a .) > '$probe/mode'
@@ -168,6 +169,20 @@ class SpawnScriptWorkDirSpec extends AnyFlatSpec with Matchers with SpawnScriptT
       Files.exists(cwd) shouldBe false
       Files.exists(Paths.get(spill)) shouldBe false
     finally stop(p)
+  }
+
+  it should "refuse a duckdb CLI that cannot run the .shell keep-alive" in {
+    val start = dir("start")
+    // A stand-in that answers nothing: no `qod-shell-ok` from the spawn-time probe.
+    val bin = tempDir.resolve("noshell/duckdb")
+    Files.createDirectories(bin.getParent)
+    Files.writeString(bin, "#!/bin/sh\nexit 0\n")
+    Files.setPosixFilePermissions(bin, PosixFilePermissions.fromString("rwx------"))
+    val p   = launch(start, memory ++ Seq("DUCKDB_BIN" -> bin.toString))
+    val out = new String(p.getInputStream.readAllBytes())
+    p.waitFor(30, TimeUnit.SECONDS) shouldBe true
+    p.exitValue() shouldBe 1
+    out should include("cannot run the .shell dot-command")
   }
 
   it should "resolve a relative DUCKDB_BIN before moving duckdb into its own directory" in {

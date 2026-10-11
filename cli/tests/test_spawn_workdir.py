@@ -56,6 +56,7 @@ def test_duckdb_runs_in_an_empty_private_directory_removed_on_stop(tmp_path):
     fake.parent.mkdir()
     fake.write_text(
         "#!/bin/sh\n"
+        '[ "$1" = -no-init ] && { echo qod-shell-ok; exit 0; }\n'
         f"pwd -P > '{probe}/cwd.part'\n"
         f"ls -A | wc -l | tr -d ' ' > '{probe}/entries'\n"
         f"mv '{probe}/cwd.part' '{probe}/cwd'\n"

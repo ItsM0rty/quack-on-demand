@@ -211,6 +211,13 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
   # would otherwise resolve there).
   DUCKDB="$(command -v "$DUCKDB")"
   [[ "$DUCKDB" == /* ]] || DUCKDB="$START_DIR/$DUCKDB"
+  # The node is held open by a `.shell` dot-command (the keep-alive below). A CLI without it would
+  # go straight to `.exit` after starting to serve, a silent crash loop; refuse up front instead.
+  # One duckdb start with no init file (-no-init: never the OS user's ~/.duckdbrc).
+  if [[ "$("$DUCKDB" -no-init -noheader -c ".shell 'echo qod-shell-ok'" < /dev/null 2>/dev/null)" != *qod-shell-ok* ]]; then
+    echo "ERROR: $DUCKDB cannot run the .shell dot-command the node keep-alive needs" >&2
+    exit 1
+  fi
 fi
 
 # Sweep node directories left by an earlier spawn whose script died on SIGKILL (which skips the
@@ -248,7 +255,9 @@ cleanup() {
   fi
   rm -rf -- "$NODE_DIR" ${SPILL_DIR:+"$SPILL_DIR"}
 }
-trap cleanup TERM INT EXIT
+STOPPING=""
+trap 'STOPPING=1; cleanup' TERM INT
+trap cleanup EXIT
 printf '%s' "$$" > "$NODE_DIR/owner.pid"
 WORK_DIR="$NODE_DIR/cwd"
 mkdir -m 700 "$WORK_DIR"
@@ -531,5 +540,15 @@ fi
 { printf '%s' "$INIT_SQL" > "$INIT_FIFO"; rm -f -- "$INIT_FIFO"; } &
 INIT_WRITER=$!
 
-# Block until duckdb is killed (typically SIGTERM from the manager).
-wait "$DUCK_PID"
+# Block until duckdb is killed (typically SIGTERM from the manager, which runs the trap).
+rc=0
+wait "$DUCK_PID" || rc=$?
+if [[ -n "$STOPPING" ]]; then
+  exit 143
+fi
+# duckdb ended on its own while this wrapper is alive: the keep-alive only returns once the wrapper
+# is gone, so this is a failure (a crashed node, or an init that never reached the keep-alive). Say
+# so and exit non-zero, rather than vanishing; the manager then sees the node down.
+DUCK_PID=""
+echo "ERROR: the node's duckdb exited (status $rc) while its wrapper was still running; see the node output above" >&2
+exit 1
