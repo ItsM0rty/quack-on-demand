@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useState } from 'react';
-import { api, errorMessage } from '../api/client';
+import { api, ApiError, errorMessage } from '../api/client';
 import type {
   FederatedSourceResponse,
   FederatedSourceType,
@@ -1019,39 +1019,48 @@ export default function FederationSection({
         await api.createFederatedSource(tenant, tenantDb, request);
       } else {
         const target = pw.secretValue;
-        // The secret the placeholder names, if the source already has it. A new source has
-        // none (the listing 404s).
-        const stored = editingAlias != null
-          ? (await api.listFederatedSecrets(tenant, tenantDb, normAlias)
-              .catch(() => ({ secrets: [] as FederatedSecretResponse[] })))
-              .secrets.find(sec => sec.name === target.name)
-          : undefined;
-        // Writing a value over an externalRef secret would silently replace the indirection
-        // (env / vault) with an inline copy: refuse, and say where to change it instead.
-        if (stored?.externalRef) {
-          setError(
-            `secret ${target.name} is resolved from ${stored.externalRef}; change it under ` +
-            `Secrets, or type a {{secret.NAME}} placeholder here instead of a value`,
-          );
-          return;
-        }
-        // An ENABLED source naming a missing secret fails the whole tenant-db's federation at
-        // the next spawn, so a source without its secret yet is saved disabled first (disabled
-        // sources are in no node's setup), then the secret, then the source as asked.
-        if (!stored) await api.createFederatedSource(tenant, tenantDb, { ...request, disabled: true });
-        else await api.createFederatedSource(tenant, tenantDb, request);
-        try {
+        // The source's current secrets, or null when the source does not exist yet (its listing
+        // 404s). Any other failure stops the save: reading it as "no secret" would skip the
+        // externalRef guard below and disable a live source.
+        const secrets = await api.listFederatedSecrets(tenant, tenantDb, normAlias)
+          .then(r => r.secrets)
+          .catch(e => {
+            if (e instanceof ApiError && e.status === 404) return null;
+            throw e;
+          });
+        if (secrets != null) {
+          const stored = secrets.find(sec => sec.name === target.name);
+          // Writing a value over an externalRef secret would silently replace the indirection
+          // (env / vault) with an inline copy: refuse, and say where to change it instead.
+          if (stored?.externalRef) {
+            setError(
+              `secret ${target.name} is resolved from ${stored.externalRef}; change it under ` +
+              `Secrets, or type a {{secret.NAME}} placeholder here instead of a value`,
+            );
+            return;
+          }
+          // An existing source: write the secret FIRST, then the source, so its placeholder
+          // resolves at every instant and a live source is never disabled.
           await api.upsertFederatedSecret(tenant, tenantDb, normAlias, target);
-        } catch (e) {
-          setError(
-            `the source was saved${stored ? '' : ' DISABLED'} but its password was not ` +
-            `(${errorMessage(e)}); expand the source and set secret ${target.name} under Secrets` +
-            (stored ? '' : ', then save the source again to enable it'),
-          );
-          await reload();
-          return;
+          await api.createFederatedSource(tenant, tenantDb, request);
+        } else {
+          // A new source: an ENABLED source naming a missing secret fails the whole tenant-db's
+          // federation at the next spawn, so it is saved disabled first (disabled sources are in
+          // no node's setup), then the secret, then the source as asked.
+          await api.createFederatedSource(tenant, tenantDb, { ...request, disabled: true });
+          try {
+            await api.upsertFederatedSecret(tenant, tenantDb, normAlias, target);
+          } catch (e) {
+            setError(
+              `the source was saved DISABLED but its password was not (${errorMessage(e)}); ` +
+              `expand the source, set secret ${target.name} under Secrets, then save the ` +
+              'source again to enable it',
+            );
+            await reload();
+            return;
+          }
+          await api.createFederatedSource(tenant, tenantDb, request);
         }
-        if (!stored) await api.createFederatedSource(tenant, tenantDb, request);
       }
       closeForm();
       await reload();
@@ -1512,7 +1521,7 @@ export default function FederationSection({
               {isIceberg || isRdbms
                 ? 'Renders a READ_ONLY ATTACH option and denies writes at the edge. Takes effect on an already-running node only after the pool recycles.'
                   + (isRdbms
-                    ? ' The edge also refuses postgres_execute / postgres_query / mysql_execute / mysql_query on it for every caller. Connecting as a database user without write privileges remains the recommended defence in depth.'
+                    ? ' The edge also refuses raw-SQL passthrough calls (postgres_execute, postgres_query, query with computed SQL, ...) aimed at it, but cannot see a macro or view that already wraps one. Connect as a database user without write privileges: that is the complete guarantee.'
                     : '')
                 : 'Denies writes to this catalog at the edge. The ATTACH text itself is yours, so this screen is the only enforcement for a sql source.'}
             </div>

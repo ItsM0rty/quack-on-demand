@@ -100,22 +100,32 @@ def test_a_new_source_is_saved_disabled_until_its_secret_exists(runner, respx_mo
     assert order == [("POST", True), ("PUT", None), ("POST", False)]
 
 
-def test_a_rotation_keeps_the_source_enabled(runner, respx_mock):
-    create, secret = _routes(respx_mock, existing_secrets=["PASSWORD"])
-    result = _invoke(runner, *PG, "--password-stdin", input="new-pw\n")
-    assert result.exit_code == 0, result.output
-    assert create.call_count == 1
-    assert _body(create)["disabled"] is False
-    assert _body(secret) == {"name": "PASSWORD", "value": "new-pw"}
+def test_an_existing_source_gets_its_secret_first_and_is_never_disabled(runner, respx_mock):
+    """Rotation, or a move to a secret name the source does not hold yet: the secret is written
+    first, so the placeholder resolves at every instant and the live source is never disabled."""
+    for secrets, name in ((["PASSWORD"], "PASSWORD"), (["OLD"], "NEW")):
+        respx_mock.reset()
+        create, secret = _routes(respx_mock, existing_secrets=secrets)
+        order = []
+        create.side_effect = lambda req: (
+            order.append(("POST", json.loads(req.content)["disabled"])),
+            httpx.Response(200, json={"alias": "x"}))[1]
+        secret.side_effect = lambda req: (order.append(("PUT", json.loads(req.content)["name"])),
+                                          httpx.Response(200, json={"name": "x"}))[1]
+        result = _invoke(runner, *PG, "--password-stdin", "--password-secret", name,
+                         input="new-pw\n")
+        assert result.exit_code == 0, result.output
+        assert order == [("PUT", name), ("POST", False)], (secrets, name)
 
 
-def test_password_prompt_and_custom_secret_name(runner, respx_mock):
+def test_a_failing_source_lookup_stops_instead_of_guessing(runner, respx_mock):
     create, secret = _routes(respx_mock)
-    result = _invoke(runner, *PG, "--password-prompt", "--password-secret", "PG_PWD",
-                     input="hunter2\nhunter2\n")
-    assert result.exit_code == 0, result.output
-    assert _body(create)["connection"]["password"] == "{{secret.PG_PWD}}"
-    assert _body(secret) == {"name": "PG_PWD", "value": "hunter2"}
+    respx_mock.get(f"{SOURCES}/shop_pg/secrets").mock(
+        return_value=httpx.Response(500, json={"error": "boom", "message": "down"})
+    )
+    result = _invoke(runner, *PG, "--password-stdin", input="pw\n")
+    assert result.exit_code != 0
+    assert not create.called and not secret.called
 
 
 def test_a_literal_password_flag_is_refused(runner, respx_mock):

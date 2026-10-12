@@ -364,18 +364,17 @@ def create(
     _create_with_secret(ctx, tenant, db, body, password_secret, secret_value)
 
 
-def _secret_exists(ctx: typer.Context, tenant: str, db: str, alias: str, name: str) -> bool:
-    """Whether source `alias` already holds secret `name` (False when the source is new)."""
+def _source_exists(ctx: typer.Context, tenant: str, db: str, alias: str) -> bool:
+    """Whether source `alias` exists: its secret listing answers 200, a new source 404s. Any
+    other failure stops the command rather than being read as "new"."""
     try:
-        data = RestClient(ctx.obj.settings).request(
-            "GET", f"{_base(tenant, db)}/{alias}/secrets"
-        )
+        RestClient(ctx.obj.settings).request("GET", f"{_base(tenant, db)}/{alias}/secrets")
     except ApiError as exc:
         if exc.status == 404:
             return False
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1)
-    return any(s.get("name") == name for s in (data or {}).get("secrets", []))
+    return True
 
 
 def _create_with_secret(
@@ -383,9 +382,12 @@ def _create_with_secret(
 ) -> None:
     """Save the source and the password secret its placeholder names, never leaving an ENABLED
     source that references a missing secret: a pool spawning then would fail to resolve it, which
-    fails the whole tenant-db's federation blob. When the secret already exists (a rotation), the
-    placeholder resolves throughout and the source is saved as asked. Otherwise the source is saved
-    disabled first (disabled sources are not in any blob), the secret written, and the source saved
+    fails the whole tenant-db's federation blob.
+
+    An existing source already holds the secret endpoint, so the secret is written FIRST and the
+    source saved after it: its placeholder resolves at every instant and it is never disabled (a
+    rotation, or a move to a new secret name). A new source has no secret endpoint yet, so it is
+    saved disabled (disabled sources are in no blob), the secret written, and the source saved
     again as asked.
     """
     alias = body["alias"].strip().lower()
@@ -393,16 +395,9 @@ def _create_with_secret(
     fix = (
         f"`qod federation secret set {tenant} {db} {alias} --name {secret} --value ...`"
     )
-    if _secret_exists(ctx, tenant, db, alias, secret):
+    if _source_exists(ctx, tenant, db, alias):
+        call(ctx, "PUT", secret_path, body={"name": secret, "value": value}, quiet=True)
         call(ctx, "POST", _base(tenant, db), body=body)
-        try:
-            call(ctx, "PUT", secret_path, body={"name": secret, "value": value}, quiet=True)
-        except typer.Exit:
-            typer.echo(
-                f"error: the source was saved but its password was not rotated; set it with {fix}",
-                err=True,
-            )
-            raise
         return
 
     call(ctx, "POST", _base(tenant, db), body={**body, "disabled": True}, quiet=True)
