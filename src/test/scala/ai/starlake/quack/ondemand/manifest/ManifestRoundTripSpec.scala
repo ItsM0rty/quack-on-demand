@@ -1399,3 +1399,109 @@ class ManifestRoundTripSpec extends AnyFlatSpec with Matchers:
       true
     fed.listSources("td-1") shouldBe Nil
   }
+
+  // ------------------------------------------------------------------
+  // The importer applies the SAME row rules as REST and MCP (FederatedSourceRules): a typed
+  // config REST refuses is refused here too, reported, and never stored.
+  // ------------------------------------------------------------------
+
+  private def pgConfigJson(
+      host: String = "pg.example.com",
+      password: String = "{{secret.PG_PWD}}",
+      schema: Option[String] = None
+  ): String =
+    ai.starlake.quack.ondemand.federation.rdbms
+      .RdbmsConfig(
+        host = host,
+        database = "shop",
+        user = "reader",
+        password = password,
+        schema = schema
+      )
+      .toJson
+
+  private def importRefuses(src: ManifestFederatedSource, expected: String): Unit =
+    val cp   = buildSrc()
+    val fed  = new InMemoryFederatedSourceStore()
+    val base = exportOk(ManifestExporter.build(cp, ExportedAt, AdminVersion, Hostname, Some(fed)))
+    val res  = ManifestImporter.apply(
+      withFederatedSources(base, List(src)),
+      cp,
+      Some(fed),
+      requireEncryption = false
+    )
+    withClue(res) {
+      res.isLeft shouldBe true
+      res.left.toOption.get.exists(_.contains(expected)) shouldBe true
+    }
+    fed.listSources("td-1") shouldBe Nil
+
+  it should "refuse a manifest postgres source with a literal password, without storing it" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "shop",
+        sourceType = "postgres",
+        config = Some(pgConfigJson(password = "hunter2"))
+      ),
+      "password must be a secret placeholder"
+    )
+
+  it should "refuse a manifest postgres source whose host is a socket path" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "shop",
+        sourceType = "postgres",
+        config = Some(pgConfigJson(host = "/var/run/postgresql"))
+      ),
+      "socket path is not accepted"
+    )
+
+  it should "refuse a manifest postgres source carrying setupSql" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "shop",
+        sourceType = "postgres",
+        setupSql = "ATTACH 'x' AS shop;",
+        config = Some(pgConfigJson())
+      ),
+      "setupSql is for sourceType 'sql', not 'postgres'"
+    )
+
+  it should "refuse a manifest mysql source with a postgres-only field" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "shop",
+        sourceType = "mysql",
+        config = Some(pgConfigJson(schema = Some("s")))
+      ),
+      "schema applies only to sourceType 'postgres'"
+    )
+
+  it should "refuse a manifest typed source aliased as its own tenant-db's catalog" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "tpch_tpch1",
+        sourceType = "postgres",
+        config = Some(pgConfigJson())
+      ),
+      "reserved"
+    )
+
+  it should "refuse an invalid iceberg_rest config on import too" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "lake",
+        sourceType = "iceberg_rest",
+        config = Some(IcebergRestConfig(warehouse = "w").toJson)
+      ),
+      "exactly one of authType / endpointType"
+    )
+
+  it should "refuse a sql source naming a secret prefix reserved for typed sources" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "legacy",
+        setupSql = "CREATE SECRET qod_pg_shop (TYPE postgres); ATTACH '' AS legacy (TYPE postgres);"
+      ),
+      "reserved for QoD's typed sources"
+    )

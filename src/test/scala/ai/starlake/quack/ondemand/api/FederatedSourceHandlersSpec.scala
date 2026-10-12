@@ -968,3 +968,13 @@ class FederatedSourceHandlersSpec
       .value
       .attachStatus shouldBe Some("unknown")
   }
+
+  it should "400 a sql source whose setupSql names a secret prefix a typed source uses" in
+    withHandlers { (h, _) =>
+      val req = FederatedSourceCreateRequest(
+        alias = "legacy",
+        setupSql = Some("CREATE SECRET QOD_PG_shop (TYPE postgres);")
+      )
+      h.createSource("acme", "acme_prod", req, None).unsafeRunSync().left.value._2.message should
+        include("reserved for QoD's typed sources")
+    }

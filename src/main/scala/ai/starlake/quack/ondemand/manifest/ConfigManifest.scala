@@ -48,8 +48,10 @@ final case class ManifestFederatedSource(
     // Typed config as raw JSON for typed sources (IcebergRestConfig, or RdbmsConfig for postgres /
     // mysql). Mirrors FederatedSource.config, which is text because `model` is a leaf package.
     // Exported verbatim rather than redacted. For postgres / mysql the one credential is
-    // `password`, which `RdbmsConfig.validate` requires to be a `{{secret.NAME}}` placeholder, so
-    // the password VALUE travels only as a (redacted) secret below; host, database and user are
+    // `password`, which `RdbmsConfig.validate` requires to be a `{{secret.NAME}}` placeholder on
+    // EVERY write path (REST, MCP, and this manifest's import, all through
+    // `FederatedSourceRules.errors`), so a stored row can only hold the placeholder and the
+    // password VALUE travels only as a (redacted) secret below; host, database and user are
     // exported in the clear.
     //
     // What that is guaranteed to be safe for, exactly: `IcebergRestConfig.validate` runs

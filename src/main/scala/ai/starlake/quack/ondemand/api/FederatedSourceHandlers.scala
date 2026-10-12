@@ -8,8 +8,9 @@ import ai.starlake.quack.model.{
   Names
 }
 import ai.starlake.quack.ondemand.auth.SessionScope
+import ai.starlake.quack.ondemand.federation.FederatedSourceRules
 import ai.starlake.quack.ondemand.federation.iceberg.IcebergRestConfig
-import ai.starlake.quack.ondemand.federation.rdbms.{RdbmsConfig, RdbmsKind}
+import ai.starlake.quack.ondemand.federation.rdbms.RdbmsConfig
 import ai.starlake.quack.ondemand.state.FederatedSourceOps
 import ai.starlake.quack.ondemand.telemetry.{AuditActions, AuditRecorder}
 import cats.effect.IO
@@ -194,14 +195,17 @@ final class FederatedSourceHandlers(
                   s"setupSql is for sourceType 'sql', not '${sourceType.wire}'"
                 )
               ).flatten
-            // A missing connection is named by its wire field: `source.validate` can only say
-            // "config", the column it is stored in.
-            val shapeErrors =
-              if sourceType.rdbms && req.connection.isEmpty then
-                fieldErrors :+ s"connection is required for sourceType '${sourceType.wire}'"
-              else fieldErrors ++ source.validate
-            // The tenant-db's own catalog alias and every sibling federated alias, excluding the
-            // row being upserted (see the iceberg arm below for why by id).
+            // Reserve the tenant-db's own DuckDB catalog alias and every sibling federated alias.
+            // Without these, `ATTACH 'x' AS "<tenant-db alias>"` reaches the node, DuckDB answers
+            // "database with name ... already exists", and because the piped CLI does not bail
+            // the node comes up with a half-applied federation blob and no loud signal. This is
+            // the last point at which the operator can simply be told.
+            //
+            // Exclude the row being upserted BY ID, not by alias equality: `existing` (like the
+            // createSource lookup that produced it) can be a legacy row whose STORED alias differs
+            // in case from the normalized `alias` here, so `_.alias == alias` would fail to
+            // exclude it and the row would reserve its own alias against itself, 400ing an upsert
+            // that should succeed. Folded for the same reason.
             def reserved: Set[String] =
               val selfId = existing.map(_.id)
               catalogAliasOf(tenantDbId).toSet ++
@@ -210,34 +214,15 @@ final class FederatedSourceHandlers(
                   .filterNot(s => selfId.contains(s.id))
                   .map(s => FederatedAlias.fold(s.alias))
                   .toSet
-            val configErrors = (sourceType, req.config, req.connection) match
-              case (t, _, Some(conn)) if t.rdbms =>
-                RdbmsKind
-                  .of(t)
-                  .map(kind =>
-                    RdbmsConfig.validated(kind, conn, alias, reserved).left.getOrElse(Nil)
-                  )
-                  .getOrElse(Nil)
-              case (FederatedSourceType.IcebergRest, Some(cfg), _) =>
-                // `validated` is the same gate the blob builder uses before render, so a config
-                // the handler accepts is one the node will attach.
-                // Reserve the tenant-db's own DuckDB catalog alias and every sibling federated
-                // alias. Without these, `ATTACH 'x' AS "<tenant-db alias>"` reaches the node,
-                // DuckDB answers "database with name ... already exists", and because the piped
-                // CLI does not bail the node comes up with a half-applied federation blob and no
-                // loud signal. This is the last point at which the operator can simply be told.
-                //
-                // Exclude the row being upserted BY ID, not by alias equality: `existing` (like
-                // the createSource lookup that produced it) can be a legacy row whose STORED
-                // alias differs in case from the normalized `alias` here, so `_.alias == alias`
-                // would fail to exclude it and the row would reserve its own alias against
-                // itself, 400ing an upsert that should succeed. Lowercased for the same reason --
-                // `validate` already compares case-insensitively, but the set itself should not
-                // rely on that to stay correct.
-                IcebergRestConfig.validated(cfg, alias, reserved).left.getOrElse(Nil)
-              case _ => Nil
-
-            val all = shapeErrors ++ configErrors
+            // The row rules are shared with the manifest importer (`FederatedSourceRules`), so no
+            // path admits what another refuses; the typed config check there is the same
+            // `validated` gate the blob builder uses before render, so a config the handler
+            // accepts is one the node will attach. A missing connection is named by its wire
+            // field: the row rules can only say "config", the column it is stored in.
+            val all =
+              if sourceType.rdbms && req.connection.isEmpty then
+                fieldErrors :+ s"connection is required for sourceType '${sourceType.wire}'"
+              else (fieldErrors ++ FederatedSourceRules.errors(source, reserved)).distinct
             if all.nonEmpty then Left(badRequest(all.mkString("; ")))
             else
               // This endpoint is a create-request-as-upsert: every field is replaced by what the
