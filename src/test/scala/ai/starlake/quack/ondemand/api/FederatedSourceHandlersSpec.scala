@@ -978,3 +978,12 @@ class FederatedSourceHandlersSpec
       h.createSource("acme", "acme_prod", req, None).unsafeRunSync().left.value._2.message should
         include("reserved for QoD's typed sources")
     }
+
+  it should "judge the reserved secret prefix after {{alias}} expansion" in withHandlers { (h, _) =>
+    val req = FederatedSourceCreateRequest(
+      alias = "pg_x",
+      setupSql = Some("CREATE SECRET qod_{{alias}} (TYPE postgres);")
+    )
+    h.createSource("acme", "acme_prod", req, None).unsafeRunSync().left.value._2.message should
+      include("reserved for QoD's typed sources")
+  }

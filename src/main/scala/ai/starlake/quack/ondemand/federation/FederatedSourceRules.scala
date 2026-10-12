@@ -36,7 +36,9 @@ object FederatedSourceRules:
     val config = source.config.filter(_.trim.nonEmpty)
     val typed  = t match
       case FederatedSourceType.Sql =>
-        val lower = source.setupSql.toLowerCase(Locale.ROOT)
+        // Judged on the text the builder will render: `{{alias}}` expands first, so
+        // `qod_{{alias}}` under alias `pg_x` is `qod_pg_x`.
+        val lower = source.setupSql.replace("{{alias}}", source.alias).toLowerCase(Locale.ROOT)
         ReservedSecretPrefixes.filter(lower.contains).map { p =>
           s"setupSql mentions '$p', a secret-name prefix reserved for QoD's typed sources"
         }
