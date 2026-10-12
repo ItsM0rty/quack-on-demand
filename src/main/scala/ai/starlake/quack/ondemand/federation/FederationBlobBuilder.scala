@@ -264,7 +264,25 @@ final class FederationBlobBuilder(
     //    template may wrap it in a literal for a comment or label).
     val step1 = template.replace(AliasToken, sqlEscapeSingleQuote(src.alias))
 
-    // 2. Resolve each distinct {{secret.NAME}} via the resolver (or keep
+    // 2. The stray-placeholder check, on the TEMPLATE (alias expanded, every well-formed
+    //    {{secret.NAME}} token removed), BEFORE any secret is resolved. It used to run on the
+    //    substituted text, i.e. on secret CONTENT: a password holding `{{` (`Xy{{9#}}z`, which
+    //    symbol-bearing generators produce) then failed the whole tenant-db's blob, and the
+    //    exception quoted the password fragment into the supervisor's ERROR log. A value spliced
+    //    into a quoted literal may carry any characters, so it is never scanned.
+    //
+    //    By construction no error this method raises can carry a resolved value: every check
+    //    runs before resolution, and the single-pass splice in step 4 cannot fail.
+    val template1            = SecretRegex.replaceAllIn(step1, "")
+    val strayCheck: IO[Unit] = OpenBraceRegex.findFirstIn(template1) match
+      case Some(stray) =>
+        val context = PlaceholderRegex.findFirstIn(template1).getOrElse(stray)
+        IO.raiseError(
+          new RuntimeException(s"unsubstituted placeholder in source '${src.alias}': $context")
+        )
+      case None => IO.unit
+
+    // 3. Resolve each distinct {{secret.NAME}} via the resolver (or keep
     //    as placeholder when building the log-safe preview). Resolved
     //    VALUES go through sqlEscapeSingleQuote at SPLICE time so a single-quote
     //    in a secret can't terminate the surrounding string literal (the
@@ -272,9 +290,6 @@ final class FederationBlobBuilder(
     //    themselves stay RAW, because the raw form is what a catalog echoing the
     //    credential back would show, and so the form the reported set has to carry
     //    for AttachErrorRedactor to find it.
-    //    The placeholder form preserved in redactSecrets mode is intentionally
-    //    NOT escaped -- it's the literal `{{secret.NAME}}` marker that the
-    //    later strayPlaceholder check needs to see verbatim.
     val secretsNeeded = SecretRegex.findAllMatchIn(step1).map(_.group(1)).toList.distinct
 
     val resolvePairs: IO[List[(String, String)]] =
@@ -298,25 +313,17 @@ final class FederationBlobBuilder(
         }
 
     for {
+      _     <- strayCheck
       pairs <- resolvePairs
       lookup =
         if redactSecrets then pairs.toMap
         else pairs.map((name, value) => name -> sqlEscapeSingleQuote(value)).toMap
+      // 4. One pass over the template: `replaceAllIn` never rescans the text it splices in, so a
+      //    value that itself reads `{{secret.OTHER}}` stays literal and resolves nothing.
       step2 = SecretRegex.replaceAllIn(
         step1,
         m => java.util.regex.Matcher.quoteReplacement(lookup(m.group(1)))
       )
-      // In preview mode secret placeholders are intentionally kept; strip
-      // them before checking for other strays, but still catch malformed
-      // or unknown {{ sequences.
-      checkTarget = if redactSecrets then SecretRegex.replaceAllIn(step2, "") else step2
-      _ <- OpenBraceRegex.findFirstIn(checkTarget) match
-        case Some(stray) =>
-          val context = PlaceholderRegex.findFirstIn(checkTarget).getOrElse(stray)
-          IO.raiseError(
-            new RuntimeException(s"unsubstituted placeholder in source '${src.alias}': $context")
-          )
-        case None => IO.unit
     } yield (step2, if redactSecrets then Set.empty[String] else pairs.map(_._2).toSet)
   }
 

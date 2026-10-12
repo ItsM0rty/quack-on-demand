@@ -11,9 +11,10 @@ import ai.starlake.quack.model.SqlLiterals.{duckdbIdent as ident, duckdbLiteral 
   *
   * The credentials ride a named temporary secret and never the ATTACH string. DuckDB prints an
   * attach path verbatim in `duckdb_databases().path` and in connection errors, readable by any SQL
-  * user of the node; with every connection field on the secret the path is `''` (verified on the
-  * 2.0 CLI against Postgres 17, including a failed ATTACH: "Unable to connect to Postgres at "":
-  * ... password authentication failed for user ...").
+  * user of the node; with every connection field on the secret the path holds only
+  * `RdbmsKind.attachPath` (`connect_timeout=10` for postgres, `''` for mysql), never a credential
+  * (verified on the 2.0 CLI against Postgres 17, including a failed ATTACH: "Unable to connect to
+  * Postgres at "": ... password authentication failed for user ...").
   *
   * The secret is DROPPED right after the ATTACH, as the node's own DuckLake catalog secret is
   * (`CatalogPgSecret`). Evidence, 2.0 CLI against Postgres 17: the postgres extension resolves the
@@ -27,7 +28,12 @@ import ai.starlake.quack.model.SqlLiterals.{duckdbIdent as ident, duckdbLiteral 
   *
   * The piped node init runs with `.bail off`, so a failed ATTACH (an unreachable database) still
   * reaches the DROP. A path that runs this block as ONE batch, where a failure stops the batch,
-  * must run [[cleanupSql]] itself afterwards; the attach verifier does.
+  * must run [[cleanupSql]] itself afterwards; the attach verifier does. The secret is therefore
+  * live for exactly as long as the ATTACH runs. At spawn that is before `quack_serve`, so no
+  * session exists; on the verifier's re-attach the node is serving, and a session that may run
+  * ATTACH could name the secret in that window with a path of its own, and the path's keys WIN over
+  * the secret's (2.0 CLI: `ATTACH 'host=127.0.0.2' ... (SECRET s)` dialled 127.0.0.2), i.e.
+  * redirect the password. `connect_timeout` bounds that window for postgres.
   *
   * One statement per line group, never two on one line: when a statement fails the CLI skips the
   * rest of that line (CLAUDE.md).
@@ -76,7 +82,8 @@ object RdbmsSetupSql:
       s"CREATE OR REPLACE TEMPORARY SECRET $secret (\n  " + secretOpts.mkString(
         ",\n  "
       ) + "\n);\n" +
-      s"ATTACH '' AS ${ident(v.alias)} (\n  " + attachOpts.mkString(",\n  ") + "\n);\n" +
+      s"ATTACH ${lit(kind.attachPath)} AS ${ident(v.alias)} (\n  " + attachOpts.mkString(",\n  ") +
+      "\n);\n" +
       cleanupSql(kind, v.alias)
 
   /** Drops the source's secret. The tail of [[render]], and what a caller that ran the block as one

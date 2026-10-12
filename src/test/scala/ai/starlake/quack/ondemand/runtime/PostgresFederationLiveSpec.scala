@@ -159,7 +159,8 @@ class PostgresFederationLiveSpec extends AnyFlatSpec with Matchers with BeforeAn
   }
 
   it should "keep the password out of duckdb_databases().path and leave no secret behind" in {
-    rows(s"SELECT path FROM duckdb_databases() WHERE database_name = '$alias'") shouldBe List("")
+    rows(s"SELECT path FROM duckdb_databases() WHERE database_name = '$alias'") shouldBe
+      List("connect_timeout=10")
     rows(
       "SELECT string_agg(path, '|') FROM duckdb_databases()"
     ).mkString should not include password

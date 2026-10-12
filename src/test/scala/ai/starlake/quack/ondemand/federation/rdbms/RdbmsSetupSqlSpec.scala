@@ -33,7 +33,7 @@ class RdbmsSetupSqlSpec extends AnyFlatSpec with Matchers with EitherValues:
         |  USER 'svc_reader',
         |  PASSWORD '{{secret.PG_PWD}}'
         |);
-        |ATTACH '' AS "sales" (
+        |ATTACH 'connect_timeout=10' AS "sales" (
         |  TYPE postgres,
         |  SECRET "qod_pg_sales",
         |  READ_ONLY
@@ -77,7 +77,9 @@ class RdbmsSetupSqlSpec extends AnyFlatSpec with Matchers with EitherValues:
 
   it should "never put a credential or a connection field in the ATTACH string" in {
     val sql = render(RdbmsKind.Postgres)
-    sql should include("ATTACH '' AS")
+    // Only the non-credential connect timeout, which bounds how long the secret is live.
+    sql should include("ATTACH 'connect_timeout=10' AS")
+    render(RdbmsKind.Mysql) should include("ATTACH '' AS")
     val attach = sql.substring(sql.indexOf("ATTACH"))
     attach should not include "PG_PWD"
     attach should not include "pg.example.com"
@@ -118,7 +120,7 @@ class RdbmsSetupSqlSpec extends AnyFlatSpec with Matchers with EitherValues:
 
   it should "quote the alias and secret as identifiers" in {
     val sql = render(RdbmsKind.Postgres, alias = "Mixed_Case")
-    sql should include("ATTACH '' AS \"mixed_case\" (")
+    sql should include("ATTACH 'connect_timeout=10' AS \"mixed_case\" (")
     sql should include("SECRET \"qod_pg_mixed_case\"")
   }
 

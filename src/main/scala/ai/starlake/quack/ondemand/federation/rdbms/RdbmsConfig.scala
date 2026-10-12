@@ -14,6 +14,13 @@ import io.circe.syntax.*
   * ATTACH with "server does not support SSL, but SSL was required"), and the mysql extension's
   * `ssl_mode` secret parameter (duckdb-mysql `SetMySQLSecretParameters`; the extension is not in
   * the 2.0 toolchain, so that one is read from source, not run).
+  *
+  * `attachPath` is the ATTACH path string, which carries no credential. Postgres gets
+  * `connect_timeout=10`: an ATTACH to an unreachable host otherwise blocks for the OS TCP timeout
+  * (about 75 s on macOS, minutes on Linux; with `connect_timeout=3` it failed in 3 s on the 2.0
+  * CLI), which on the attach verifier's retry path is how long the credential-bearing secret stays
+  * live on a serving node. MySQL gets none: its connection-string timeout key is unverified (no
+  * extension in the toolchain).
   */
 enum RdbmsKind(
     val sourceType: FederatedSourceType,
@@ -21,7 +28,8 @@ enum RdbmsKind(
     val defaultPort: Int,
     val secretPrefix: String,
     val sslModeOption: String,
-    val sslModes: List[String]
+    val sslModes: List[String],
+    val attachPath: String
 ):
   case Postgres
       extends RdbmsKind(
@@ -30,7 +38,8 @@ enum RdbmsKind(
         5432,
         "qod_pg_",
         "SSLMODE",
-        List("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+        List("disable", "allow", "prefer", "require", "verify-ca", "verify-full"),
+        "connect_timeout=10"
       )
   case Mysql
       extends RdbmsKind(
@@ -39,7 +48,8 @@ enum RdbmsKind(
         3306,
         "qod_mysql_",
         "SSL_MODE",
-        List("disabled", "preferred", "required", "verify_ca", "verify_identity")
+        List("disabled", "preferred", "required", "verify_ca", "verify_identity"),
+        ""
       )
 
   def wire: String = sourceType.wire
@@ -63,6 +73,14 @@ object RdbmsKind:
   * tenant chose. For the same reason `host` must be a host name or an IP address: a path would make
   * libpq connect over a Unix socket on the node's own host, where peer authentication needs no
   * password at all.
+  *
+  * Literal fields may carry spaces, `=` and quotes: both extensions quote what they take off the
+  * secret into their `key=value` connection string. Postgres was probed on the 2.0 CLI (a database
+  * named `nosuch sslmode=require` was asked for by that name); duckdb-mysql wraps every secret
+  * value in double quotes with backslash and double quote backslash-escaped
+  * (`EscapeConnectionString`, called by `AddConnectionOption` in `mysql_catalog.cpp`), read from
+  * source, not run. Characters that would DISPLAY differently from what is attached (controls,
+  * format and bidi characters, line and paragraph separators, private use) are refused.
   */
 final case class RdbmsConfig(
     host: String = "",
@@ -144,7 +162,8 @@ final case class RdbmsConfig(
     ).foreach { (name, value) =>
       value.foreach { v =>
         if v.contains("{{") then errs += s"$name must not contain '{{' (only password is a secret)"
-        if v.exists(RdbmsConfig.isControl) then errs += s"$name must not contain control characters"
+        if v.codePoints().anyMatch(RdbmsConfig.isInvisible(_)) then
+          errs += s"$name must not contain control, format or invisible characters"
       }
     }
 
@@ -171,7 +190,18 @@ object RdbmsConfig:
 
   private def isHost(h: String): Boolean = Hostname.matches(h) || Ipv6.matches(h)
 
-  private def isControl(c: Char): Boolean = c < ' ' || c == '\u007f'
+  /** Controls (C0 and C1), format characters (zero-width, bidi overrides and isolates, soft
+    * hyphen), line / paragraph separators, unpaired surrogates and private use: none can break the
+    * quoted SQL, but each lets a field display, in the admin UI or an exported manifest,
+    * differently from what is attached (Trojan-Source style). Judged per code point, so a
+    * supplementary character is not mistaken for its two surrogates.
+    */
+  private def isInvisible(cp: Int): Boolean =
+    Character.getType(cp) match
+      case Character.CONTROL | Character.FORMAT | Character.LINE_SEPARATOR |
+          Character.PARAGRAPH_SEPARATOR | Character.SURROGATE | Character.PRIVATE_USE =>
+        true
+      case _ => false
 
   // Absent optional wire fields fall back to the case-class defaults, as for IcebergRestConfig.
   private given Configuration = Configuration.default.withDefaults

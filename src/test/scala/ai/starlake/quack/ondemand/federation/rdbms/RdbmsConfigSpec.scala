@@ -109,9 +109,9 @@ class RdbmsConfigSpec extends AnyFlatSpec with Matchers with EitherValues:
 
   it should "refuse control characters in literal fields" in {
     errs(RdbmsKind.Postgres, ok.copy(database = "ware\nhouse")).mkString should
-      include("database must not contain control characters")
+      include("database must not contain control, format or invisible characters")
     errs(RdbmsKind.Postgres, ok.copy(user = "s\u0000vc")).mkString should
-      include("user must not contain control characters")
+      include("user must not contain control, format or invisible characters")
     // Trailing ones are trimmed away before validation: the value rendered carries none.
     errs(RdbmsKind.Postgres, ok.copy(user = "svc\u0000")) shouldBe Nil
   }
@@ -140,4 +140,27 @@ class RdbmsConfigSpec extends AnyFlatSpec with Matchers with EitherValues:
     val cfg = ok.copy(port = Some(6432), schema = Some("s"), sslMode = Some("require"))
     RdbmsConfig.fromJson(cfg.toJson).value shouldBe cfg
     RdbmsConfig.fromJson("""{"host":"h"}""").value shouldBe RdbmsConfig(host = "h")
+  }
+
+  it should "refuse invisible, bidi and separator characters that would display unlike what attaches" in {
+    for (label, ch) <- List(
+        "C1 control"     -> "\u0085",
+        "zero-width"     -> "​",
+        "bidi override"  -> "‮",
+        "bidi isolate"   -> "⁦",
+        "line separator" -> " ",
+        "para separator" -> " ",
+        "soft hyphen"    -> "­",
+        "private use"    -> "",
+        "lone surrogate" -> "\ud800"
+      )
+    do
+      withClue(label)(
+        errs(RdbmsKind.Postgres, ok.copy(database = s"ware${ch}house")).mkString should
+          include("database must not contain control, format or invisible characters")
+      )
+  }
+
+  it should "accept supplementary characters, judged per code point" in {
+    errs(RdbmsKind.Postgres, ok.copy(database = "lake_🦆")) shouldBe Nil
   }

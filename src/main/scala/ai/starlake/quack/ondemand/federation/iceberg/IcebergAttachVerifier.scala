@@ -191,10 +191,9 @@ final class IcebergAttachVerifier(
           // No credential set is passed, and that is deliberate rather than inherited: rendering
           // failed, so nothing was resolved and there is nothing to name. Every raise on this path
           // (FederationBlobBuilder's config, alias-collision and unresolved-secret arms) names
-          // aliases, secret NAMES and config errors, never a resolved value -- with one contrived
-          // exception, the stray-placeholder arm, which quotes the already-substituted text and so
-          // would quote a resolved secret that itself contained `{{...}}`. `scrub` is still called
-          // for that reason: its blanket arm does not need a credential set to mask an
+          // aliases, secret NAMES and config errors, never a resolved value: the stray-placeholder
+          // arm now runs on the template before any secret is resolved. `scrub` is still called as
+          // defence in depth: its blanket arm does not need a credential set to mask an
           // encoded-looking blob.
           note(node, startedAtMs, src, s"could not render attach SQL: ${t.getMessage}", Set.empty)
         case Right(block) =>
