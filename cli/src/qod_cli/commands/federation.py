@@ -1,4 +1,6 @@
 import json
+import re
+import sys
 
 import typer
 
@@ -38,7 +40,16 @@ def get(ctx: typer.Context, tenant: str = TENANT, db: str = DB, alias: str = ALI
     call(ctx, "GET", f"{_base(tenant, db)}/{alias}")
 
 
-_TYPE_WIRE = {"sql": "sql", "iceberg-rest": "iceberg_rest", "iceberg_rest": "iceberg_rest"}
+_TYPE_WIRE = {
+    "sql": "sql",
+    "iceberg-rest": "iceberg_rest",
+    "iceberg_rest": "iceberg_rest",
+    "postgres": "postgres",
+    "mysql": "mysql",
+}
+
+_SECRET_PLACEHOLDER = re.compile(r"^\{\{secret\.[A-Za-z0-9_]+\}\}$")
+_SECRET_NAME = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def _iceberg_config(
@@ -108,6 +119,72 @@ def _iceberg_config(
     return cfg
 
 
+def _rdbms_connection(
+    wire: str,
+    raw: str | None,
+    host: str | None,
+    port: int | None,
+    database: str | None,
+    user: str | None,
+    password: str | None,
+    schema: str | None,
+    ssl_mode: str | None,
+) -> dict:
+    """Assemble the typed postgres / mysql connection. --connection wins whole; otherwise build it
+    from the flags. `password` here is always a {{secret.NAME}} placeholder (the caller resolved
+    --password-stdin / --password-prompt into one); the manager refuses a literal.
+    """
+    if raw is not None:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"--connection is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise typer.BadParameter("--connection must be a JSON object")
+        return parsed
+
+    conn: dict = {}
+    for key, value in (
+        ("host", host),
+        ("database", database),
+        ("user", user),
+        ("password", password),
+        ("schema", schema),
+        ("sslMode", ssl_mode),
+    ):
+        if value is not None:
+            conn[key] = value
+    if port is not None:
+        conn["port"] = port
+    missing = [flag for flag, key in (("--host", "host"), ("--database", "database"),
+                                      ("--user", "user")) if not conn.get(key)]
+    if missing:
+        raise typer.BadParameter(
+            f"{', '.join(missing)} required for --type {wire} (or pass the whole --connection JSON)"
+        )
+    if "password" not in conn:
+        raise typer.BadParameter(
+            f"--type {wire} needs a password: --password-stdin, --password-prompt, or "
+            "--password '{{secret.NAME}}' naming an existing secret"
+        )
+    return conn
+
+
+def _read_password(stdin: bool, prompt: bool) -> str | None:
+    """The literal password value, read without it ever touching argv (shell history, `ps`)."""
+    if stdin and prompt:
+        raise typer.BadParameter("pass at most one of --password-stdin / --password-prompt")
+    if stdin:
+        value = sys.stdin.read().rstrip("\r\n")
+    elif prompt:
+        value = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+    else:
+        return None
+    if not value.strip():
+        raise typer.BadParameter("the password read is blank")
+    return value
+
+
 @app.command()
 @covers(
     "POST",
@@ -122,6 +199,7 @@ def _iceberg_config(
         "sourceType": "--type",
         "config": "--config",
         "readOnly": "--read-only",
+        "connection": "--connection",
     },
 )
 def create(
@@ -132,11 +210,13 @@ def create(
     setup_sql: str = typer.Option(None, "--setup-sql", help="sql sources only."),
     description: str = typer.Option(None, "--description"),
     disabled: bool = typer.Option(False, "--disabled"),
-    source_type: str = typer.Option("sql", "--type", help="sql | iceberg-rest"),
+    source_type: str = typer.Option(
+        "sql", "--type", help="sql | iceberg-rest | postgres | mysql",
+    ),
     config: str = typer.Option(None, "--config", help="Whole typed config as JSON."),
     read_only: bool = typer.Option(
         None, "--read-only/--no-read-only",
-        help="Deny writes to this catalog. Defaults on for iceberg-rest.",
+        help="Deny writes to this catalog. Defaults on for iceberg-rest, postgres and mysql.",
     ),
     uri: str = typer.Option(None, "--uri", help="Iceberg REST endpoint."),
     warehouse: str = typer.Option(
@@ -170,10 +250,48 @@ def create(
         help="s3:// prefix holding the catalog's table data; repeatable, required with "
         "--aws-credentials.",
     ),
+    connection: str = typer.Option(
+        None, "--connection", help="postgres / mysql: the whole typed connection as JSON.",
+    ),
+    host: str = typer.Option(None, "--host", help="postgres / mysql: host name or IP address."),
+    port: int = typer.Option(
+        None, "--port", help="postgres / mysql: defaults to 5432 / 3306.",
+    ),
+    database: str = typer.Option(None, "--database", help="postgres / mysql: database name."),
+    user: str = typer.Option(None, "--user", help="postgres / mysql: user name."),
+    password: str = typer.Option(
+        None, "--password",
+        help="postgres / mysql: a {{secret.NAME}} placeholder naming an existing secret of this "
+        "source. A literal is refused; use --password-stdin or --password-prompt for a value.",
+    ),
+    password_stdin: bool = typer.Option(
+        False, "--password-stdin",
+        help="postgres / mysql: read the password from stdin and store it as this source's "
+        "secret (see --password-secret).",
+    ),
+    password_prompt: bool = typer.Option(
+        False, "--password-prompt",
+        help="postgres / mysql: prompt for the password (hidden) and store it as this source's "
+        "secret.",
+    ),
+    password_secret: str = typer.Option(
+        "PASSWORD", "--password-secret",
+        help="Name of the secret --password-stdin / --password-prompt stores the value under.",
+    ),
+    schema: str = typer.Option(
+        None, "--schema", help="postgres only: attach just this schema.",
+    ),
+    ssl_mode: str = typer.Option(
+        None, "--ssl-mode",
+        help="postgres: disable | allow | prefer | require | verify-ca | verify-full; "
+        "mysql: disabled | preferred | required | verify_ca | verify_identity.",
+    ),
 ):
     wire = _TYPE_WIRE.get(source_type)
     if wire is None:
-        raise typer.BadParameter(f"--type must be sql or iceberg-rest, got '{source_type}'")
+        raise typer.BadParameter(
+            f"--type must be sql, iceberg-rest, postgres or mysql, got '{source_type}'"
+        )
 
     body: dict = {"alias": alias, "disabled": disabled}
     if description is not None:
@@ -181,7 +299,41 @@ def create(
     if read_only is not None:
         body["readOnly"] = read_only
 
-    if wire == "iceberg_rest":
+    rdbms_flags = (connection, host, port, database, user, password, schema, ssl_mode)
+    if wire not in ("postgres", "mysql") and (
+        any(v is not None for v in rdbms_flags) or password_stdin or password_prompt
+    ):
+        raise typer.BadParameter(
+            "--connection / --host / --port / --database / --user / --password* / --schema / "
+            "--ssl-mode are for --type postgres or mysql"
+        )
+
+    secret_value: str | None = None
+    if wire in ("postgres", "mysql"):
+        if setup_sql is not None or config is not None:
+            raise typer.BadParameter(
+                f"--setup-sql / --config are not for --type {wire}; use the connection flags"
+            )
+        secret_value = _read_password(password_stdin, password_prompt)
+        if secret_value is not None:
+            if password is not None:
+                raise typer.BadParameter(
+                    "--password names an existing secret; it cannot be combined with "
+                    "--password-stdin / --password-prompt"
+                )
+            if not _SECRET_NAME.match(password_secret):
+                raise typer.BadParameter("--password-secret must be letters, digits, underscore")
+            password = "{{secret." + password_secret + "}}"
+        elif password is not None and not _SECRET_PLACEHOLDER.match(password.strip()):
+            raise typer.BadParameter(
+                "--password takes a {{secret.NAME}} placeholder, never the password itself "
+                "(it would land in your shell history); use --password-stdin or --password-prompt"
+            )
+        body["sourceType"] = wire
+        body["connection"] = _rdbms_connection(
+            wire, connection, host, port, database, user, password, schema, ssl_mode,
+        )
+    elif wire == "iceberg_rest":
         if setup_sql is not None:
             raise typer.BadParameter("--setup-sql is for --type sql; use the iceberg flags")
         body["sourceType"] = "iceberg_rest"
@@ -196,7 +348,27 @@ def create(
             raise typer.BadParameter("--setup-sql is required for --type sql")
         body["setupSql"] = setup_sql
 
+    if secret_value is None:
+        call(ctx, "POST", _base(tenant, db), body=body)
+        return
+    # The secret can only be set once its source exists, so the source goes first. Until the
+    # second call lands, a pool spawning in between fails to resolve the placeholder for this
+    # source; if it fails, the error says how to finish by hand.
     call(ctx, "POST", _base(tenant, db), body=body)
+    alias_path = body["alias"].strip().lower()
+    try:
+        call(
+            ctx, "PUT", f"{_base(tenant, db)}/{alias_path}/secrets",
+            body={"name": password_secret, "value": secret_value}, quiet=True,
+        )
+    except typer.Exit:
+        typer.echo(
+            f"error: the source was saved but its password secret was not; set it with "
+            f"`qod federation secret set {tenant} {db} {alias_path} --name {password_secret} "
+            f"--value ...`",
+            err=True,
+        )
+        raise
 
 
 @app.command()
