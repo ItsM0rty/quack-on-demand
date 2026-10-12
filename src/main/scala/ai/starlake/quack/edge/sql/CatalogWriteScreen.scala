@@ -122,6 +122,24 @@ import java.util.Locale
   * is read-only, even though `acme_db` itself is not. This is intentional fail-closed behaviour,
   * not a bug, but an operator flipping `read_only` on one source needs to expect it pool-wide.
   *
+  * Raw-SQL passthrough calls. `postgres_execute` / `postgres_query` (and the mysql extension's
+  * `mysql_execute` / `mysql_query`) run SQL text on an attached catalog's remote server, which no
+  * parser here sees. Against a READ-ONLY catalog that text can end the remote's read-only
+  * transaction: inside one DuckDB transaction, `CALL postgres_execute('<alias>', 'COMMIT')` and
+  * then a write ran the write on the 2.0 CLI, defeating the engine-level `READ_ONLY` of a typed
+  * source. ACL and lockdown both default off, so before this rule any principal could do it. So,
+  * whenever a catalog on the pool is read-only and for EVERY caller (superusers included: this
+  * screen runs after the ACL gate whatever it decided), a call to one of the four is refused when
+  * its first argument names a read-only catalog (a string literal, compared case-insensitively
+  * after DuckDB's own literal decoding), and when its first argument is anything else (a
+  * concatenation, a column, a parameter: a catalog chosen at run time). A call whose literal first
+  * argument names a WRITABLE catalog is untouched, which keeps the superuser passthrough to
+  * writable sources (owner ruling). The calls are read from DuckDB's own tokens through
+  * [[FunctionCalls]], so every quoting and qualification of the name, `CALL` and table-function
+  * forms, and calls inside `EXPLAIN`, `PREPARE` or a string literal body are all seen; a scan
+  * truncated by literal nesting fails closed. This runs before the cheap read-side path, which
+  * would otherwise admit `SELECT * FROM postgres_query(...)` as a plain select.
+  *
   * When NOTHING is read-only the screen is inert and never parses, so it costs nothing on the
   * overwhelmingly common path.
   */
@@ -146,126 +164,171 @@ object CatalogWriteScreen extends LazyLogging:
     // lexing only happens on the refusal path.
     else if BacktickScreen.find(sql).isDefined then BacktickScreen.find(sql)
     else
-      val fragments = LockdownScreen.splitStatements(sql)
-      if fragments.forall(f => ReadSideKinds.contains(classify(f))) then
-        // Cheap path: no fragment of the batch is even shaped like a write, so nothing to parse.
-        // An empty fragment list (blank submission) also lands here vacuously.
-        None
-      else
-        // `FederatedAlias.fold`, NOT `toLowerCase`: the other side of the `denied.contains` below
-        // is `TableAccess.table.canonical`, which the ACL parser lowercased with `Locale.ROOT`.
-        // The match is exact string equality with no `equalsIgnoreCase` behind it, so a default
-        // locale on THIS side is a fail-OPEN -- under `-Duser.language=tr` a legacy alias holding
-        // an `I` folds to the dotless i (U+0131) here, matches nothing, and the write is
-        // admitted.
-        val denied     = readOnlyCatalogs.map(FederatedAlias.fold)
-        val deniedList = denied.toList.sorted.mkString(", ")
-        val result     = SqlParser.extract(sql, config)
+      rawSqlDenial(sql, readOnlyCatalogs.map(FederatedAlias.fold))
+        .orElse(screenStatements(sql, classify, readOnlyCatalogs, config))
 
-        // `PREPARE p AS INSERT ...; EXECUTE p` composes into an executed write without either
-        // statement ever classifying Dml/Ddl or resolving through SqlParser (neither node type has
-        // an arm there) -- see the scaladoc's PREPARE/EXECUTE paragraph. Recognized purely by first
-        // token, independently of the classifier's tunable buckets. Routes through the one shared
-        // reader (`SqlTrivia.firstToken`) rather than a hand-rolled takeWhile, so this and the
-        // `classify` arm below judge the exact same head; `normalized` has already been through
-        // the same three passes in `isWriteShaped`, so `firstToken`'s own are no-ops on it.
-        // `.takeWhile(_ != ';')` is this call site's own extra (a bare `EXECUTE;`), not universal
-        // to the shared primitive. `Locale.ROOT` on the uppercasing for the same reason every
-        // other keyword fold in the manager carries it (`StatementClassifier`, `LockdownScreen`):
-        // latent here, since neither PREPARE nor EXECUTE holds an `i`, but the next keyword added
-        // to this list need not be so lucky.
-        def isPrepareOrExecute(normalized: String): Boolean =
-          val head = SqlTrivia.firstToken(normalized).takeWhile(_ != ';').toUpperCase(Locale.ROOT)
-          head == "PREPARE" || head == "EXECUTE"
+  /** The SQL-running passthrough functions screened by [[rawSqlDenial]]. */
+  val RawSqlFunctions: Set[String] =
+    Set("postgres_execute", "postgres_query", "mysql_execute", "mysql_query")
 
-        // jsqlparser's `UnsupportedStatement` (the node `Feature.allowUnsupportedStatements`
-        // produces for a statement it cannot parse at all) has an empty `toString`, and
-        // `sqlSnippet` is built from `stmt.toString`. A blank snippet is therefore not evidence of
-        // anything -- it is the parser giving up on the ORIGINAL text, which may well have been a
-        // write. Fail closed rather than let an empty string classify as `Other` and be admitted.
-        // The blank check runs on the RAW snippet: normalizing first would turn a comment-only
-        // fragment into an empty string too, and that is already handled by the check itself, so
-        // normalizing before it would only cost the distinction for no benefit.
-        //
-        // `classify` gets the ORIGINAL snippet, never a normalized copy: the classifier strips
-        // comments and normalizes trivia itself, and its WITH arm lexes the text it is handed as
-        // DuckDB does. `SqlTrivia.normalize` rewrites characters DuckDB reads as identifier or
-        // dollar-tag characters (U+00AD, a kept NBSP) to spaces, so a normalized copy can open a
-        // dollar-quoted string DuckDB never opens and hide a DML CTE behind it: `WITH a<U+00AD>$q$
-        // AS (DELETE ...), b$q$ AS (...) SELECT ...` runs the DELETE on DuckDB 2.0 and classified
-        // Select once normalized.
-        //
-        // Only the PREPARE/EXECUTE head read takes the normalized copy (`stripLeading ->
-        // stripComments -> normalize`, the order `SqlTrivia.firstToken`'s scaladoc accounts for).
-        // It reads a single head word, which normalizing after lexing cannot move: it can only
-        // split a word DuckDB reads whole, and DuckDB rejects the statement that word starts.
-        // What IS load-bearing here is the CHECKPOINT fragment-list fallback (this method's own
-        // second call site below): `fragments.exists(isWriteShaped)` hands this method raw,
-        // comment-intact split fragments with no jsqlparser re-rendering to fall back on, so a
-        // write hidden behind a leading comment reaches the gate through this path and nowhere
-        // else. Verified against a real DuckDB 1.5.4 that the shapes involved execute: a leading
-        // `/* a /* b */ c */ PREPARE p AS INSERT ...` runs the INSERT.
-        def isWriteShaped(snippet: String): Boolean =
-          if snippet.isBlank then true
+  /** See the scaladoc's raw-SQL paragraph. `denied` is already folded. */
+  private[sql] def rawSqlDenial(sql: String, denied: Set[String]): Option[String] =
+    val scan       = FunctionCalls.scan(sql)
+    val deniedList = denied.toList.sorted.mkString(", ")
+    val calls      = scan.calls.filter(c => RawSqlFunctions(c.name))
+    calls.iterator
+      .flatMap { c =>
+        FunctionCalls.firstStringArgument(c) match
+          case Some(target) if denied.contains(FederatedAlias.fold(target)) =>
+            Some(
+              s"${c.name} on catalog '${FederatedAlias.fold(target)}', which is read-only on " +
+                "this deployment, would run SQL past its read-only attach"
+            )
+          case Some(_) => None
+          case None    =>
+            Some(
+              s"${c.name} whose catalog argument is not a string literal is refused while a " +
+                s"read-only catalog ($deniedList) is attached"
+            )
+      }
+      .nextOption()
+      .orElse(
+        Option.when(scan.truncated && scan.texts.exists(t => mentionsRawSql(t)))(
+          "SQL-running call nested too deep to verify while a read-only catalog " +
+            s"($deniedList) is attached"
+        )
+      )
+
+  private def mentionsRawSql(text: String): Boolean =
+    val lower = text.toLowerCase(Locale.ROOT)
+    RawSqlFunctions.exists(lower.contains)
+
+  private def screenStatements(
+      sql: String,
+      classify: String => StatementKind,
+      readOnlyCatalogs: Set[String],
+      config: Config
+  ): Option[String] =
+    val fragments = LockdownScreen.splitStatements(sql)
+    if fragments.forall(f => ReadSideKinds.contains(classify(f))) then
+      // Cheap path: no fragment of the batch is even shaped like a write, so nothing to parse.
+      // An empty fragment list (blank submission) also lands here vacuously.
+      None
+    else
+      // `FederatedAlias.fold`, NOT `toLowerCase`: the other side of the `denied.contains` below
+      // is `TableAccess.table.canonical`, which the ACL parser lowercased with `Locale.ROOT`.
+      // The match is exact string equality with no `equalsIgnoreCase` behind it, so a default
+      // locale on THIS side is a fail-OPEN -- under `-Duser.language=tr` a legacy alias holding
+      // an `I` folds to the dotless i (U+0131) here, matches nothing, and the write is
+      // admitted.
+      val denied     = readOnlyCatalogs.map(FederatedAlias.fold)
+      val deniedList = denied.toList.sorted.mkString(", ")
+      val result     = SqlParser.extract(sql, config)
+
+      // `PREPARE p AS INSERT ...; EXECUTE p` composes into an executed write without either
+      // statement ever classifying Dml/Ddl or resolving through SqlParser (neither node type has
+      // an arm there) -- see the scaladoc's PREPARE/EXECUTE paragraph. Recognized purely by first
+      // token, independently of the classifier's tunable buckets. Routes through the one shared
+      // reader (`SqlTrivia.firstToken`) rather than a hand-rolled takeWhile, so this and the
+      // `classify` arm below judge the exact same head; `normalized` has already been through
+      // the same three passes in `isWriteShaped`, so `firstToken`'s own are no-ops on it.
+      // `.takeWhile(_ != ';')` is this call site's own extra (a bare `EXECUTE;`), not universal
+      // to the shared primitive. `Locale.ROOT` on the uppercasing for the same reason every
+      // other keyword fold in the manager carries it (`StatementClassifier`, `LockdownScreen`):
+      // latent here, since neither PREPARE nor EXECUTE holds an `i`, but the next keyword added
+      // to this list need not be so lucky.
+      def isPrepareOrExecute(normalized: String): Boolean =
+        val head = SqlTrivia.firstToken(normalized).takeWhile(_ != ';').toUpperCase(Locale.ROOT)
+        head == "PREPARE" || head == "EXECUTE"
+
+      // jsqlparser's `UnsupportedStatement` (the node `Feature.allowUnsupportedStatements`
+      // produces for a statement it cannot parse at all) has an empty `toString`, and
+      // `sqlSnippet` is built from `stmt.toString`. A blank snippet is therefore not evidence of
+      // anything -- it is the parser giving up on the ORIGINAL text, which may well have been a
+      // write. Fail closed rather than let an empty string classify as `Other` and be admitted.
+      // The blank check runs on the RAW snippet: normalizing first would turn a comment-only
+      // fragment into an empty string too, and that is already handled by the check itself, so
+      // normalizing before it would only cost the distinction for no benefit.
+      //
+      // `classify` gets the ORIGINAL snippet, never a normalized copy: the classifier strips
+      // comments and normalizes trivia itself, and its WITH arm lexes the text it is handed as
+      // DuckDB does. `SqlTrivia.normalize` rewrites characters DuckDB reads as identifier or
+      // dollar-tag characters (U+00AD, a kept NBSP) to spaces, so a normalized copy can open a
+      // dollar-quoted string DuckDB never opens and hide a DML CTE behind it: `WITH a<U+00AD>$q$
+      // AS (DELETE ...), b$q$ AS (...) SELECT ...` runs the DELETE on DuckDB 2.0 and classified
+      // Select once normalized.
+      //
+      // Only the PREPARE/EXECUTE head read takes the normalized copy (`stripLeading ->
+      // stripComments -> normalize`, the order `SqlTrivia.firstToken`'s scaladoc accounts for).
+      // It reads a single head word, which normalizing after lexing cannot move: it can only
+      // split a word DuckDB reads whole, and DuckDB rejects the statement that word starts.
+      // What IS load-bearing here is the CHECKPOINT fragment-list fallback (this method's own
+      // second call site below): `fragments.exists(isWriteShaped)` hands this method raw,
+      // comment-intact split fragments with no jsqlparser re-rendering to fall back on, so a
+      // write hidden behind a leading comment reaches the gate through this path and nowhere
+      // else. Verified against a real DuckDB 1.5.4 that the shapes involved execute: a leading
+      // `/* a /* b */ c */ PREPARE p AS INSERT ...` runs the INSERT.
+      def isWriteShaped(snippet: String): Boolean =
+        if snippet.isBlank then true
+        else
+          val normalized =
+            SqlTrivia.normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(snippet)))
+          if isPrepareOrExecute(normalized) then true
           else
-            val normalized =
-              SqlTrivia.normalize(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(snippet)))
-            if isPrepareOrExecute(normalized) then true
-            else
-              classify(snippet) match
-                case StatementKind.Dml | StatementKind.Ddl => true
-                case _                                     => false
+            classify(snippet) match
+              case StatementKind.Dml | StatementKind.Ddl => true
+              case _                                     => false
 
-        def offendingIn(accesses: Set[TableAccess]): Set[String] =
-          accesses.collect {
-            case a
-                if (a.verb == Verb.Write || a.verb == Verb.Ddl) &&
-                  denied.contains(catalogOf(a.table.canonical)) =>
-              a.table.canonical
-          }
+      def offendingIn(accesses: Set[TableAccess]): Set[String] =
+        accesses.collect {
+          case a
+              if (a.verb == Verb.Write || a.verb == Verb.Ddl) &&
+                denied.contains(catalogOf(a.table.canonical)) =>
+            a.table.canonical
+        }
 
-        def denialFor(stmt: StatementResult): Option[String] = stmt match
-          case StatementResult.ParseError(_, snippet, msg) =>
-            if isWriteShaped(snippet) then
-              Some(
-                "write statement could not be parsed while a read-only catalog " +
-                  s"($deniedList) is attached: $msg ($snippet)"
-              )
-            else None
-          case StatementResult.Extracted(_, snippet, accesses, q, u) =>
-            if isWriteShaped(snippet) && (q.nonEmpty || u.nonEmpty) then
-              val detail = (q.map(describe) ++ u).mkString("; ")
-              Some(
-                "write target could not be fully resolved while a read-only catalog " +
-                  s"($deniedList) is attached: $detail"
-              )
-            else
-              val offending = offendingIn(accesses)
-              if offending.isEmpty then None
-              else
-                Some(
-                  s"catalog '${catalogOf(offending.head)}' is read-only on this deployment " +
-                    s"(write target: ${offending.toList.sorted.mkString(", ")})"
-                )
-          case StatementResult.ControlFlow(_, _, _) => None
-
-        if result.statements.length < fragments.length then
-          // `SqlParser.extract` collapsed the whole submission into fewer StatementResults than
-          // there are top-level fragments -- jsqlparser threw on the SUBMISSION rather than on one
-          // statement, and `SqlParser.extract`'s outer catch reports that as a SINGLE ParseError
-          // whose snippet is the entire submission text (see the scaladoc's step 3). That collapsed
-          // snippet cannot be handed to `isWriteShaped`: doing so would classify the whole
-          // submission by its first token, exactly the bypass this screen exists to close. Fall
-          // back to the fragment list the splitter already produced above instead, and fail closed
-          // if ANY fragment looks write-shaped on its own.
-          if fragments.exists(isWriteShaped) then
+      def denialFor(stmt: StatementResult): Option[String] = stmt match
+        case StatementResult.ParseError(_, snippet, msg) =>
+          if isWriteShaped(snippet) then
             Some(
               "write statement could not be parsed while a read-only catalog " +
-                s"($deniedList) is attached and the submission could not be split into " +
-                "individually verifiable statements"
+                s"($deniedList) is attached: $msg ($snippet)"
             )
           else None
-        else result.statements.iterator.flatMap(denialFor).nextOption()
+        case StatementResult.Extracted(_, snippet, accesses, q, u) =>
+          if isWriteShaped(snippet) && (q.nonEmpty || u.nonEmpty) then
+            val detail = (q.map(describe) ++ u).mkString("; ")
+            Some(
+              "write target could not be fully resolved while a read-only catalog " +
+                s"($deniedList) is attached: $detail"
+            )
+          else
+            val offending = offendingIn(accesses)
+            if offending.isEmpty then None
+            else
+              Some(
+                s"catalog '${catalogOf(offending.head)}' is read-only on this deployment " +
+                  s"(write target: ${offending.toList.sorted.mkString(", ")})"
+              )
+        case StatementResult.ControlFlow(_, _, _) => None
+
+      if result.statements.length < fragments.length then
+        // `SqlParser.extract` collapsed the whole submission into fewer StatementResults than
+        // there are top-level fragments -- jsqlparser threw on the SUBMISSION rather than on one
+        // statement, and `SqlParser.extract`'s outer catch reports that as a SINGLE ParseError
+        // whose snippet is the entire submission text (see the scaladoc's step 3). That collapsed
+        // snippet cannot be handed to `isWriteShaped`: doing so would classify the whole
+        // submission by its first token, exactly the bypass this screen exists to close. Fall
+        // back to the fragment list the splitter already produced above instead, and fail closed
+        // if ANY fragment looks write-shaped on its own.
+        if fragments.exists(isWriteShaped) then
+          Some(
+            "write statement could not be parsed while a read-only catalog " +
+              s"($deniedList) is attached and the submission could not be split into " +
+              "individually verifiable statements"
+          )
+        else None
+      else result.statements.iterator.flatMap(denialFor).nextOption()
 
   /** Human-readable rendering of a qualification failure, matching `PostgresAclValidator`'s wording
     * for the same `DenyReason` so an operator sees one consistent message across both gates.

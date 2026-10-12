@@ -175,6 +175,28 @@ private[quack] object FunctionCalls:
 
   private val ConstantWords = Set("true", "false", "null")
 
+  /** The decoded value of `call`'s FIRST argument when that argument is exactly one VARCHAR string
+    * literal (plain `'...'`, national `n'...'`, escape `e'...'` or dollar-quoted) followed by `,`
+    * or `)`. None for anything else: a column, a quoted identifier, a blob or bit-string literal
+    * (`x'...'`, `b'...'`, whose text is not the value a cast to VARCHAR would produce), a
+    * concatenation, a cast, a nested call, a parameter, no argument at all, or a literal followed
+    * by another literal (a continuation, whose folded value the [[scan]]'s folded reading reports
+    * as its own call). A caller treating None as "cannot tell" therefore fails closed on every form
+    * it cannot read.
+    */
+  def firstStringArgument(call: Call): Option[String] =
+    val text   = call.text
+    val values = SqlLexer.keptSpacesRestored(text)
+    val toks   = SqlLexer.tokens(text).filter(t => !t.isTrivia && t.start >= call.argsFrom)
+    def punct(t: SqlLexer.Token, c: Char) =
+      t.kind == SqlLexer.Kind.Punct && text.charAt(t.start) == c
+    def varcharLiteral(t: SqlLexer.Token) =
+      t.kind == SqlLexer.Kind.Literal && "'$eEnN".indexOf(text.charAt(t.start).toInt) >= 0
+    toks.headOption.filter(varcharLiteral).flatMap { first =>
+      if toks.lift(1).exists(n => punct(n, ',') || punct(n, ')')) then stringBody(values, first)
+      else None
+    }
+
   private def isOpenParen(view: String, t: SqlLexer.Token): Boolean =
     t.kind == SqlLexer.Kind.Punct && view.charAt(t.start) == '('
 

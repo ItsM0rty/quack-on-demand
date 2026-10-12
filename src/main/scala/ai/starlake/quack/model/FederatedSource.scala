@@ -61,13 +61,16 @@ import java.time.Instant
   *     [[ai.starlake.quack.ondemand.federation.rdbms.RdbmsSetupSql.render]], with one residual the
   *     Iceberg layer does not have. The postgres extension runs every statement on the remote in a
   *     `READ ONLY` transaction, which refuses DML and `postgres_execute` writes alike, but a caller
-  *     allowed to run `postgres_execute` can end that transaction itself: inside one DuckDB
+  *     who may run the raw-SQL passthroughs can end that transaction itself: inside one DuckDB
   *     transaction, `CALL postgres_execute('<alias>', 'COMMIT')` followed by a write ran the write
-  *     in autocommit on the 2.0 CLI. `CatalogReachingCalls` refuses `postgres_execute` to tenant
-  *     principals whenever the ACL validates, and lockdown refuses it to every caller, so this is
-  *     reachable by a superuser or on a pool with the ACL and lockdown both off. The robust
-  *     read-only guarantee for these types is therefore a database role without write privileges on
-  *     the remote; `READ_ONLY` and `CatalogWriteScreen` are the layers on top of it.
+  *     in autocommit on the 2.0 CLI. The SQL ACL and node lockdown both default OFF, so on a
+  *     default install that was every principal. `CatalogWriteScreen` (which always runs) now
+  *     refuses `postgres_execute`, `postgres_query`, `mysql_execute` and `mysql_query` for EVERY
+  *     caller, superusers included, when the first argument names a read-only catalog or is not a
+  *     string literal while any catalog on the pool is read-only. A database role without write
+  *     privileges on the remote stays the recommended defence in depth. For MySQL, whether
+  *     `READ_ONLY` itself refuses writes through the extension is unverified (no extension in the
+  *     2.0 toolchain).
   *   - `Sql`: edge-screen-only. The operator writes the ATTACH text (`setupSql`), so QoD has no
   *     rendering step to add the flag to; `CatalogWriteScreen` is the ONLY enforcement for these
   *     sources, with every gap documented above PLUS a mutating `CALL`, which the screen cannot
