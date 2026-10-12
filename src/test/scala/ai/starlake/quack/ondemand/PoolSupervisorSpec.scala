@@ -520,10 +520,11 @@ class PoolSupervisorSpec extends AnyFlatSpec with Matchers:
   // ---------- reconcileLoop ----------
 
   "PoolSupervisor.reconcileLoop" should "run reconcile repeatedly, respawning a node that stays dead" in {
-    // CapturingBackend nodes carry pid=Some(1) with an unreachable socket, so
-    // isReachable returns false every pass: each reconcile tick finds the node
-    // dead and respawns it, appending one NodeSpec. Watching specs grow past the
-    // initial spawn proves the loop fired reconcile more than once.
+    // CapturingBackend nodes carry pid=Some(1) with an unreachable socket and
+    // startedAt=EPOCH, so every pass finds the node dead: pid 1 did not start at
+    // EPOCH (NodeProcess identity check), and EPOCH is far outside the startup
+    // window. Each tick respawns, appending one NodeSpec; watching specs grow past
+    // the initial spawn proves the loop fired reconcile more than once.
     val (sup, b) = freshSupervisorWithBackend()
     sup.createTenant(Tenant("acme")).unsafeRunSync()
     sup

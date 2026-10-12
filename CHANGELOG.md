@@ -376,8 +376,10 @@
   (more likely with a slow init SQL or a short `QOD_RECONCILE_INTERVAL_SEC`) read the node as dead
   and started a second process under the same node id without stopping the first, which kept
   running untracked, held its port and outlived the manager. A node whose process is alive now
-  counts as starting for 120 s after its spawn, and starting a node under an id whose process the
-  manager still holds stops that process first. Kubernetes and fleet nodes were not affected: their
+  counts as starting for 120 s after its spawn, and replacing a node stops its old process first,
+  including one an earlier manager left running. A node's process is recognized by its start time,
+  not its pid alone, so a pid reused by another process after a restart is never adopted or
+  signalled. Kubernetes and fleet nodes were not affected: their
   start returns only once the node is ready, and a pod name or fleet assignment is unique per id.
 
 - **Security: a batched `USE` or `SET search_path` no longer reaches tables outside a user's

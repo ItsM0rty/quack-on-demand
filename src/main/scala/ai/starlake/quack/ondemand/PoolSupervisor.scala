@@ -24,6 +24,7 @@ import ai.starlake.quack.ondemand.runtime.{
   NoFreeServer,
   NodeLockdown,
   NodePaths,
+  NodeProcess,
   ObjectStoreSecret,
   QuackBackend
 }
@@ -1002,11 +1003,13 @@ final class PoolSupervisor(
       spawnFromDistribution(key, state)
     else
       backend.liveNodeIds(key).flatMap { live =>
-        // pid-carrying nodes (local backend) keep the existing pid+socket probe; pid-less nodes
-        // (k8s) are live iff the labeled pod list contains them. live=None means the backend can't
-        // enumerate (local mode / apiserver blip): treat as alive, heal nothing.
+        // pid-carrying nodes (local backend) are live when the row's process is still the node's
+        // (NodeProcess: pid alive AND its start instant matches startedAt) and it either is inside
+        // its startup window or accepts a connection; pid-less nodes (k8s) are live iff the labeled
+        // pod list contains them. live=None means the backend can't enumerate (local mode /
+        // apiserver blip): treat as alive, heal nothing.
         def podAlive(n: RunningNode): Boolean = n.pid match
-          case Some(_) => isStarting(n) || isReachable(n)
+          case Some(_) => NodeProcess.of(n).isDefined && (isStarting(n) || isReachable(n))
           case None    => live.fold(true)(_.contains(n.nodeId))
 
         // Heal to target: rows beyond distribution.total are pruned, but ONLY rows whose pod is
@@ -1093,7 +1096,8 @@ final class PoolSupervisor(
                   // row goes): a kept node keeps its full state, healthy = false included, so it
                   // stays unroutable and keeps its counters and an operator draining flag.
                   val wasQuarantined = tracker.snapshot(n.nodeId).quarantined
-                  startNodeEmitting(key, respawnSpec(key, spawnState, n)).attempt
+                  (backend.stopStray(n) *>
+                    startNodeEmitting(key, respawnSpec(key, spawnState, n))).attempt
                     .flatMap {
                       case Left(NoFreeServer(_, _, reason, None)) =>
                         // Fleet: no server holds the node any more (drained, removed or
@@ -1263,33 +1267,25 @@ final class PoolSupervisor(
         found
       case _ => NodePlacement.empty
 
-  private def pidAlive(pid: Long): Boolean =
-    Option(java.lang.ProcessHandle.of(pid))
-      .flatMap(o => if o.isPresent then Some(o.get()) else None)
-      .exists(_.isAlive)
-
-  /** A pid-carrying node inside its startup window ([[nodeStartupGrace]] from `startedAt`) whose
-    * process is alive: it may not listen yet, and reconcile must not respawn it. Judged without a
-    * socket probe, so a node still binding its port is never declared dead.
+  /** True while `n` is inside its startup window ([[nodeStartupGrace]] from `startedAt`): its
+    * verified process may not listen yet, and reconcile must not respawn it. Judged without a
+    * socket probe, so a node still binding its port is never declared dead. A negative elapsed time
+    * (the wall clock stepped back) counts as expired: the window must stay bounded, and replacing a
+    * node early is safe now that the replacement stops it first.
     */
   private def isStarting(n: RunningNode): Boolean =
-    n.pid.exists(pidAlive) &&
-      java.time.Duration
-        .between(n.startedAt, java.time.Instant.now())
-        .compareTo(java.time.Duration.ofNanos(nodeStartupGrace.toNanos)) < 0
+    val elapsed = java.time.Duration.between(n.startedAt, java.time.Instant.now())
+    !elapsed.isNegative && elapsed.compareTo(
+      java.time.Duration.ofNanos(nodeStartupGrace.toNanos)
+    ) < 0
 
   private def isReachable(n: RunningNode): Boolean =
-    n.pid match
-      case None    => true // K8s: defer to control-plane liveness + HealthProbe.
-      case Some(p) =>
-        if !pidAlive(p) then false
-        else
-          val sock = new java.net.Socket()
-          try { sock.connect(new java.net.InetSocketAddress(n.host, n.port), 250); true }
-          catch case _: Throwable => false
-          finally
-            try sock.close()
-            catch case _: Throwable => ()
+    val sock = new java.net.Socket()
+    try { sock.connect(new java.net.InetSocketAddress(n.host, n.port), 250); true }
+    catch case _: Throwable => false
+    finally
+      try sock.close()
+      catch case _: Throwable => ()
 
   // ---------- Read API ----------
 

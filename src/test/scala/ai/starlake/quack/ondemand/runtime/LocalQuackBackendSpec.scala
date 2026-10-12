@@ -49,6 +49,38 @@ class LocalQuackBackendSpec extends AnyFlatSpec with Matchers with org.scalatest
       noException should be thrownBy backend.start(spec).unsafeRunSync()
     finally backend.stop(key, "node-again").unsafeRunSync()
 
+  // A row's pid can name an unrelated process after a manager or container restart. adopt() must
+  // not take it for the node unless its start instant matches the row's startedAt, so neither
+  // stop() nor cleanup() ever signals it.
+  it should "never signal an adopted pid whose process did not start when the node did" in:
+    assume(!isWindows)
+    val unrelated = new java.lang.ProcessBuilder(sleepCmd(30)*).start()
+    val backend   = new LocalQuackBackend(23135, 23136, commandFor = (_, _, _) => sleepCmd(30))
+    val key       = PoolKey("t", "t_default", "p")
+    val row       = ai.starlake.quack.model.RunningNode(
+      nodeId = "adopted-mismatch",
+      poolKey = key,
+      role = Role.Dual,
+      host = "127.0.0.1",
+      port = 23135,
+      token = "tok",
+      pid = Some(unrelated.pid()),
+      podName = None,
+      startedAt = java.time.Instant.now().minusSeconds(60),
+      maxConcurrent = 4
+    )
+    try
+      backend.adopt(row).unsafeRunSync()
+      backend.stop(key, "adopted-mismatch").unsafeRunSync()
+      backend.adopt(row).unsafeRunSync()
+      backend.stopStray(row).unsafeRunSync()
+      backend.cleanup().unsafeRunSync()
+      unrelated.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS)
+      unrelated.isAlive shouldBe true
+    finally
+      unrelated.destroyForcibly()
+      ()
+
   it should "carry NodeSpec.maxConcurrent through to RunningNode" in:
     val backend = new LocalQuackBackend(23030, 23031, commandFor = (_, _, _) => sleepCmd(30))
     val spec    = NodeSpec(

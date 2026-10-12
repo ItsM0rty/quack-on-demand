@@ -32,6 +32,13 @@ trait QuackBackend:
     */
   def adopt(node: RunningNode): IO[Unit] = IO.unit
 
+  /** Stop `node`'s process when it is still running but this backend does not hold it (it outlived
+    * an earlier manager and was never adopted). Reconcile calls it before replacing a node it
+    * judged dead, so the replacement cannot leave the old process running untracked. The default
+    * has nothing to stop: a pod name or a fleet assignment is unique per node id.
+    */
+  def stopStray(node: RunningNode): IO[Unit] = IO.unit
+
   /** `node` as its runtime currently places it. A backend that can move a live node without the
     * supervisor writing the row (fleet: a claim committed, then the manager died before the node
     * row write) answers the real address and token, and reconcile rewrites the row. The same

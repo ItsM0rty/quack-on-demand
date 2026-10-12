@@ -9,14 +9,20 @@ import ai.starlake.quack.model.{
   Tenant,
   TenantDbKind
 }
-import ai.starlake.quack.ondemand.runtime.{LocalQuackBackend, LocalQuackBackendSpec, QuackBackend}
+import ai.starlake.quack.ondemand.runtime.{
+  LocalQuackBackend,
+  LocalQuackBackendSpec,
+  NodeProcess,
+  QuackBackend
+}
 import ai.starlake.quack.ondemand.state.InMemoryControlPlaneStore
 import cats.effect.IO
 import cats.effect.unsafe.implicits.global
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.time.Instant
+import java.util.concurrent.{ConcurrentLinkedQueue, TimeUnit}
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
@@ -32,91 +38,151 @@ class ReconcileStartupWindowSpec extends AnyFlatSpec with Matchers:
 
   private val poolKey = PoolKey("acme", "acme_default", "sales")
 
+  /** One start: the node and its process handle taken right after the fork (start-time-bound, so
+    * checking or killing it later can never reach a process that reuses the pid).
+    */
+  private final case class Started(node: RunningNode, handle: Option[ProcessHandle]):
+    def alive: Boolean = handle.exists(_.isAlive)
+
   /** The real local backend, recording every node it starts. */
-  private final class RecordingLocal(min: Int, max: Int) extends QuackBackend:
-    private val inner = new LocalQuackBackend(
-      min,
-      max,
-      commandFor = (_, _, _) => LocalQuackBackendSpec.sleepCmd(60)
-    )
-    val started                                = new ConcurrentLinkedQueue[RunningNode]()
-    def start(spec: NodeSpec): IO[RunningNode] = inner.start(spec).flatTap(n => IO(started.add(n)))
-    def stop(k: PoolKey, id: String): IO[Unit] = inner.stop(k, id)
-    def isAlive(id: String): Boolean           = inner.isAlive(id)
-    def discoverExisting(): IO[List[RunningNode]] = inner.discoverExisting()
-    def cleanup(): IO[Unit]                       = inner.cleanup()
-    override def adopt(n: RunningNode): IO[Unit]  = inner.adopt(n)
+  private final class RecordingLocal(min: Int, max: Int, cmd: List[String]) extends QuackBackend:
+    private val inner = new LocalQuackBackend(min, max, commandFor = (_, _, _) => cmd)
+    val started       = new ConcurrentLinkedQueue[Started]()
+    def start(spec: NodeSpec): IO[RunningNode] =
+      inner.start(spec).flatTap(n => IO(started.add(Started(n, NodeProcess.of(n)))))
+    def stop(k: PoolKey, id: String): IO[Unit]       = inner.stop(k, id)
+    def isAlive(id: String): Boolean                 = inner.isAlive(id)
+    def discoverExisting(): IO[List[RunningNode]]    = inner.discoverExisting()
+    def cleanup(): IO[Unit]                          = inner.cleanup()
+    override def adopt(n: RunningNode): IO[Unit]     = inner.adopt(n)
+    override def stopStray(n: RunningNode): IO[Unit] = inner.stopStray(n)
+    def all: List[Started]                           = started.asScala.toList
 
-  private def alive(n: RunningNode): Boolean =
-    n.pid.flatMap(p => Option(java.lang.ProcessHandle.of(p).orElse(null))).exists(_.isAlive)
-
-  private def kill(n: RunningNode): Unit =
-    n.pid.flatMap(p => Option(java.lang.ProcessHandle.of(p).orElse(null))).foreach { h =>
+  private def kill(h: ProcessHandle): Unit =
+    if h.isAlive then
       h.descendants().forEach { d => d.destroyForcibly(); () }
       h.destroyForcibly()
       ()
-    }
 
-  private def withPool(min: Int, max: Int, grace: FiniteDuration)(
-      body: (PoolSupervisor, RecordingLocal) => Unit
-  ): Unit =
-    val backend = new RecordingLocal(min, max)
-    val sup     = new PoolSupervisor(
-      backend,
-      new NodeLoadTracker,
-      new InMemoryControlPlaneStore(),
-      nodeStartupGrace = grace
-    )
+  /** A process the test owns, outside any backend. */
+  private def foreignSleep(): Process =
+    new java.lang.ProcessBuilder(LocalQuackBackendSpec.sleepCmd(60)*).start()
+
+  private def withPool(
+      min: Int,
+      max: Int,
+      grace: FiniteDuration,
+      cmd: List[String] = LocalQuackBackendSpec.sleepCmd(60)
+  )(body: (PoolSupervisor, RecordingLocal, InMemoryControlPlaneStore) => Unit): Unit =
+    val backend = new RecordingLocal(min, max, cmd)
+    val store   = new InMemoryControlPlaneStore()
+    val sup     = new PoolSupervisor(backend, new NodeLoadTracker, store, nodeStartupGrace = grace)
     try
       sup.createTenant(Tenant("acme")).unsafeRunSync()
       sup
         .createTenantDb("acme", "default", TenantDbKind.InMemory, Map.empty, dataPath = "")
         .unsafeRunSync()
       sup.createPool(poolKey, RoleDistribution(0, 0, 1)).unsafeRunSync()
-      body(sup, backend)
+      body(sup, backend, store)
     finally
       backend.cleanup().unsafeRunSync()
-      backend.started.asScala.foreach(kill)
+      backend.all.flatMap(_.handle).foreach(kill)
 
-  /** Run the reconcile loop every 20 ms for `forMs`, then stop it. */
-  private def tick(sup: PoolSupervisor, forMs: Long): Unit =
-    val fiber = sup.reconcileLoop(20.millis).start.unsafeRunSync()
-    Thread.sleep(forMs)
+  /** Run the reconcile loop every 20 ms until `done` or `forMs` elapses, then stop it. */
+  private def tick(sup: PoolSupervisor, forMs: Long, done: () => Boolean = () => false): Unit =
+    val deadline = System.currentTimeMillis() + forMs
+    val fiber    = sup.reconcileLoop(20.millis).start.unsafeRunSync()
+    while !done() && System.currentTimeMillis() < deadline do Thread.sleep(20)
     fiber.cancel.unsafeRunSync()
+
+  /** Point the pool's only node row at another process, as a row a previous manager wrote. */
+  private def rewriteRow(
+      sup: PoolSupervisor,
+      store: InMemoryControlPlaneStore,
+      pid: Long,
+      startedAt: Instant
+  ): Unit =
+    val n = sup.get(poolKey).get.nodes.head
+    store.upsertNode(n.copy(pid = Some(pid), startedAt = startedAt), store.snapshot().pools.head.id)
 
   "reconcile" should "not respawn a local node that is alive but still inside its startup window" in:
     assume(!LocalQuackBackendSpec.isWindows)
-    withPool(23140, 23149, grace = 1.minute) { (sup, backend) =>
-      val first = backend.started.asScala.toList
+    withPool(23140, 23149, grace = 1.minute) { (sup, backend, _) =>
+      val first = backend.all
       first should have size 1
       tick(sup, 600)
       withClue("starts after ~30 reconcile ticks of a node still starting: ") {
-        backend.started.asScala.toList shouldBe first
+        backend.all.map(_.node) shouldBe first.map(_.node)
       }
-      sup.get(poolKey).get.nodes.flatMap(_.pid) shouldBe first.flatMap(_.pid)
-      alive(first.head) shouldBe true
+      sup.get(poolKey).get.nodes.flatMap(_.pid) shouldBe first.flatMap(_.node.pid)
+      first.head.alive shouldBe true
     }
 
   it should "stop the old process before respawning a node past its startup window" in:
     assume(!LocalQuackBackendSpec.isWindows)
-    withPool(23150, 23152, grace = 200.millis) { (sup, backend) =>
+    withPool(23150, 23152, grace = 200.millis) { (sup, backend, _) =>
       // Each pass after the window finds the never-listening node dead and replaces it.
-      val deadline = System.currentTimeMillis() + 6000
-      val fiber    = sup.reconcileLoop(20.millis).start.unsafeRunSync()
-      while backend.started.size < 5 && System.currentTimeMillis() < deadline do Thread.sleep(20)
-      fiber.cancel.unsafeRunSync()
-
-      val all = backend.started.asScala.toList
+      tick(sup, 6000, () => backend.started.size >= 5)
+      val all = backend.all
       all.size should be >= 2
-      all.map(_.nodeId).distinct shouldBe List(PoolSupervisor.nodeId(poolKey, 1))
-      val tracked = sup.get(poolKey).get.nodes.flatMap(_.pid).toSet
-      tracked should have size 1
-      val untracked = all.filterNot(n => n.pid.exists(tracked.contains))
-      withClue(
-        s"replaced nodes still running untracked: ${untracked.filter(alive).flatMap(_.pid)}"
-      ) {
-        untracked.filter(alive) shouldBe empty
+      all.map(_.node.nodeId).distinct shouldBe List(PoolSupervisor.nodeId(poolKey, 1))
+      // Every process but the newest was replaced. (The newest may be missing from the pool state
+      // when the loop was cancelled between its start and its row write, so compare to `all`.)
+      withClue(s"replaced nodes still running: ${all.init.filter(_.alive).flatMap(_.node.pid)}") {
+        all.init.filter(_.alive) shouldBe empty
       }
+      all.flatMap(_.node.pid) should contain allElementsOf sup.get(poolKey).get.nodes.flatMap(_.pid)
       // A range of three ports: a lease leaked per replacement would refuse the fourth start.
       all.size should be >= 5
+    }
+
+  it should "respawn a node whose process dies inside its startup window" in:
+    // The window only shields a node whose process is still running: a wrapper exits as soon as its
+    // duckdb does, so a crash during startup is replaced on the next pass, not after the window.
+    assume(!LocalQuackBackendSpec.isWindows)
+    withPool(23160, 23162, grace = 1.minute, cmd = List("sh", "-c", "exit 1")) {
+      (sup, backend, _) =>
+        tick(sup, 5000, () => backend.started.size >= 3)
+        backend.started.size should be >= 3
+        backend.all.init.filter(_.alive) shouldBe empty
+    }
+
+  it should "neither treat as starting nor signal an unrelated process under the row's pid" in:
+    // After a manager or container restart a row's pid can name an unrelated process. Inside the
+    // window a live pid alone used to make the node "starting": reconcile adopted it, and the
+    // replacement or shutdown then SIGTERMed / SIGKILLed that process.
+    assume(!LocalQuackBackendSpec.isWindows)
+    withPool(23170, 23172, grace = 1.minute) { (sup, backend, store) =>
+      val unrelated = foreignSleep()
+      try
+        // A node started 30 s ago (inside the 1 min window) whose pid now names a process that
+        // started just now.
+        rewriteRow(sup, store, unrelated.pid(), Instant.now().minusSeconds(30))
+        sup.reconcile().unsafeRunSync()
+        withClue("the node was treated as starting instead of dead: ") {
+          backend.started.size shouldBe 2
+        }
+        unrelated.isAlive shouldBe true
+        backend.cleanup().unsafeRunSync()
+        unrelated.waitFor(500, TimeUnit.MILLISECONDS)
+        unrelated.isAlive shouldBe true
+      finally kill(unrelated.toHandle)
+    }
+
+  it should "stop a node process an earlier manager left running before replacing it" in:
+    // A node that never listened outlives its manager (unclean exit), so this generation never
+    // adopted it. Once past its window it is replaced, and the replacement must stop it first.
+    assume(!LocalQuackBackendSpec.isWindows)
+    withPool(23180, 23182, grace = 100.millis) { (sup, backend, store) =>
+      val stray = foreignSleep()
+      try
+        val strayStart = stray.toHandle.info().startInstant().get()
+        rewriteRow(sup, store, stray.pid(), strayStart)
+        Thread.sleep(300) // past the window
+        sup.reconcile().unsafeRunSync()
+        backend.started.size shouldBe 2
+        withClue("the earlier manager's process survived its replacement: ") {
+          stray.waitFor(10, TimeUnit.SECONDS) shouldBe true
+        }
+      finally kill(stray.toHandle)
     }
