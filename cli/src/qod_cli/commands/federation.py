@@ -5,6 +5,7 @@ import sys
 import typer
 
 from ..registry import covers
+from ..rest import ApiError, RestClient
 from ._run import call
 
 app = typer.Typer(help="Federated sources per (tenant, tenant-db).")
@@ -314,6 +315,15 @@ def create(
             raise typer.BadParameter(
                 f"--setup-sql / --config are not for --type {wire}; use the connection flags"
             )
+        if connection is not None and (
+            any(v is not None for v in (host, port, database, user, password, schema, ssl_mode))
+            or password_stdin or password_prompt
+        ):
+            raise typer.BadParameter(
+                "--connection carries the whole connection, password placeholder included; it "
+                "cannot be combined with --host / --port / --database / --user / --password* / "
+                "--schema / --ssl-mode"
+            )
         secret_value = _read_password(password_stdin, password_prompt)
         if secret_value is not None:
             if password is not None:
@@ -351,21 +361,66 @@ def create(
     if secret_value is None:
         call(ctx, "POST", _base(tenant, db), body=body)
         return
-    # The secret can only be set once its source exists, so the source goes first. Until the
-    # second call lands, a pool spawning in between fails to resolve the placeholder for this
-    # source; if it fails, the error says how to finish by hand.
-    call(ctx, "POST", _base(tenant, db), body=body)
-    alias_path = body["alias"].strip().lower()
+    _create_with_secret(ctx, tenant, db, body, password_secret, secret_value)
+
+
+def _secret_exists(ctx: typer.Context, tenant: str, db: str, alias: str, name: str) -> bool:
+    """Whether source `alias` already holds secret `name` (False when the source is new)."""
     try:
-        call(
-            ctx, "PUT", f"{_base(tenant, db)}/{alias_path}/secrets",
-            body={"name": password_secret, "value": secret_value}, quiet=True,
+        data = RestClient(ctx.obj.settings).request(
+            "GET", f"{_base(tenant, db)}/{alias}/secrets"
         )
+    except ApiError as exc:
+        if exc.status == 404:
+            return False
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1)
+    return any(s.get("name") == name for s in (data or {}).get("secrets", []))
+
+
+def _create_with_secret(
+    ctx: typer.Context, tenant: str, db: str, body: dict, secret: str, value: str
+) -> None:
+    """Save the source and the password secret its placeholder names, never leaving an ENABLED
+    source that references a missing secret: a pool spawning then would fail to resolve it, which
+    fails the whole tenant-db's federation blob. When the secret already exists (a rotation), the
+    placeholder resolves throughout and the source is saved as asked. Otherwise the source is saved
+    disabled first (disabled sources are not in any blob), the secret written, and the source saved
+    again as asked.
+    """
+    alias = body["alias"].strip().lower()
+    secret_path = f"{_base(tenant, db)}/{alias}/secrets"
+    fix = (
+        f"`qod federation secret set {tenant} {db} {alias} --name {secret} --value ...`"
+    )
+    if _secret_exists(ctx, tenant, db, alias, secret):
+        call(ctx, "POST", _base(tenant, db), body=body)
+        try:
+            call(ctx, "PUT", secret_path, body={"name": secret, "value": value}, quiet=True)
+        except typer.Exit:
+            typer.echo(
+                f"error: the source was saved but its password was not rotated; set it with {fix}",
+                err=True,
+            )
+            raise
+        return
+
+    call(ctx, "POST", _base(tenant, db), body={**body, "disabled": True}, quiet=True)
+    try:
+        call(ctx, "PUT", secret_path, body={"name": secret, "value": value}, quiet=True)
     except typer.Exit:
         typer.echo(
-            f"error: the source was saved but its password secret was not; set it with "
-            f"`qod federation secret set {tenant} {db} {alias_path} --name {password_secret} "
-            f"--value ...`",
+            f"error: the source was saved DISABLED and its password secret was not; set it with "
+            f"{fix}, then re-run this command",
+            err=True,
+        )
+        raise
+    try:
+        call(ctx, "POST", _base(tenant, db), body=body)
+    except typer.Exit:
+        typer.echo(
+            "error: the source and its password are saved, but the source is still DISABLED; "
+            "re-run this command to enable it",
             err=True,
         )
         raise
