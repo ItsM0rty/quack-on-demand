@@ -1358,13 +1358,18 @@ Then recycle the pool's nodes, as for any new source.
   ATTACH) and by the edge. The raw-SQL passthroughs `postgres_execute`,
   `postgres_query`, `mysql_execute` and `mysql_query` could end the remote's
   read-only transaction and write, and the SQL ACL and node lockdown are both
-  OFF by default, so the edge refuses them for every caller (superusers
-  included) when their first argument names a read-only catalog, or is not a
-  plain string literal while the pool has any read-only catalog. Calls to a
-  writable catalog are unchanged. **Connecting as a database user without
-  write privileges** is still the recommended defence in depth. For `mysql`,
-  whether `READ_ONLY` alone refuses writes is unverified (the extension is not
-  in the DuckDB 2.0 toolchain).
+  OFF by default, so while the pool has any read-only catalog the edge
+  refuses, for every caller (superusers included): those four when their
+  first argument names a read-only catalog or is not a plain string literal;
+  `query` / `query_table` with a computed argument; and
+  `json_execute_serialized_sql`. Calls to a writable catalog are unchanged.
+  The screen reads the statement text only: a table macro or view that
+  already wraps a passthrough (for example one created in the DuckLake
+  catalog before the source became read-only), or one in an attached
+  database, is not seen. **Connect as a database user without write
+  privileges**: that is the complete guarantee. For `mysql`, whether
+  `READ_ONLY` alone refuses writes is unverified (the extension is not in the
+  DuckDB 2.0 toolchain).
 - A `sql` source's setup SQL may not mention `qod_pg_`, `qod_mysql_` or
   `qod_ice_`: those secret-name prefixes belong to the typed sources, whose
   blocks create and drop them.

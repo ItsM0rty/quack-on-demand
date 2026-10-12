@@ -37,12 +37,16 @@
   credentials once the ATTACH returns (a re-attach without `READ_ONLY` would otherwise write through
   them); the attached catalog keeps working and reconnects without it. New sources default to
   read-only, enforced by the engine (`READ_ONLY`) and the edge. The SQL ACL and node lockdown are
-  both off by default, so the edge now refuses `postgres_execute`, `postgres_query`,
-  `mysql_execute` and `mysql_query` for every caller, superusers included, when they target a
-  read-only catalog (any source type) or a catalog the edge cannot read from a string literal while
-  the pool has a read-only catalog: through them a session could end the remote's read-only
-  transaction and write. Calls to writable catalogs are unchanged. A database user without write
-  privileges remains the recommended defence in depth. The attach verifier now watches these
+  both off by default, so while a pool has a read-only catalog (any source type) the edge refuses,
+  for every caller, superusers included: `postgres_execute`, `postgres_query`, `mysql_execute` and
+  `mysql_query` targeting a read-only catalog or a catalog it cannot read from a string literal;
+  `query` / `query_table` with a computed argument; and `json_execute_serialized_sql`. Through them
+  a session could end the remote's read-only transaction and write. Calls to writable catalogs and
+  constant `query('...')` bodies (judged by the same rule) are unchanged. This screen reads the SQL
+  text only: a table macro or view that already wraps a passthrough, created before the catalog
+  became read-only (a DuckLake catalog keeps such a macro), and macros or views in attached
+  databases are not seen. A database user without write privileges on the remote is the complete
+  guarantee; configure one. The attach verifier now watches these
   sources like Iceberg ones (`attachStatus`, per-node failures, retry) and drops the secret when a
   retried attach fails. Manifest import applies the same validation as REST and MCP to every typed
   source (Iceberg included). Fixed with it: a secret value containing `{{` no longer fails the

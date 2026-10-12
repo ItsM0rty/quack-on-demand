@@ -140,6 +140,19 @@ import java.util.Locale
   * truncated by literal nesting fails closed. This runs before the cheap read-side path, which
   * would otherwise admit `SELECT * FROM postgres_query(...)` as a plain select.
   *
+  * A passthrough whose NAME is computed at run time reaches no call token at all:
+  * `FROM query('FROM postgres_' || 'execute(''shop'', ''COMMIT'')')` and the same with an INSERT
+  * wrote to a read-only catalog on the 2.0 CLI. So, under the same condition and for every caller,
+  * `query` / `query_table` with any non-constant argument and `json_execute_serialized_sql` in any
+  * form are refused too; a constant `query('...')` body is read like any statement and judged by
+  * the rule above.
+  *
+  * What no lexical screen can see, and therefore stays open: a table macro or view that already
+  * wraps a passthrough or `query(...)`, created before the catalog became read-only (a DuckLake
+  * catalog keeps a macro, which binds at call time, across sessions), and macros or views inside
+  * attached databases generally. Only the screened SQL text is visible here, not what an object it
+  * names expands to. A remote role without write privileges is the complete guarantee.
+  *
   * When NOTHING is read-only the screen is inert and never parses, so it costs nothing on the
   * overwhelmingly common path.
   */
@@ -171,11 +184,54 @@ object CatalogWriteScreen extends LazyLogging:
   val RawSqlFunctions: Set[String] =
     Set("postgres_execute", "postgres_query", "mysql_execute", "mysql_query")
 
+  /** Carriers that run SQL text, or name a table, given as a value: with a constant argument the
+    * text is a literal body [[FunctionCalls.scan]] reads like any other statement (so a passthrough
+    * inside it is judged by the rule above); with a computed one (`'postgres_' || 'execute(...)'`,
+    * `concat`, `printf`, `getvariable`, a parameter, a macro argument) it is SQL nobody here can
+    * read. The 2.0 CLI ran `FROM query('FROM postgres_' || 'execute(''shop'', ''COMMIT'')')` and
+    * then the same shape with an INSERT, and the write landed on a read-only catalog.
+    */
+  private val ComputedSqlCarriers: Set[String] = Set("query", "query_table")
+
+  /** Runs a serialized statement whose function names are JSON string values no call scan sees;
+    * refused outright (table function and pragma) while a catalog is read-only. The
+    * `*_external_resource` invokers take a single payload argument, so a two-argument passthrough
+    * does not bind through them (2.0 CLI: "No function matches"); they are not listed.
+    */
+  private val OpaqueSqlCarrier = "json_execute_serialized_sql"
+
   /** See the scaladoc's raw-SQL paragraph. `denied` is already folded. */
   private[sql] def rawSqlDenial(sql: String, denied: Set[String]): Option[String] =
     val scan       = FunctionCalls.scan(sql)
     val deniedList = denied.toList.sorted.mkString(", ")
     val calls      = scan.calls.filter(c => RawSqlFunctions(c.name))
+    val computed   = scan.calls.iterator
+      .filter(c => ComputedSqlCarriers(c.name) && !FunctionCalls.constantArguments(c))
+      .map { c =>
+        s"${c.name} with SQL computed at run time is refused while a read-only catalog " +
+          s"($deniedList) is attached: it could run a passthrough no screen can read"
+      }
+      .nextOption()
+    val opaque =
+      Option.when(scan.texts.exists(_.toLowerCase(Locale.ROOT).contains(OpaqueSqlCarrier)))(
+        s"$OpaqueSqlCarrier is refused while a read-only catalog ($deniedList) is attached: " +
+          "the statement it runs is serialized where no screen can read it"
+      )
+    computed
+      .orElse(opaque)
+      .orElse(rawCallDenial(calls, denied, deniedList))
+      .orElse(
+        Option.when(scan.truncated && scan.texts.exists(t => mentionsRawSql(t)))(
+          "SQL-running call nested too deep to verify while a read-only catalog " +
+            s"($deniedList) is attached"
+        )
+      )
+
+  private def rawCallDenial(
+      calls: Vector[FunctionCalls.Call],
+      denied: Set[String],
+      deniedList: String
+  ): Option[String] =
     calls.iterator
       .flatMap { c =>
         FunctionCalls.firstStringArgument(c) match
@@ -192,16 +248,10 @@ object CatalogWriteScreen extends LazyLogging:
             )
       }
       .nextOption()
-      .orElse(
-        Option.when(scan.truncated && scan.texts.exists(t => mentionsRawSql(t)))(
-          "SQL-running call nested too deep to verify while a read-only catalog " +
-            s"($deniedList) is attached"
-        )
-      )
 
   private def mentionsRawSql(text: String): Boolean =
     val lower = text.toLowerCase(Locale.ROOT)
-    RawSqlFunctions.exists(lower.contains)
+    (RawSqlFunctions ++ ComputedSqlCarriers).exists(lower.contains)
 
   private def screenStatements(
       sql: String,

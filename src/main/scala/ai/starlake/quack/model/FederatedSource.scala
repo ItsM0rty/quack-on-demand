@@ -65,12 +65,15 @@ import java.time.Instant
   *     transaction, `CALL postgres_execute('<alias>', 'COMMIT')` followed by a write ran the write
   *     in autocommit on the 2.0 CLI. The SQL ACL and node lockdown both default OFF, so on a
   *     default install that was every principal. `CatalogWriteScreen` (which always runs) now
-  *     refuses `postgres_execute`, `postgres_query`, `mysql_execute` and `mysql_query` for EVERY
-  *     caller, superusers included, when the first argument names a read-only catalog or is not a
-  *     string literal while any catalog on the pool is read-only. A database role without write
-  *     privileges on the remote stays the recommended defence in depth. For MySQL, whether
-  *     `READ_ONLY` itself refuses writes through the extension is unverified (no extension in the
-  *     2.0 toolchain).
+  *     refuses, for EVERY caller, superusers included, while any catalog on the pool is read-only:
+  *     `postgres_execute`, `postgres_query`, `mysql_execute` and `mysql_query` whose first argument
+  *     names a read-only catalog or is not a string literal, `query` / `query_table` with a
+  *     computed argument, and `json_execute_serialized_sql`. It reads statement text only, so a
+  *     table macro or view that already wraps a passthrough (created before the catalog became
+  *     read-only, e.g. in a DuckLake catalog) or lives in an attached database is not seen. A
+  *     database role without write privileges on the remote is the complete guarantee. For MySQL,
+  *     whether `READ_ONLY` itself refuses writes through the extension is unverified (no extension
+  *     in the 2.0 toolchain).
   *   - `Sql`: edge-screen-only. The operator writes the ATTACH text (`setupSql`), so QoD has no
   *     rendering step to add the flag to; `CatalogWriteScreen` is the ONLY enforcement for these
   *     sources, with every gap documented above PLUS a mutating `CALL`, which the screen cannot

@@ -117,3 +117,53 @@ class CatalogWriteScreenRawSqlSpec extends AnyFlatSpec with Matchers with Option
     first("SELECT f()") shouldBe None
     first("SELECT f(b'0101')") shouldBe None
   }
+
+  // --- Re-review R1: a passthrough whose NAME is computed at run time -------------------------
+
+  "the computed-SQL rule" should "refuse the reproduced query() bypass that wrote on the 2.0 CLI" in {
+    screen(
+      "BEGIN; FROM query('FROM postgres_' || 'execute(''shop'', ''COMMIT'')'); " +
+        "FROM query('FROM postgres_' || 'execute(''shop'', ''INSERT INTO t VALUES (42)'')'); " +
+        "COMMIT"
+    ).value should include("computed at run time")
+  }
+
+  it should "refuse every way of computing the SQL a query() / query_table() runs" in {
+    for sql <- List(
+        "FROM query('FROM postgres_' || 'execute(''shop'', ''COMMIT'')')",
+        "FROM query(concat('FROM postgres_', 'execute(''shop'', ''COMMIT'')'))",
+        "FROM query(printf('FROM %s(''shop'', ''COMMIT'')', 'postgres_' || 'execute'))",
+        "SELECT * FROM query(getvariable('q'))",
+        "PREPARE p AS FROM query($1)",
+        "PREPARE p AS FROM query(?)",
+        "CREATE MACRO m(a) AS TABLE FROM query(a)",
+        "SELECT * FROM QUERY(lower('FROM POSTGRES_EXECUTE(''shop'', ''COMMIT'')'))",
+        "SELECT * FROM \"query\"(upper('x'))",
+        "SELECT * FROM query_table('t' || 'x')",
+        "SELECT * FROM system.main.query(some_column) FROM acme_db.main.t"
+      )
+    do withClue(sql)(screen(sql) should not be None)
+  }
+
+  it should "refuse json_execute_serialized_sql, as a table function and as a pragma" in {
+    screen("SELECT * FROM json_execute_serialized_sql('{}')") should not be None
+    screen("PRAGMA json_execute_serialized_sql('{}')") should not be None
+    screen("SELECT * FROM \"JSON_EXECUTE_SERIALIZED_SQL\"('{}')") should not be None
+  }
+
+  it should "still judge a CONSTANT query() body by the raw-SQL rule, doubled quotes included" in {
+    screen("FROM query('FROM postgres_execute(''shop'', ''COMMIT'')')").value should
+      include("catalog 'shop'")
+    screen(
+      "FROM query('FROM query(''FROM postgres_execute(''''shop'''', ''''COMMIT'''')'')')"
+    ).value should include("catalog 'shop'")
+    screen("FROM query('FROM postgres_query(''pg_rw'', ''SELECT 1'')')") shouldBe None
+    screen("FROM query('SELECT 42')") shouldBe None
+    screen("SELECT * FROM query_table('acme_db.main.t')") shouldBe None
+  }
+
+  it should "leave query() alone when nothing on the pool is read-only" in {
+    screen("FROM query('FROM postgres_' || 'execute(''shop'', ''COMMIT'')')", Set.empty) shouldBe
+      None
+    screen("SELECT * FROM json_execute_serialized_sql('{}')", Set.empty) shouldBe None
+  }
