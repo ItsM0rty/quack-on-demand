@@ -1316,8 +1316,9 @@ qod federation secret set acme acme_fed glue_lake --name AWS_SECRET --value "$AW
 A typed source for an external Postgres or MySQL database: no SQL to write, and
 the password never sits in an `ATTACH` string. QoD renders a temporary DuckDB
 secret holding the connection, an `ATTACH '' AS <alias> (TYPE postgres, SECRET
-..., READ_ONLY)` and a `DROP SECRET` right after it, so no session on the node
-can reuse the credentials (for instance to re-attach the server writable).
+..., READ_ONLY)` and a `DROP SECRET` right after it, so no session can reuse
+the credentials once the ATTACH returns (for instance to re-attach the server
+writable).
 
 ```bash
 # Read the password from stdin (or --password-prompt): the CLI stores it as the
@@ -1354,10 +1355,20 @@ Then recycle the pool's nodes, as for any new source.
 - `--connection '<json>'` passes the whole object (`host`, `port`, `database`,
   `user`, `password`, `schema`, `sslMode`) instead of the flags.
 - `--read-only` **defaults ON**, enforced by the engine (`READ_ONLY` on the
-  ATTACH). One residual: whoever may run `postgres_execute` (a superuser, or
-  anyone on a pool with the SQL ACL and lockdown both off) can end the remote's
-  read-only transaction and write. **Connect as a database user without write
-  privileges** for a hard guarantee.
+  ATTACH) and by the edge. The raw-SQL passthroughs `postgres_execute`,
+  `postgres_query`, `mysql_execute` and `mysql_query` could end the remote's
+  read-only transaction and write, and the SQL ACL and node lockdown are both
+  OFF by default, so the edge refuses them for every caller (superusers
+  included) when their first argument names a read-only catalog, or is not a
+  plain string literal while the pool has any read-only catalog. Calls to a
+  writable catalog are unchanged. **Connecting as a database user without
+  write privileges** is still the recommended defence in depth. For `mysql`,
+  whether `READ_ONLY` alone refuses writes is unverified (the extension is not
+  in the DuckDB 2.0 toolchain).
+- A `sql` source's setup SQL may not mention `qod_pg_`, `qod_mysql_` or
+  `qod_ice_`: those secret-name prefixes belong to the typed sources, whose
+  blocks create and drop them.
+- A manifest import validates typed sources exactly as `create` does.
 - `create` upserts, so re-running it edits the source; a re-run with
   `--password-stdin` rotates the stored password. Recycle the pool to apply.
 - The attach state is reported like an Iceberg catalog's (next section).
