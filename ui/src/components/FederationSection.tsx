@@ -952,8 +952,19 @@ export default function FederationSection({
     * QoD does not own starts read-only (the manager's own default for a new
     * typed row), a `sql` source keeps today's behaviour. */
   function selectSourceType(next: FederatedSourceType) {
+    const prev = sourceType;
     setSourceType(next);
     setReadOnly(next !== 'sql');
+    // TLS mode names differ between postgres and mysql, and a port left at the other type's
+    // default would point at the wrong server: neither may survive a switch unseen (the select
+    // would show "client default" while the state still held the other type's value).
+    if (isRdbmsType(prev) && isRdbmsType(next) && prev !== next) {
+      setRdbms(f => ({
+        ...f,
+        sslMode: '',
+        port: f.port.trim() === String(RDBMS_DEFAULT_PORT[prev]) ? '' : f.port,
+      }));
+    }
   }
 
   function openCreate() {
@@ -991,31 +1002,56 @@ export default function FederationSection({
     // operator sees in this field identical to the one it is stored under.
     const normAlias = alias.trim().toLowerCase();
     const pw = isRdbms ? rdbmsPassword(rdbms) : null;
+    const request = {
+      alias:       normAlias,
+      description: description.trim() || undefined,
+      sourceType,
+      readOnly,
+      // Exactly one shape per type: the manager 400s a row carrying another.
+      ...(isIceberg
+        ? { config: buildIcebergConfig(icebergMode, iceberg) }
+        : isRdbmsType(sourceType)
+          ? { connection: buildRdbmsConnection(sourceType, rdbms, pw?.placeholder ?? '') }
+          : { setupSql: setupSql.trim() || undefined }),
+    };
     try {
-      await api.createFederatedSource(tenant, tenantDb, {
-        alias:       normAlias,
-        description: description.trim() || undefined,
-        sourceType,
-        readOnly,
-        // Exactly one shape per type: the manager 400s a row carrying another.
-        ...(isIceberg
-          ? { config: buildIcebergConfig(icebergMode, iceberg) }
-          : isRdbmsType(sourceType)
-            ? { connection: buildRdbmsConnection(sourceType, rdbms, pw?.placeholder ?? '') }
-            : { setupSql: setupSql.trim() || undefined }),
-      });
-      // The secret can only be written once its source exists.
-      if (pw?.secretValue) {
+      if (!pw?.secretValue) {
+        await api.createFederatedSource(tenant, tenantDb, request);
+      } else {
+        const target = pw.secretValue;
+        // The secret the placeholder names, if the source already has it. A new source has
+        // none (the listing 404s).
+        const stored = editingAlias != null
+          ? (await api.listFederatedSecrets(tenant, tenantDb, normAlias)
+              .catch(() => ({ secrets: [] as FederatedSecretResponse[] })))
+              .secrets.find(sec => sec.name === target.name)
+          : undefined;
+        // Writing a value over an externalRef secret would silently replace the indirection
+        // (env / vault) with an inline copy: refuse, and say where to change it instead.
+        if (stored?.externalRef) {
+          setError(
+            `secret ${target.name} is resolved from ${stored.externalRef}; change it under ` +
+            `Secrets, or type a {{secret.NAME}} placeholder here instead of a value`,
+          );
+          return;
+        }
+        // An ENABLED source naming a missing secret fails the whole tenant-db's federation at
+        // the next spawn, so a source without its secret yet is saved disabled first (disabled
+        // sources are in no node's setup), then the secret, then the source as asked.
+        if (!stored) await api.createFederatedSource(tenant, tenantDb, { ...request, disabled: true });
+        else await api.createFederatedSource(tenant, tenantDb, request);
         try {
-          await api.upsertFederatedSecret(tenant, tenantDb, normAlias, pw.secretValue);
+          await api.upsertFederatedSecret(tenant, tenantDb, normAlias, target);
         } catch (e) {
           setError(
-            `the source was saved but its password was not (${errorMessage(e)}); ` +
-            `expand the source and set secret ${pw.secretValue.name} under Secrets`,
+            `the source was saved${stored ? '' : ' DISABLED'} but its password was not ` +
+            `(${errorMessage(e)}); expand the source and set secret ${target.name} under Secrets` +
+            (stored ? '' : ', then save the source again to enable it'),
           );
           await reload();
           return;
         }
+        if (!stored) await api.createFederatedSource(tenant, tenantDb, request);
       }
       closeForm();
       await reload();
@@ -1475,7 +1511,9 @@ export default function FederationSection({
             <div style={{ fontSize: '.75em', color: 'var(--text-mute)' }}>
               {isIceberg || isRdbms
                 ? 'Renders a READ_ONLY ATTACH option and denies writes at the edge. Takes effect on an already-running node only after the pool recycles.'
-                  + (isRdbms ? ' For a hard guarantee, connect as a database user without write privileges.' : '')
+                  + (isRdbms
+                    ? ' The edge also refuses postgres_execute / postgres_query / mysql_execute / mysql_query on it for every caller. Connecting as a database user without write privileges remains the recommended defence in depth.'
+                    : '')
                 : 'Denies writes to this catalog at the edge. The ATTACH text itself is yours, so this screen is the only enforcement for a sql source.'}
             </div>
               </div>
