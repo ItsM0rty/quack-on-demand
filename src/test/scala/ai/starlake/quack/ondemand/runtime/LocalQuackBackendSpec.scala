@@ -30,6 +30,25 @@ class LocalQuackBackendSpec extends AnyFlatSpec with Matchers with org.scalatest
     backend.stop(PoolKey("t", "t_default", "p"), "node-2").unsafeRunSync()
     backend.isAlive("node-2") shouldBe false
 
+  // Regression for the pool-create spawn race: reconcile respawned a node it judged dead under the
+  // same id, and start() overwrote the held Process handle, so the first process ran on untracked
+  // (holding its port) and its port lease leaked.
+  it should "stop the process it still holds under a node id before starting another one" in:
+    assume(!isWindows)
+    val backend = new LocalQuackBackend(23130, 23131, commandFor = (_, _, _) => sleepCmd(30))
+    val key     = PoolKey("t", "t_default", "p")
+    val spec    = NodeSpec(key, "node-again", Role.Dual, Map.empty, Map.empty)
+    val first   = backend.start(spec).unsafeRunSync()
+    try
+      val second = backend.start(spec).unsafeRunSync()
+      val handle = java.lang.ProcessHandle.of(first.pid.value)
+      handle.isPresent && handle.get().isAlive shouldBe false
+      backend.isAlive("node-again") shouldBe true
+      second.pid should not be first.pid
+      // Two ports: a lease leaked per replacement would refuse this third start.
+      noException should be thrownBy backend.start(spec).unsafeRunSync()
+    finally backend.stop(key, "node-again").unsafeRunSync()
+
   it should "carry NodeSpec.maxConcurrent through to RunningNode" in:
     val backend = new LocalQuackBackend(23030, 23031, commandFor = (_, _, _) => sleepCmd(30))
     val spec    = NodeSpec(

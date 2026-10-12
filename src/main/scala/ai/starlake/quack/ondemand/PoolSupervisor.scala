@@ -139,7 +139,14 @@ final class PoolSupervisor(
       * stamps on the tombstone row.
       */
     managedStore: Option[ai.starlake.quack.ManagedObjectStoreConfig] = None,
-    duckLakeInitializer: (Map[String, String], Boolean) => Unit = DuckLakeInitializer.initBlocking
+    duckLakeInitializer: (Map[String, String], Boolean) => Unit = DuckLakeInitializer.initBlocking,
+    /** How long after its spawn a pid-carrying (local) node whose process is alive but whose port
+      * is still closed counts as starting rather than dead. The local backend returns at fork time,
+      * well before DuckDB finishes INSTALL/LOAD + ATTACH and listens, so without this window a
+      * reconcile tick in that gap respawns a node that is merely slow to come up. Past it, a node
+      * that never listened (an init that hangs, a port taken by a stray) is respawned as before.
+      */
+    nodeStartupGrace: scala.concurrent.duration.FiniteDuration = PoolSupervisor.NodeStartupGrace
 ) extends LazyLogging:
 
   // Surrogate-id-indexed caches of the persisted state.
@@ -999,7 +1006,7 @@ final class PoolSupervisor(
         // (k8s) are live iff the labeled pod list contains them. live=None means the backend can't
         // enumerate (local mode / apiserver blip): treat as alive, heal nothing.
         def podAlive(n: RunningNode): Boolean = n.pid match
-          case Some(_) => isReachable(n)
+          case Some(_) => isStarting(n) || isReachable(n)
           case None    => live.fold(true)(_.contains(n.nodeId))
 
         // Heal to target: rows beyond distribution.total are pruned, but ONLY rows whose pod is
@@ -1256,14 +1263,26 @@ final class PoolSupervisor(
         found
       case _ => NodePlacement.empty
 
+  private def pidAlive(pid: Long): Boolean =
+    Option(java.lang.ProcessHandle.of(pid))
+      .flatMap(o => if o.isPresent then Some(o.get()) else None)
+      .exists(_.isAlive)
+
+  /** A pid-carrying node inside its startup window ([[nodeStartupGrace]] from `startedAt`) whose
+    * process is alive: it may not listen yet, and reconcile must not respawn it. Judged without a
+    * socket probe, so a node still binding its port is never declared dead.
+    */
+  private def isStarting(n: RunningNode): Boolean =
+    n.pid.exists(pidAlive) &&
+      java.time.Duration
+        .between(n.startedAt, java.time.Instant.now())
+        .compareTo(java.time.Duration.ofNanos(nodeStartupGrace.toNanos)) < 0
+
   private def isReachable(n: RunningNode): Boolean =
     n.pid match
       case None    => true // K8s: defer to control-plane liveness + HealthProbe.
       case Some(p) =>
-        val pidAlive = Option(java.lang.ProcessHandle.of(p))
-          .flatMap(o => if o.isPresent then Some(o.get()) else None)
-          .exists(_.isAlive)
-        if !pidAlive then false
+        if !pidAlive(p) then false
         else
           val sock = new java.net.Socket()
           try { sock.connect(new java.net.InetSocketAddress(n.host, n.port), 250); true }
@@ -3984,6 +4003,12 @@ final class PoolSupervisor(
     }
 
 object PoolSupervisor:
+
+  /** Default [[PoolSupervisor]] `nodeStartupGrace`: the same 120 s the K8s and fleet backends give
+    * a node to become ready (`QOD_K8S_STARTUP_TIMEOUT_SEC`, `QOD_FLEET_STARTUP_TIMEOUT_SEC`).
+    */
+  val NodeStartupGrace: scala.concurrent.duration.FiniteDuration =
+    scala.concurrent.duration.DurationInt(120).seconds
 
   /** Concatenate per-pool [[ai.starlake.quack.ondemand.PoolState.initSql]] with the federation blob
     * for shipment as a single `extraSetupSql` to spawn-quack-node.sh. Order: `initSql` FIRST

@@ -3,6 +3,7 @@ package ai.starlake.quack.ondemand.runtime
 import java.util.Locale
 import ai.starlake.quack.model.{NodeSpec, PoolKey, RunningNode}
 import cats.effect.IO
+import com.typesafe.scalalogging.LazyLogging
 
 import java.lang.{ProcessBuilder => JProcessBuilder}
 import java.security.SecureRandom
@@ -16,7 +17,8 @@ final class LocalQuackBackend(
     max: Int,
     commandFor: (NodeSpec, Int, String) => List[String] =
       LocalQuackBackend.defaultCommand(LocalQuackBackend.DefaultSpawnScript)
-) extends QuackBackend:
+) extends QuackBackend
+    with LazyLogging:
 
   private val ports     = new PortAllocator(min, max)
   private val processes = TrieMap.empty[String, Process]
@@ -31,6 +33,16 @@ final class LocalQuackBackend(
   NodeSecretFiles.sweepStale()
 
   def start(spec: NodeSpec): IO[RunningNode] = IO.blocking {
+    // One process per node id. A start under an id this backend still holds (reconcile replacing
+    // a node it judged dead) stops the held process first: overwriting the handle instead would
+    // leave that process running untracked, holding its port past every stop path, and leak the
+    // port lease too.
+    if processes.contains(spec.nodeId) || adoptedPids.contains(spec.nodeId) ||
+      nodePorts.contains(spec.nodeId)
+    then
+      if isAlive(spec.nodeId) then
+        logger.warn(s"start of ${spec.nodeId}: stopping its still-running process first")
+      release(spec.nodeId)
     val port  = ports.lease().getOrElse(throw new RuntimeException(s"no free port in [$min, $max]"))
     val token = LocalQuackBackend.randomToken()
     val cmd   = commandFor(spec, port, token)
@@ -117,7 +129,14 @@ final class LocalQuackBackend(
     )
   }
 
-  def stop(key: PoolKey, nodeId: String): IO[Unit] = IO.blocking {
+  def stop(key: PoolKey, nodeId: String): IO[Unit] = IO.blocking(release(nodeId))
+
+  /** Terminate the node's process tree and drop every entry held for its id. An adopt entry is
+    * dropped even when a Process handle exists (reconcile adopts the nodes this backend started
+    * too), so `cleanup()` never signals a pid that has already been reaped and possibly reused.
+    */
+  private def release(nodeId: String): Unit =
+    val adoptedPid = adoptedPids.remove(nodeId)
     processes.remove(nodeId) match
       case Some(p) =>
         LocalQuackBackend.terminate(p.pid(), force = false)
@@ -127,7 +146,7 @@ final class LocalQuackBackend(
         // Adopted (from `reconcile`): no Process handle, but we kept the
         // pid. Fall back to pid-based teardown so the whole node tree still
         // dies (SIGTERM on Unix, `taskkill /T` on Windows).
-        adoptedPids.remove(nodeId).foreach { pid =>
+        adoptedPid.foreach { pid =>
           LocalQuackBackend.terminate(pid, force = false)
           val handle = Option(java.lang.ProcessHandle.of(pid))
             .flatMap(o => if o.isPresent then Some(o.get()) else None)
@@ -142,8 +161,6 @@ final class LocalQuackBackend(
         }
     tokens.remove(nodeId)
     nodePorts.remove(nodeId).foreach(ports.release)
-    ()
-  }
 
   def isAlive(nodeId: String): Boolean =
     processes.get(nodeId).exists(_.isAlive)
