@@ -1,7 +1,13 @@
 package ai.starlake.quack.ondemand.federation
 
-import ai.starlake.quack.model.{FederatedSecret, FederatedSource, FederatedSourceType}
+import ai.starlake.quack.model.{
+  FederatedAlias,
+  FederatedSecret,
+  FederatedSource,
+  FederatedSourceType
+}
 import ai.starlake.quack.ondemand.federation.iceberg.{IcebergRestConfig, IcebergSetupSql}
+import ai.starlake.quack.ondemand.federation.rdbms.{RdbmsConfig, RdbmsKind, RdbmsSetupSql}
 import cats.effect.IO
 import cats.syntax.all.*
 
@@ -17,12 +23,21 @@ import cats.syntax.all.*
   *
   * Empty in `redactSecrets` (preview) mode, where nothing was resolved. NEVER log `sql`.
   *
+  * `cleanupSql` is what a caller that ran `sql` as ONE batch must run when the batch failed part
+  * way: a Postgres / MySQL block creates a credential-bearing secret, then ATTACHes, then drops the
+  * secret, and a failed ATTACH stops a batch before the drop (the node's piped init runs with
+  * `.bail off` and needs none of this). None for a block that leaves nothing behind.
+  *
   * `toString` is overridden because "NEVER log sql" is a comment, not a guard: a case class whose
   * DERIVED `toString` renders the SQL and the raw secret set is one string interpolation away from
   * the exact leak this type exists to help prevent. No caller renders it today; the override is so
   * that a future log line, exception message or debug print cannot.
   */
-final case class ResolvedFederationBlock(sql: String, secretValues: Set[String]):
+final case class ResolvedFederationBlock(
+    sql: String,
+    secretValues: Set[String],
+    cleanupSql: Option[String]
+):
   override def toString: String =
     s"ResolvedFederationBlock(sql=${sql.length} chars, secretValues=${secretValues.size} values)"
 
@@ -146,13 +161,14 @@ final class FederationBlobBuilder(
     resolved <- substitute(src, template, byName, redactSecrets)
   } yield ResolvedFederationBlock(
     s"-- BEGIN federation: ${src.alias}\n${resolved._1}\n-- END federation: ${src.alias}",
-    resolved._2
+    resolved._2,
+    RdbmsKind.of(src.sourceType).map(RdbmsSetupSql.cleanupSql(_, FederatedAlias.fold(src.alias)))
   )
 
-  /** The pre-substitution SQL for one source. A `Sql` source supplies it directly; an `IcebergRest`
-    * source has it rendered from typed config. The rendered form still carries `{{secret.NAME}}`
-    * placeholders, so everything downstream (substitution, SQL escaping, the stray-placeholder
-    * check, redaction) applies to both shapes identically.
+  /** The pre-substitution SQL for one source. A `Sql` source supplies it directly; a typed one
+    * (`IcebergRest`, `Postgres`, `Mysql`) has it rendered from its config. The rendered form still
+    * carries `{{secret.NAME}}` placeholders, so everything downstream (substitution, SQL escaping,
+    * the stray-placeholder check, redaction) applies to both shapes identically.
     *
     * A config that will not parse raises rather than degrading: silently skipping the source would
     * bring a node up with the catalog missing, which is exactly the failure the attach verifier
@@ -164,9 +180,9 @@ final class FederationBlobBuilder(
     * `FederatedSourceHandlers.toSource` runs the same check at REST/MCP write time, but
     * `ManifestImporter` builds `FederatedSource` rows directly and calls `upsertSource` without
     * going through that handler, so this is the layer that check reaches for every write path --
-    * for `IcebergRest` sources only. Only the `IcebergRest` arm below calls
-    * `IcebergRestConfig.validated`; two colliding `Sql` sources (or a `Sql` source colliding with
-    * the tenant-db's own alias) are never checked here, since a `Sql` source's setup SQL is
+    * for typed sources only. Only the typed arms below call `IcebergRestConfig.validated` /
+    * `RdbmsConfig.validated`; two colliding `Sql` sources (or a `Sql` source colliding with the
+    * tenant-db's own alias) are never checked here, since a `Sql` source's setup SQL is
     * operator-written and unparsed.
     *
     * On an actual collision this raises rather than degrading: without it, a colliding ATTACH fails
@@ -209,6 +225,32 @@ final class FederationBlobBuilder(
                 IO.raiseError(
                   new RuntimeException(s"invalid iceberg config for source '${src.alias}': $err")
                 )
+      case FederatedSourceType.Postgres => rdbmsTemplate(src, RdbmsKind.Postgres, reservedAliases)
+      case FederatedSourceType.Mysql    => rdbmsTemplate(src, RdbmsKind.Mysql, reservedAliases)
+
+  /** The Postgres / MySQL arm of [[bodyTemplate]], same contract as the Iceberg one: parse, run
+    * `RdbmsConfig.validated` (the only way to obtain what `render` accepts), raise on anything
+    * else.
+    */
+  private def rdbmsTemplate(
+      src: FederatedSource,
+      kind: RdbmsKind,
+      reservedAliases: Set[String]
+  ): IO[String] =
+    val invalid = (why: String) =>
+      IO.raiseError(
+        new RuntimeException(s"invalid ${kind.wire} config for source '${src.alias}': $why")
+      )
+    src.config.filter(_.trim.nonEmpty) match
+      case None =>
+        IO.raiseError(new RuntimeException(s"${kind.wire} source '${src.alias}' has no config"))
+      case Some(json) =>
+        RdbmsConfig.fromJson(json) match
+          case Left(err)  => invalid(err)
+          case Right(cfg) =>
+            RdbmsConfig.validated(kind, cfg, src.alias, reservedAliases) match
+              case Left(errs) => invalid(errs.mkString("; "))
+              case Right(v)   => IO.pure(RdbmsSetupSql.render(v, src.readOnly))
 
   private def substitute(
       src: FederatedSource,

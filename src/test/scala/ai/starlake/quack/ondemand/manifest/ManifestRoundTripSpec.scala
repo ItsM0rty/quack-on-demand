@@ -1329,3 +1329,73 @@ class ManifestRoundTripSpec extends AnyFlatSpec with Matchers:
     ManifestImporter.apply(exported, cp, requireEncryption = false) shouldBe Right(())
     cp.listTenants().find(_.id == "acme").get.acl.opaToken shouldBe Some("real-token")
   }
+
+  // ------------------------------------------------------------------
+  // A postgres-typed federated source survives export -> YAML -> import with its typed connection
+  // and readOnly intact, and its password secret is redacted on the way out and its stored value
+  // reused on the way back in.
+  // ------------------------------------------------------------------
+
+  it should "round-trip a postgres federated source with its password secret redacted" in {
+    val cp  = buildSrc()
+    val fed = new InMemoryFederatedSourceStore()
+    val cfg = ai.starlake.quack.ondemand.federation.rdbms
+      .RdbmsConfig(
+        host = "pg.example.com",
+        port = Some(6432),
+        database = "shop",
+        user = "reader",
+        password = "{{secret.PG_PWD}}",
+        schema = Some("sales"),
+        sslMode = Some("require")
+      )
+      .toJson
+    fed.upsertSource(
+      FederatedSource(
+        id = "fs-pg",
+        tenantDbId = "td-1",
+        alias = "shop_pg",
+        sourceType = FederatedSourceType.Postgres,
+        config = Some(cfg),
+        readOnly = true
+      )
+    )
+    fed.upsertSecret(FederatedSecret("fsec-pg", "fs-pg", "PG_PWD", Some("s3cr3t-pw"), None))
+
+    val exported =
+      exportOk(ManifestExporter.build(cp, ExportedAt, AdminVersion, Hostname, Some(fed)))
+    val yaml = Yaml.pretty(exported.asJson)
+    yaml should not include "s3cr3t-pw"
+    val msrc = exported.tenants.head.tenantDbs.head.federatedSources.head
+    msrc.sourceType shouldBe "postgres"
+    msrc.config shouldBe Some(cfg)
+    msrc.readOnly shouldBe true
+    msrc.secrets.map(s => s.name -> s.value) shouldBe
+      List("PG_PWD" -> Some(FederatedSecret.RedactedMarker))
+
+    val reparsed = parser.parse(yaml).flatMap(_.as[ConfigManifest]).fold(throw _, identity)
+    ManifestImporter.apply(reparsed, cp, Some(fed), requireEncryption = false) shouldBe Right(())
+
+    val back = fed.listSources("td-1")
+    back should have size 1
+    back.head.sourceType shouldBe FederatedSourceType.Postgres
+    back.head.config shouldBe Some(cfg)
+    back.head.readOnly shouldBe true
+    fed.listSecrets(back.head.id).map(s => s.name -> s.value) shouldBe
+      List("PG_PWD" -> Some("s3cr3t-pw"))
+  }
+
+  it should "refuse a mysql manifest source with no config, naming the type" in {
+    val cp   = buildSrc()
+    val fed  = new InMemoryFederatedSourceStore()
+    val base = exportOk(ManifestExporter.build(cp, ExportedAt, AdminVersion, Hostname, Some(fed)))
+    val withFed =
+      withFederatedSources(
+        base,
+        List(ManifestFederatedSource(alias = "shop_my", sourceType = "mysql"))
+      )
+    val res = ManifestImporter.apply(withFed, cp, Some(fed), requireEncryption = false)
+    res.left.toOption.get.exists(_.contains("config is required for sourceType 'mysql'")) shouldBe
+      true
+    fed.listSources("td-1") shouldBe Nil
+  }

@@ -865,9 +865,10 @@ object ManifestImporter extends LazyLogging:
     * the alias is normalized through `Names.normalizeOrError` (an invalid one is reported and the
     * source skipped, never written under a name every other path rejects), the constructed row is
     * run through `FederatedSource.validate`, and a blank inline secret value is refused the way
-    * `upsertSecret` refuses it. The one guard NOT replicated here is `IcebergRestConfig.validated`:
-    * an `iceberg_rest` config that parses but does not validate is stored, and
-    * `FederationBlobBuilder.bodyTemplate` is what catches it, at node spawn.
+    * `upsertSecret` refuses it. The one guard NOT replicated here is the typed config's own
+    * (`IcebergRestConfig.validated`, `RdbmsConfig.validated`): a typed config that parses but does
+    * not validate is stored, and `FederationBlobBuilder.bodyTemplate` is what catches it, at node
+    * spawn.
     *
     * Identity is the ROW ID throughout, never the alias string: aliases are case-insensitive to
     * DuckDB, and rows written before normalization landed may carry a case the manifest does not
