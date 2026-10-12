@@ -4,6 +4,7 @@ import ai.starlake.quack.BuildVersions
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{Files, Path, Paths}
 import scala.sys.process.*
 import scala.util.Try
@@ -60,12 +61,60 @@ class SpawnScriptWindowsInitSpec extends AnyFlatSpec with Matchers with SpawnScr
   private def dotLines(out: String): Vector[String] =
     out.linesIterator.filter(_.startsWith(".")).toVector
 
+  // DuckDB's secret directory moves below the read-only marker file of the node's own `secrets`
+  // directory before anything else, under `.bail on` (the outer init turned bail off), so the OS
+  // user's ~/.duckdb/stored_secrets never loads. The ACL that makes the directory read-only on
+  // Windows only runs there; elsewhere the script applies 0500 / 0400.
+  "the PowerShell node payload" should "move the secret directory below the marker first" in {
+    val tmp            = Files.createDirectories(tempDir.resolve("t"))
+    val (rc, out, err) = dryRun(tmp, "windows")
+    withClue(err)(rc shouldBe 0)
+    val lines = out.linesIterator.filter(_.trim.nonEmpty).toVector
+    lines.take(4) shouldBe Vector(
+      ".bail on",
+      lines(1),
+      "SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();",
+      ".bail off"
+    )
+    lines(1) should startWith("SET secret_directory = '")
+    val path = Paths.get(lines(1).stripPrefix("SET secret_directory = '").stripSuffix("';"))
+    path.isAbsolute shouldBe true
+    path.getFileName.toString shouldBe "s"
+    path.getParent.getFileName.toString shouldBe "none"
+    val nodeDir = path.getParent.getParent.getParent
+    path.getParent.getParent.getFileName.toString shouldBe "secrets"
+    nodeDir.getFileName.toString should startWith("quack-node.")
+    path.toString should startWith(tmp.toString)
+    // The dry run removes its node directory, read-only secret directory and marker included.
+    Files.exists(nodeDir) shouldBe false
+  }
+
+  // A node whose script was killed leaves its read-only secret directory; the next spawn's sweep
+  // gives it back to the current user before removing it (chmod 700 here, the ACL on Windows), and
+  // says so on stderr when a node directory cannot be removed.
+  "a later PowerShell spawn" should "sweep a dead node's read-only secret directory" in {
+    assume(!scala.util.Properties.isWin, "checks the POSIX branch; the ACL branch runs on Windows")
+    val tmp  = Files.createDirectories(tempDir.resolve("t"))
+    val dead = new java.lang.ProcessBuilder("true").start()
+    dead.waitFor()
+    val stale = Files.createDirectories(tmp.resolve("quack-node.deadbeef0001"))
+    val sec   = Files.createDirectories(stale.resolve("secrets"))
+    Files.writeString(stale.resolve("owner.pid"), s"${dead.pid()} 0")
+    Files.createFile(sec.resolve("none"))
+    Files.setPosixFilePermissions(sec.resolve("none"), PosixFilePermissions.fromString("r--------"))
+    Files.setPosixFilePermissions(sec, PosixFilePermissions.fromString("r-x------"))
+    val (rc, _, err) = dryRun(tmp, "windows")
+    withClue(err)(rc shouldBe 0)
+    Files.exists(stale) shouldBe false
+    err should not include "could not remove"
+  }
+
   "the Windows outer init" should "hand the CLI only relative, single-quoted paths" in {
     val tmp            = Files.createDirectories(tempDir.resolve("my temp"))
     val (rc, out, err) = dryRun(tmp, "windows")
     withClue(err)(rc shouldBe 0)
-    // The outer init's five lines come last (the payload, printed first, opens with its own
-    // `.bail off`).
+    // The outer init's five lines come last (the payload, printed first, has its own `.bail`
+    // lines).
     val dots = dotLines(out).takeRight(5)
     dots shouldBe Vector(
       ".bail off",

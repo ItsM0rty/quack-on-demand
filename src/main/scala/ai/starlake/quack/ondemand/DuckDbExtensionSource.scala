@@ -18,8 +18,9 @@ final case class DuckDbExtensionSource(dir: Option[String]):
       val path = s"${d.stripSuffix("/")}/$extension.duckdb_extension".replace("'", "''")
       s"LOAD '$path';"
 
-  /** JDBC properties of the manager's in-process DuckDB: the [[InProcessDuckDb]] thread budget,
-    * plus `allow_unsigned_extensions` when extensions load from a directory.
+  /** JDBC properties of the manager's in-process DuckDB: the [[InProcessDuckDb]] settings (thread
+    * budget, read-only secret directory), plus `allow_unsigned_extensions` when extensions load
+    * from a directory.
     */
   def connectionProperties: Properties =
     val p = InProcessDuckDb.properties

@@ -276,8 +276,56 @@ function New-PrivateDirectory([string]$path) {
   }
 }
 
+# The node's secret directory home (mirrors SECRET_DIR in spawn-quack-node.sh): a directory holding
+# only the regular file `none`, which nobody can write to. DuckDB's secret directory is set BELOW
+# that file, so it can never exist as a directory: CreateDirectoryW on an existing file fails for
+# administrators too. On Windows a read-only attribute would not stop file creation in a directory,
+# so the directory gets an ACL with no inherited entries that allows the current user only read,
+# traverse, delete and delete-child (so Remove-NodeDirectory can remove the marker and the
+# directory) and explicitly denies creating files or subdirectories. Elsewhere: 0400 / 0500.
+function New-SecretDirectory([string]$path) {
+  New-Item -ItemType Directory -Path $path -Force | Out-Null
+  $marker = Join-Path $path 'none'
+  [System.IO.File]::WriteAllText($marker, '')
+  if ($onWindows) {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+      $me, 'ReadAndExecute, Delete, DeleteSubdirectoriesAndFiles', 'None', 'None', 'Allow')))
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+      $me, 'CreateFiles, CreateDirectories', 'None', 'None', 'Deny')))
+    Set-Acl -LiteralPath $path -AclObject $acl
+  } else {
+    & chmod 400 $marker
+    & chmod 500 $path
+  }
+  return (Join-Path $marker 's')
+}
+
 # Remove a node directory and the spill directory it records.
 function Remove-NodeDirectory([string]$dir) {
+  # The secret directory is read-only around its marker file (New-SecretDirectory): give the current
+  # user full control of it again first, inherited by the marker (on Windows the marker's DACL is
+  # empty once Set-Acl re-propagated the directory's), or chmod 700 elsewhere. The owner may always
+  # rewrite the DACL.
+  $secrets = Join-Path $dir 'secrets'
+  if (Test-Path -LiteralPath $secrets -PathType Container) {
+    if ($onWindows) {
+      try {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+          $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        Set-Acl -LiteralPath $secrets -AclObject $acl
+      } catch {
+        [Console]::Error.WriteLine("WARN: could not restore access to $secrets before removing it: $($_.Exception.Message)")
+      }
+    } else {
+      & chmod 700 $secrets 2>$null
+    }
+  }
   $spillFile = Join-Path $dir 'spill.path'
   if (Test-Path -LiteralPath $spillFile -PathType Leaf) {
     $spill = ([System.IO.File]::ReadAllText($spillFile)).Trim()
@@ -286,10 +334,14 @@ function Remove-NodeDirectory([string]$dir) {
     }
   }
   Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $dir) {
+    [Console]::Error.WriteLine("WARN: could not remove the node directory $dir; remove it by hand")
+  }
 }
 
 # Per-node private state: $nodeDir holds owner.pid (the owning script's PID and its start ticks),
-# spill.path and $workDir, the empty directory duckdb runs in. Node directories of earlier spawns
+# spill.path, $workDir, the empty directory duckdb runs in, and the read-only `secrets` directory
+# below which duckdb's secret directory points. Node directories of earlier spawns
 # whose owning script is gone (taskkill /T /F skipped their cleanup) are removed first. The owner is
 # alive only when a process of that PID exists AND started at the recorded time: Windows recycles
 # PIDs, so the start time keeps the sweep from sparing (or killing) an unrelated process's dir. A
@@ -326,6 +378,13 @@ $nodeDir = Join-Path $tempRoot "quack-node.$markerPart$nodeId"
 New-PrivateDirectory $nodeDir
 $workDir = Join-Path $nodeDir 'cwd'
 New-PrivateDirectory $workDir
+# DuckDB loads every persistent secret of its secret directory on first secret use, and the default
+# is the OS user's ~/.duckdb/stored_secrets, which would put an operator's own cloud keys on every
+# node. The node's secret directory is $secretPath instead, a path below a read-only marker file
+# (New-SecretDirectory): nothing loads and CREATE PERSISTENT SECRET fails, while persistent secrets
+# stay enabled (with allow_persistent_secrets = false, DuckDB 2.0 refuses every postgres ATTACH that
+# names no SECRET, inline credentials included). Mirrors SECRET_PATH in spawn-quack-node.sh.
+$secretPath = New-SecretDirectory (Join-Path $nodeDir 'secrets')
 # DuckDB's spill directory defaults to `.tmp` under its working directory, which no longer persists
 # across nodes. Give each node its own under `.tmp` of the starting directory (where it spilled
 # before), per node so that under lockdown, where DuckDB admits its temp directory, no node can read
@@ -366,15 +425,18 @@ $encryptionKey = Secret-Or 'encryptionKey' ''
 # Build init SQL piecemeal based on $kind so memory / duckdb-file skip the
 # DuckLake-specific setup entirely. Mirrors spawn-quack-node.sh.
 $sb = [System.Text.StringBuilder]::new()
-# The CLI exits on the first error of an -init file by default; a node has always carried on past
-# a failing statement (an unreachable federated source, an offline INSTALL), so keep doing that.
-[void]$sb.AppendLine('.bail off')
-# First, before any CREATE SECRET or ATTACH: DuckDB loads every persistent secret of the OS user
-# (~/.duckdb/stored_secrets) on first secret use, which would put an operator's own cloud keys on
-# every node. Reading duckdb_secrets() then puts the secret manager in use, after which DuckDB
-# refuses to change the setting from any session. Mirrors spawn-quack-node.sh.
-[void]$sb.AppendLine('SET allow_persistent_secrets = false;')
+# First, before any CREATE SECRET or ATTACH: $secretPath (see above) replaces the OS user's
+# ~/.duckdb/stored_secrets. Reading duckdb_secrets() then puts the secret manager in use, after which
+# DuckDB refuses to change secret_directory, allow_persistent_secrets or default_secret_storage from
+# any session. Under `.bail on`: the outer init turned bail off before `.read`ing this payload, and
+# if either statement failed the node must not start on the default secret directory. Mirrors
+# spawn-quack-node.sh.
+[void]$sb.AppendLine('.bail on')
+[void]$sb.AppendLine("SET secret_directory = '$($secretPath.Replace("'", "''"))';")
 [void]$sb.AppendLine('SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();')
+# A node has always carried on past a failing statement (an unreachable federated source, an offline
+# INSTALL), so keep doing that from here on.
+[void]$sb.AppendLine('.bail off')
 if (-not [string]::IsNullOrEmpty($proxySql))  { [void]$sb.AppendLine($proxySql) }
 # Before dbInitSql, so an operator's own SET temp_directory still wins.
 [void]$sb.AppendLine("SET temp_directory = '$($spillDir.Replace("'", "''"))';")
