@@ -58,3 +58,25 @@ class DemoSeedSpec extends AnyFlatSpec with Matchers:
     val out  = DemoSeed.run(pg, "acme_tpch", "tpch1", home, 0.1, fake.toString, maxAttempts = 1)
     out.left.toOption.getOrElse("") should include("agent=0")
   }
+
+  it should "skip ~/.duckdbrc and move the secret directory before any statement" in {
+    assume(!scala.util.Properties.isWin, "the fake duckdb is a POSIX shell script")
+    val dir  = java.nio.file.Files.createTempDirectory("qod-demo-seed-spec")
+    val fake = dir.resolve("duckdb")
+    java.nio.file.Files
+      .writeString(fake, "#!/bin/sh\necho \"args=$*\" >&2\nhead -n 4 >&2\nexit 1\n")
+    fake.toFile.setExecutable(true)
+    val home = DemoHome(dir, dir.resolve("pg"), dir.resolve("ducklake"), dir.resolve("native"))
+    val pg   = PgCoords("localhost", 54321, "postgres", "")
+    val err  = DemoSeed
+      .run(pg, "acme_tpch", "tpch1", home, 0.1, fake.toString, maxAttempts = 1)
+      .left
+      .toOption
+      .getOrElse("")
+    val secrets = ai.starlake.quack.ondemand.InProcessDuckDb.secretDirectory.toString
+    err should include("args=-no-init")
+    err should include(
+      s".bail on\nSET secret_directory = '$secrets';\n" +
+        "SELECT count(*) FROM duckdb_secrets();\n.bail off"
+    )
+  }

@@ -24,14 +24,10 @@ private trait SpawnScriptTempDir extends BeforeAndAfterEach:
     tempDir = Files.createTempDirectory("spawn-script-encryption-spec")
 
   override def afterEach(): Unit =
-    Files
-      .walk(tempDir)
-      .iterator()
-      .asScala
-      .toSeq
-      .sortBy(_.toString.length)
-      .reverse
-      .foreach(Files.deleteIfExists)
+    val all = Files.walk(tempDir).iterator().asScala.toSeq
+    // A SIGKILLed node leaves its read-only (0500) secret directory around a marker file.
+    all.filter(Files.isDirectory(_)).foreach(_.toFile.setWritable(true, true))
+    all.sortBy(_.toString.length).reverse.foreach(Files.deleteIfExists)
 
   /** Run a spawn script the way the launchers do: every [[NodeSecretFiles.Keys]] entry of `env`
     * (plus a node token) goes to an ephemeral secrets directory, the rest to the environment.

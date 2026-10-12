@@ -101,6 +101,11 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
     withClue(Files.readString(tempDir.resolve("node.log")))(listening(port) shouldBe true)
     (p, port)
 
+  private def entries(dir: Path): List[String] =
+    val s = Files.list(dir)
+    try s.iterator().asScala.map(_.getFileName.toString).toList.sorted
+    finally s.close()
+
   /** Where the script creates its per-node directory (its TMPDIR). */
   private def nodeTmp: Path = Files.createDirectories(tempDir.resolve("node-tmp"))
 
@@ -176,24 +181,36 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
     val (p, port) = startNode("SELECT 1;", Seq("HOME" -> home.toString))
     try
       onNode(port, "SELECT count(*) FROM duckdb_secrets()") shouldBe List("0")
-      val dir = Paths.get(onNode(port, "SELECT current_setting('secret_directory')").head)
-      dir.startsWith(nodeTmp) shouldBe true
+      // A path below the regular file `none` of the node's read-only `secrets` directory.
+      val configured =
+        Paths.get(onNode(port, "SELECT current_setting('secret_directory')").head)
+      configured.startsWith(nodeTmp) shouldBe true
+      val marker = configured.getParent
+      val dir    = marker.getParent
+      marker.getFileName.toString shouldBe "none"
+      Files.isRegularFile(marker) shouldBe true
       dir.getFileName.toString shouldBe "secrets"
       PosixFilePermissions.toString(Files.getPosixFilePermissions(dir)) shouldBe "r-x------"
-      val (rc, _, err) = onNodeResult(
-        port,
-        "CREATE PERSISTENT SECRET tenant_keys (TYPE s3, KEY_ID 'AKIATENANT', SECRET 's')"
-      )
-      rc should not be 0
-      err should include("IO Error")
+      PosixFilePermissions.toString(Files.getPosixFilePermissions(marker)) shouldBe "r--------"
+      def persistentCreateRefused(): Unit =
+        val (rc, _, err) = onNodeResult(
+          port,
+          "CREATE PERSISTENT SECRET tenant_keys (TYPE s3, KEY_ID 'AKIATENANT', SECRET 's')"
+        )
+        rc should not be 0
+        err should include("File exists")
+        entries(dir) shouldBe List("none")
+        Files.size(marker) shouldBe 0
+      persistentCreateRefused()
+      // What a root node with CAP_DAC_OVERRIDE sees: a writable directory. The marker still holds.
+      Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"))
+      persistentCreateRefused()
+      Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"))
       val moved          = home.resolve(".duckdb/stored_secrets").toString.replace("'", "''")
       val (rc2, _, err2) = onNodeResult(port, s"SET secret_directory = '$moved'")
       rc2 should not be 0
       err2 should include("after the secret manager is used")
       onNode(port, "SELECT count(*) FROM duckdb_secrets()") shouldBe List("0")
-      val left = Files.list(dir)
-      try left.iterator().asScala.toList shouldBe empty
-      finally left.close()
       // A normal stop (SIGTERM) removes the node directory, read-only secret directory included.
       p.destroy()
       p.waitFor(20, TimeUnit.SECONDS) shouldBe true
@@ -214,7 +231,7 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
     }
   }
 
-  "the node init SQL" should "move the secret directory before anything else" in {
+  "the node init SQL" should "move the secret directory before anything else, failing closed" in {
     val dir = NodeSecretFiles.writePrivateDir(
       Map(NodeSecretFiles.TokenKey -> Token, "pgPassword" -> "p"),
       Some(tempDir)
@@ -232,15 +249,46 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
       NodeSecretFiles.DirEnv       -> dir.toString,
       NodeSecretFiles.EphemeralEnv -> "1"
     ).!!.linesIterator.filter(_.trim.nonEmpty).toVector
+    // Before `.bail off`: if either failed, the CLI would exit instead of serving on the default
+    // secret directory.
     lines.take(3) shouldBe Vector(
-      ".bail off",
-      lines(1),
-      "SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();"
+      lines(0),
+      "SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();",
+      ".bail off"
     )
-    // An absolute path in the node's own directory, under the script's TMPDIR.
+    // An absolute path below the marker file of the node's own directory, under its TMPDIR.
     val tmp = nodeTmp.toString.replace("'", "''")
-    lines(1) should fullyMatch regex
-      ("""SET secret_directory = '\Q""" + tmp + """\E/quack-node\.[^/']+/secrets';""")
+    lines(0) should fullyMatch regex
+      ("""SET secret_directory = '\Q""" + tmp + """\E/quack-node\.[^/']+/secrets/none/s';""")
+  }
+
+  // A SIGKILLed wrapper skips its cleanup; the next spawn's sweep removes its directory, read-only
+  // secret directory and marker file included (rm -rf alone cannot unlink a file in a 0500 dir).
+  "a later spawn" should "sweep a dead node's read-only secret directory" in {
+    val dead = new java.lang.ProcessBuilder("true").start()
+    dead.waitFor(10, TimeUnit.SECONDS) shouldBe true
+    val stale   = Files.createDirectories(nodeTmp.resolve("quack-node.STALE1"))
+    val secrets = Files.createDirectories(stale.resolve("secrets"))
+    Files.writeString(stale.resolve("owner.pid"), dead.pid().toString)
+    Files.createFile(secrets.resolve("none"))
+    Files.setPosixFilePermissions(
+      secrets.resolve("none"),
+      PosixFilePermissions.fromString("r--------")
+    )
+    Files.setPosixFilePermissions(secrets, PosixFilePermissions.fromString("r-x------"))
+    val dir = NodeSecretFiles.writePrivateDir(Map(NodeSecretFiles.TokenKey -> Token), Some(tempDir))
+    Process(
+      Seq("bash", script, "21999"),
+      None,
+      "QOD_SPAWN_DRY_RUN"          -> "1",
+      "TMPDIR"                     -> nodeTmp.toString,
+      "kind"                       -> "memory",
+      "schemaName"                 -> "main",
+      "dbName"                     -> "m",
+      NodeSecretFiles.DirEnv       -> dir.toString,
+      NodeSecretFiles.EphemeralEnv -> "1"
+    ).!!
+    Files.exists(stale) shouldBe false
   }
 
   // The node is kept alive by a `.shell` dot-command that waits on the wrapper's pid, not by a

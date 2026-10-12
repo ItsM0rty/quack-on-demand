@@ -60,35 +60,40 @@ class SpawnScriptWindowsInitSpec extends AnyFlatSpec with Matchers with SpawnScr
   private def dotLines(out: String): Vector[String] =
     out.linesIterator.filter(_.startsWith(".")).toVector
 
-  // DuckDB's secret directory moves to the node's own empty read-only one before anything else, so
-  // the OS user's ~/.duckdb/stored_secrets never loads. The ACL that makes it read-only on Windows
-  // only runs there; elsewhere the script applies 0500.
-  "the PowerShell node payload" should "move the secret directory into the node directory first" in {
+  // DuckDB's secret directory moves below the read-only marker file of the node's own `secrets`
+  // directory before anything else, under `.bail on` (the outer init turned bail off), so the OS
+  // user's ~/.duckdb/stored_secrets never loads. The ACL that makes the directory read-only on
+  // Windows only runs there; elsewhere the script applies 0500 / 0400.
+  "the PowerShell node payload" should "move the secret directory below the marker first" in {
     val tmp            = Files.createDirectories(tempDir.resolve("t"))
     val (rc, out, err) = dryRun(tmp, "windows")
     withClue(err)(rc shouldBe 0)
     val lines = out.linesIterator.filter(_.trim.nonEmpty).toVector
-    lines.take(3) shouldBe Vector(
-      ".bail off",
+    lines.take(4) shouldBe Vector(
+      ".bail on",
       lines(1),
-      "SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();"
+      "SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();",
+      ".bail off"
     )
     lines(1) should startWith("SET secret_directory = '")
-    val dir = Paths.get(lines(1).stripPrefix("SET secret_directory = '").stripSuffix("';"))
-    dir.isAbsolute shouldBe true
-    dir.getFileName.toString shouldBe "secrets"
-    dir.getParent.getFileName.toString should startWith("quack-node.")
-    dir.toString should startWith(tmp.toString)
-    // The dry run removes its node directory, read-only secret directory included.
-    Files.exists(dir.getParent) shouldBe false
+    val path = Paths.get(lines(1).stripPrefix("SET secret_directory = '").stripSuffix("';"))
+    path.isAbsolute shouldBe true
+    path.getFileName.toString shouldBe "s"
+    path.getParent.getFileName.toString shouldBe "none"
+    val nodeDir = path.getParent.getParent.getParent
+    path.getParent.getParent.getFileName.toString shouldBe "secrets"
+    nodeDir.getFileName.toString should startWith("quack-node.")
+    path.toString should startWith(tmp.toString)
+    // The dry run removes its node directory, read-only secret directory and marker included.
+    Files.exists(nodeDir) shouldBe false
   }
 
   "the Windows outer init" should "hand the CLI only relative, single-quoted paths" in {
     val tmp            = Files.createDirectories(tempDir.resolve("my temp"))
     val (rc, out, err) = dryRun(tmp, "windows")
     withClue(err)(rc shouldBe 0)
-    // The outer init's five lines come last (the payload, printed first, opens with its own
-    // `.bail off`).
+    // The outer init's five lines come last (the payload, printed first, has its own `.bail`
+    // lines).
     val dots = dotLines(out).takeRight(5)
     dots shouldBe Vector(
       ".bail off",

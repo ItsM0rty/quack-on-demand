@@ -146,28 +146,60 @@ class InProcessDuckDbSpec extends AnyFlatSpec with Matchers:
     finally deleteTree(home)
   }
 
-  // An empty, owner-only, read-only directory: nothing to load, and CREATE PERSISTENT SECRET fails.
-  it should "use an empty read-only secret directory outside the OS user's home" in {
+  /** The marker file the in-process secret directory points below, and the directory holding it. */
+  private def secretLayout(c: Connection): (Path, Path) =
+    val configured = Paths.get(query1(c, "SELECT current_setting('secret_directory')"))
+    // Checked first: the real ~/.duckdb is never inspected.
+    configured.toAbsolutePath.startsWith(Paths.get(sys.props("user.home"))) shouldBe false
+    configured shouldBe InProcessDuckDb.secretDirectory
+    (configured.getParent, configured.getParent.getParent)
+
+  private def entries(dir: Path): List[String] =
+    val s = Files.list(dir)
+    try s.iterator().asScala.map(_.getFileName.toString).toList.sorted
+    finally s.close()
+
+  private def refusePersistentCreate(c: Connection): Unit =
+    val st = c.createStatement()
+    try
+      val e = intercept[java.sql.SQLException](
+        st.execute("CREATE PERSISTENT SECRET tenant_keys (TYPE s3, KEY_ID 'k', SECRET 's')")
+      )
+      e.getMessage should include("File exists")
+    finally st.close()
+
+  // A path below a regular file of a read-only directory: it can never exist as a directory, so
+  // nothing loads and CREATE PERSISTENT SECRET fails, and the marker cannot be replaced.
+  it should "point its secret directory below a read-only marker file" in {
     val c =
       DriverManager.getConnection("jdbc:duckdb:", DuckDbExtensionSource(None).connectionProperties)
     try
-      val dir = Paths.get(query1(c, "SELECT current_setting('secret_directory')"))
-      // Checked first: the real ~/.duckdb is never inspected.
-      dir.toAbsolutePath.startsWith(Paths.get(sys.props("user.home"))) shouldBe false
-      Files.isDirectory(dir) shouldBe true
+      val (marker, dir) = secretLayout(c)
+      Files.isRegularFile(marker) shouldBe true
+      Files.size(marker) shouldBe 0
       if Files.getFileStore(dir).supportsFileAttributeView("posix") then
         PosixFilePermissions.toString(Files.getPosixFilePermissions(dir)) shouldBe "r-x------"
-      val st = c.createStatement()
-      try
-        val e = intercept[java.sql.SQLException](
-          st.execute("CREATE PERSISTENT SECRET tenant_keys (TYPE s3, KEY_ID 'k', SECRET 's')")
-        )
-        e.getMessage should include("IO Error")
-      finally st.close()
+        PosixFilePermissions.toString(Files.getPosixFilePermissions(marker)) shouldBe "r--------"
+      refusePersistentCreate(c)
       query1(c, "SELECT count(*) FROM duckdb_secrets()") shouldBe "0"
-      val left = Files.list(dir)
-      try left.iterator().asScala.toList shouldBe empty
-      finally left.close()
+      entries(dir) shouldBe List("none")
+      Files.size(marker) shouldBe 0
+    finally c.close()
+  }
+
+  // What a root process with CAP_DAC_OVERRIDE sees: the directory is writable. The marker alone
+  // still makes the configured path impossible, so a persistent create fails all the same.
+  it should "refuse CREATE PERSISTENT SECRET even when its directory is writable" in {
+    val c =
+      DriverManager.getConnection("jdbc:duckdb:", DuckDbExtensionSource(None).connectionProperties)
+    try
+      val (_, dir) = secretLayout(c)
+      assume(Files.getFileStore(dir).supportsFileAttributeView("posix"), "POSIX permissions only")
+      Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"))
+      try
+        refusePersistentCreate(c)
+        entries(dir) shouldBe List("none")
+      finally Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"))
     finally c.close()
   }
 
