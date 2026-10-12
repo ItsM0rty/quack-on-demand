@@ -8,6 +8,7 @@ import type {
   IcebergAuthType,
   IcebergEndpointType,
   IcebergRestConfig,
+  RdbmsConnection,
 } from '../api/types';
 import { DeleteIcon, EditIcon } from './Icons';
 import { Modal } from './Modal';
@@ -285,6 +286,97 @@ function icebergFieldsOf(config: IcebergRestConfig | undefined): IcebergFields {
     awsSecretAccessKey: config.awsSecretAccessKey ?? '',
     awsSessionToken:    config.awsSessionToken    ?? '',
     awsScope:           (config.awsScope ?? []).join('\n'),
+  };
+}
+
+/** The two relational source types, whose form and wire field (`connection`)
+  * they share. */
+type RdbmsType = 'postgres' | 'mysql';
+
+function isRdbmsType(t: FederatedSourceType): t is RdbmsType {
+  return t === 'postgres' || t === 'mysql';
+}
+
+const RDBMS_DEFAULT_PORT: Record<RdbmsType, number> = { postgres: 5432, mysql: 3306 };
+
+/** The TLS modes each extension forwards to its client library; mirrors the
+  * manager's `RdbmsKind.sslModes`. '' = the client library's default. */
+const RDBMS_SSL_MODES: Record<RdbmsType, string[]> = {
+  postgres: ['disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full'],
+  mysql:    ['disabled', 'preferred', 'required', 'verify_ca', 'verify_identity'],
+};
+
+/** Secret the form stores a typed password under when the source has none yet. */
+const DEFAULT_PASSWORD_SECRET = 'PASSWORD';
+
+/** Every input of the Postgres / MySQL form. `password` is write-only: it is
+  * never prefilled, and leaving it blank on an edit keeps the stored secret.
+  * `passwordRef` is the stored `{{secret.NAME}}` placeholder, which is not a
+  * secret and is shown so the operator knows which secret is wired. */
+type RdbmsFields = {
+  host:        string;
+  port:        string;
+  database:    string;
+  user:        string;
+  password:    string;
+  passwordRef: string;
+  schema:      string;
+  sslMode:     string;
+};
+
+const EMPTY_RDBMS_FIELDS: RdbmsFields = {
+  host: '', port: '', database: '', user: '', password: '', passwordRef: '', schema: '', sslMode: '',
+};
+
+function rdbmsFieldsOf(c: RdbmsConnection | undefined): RdbmsFields {
+  if (!c) return EMPTY_RDBMS_FIELDS;
+  return {
+    host:        c.host ?? '',
+    port:        c.port != null ? String(c.port) : '',
+    database:    c.database ?? '',
+    user:        c.user ?? '',
+    password:    '',
+    passwordRef: c.password ?? '',
+    schema:      c.schema ?? '',
+    sslMode:     c.sslMode ?? '',
+  };
+}
+
+/** The secret NAME inside a `{{secret.NAME}}` placeholder, or null. */
+function secretNameOf(placeholder: string): string | null {
+  const m = /^\{\{secret\.([A-Za-z0-9_]+)\}\}$/.exec(placeholder.trim());
+  return m ? m[1] : null;
+}
+
+/** What to send and what to store for the password.
+  *
+  * A typed value never goes into the source row: the row carries a
+  * `{{secret.NAME}}` placeholder and the value is written to that secret
+  * (inline, through the secrets endpoint) right after the source is saved.
+  * Typing a placeholder instead points the source at a secret managed under
+  * Secrets (an externalRef one, say) and writes nothing. Blank keeps the
+  * stored reference. */
+function rdbmsPassword(
+  f: RdbmsFields,
+): { placeholder: string; secretValue?: { name: string; value: string } } {
+  const typed = f.password;
+  if (typed.trim().length === 0) return { placeholder: f.passwordRef };
+  if (isSecretPlaceholder(typed)) return { placeholder: typed.trim() };
+  const name = secretNameOf(f.passwordRef) ?? DEFAULT_PASSWORD_SECRET;
+  return { placeholder: `{{secret.${name}}}`, secretValue: { name, value: typed } };
+}
+
+function buildRdbmsConnection(t: RdbmsType, f: RdbmsFields, password: string): RdbmsConnection {
+  const set = (s: string) => (s.trim().length > 0 ? s.trim() : undefined);
+  const port = f.port.trim();
+  return {
+    host:     f.host.trim(),
+    port:     port.length > 0 ? Number(port) : undefined,
+    database: f.database.trim(),
+    user:     f.user.trim(),
+    password,
+    schema:   t === 'postgres' ? set(f.schema) : undefined,
+    sslMode:  set(f.sslMode),
   };
 }
 
@@ -820,10 +912,14 @@ export default function FederationSection({
   const [readOnly,    setReadOnly]    = useState(false);
   const [icebergMode, setIcebergMode] = useState<IcebergMode>('none');
   const [iceberg,     setIceberg]     = useState<IcebergFields>(EMPTY_ICEBERG_FIELDS);
+  const [rdbms,       setRdbms]       = useState<RdbmsFields>(EMPTY_RDBMS_FIELDS);
 
   const isIceberg = sourceType === 'iceberg_rest';
+  const isRdbms   = isRdbmsType(sourceType);
   const setIcebergField = (key: keyof IcebergFields, value: string) =>
     setIceberg(prev => ({ ...prev, [key]: value }));
+  const setRdbmsField = (key: keyof RdbmsFields, value: string) =>
+    setRdbms(prev => ({ ...prev, [key]: value }));
 
   // Blocks submit only on a credential the manager is certain to reject.
   const credentialsOk =
@@ -848,15 +944,16 @@ export default function FederationSection({
     setReadOnly(false);
     setIcebergMode('none');
     setIceberg(EMPTY_ICEBERG_FIELDS);
+    setRdbms(EMPTY_RDBMS_FIELDS);
     setError(null);
   }
 
   /** Picking the type also resets the read-only default: an external catalog
     * QoD does not own starts read-only (the manager's own default for a new
-    * `iceberg_rest` row), a `sql` source keeps today's behaviour. */
+    * typed row), a `sql` source keeps today's behaviour. */
   function selectSourceType(next: FederatedSourceType) {
     setSourceType(next);
-    setReadOnly(next === 'iceberg_rest');
+    setReadOnly(next !== 'sql');
   }
 
   function openCreate() {
@@ -873,6 +970,7 @@ export default function FederationSection({
     setReadOnly(s.readOnly);
     setIcebergMode(icebergModeOf(s.config));
     setIceberg(icebergFieldsOf(s.config));
+    setRdbms(rdbmsFieldsOf(s.connection));
     setError(null);
     setEditingAlias(s.alias);
     setAdding(true);
@@ -888,20 +986,37 @@ export default function FederationSection({
     ev.preventDefault();
     setError(null);
     if (!credentialsOk) return;
+    // The manager normalizes every alias through Names.normalizeOrError
+    // (lowercase); sending the normalized form is what keeps the value the
+    // operator sees in this field identical to the one it is stored under.
+    const normAlias = alias.trim().toLowerCase();
+    const pw = isRdbms ? rdbmsPassword(rdbms) : null;
     try {
       await api.createFederatedSource(tenant, tenantDb, {
-        // The manager normalizes every alias through Names.normalizeOrError
-        // (lowercase); sending the normalized form is what keeps the value the
-        // operator sees in this field identical to the one it is stored under.
-        alias:       alias.trim().toLowerCase(),
+        alias:       normAlias,
         description: description.trim() || undefined,
         sourceType,
         readOnly,
-        // Exactly one of the two: the manager 400s a row carrying both.
+        // Exactly one shape per type: the manager 400s a row carrying another.
         ...(isIceberg
           ? { config: buildIcebergConfig(icebergMode, iceberg) }
-          : { setupSql: setupSql.trim() || undefined }),
+          : isRdbmsType(sourceType)
+            ? { connection: buildRdbmsConnection(sourceType, rdbms, pw?.placeholder ?? '') }
+            : { setupSql: setupSql.trim() || undefined }),
       });
+      // The secret can only be written once its source exists.
+      if (pw?.secretValue) {
+        try {
+          await api.upsertFederatedSecret(tenant, tenantDb, normAlias, pw.secretValue);
+        } catch (e) {
+          setError(
+            `the source was saved but its password was not (${errorMessage(e)}); ` +
+            `expand the source and set secret ${pw.secretValue.name} under Secrets`,
+          );
+          await reload();
+          return;
+        }
+      }
       closeForm();
       await reload();
     } catch (e) {
@@ -937,8 +1052,9 @@ export default function FederationSection({
       <p className="subtle">
         Federated sources are DuckDB <code>ATTACH</code> / extension-based remote catalogs injected
         at session start via <code>setupSql</code>. Secrets referenced inside that SQL are resolved
-        from the secrets table at runtime. An <code>iceberg_rest</code> source skips the hand-written
-        SQL: fill in the typed form and the manager renders the <code>ATTACH</code> itself.
+        from the secrets table at runtime. An <code>iceberg_rest</code>, <code>postgres</code> or
+        {' '}<code>mysql</code> source skips the hand-written SQL: fill in the typed form and the
+        manager renders the <code>ATTACH</code> itself.
       </p>
 
       {error && <div className="login-err">Error: {error}</div>}
@@ -978,13 +1094,15 @@ export default function FederationSection({
               >
                 <option value="sql">sql - your own ATTACH / setup SQL</option>
                 <option value="iceberg_rest">iceberg_rest - external Iceberg REST catalog</option>
+                <option value="postgres">postgres - external Postgres database</option>
+                <option value="mysql">mysql - external MySQL database</option>
               </select>
             </label>
             {editingAlias != null && (
               <div style={{ fontSize: '.75em', color: 'var(--text-mute)', marginTop: '-.35rem' }}>
-                The type is fixed for an existing alias: the manager refuses a flip between sql and
-                iceberg_rest rather than replacing your setup SQL with a rendered config unseen.
-                Delete the source and recreate it to change type.
+                The type is fixed for an existing alias: the manager refuses a flip between types
+                rather than replacing your setup SQL with a rendered config unseen. Delete the
+                source and recreate it to change type.
               </div>
             )}
             <label>
@@ -1215,7 +1333,95 @@ export default function FederationSection({
               </>
             )}
 
-            {!isIceberg && (
+            {isRdbmsType(sourceType) && (
+              <>
+                <label>
+                  Host <span style={{ color: 'var(--bad)' }}>*</span>
+                  <input
+                    value={rdbms.host}
+                    onChange={ev => setRdbmsField('host', ev.target.value)}
+                    placeholder={sourceType === 'postgres' ? 'pg.example.com' : 'mysql.example.com'}
+                    required
+                  />
+                </label>
+                <label>
+                  Port
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={rdbms.port}
+                    onChange={ev => setRdbmsField('port', ev.target.value)}
+                    placeholder={String(RDBMS_DEFAULT_PORT[sourceType])}
+                  />
+                </label>
+                <label>
+                  Database <span style={{ color: 'var(--bad)' }}>*</span>
+                  <input
+                    value={rdbms.database}
+                    onChange={ev => setRdbmsField('database', ev.target.value)}
+                    placeholder="warehouse"
+                    required
+                  />
+                </label>
+                <label>
+                  User <span style={{ color: 'var(--bad)' }}>*</span>
+                  <input
+                    value={rdbms.user}
+                    onChange={ev => setRdbmsField('user', ev.target.value)}
+                    placeholder="svc_qod_reader"
+                    autoComplete="off"
+                    required
+                  />
+                </label>
+                <label>
+                  Password
+                  {rdbms.passwordRef === '' && <span style={{ color: 'var(--bad)' }}> *</span>}
+                  <input
+                    type="password"
+                    value={rdbms.password}
+                    onChange={ev => setRdbmsField('password', ev.target.value)}
+                    placeholder={rdbms.passwordRef !== ''
+                      ? `stored in ${rdbms.passwordRef}; leave blank to keep it`
+                      : 'write-only'}
+                    autoComplete="new-password"
+                    required={rdbms.passwordRef === ''}
+                  />
+                </label>
+                <div style={{ fontSize: '.75em', color: 'var(--text-mute)' }}>
+                  Write-only: the value is stored as this source's secret
+                  {' '}<code>{secretNameOf(rdbms.passwordRef) ?? DEFAULT_PASSWORD_SECRET}</code> and
+                  never shown again. It reaches the node on a temporary DuckDB secret that is
+                  dropped right after the ATTACH, never in the ATTACH string. Typing a
+                  {' '}{'{{secret.NAME}}'} placeholder instead points at a secret you manage under
+                  Secrets.
+                </div>
+                <label>
+                  TLS mode
+                  <select
+                    value={rdbms.sslMode}
+                    onChange={ev => setRdbmsField('sslMode', ev.target.value)}
+                  >
+                    <option value="">client default</option>
+                    {RDBMS_SSL_MODES[sourceType].map(m => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                </label>
+                {sourceType === 'postgres' && (
+                  <label>
+                    Schema
+                    <input
+                      value={rdbms.schema}
+                      onChange={ev => setRdbmsField('schema', ev.target.value)}
+                      placeholder="Optional; attach only this schema"
+                    />
+                  </label>
+                )}
+              </>
+            )}
+
+            {!isIceberg && !isRdbms && (
             <label>
               Setup SQL <span style={{ color: 'var(--bad)' }}>*</span>
               <div className="setup-templates">
@@ -1267,8 +1473,9 @@ export default function FederationSection({
               {' '}Read-only catalog
             </label>
             <div style={{ fontSize: '.75em', color: 'var(--text-mute)' }}>
-              {isIceberg
+              {isIceberg || isRdbms
                 ? 'Renders a READ_ONLY ATTACH option and denies writes at the edge. Takes effect on an already-running node only after the pool recycles.'
+                  + (isRdbms ? ' For a hard guarantee, connect as a database user without write privileges.' : '')
                 : 'Denies writes to this catalog at the edge. The ATTACH text itself is yours, so this screen is the only enforcement for a sql source.'}
             </div>
               </div>
@@ -1374,6 +1581,26 @@ export default function FederationSection({
                               {s.config.awsScope && s.config.awsScope.length > 0 && (
                                 <DetailItem label="Data scope" value={s.config.awsScope.join(', ')} mono />
                               )}
+                            </div>
+                          </div>
+                        )}
+                        {s.connection && (
+                          <div style={{ marginTop: '.4rem' }}>
+                            <div style={{
+                              fontSize: '.75rem', color: 'var(--text-mute)',
+                              textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: '.25rem',
+                            }}>
+                              {s.sourceType === 'mysql' ? 'MySQL database' : 'Postgres database'}
+                            </div>
+                            <div className="row" style={{ gap: '1.5rem', flexWrap: 'wrap' }}>
+                              <DetailItem label="Host" value={s.connection.host} mono />
+                              {s.connection.port != null && <DetailItem label="Port" value={String(s.connection.port)} mono />}
+                              <DetailItem label="Database" value={s.connection.database} mono />
+                              <DetailItem label="User" value={s.connection.user} mono />
+                              {/* A {{secret.NAME}} placeholder, never the value. */}
+                              <DetailItem label="Password" value={s.connection.password} mono />
+                              {s.connection.schema && <DetailItem label="Schema" value={s.connection.schema} mono />}
+                              {s.connection.sslMode && <DetailItem label="TLS mode" value={s.connection.sslMode} mono />}
                             </div>
                           </div>
                         )}
