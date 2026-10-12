@@ -20,6 +20,7 @@ import ai.starlake.quack.ondemand.api.{
 import ai.starlake.quack.ondemand.api.Dtos.given
 import ai.starlake.quack.ondemand.auth.SessionScope
 import ai.starlake.quack.ondemand.federation.iceberg.IcebergRestConfig
+import ai.starlake.quack.ondemand.federation.rdbms.RdbmsConfig
 import cats.effect.IO
 import io.circe.{Json, JsonObject}
 import io.circe.syntax._
@@ -225,16 +226,31 @@ final class McpPlatformTools(
             Left(s"the 'config' argument is not a valid iceberg_rest declaration: ${e.getMessage}")
           case Right(cfg) => Right(Some(cfg))
 
+  /** The `connection` argument as the typed Postgres / MySQL declaration, refused at the tool level
+    * when malformed for the same reason as [[icebergConfig]].
+    */
+  private def rdbmsConnection(args: JsonObject): Either[String, Option[RdbmsConfig]] =
+    args("connection").filterNot(_.isNull) match
+      case None       => Right(None)
+      case Some(json) =>
+        json.as[RdbmsConfig] match
+          case Left(e) =>
+            Left(
+              s"the 'connection' argument is not a valid postgres / mysql declaration: ${e.getMessage}"
+            )
+          case Right(cfg) => Right(Some(cfg))
+
   private val upsertFederatedSourceTool = fedTool(
     "upsert_federated_source",
     "Create or update a federated source by alias. A 'sql' source runs setup_sql at node attach; " +
-      "an 'iceberg_rest' source is declared through config (uri, warehouse, authType, ...). " +
+      "an 'iceberg_rest' source is declared through config (uri, warehouse, authType, ...); a " +
+      "'postgres' or 'mysql' source through connection (host, port, database, user, password). " +
       "Reference secrets as {{secret.NAME}}.",
     objectSchema(
       required = List("database", "alias"),
       props = "database" -> strProp("Database (tenant-db) name."),
       "alias"       -> strProp("Source alias (stable key)."),
-      "source_type" -> strProp("sql (default) or iceberg_rest."),
+      "source_type" -> strProp("sql (default), iceberg_rest, postgres or mysql."),
       "setup_sql"   -> strProp("ATTACH / CREATE SECRET setup SQL; required for a 'sql' source."),
       "config"      -> objProp(
         "Iceberg REST catalog declaration; required for an 'iceberg_rest' source. Fields: uri, " +
@@ -247,8 +263,17 @@ final class McpPlatformTools(
           "awsSecretAccessKey and awsSessionToken must be {{secret.NAME}} placeholders, never " +
           "literals."
       ),
+      "connection" -> objProp(
+        "Postgres / MySQL database declaration; required for a 'postgres' or 'mysql' source. " +
+          "Fields: host (host name or IP), port (default 5432 / 3306), database, user, password, " +
+          "sslMode (postgres: disable | allow | prefer | require | verify-ca | verify-full; " +
+          "mysql: disabled | preferred | required | verify_ca | verify_identity), schema " +
+          "(postgres only: attach just that schema). password is required and must be a " +
+          "{{secret.NAME}} placeholder; set the value with set_federated_secret."
+      ),
       "read_only" -> boolProp(
-        "Refuse writes through this catalog; defaults to true for iceberg_rest, false for sql."
+        "Refuse writes through this catalog; defaults to true for iceberg_rest, postgres and " +
+          "mysql, false for sql."
       ),
       "description" -> strProp("Optional description."),
       "disabled"    -> boolProp("Create disabled."),
@@ -260,9 +285,10 @@ final class McpPlatformTools(
         database <- required(args, "database")
         alias    <- required(args, "alias")
         config   <- icebergConfig(args)
-      yield (tenant, database, alias, config)) match
-        case Left(err)                                => IO.pure(Left(err))
-        case Right((tenant, database, alias, config)) =>
+        conn     <- rdbmsConnection(args)
+      yield (tenant, database, alias, config, conn)) match
+        case Left(err)                                      => IO.pure(Left(err))
+        case Right((tenant, database, alias, config, conn)) =>
           h.createSource(
             tenant,
             database,
@@ -276,7 +302,8 @@ final class McpPlatformTools(
               disabled = bool(args, "disabled").getOrElse(false),
               sourceType = str(args, "source_type"),
               config = config,
-              readOnly = bool(args, "read_only")
+              readOnly = bool(args, "read_only"),
+              connection = conn
             ),
             keyOf(principal)
           ).map(res => bridge(res).map(_.asJson))

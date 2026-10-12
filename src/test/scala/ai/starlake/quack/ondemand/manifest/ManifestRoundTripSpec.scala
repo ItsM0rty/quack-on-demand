@@ -1329,3 +1329,179 @@ class ManifestRoundTripSpec extends AnyFlatSpec with Matchers:
     ManifestImporter.apply(exported, cp, requireEncryption = false) shouldBe Right(())
     cp.listTenants().find(_.id == "acme").get.acl.opaToken shouldBe Some("real-token")
   }
+
+  // ------------------------------------------------------------------
+  // A postgres-typed federated source survives export -> YAML -> import with its typed connection
+  // and readOnly intact, and its password secret is redacted on the way out and its stored value
+  // reused on the way back in.
+  // ------------------------------------------------------------------
+
+  it should "round-trip a postgres federated source with its password secret redacted" in {
+    val cp  = buildSrc()
+    val fed = new InMemoryFederatedSourceStore()
+    val cfg = ai.starlake.quack.ondemand.federation.rdbms
+      .RdbmsConfig(
+        host = "pg.example.com",
+        port = Some(6432),
+        database = "shop",
+        user = "reader",
+        password = "{{secret.PG_PWD}}",
+        schema = Some("sales"),
+        sslMode = Some("require")
+      )
+      .toJson
+    fed.upsertSource(
+      FederatedSource(
+        id = "fs-pg",
+        tenantDbId = "td-1",
+        alias = "shop_pg",
+        sourceType = FederatedSourceType.Postgres,
+        config = Some(cfg),
+        readOnly = true
+      )
+    )
+    fed.upsertSecret(FederatedSecret("fsec-pg", "fs-pg", "PG_PWD", Some("s3cr3t-pw"), None))
+
+    val exported =
+      exportOk(ManifestExporter.build(cp, ExportedAt, AdminVersion, Hostname, Some(fed)))
+    val yaml = Yaml.pretty(exported.asJson)
+    yaml should not include "s3cr3t-pw"
+    val msrc = exported.tenants.head.tenantDbs.head.federatedSources.head
+    msrc.sourceType shouldBe "postgres"
+    msrc.config shouldBe Some(cfg)
+    msrc.readOnly shouldBe true
+    msrc.secrets.map(s => s.name -> s.value) shouldBe
+      List("PG_PWD" -> Some(FederatedSecret.RedactedMarker))
+
+    val reparsed = parser.parse(yaml).flatMap(_.as[ConfigManifest]).fold(throw _, identity)
+    ManifestImporter.apply(reparsed, cp, Some(fed), requireEncryption = false) shouldBe Right(())
+
+    val back = fed.listSources("td-1")
+    back should have size 1
+    back.head.sourceType shouldBe FederatedSourceType.Postgres
+    back.head.config shouldBe Some(cfg)
+    back.head.readOnly shouldBe true
+    fed.listSecrets(back.head.id).map(s => s.name -> s.value) shouldBe
+      List("PG_PWD" -> Some("s3cr3t-pw"))
+  }
+
+  it should "refuse a mysql manifest source with no config, naming the type" in {
+    val cp   = buildSrc()
+    val fed  = new InMemoryFederatedSourceStore()
+    val base = exportOk(ManifestExporter.build(cp, ExportedAt, AdminVersion, Hostname, Some(fed)))
+    val withFed =
+      withFederatedSources(
+        base,
+        List(ManifestFederatedSource(alias = "shop_my", sourceType = "mysql"))
+      )
+    val res = ManifestImporter.apply(withFed, cp, Some(fed), requireEncryption = false)
+    res.left.toOption.get.exists(_.contains("config is required for sourceType 'mysql'")) shouldBe
+      true
+    fed.listSources("td-1") shouldBe Nil
+  }
+
+  // ------------------------------------------------------------------
+  // The importer applies the SAME row rules as REST and MCP (FederatedSourceRules): a typed
+  // config REST refuses is refused here too, reported, and never stored.
+  // ------------------------------------------------------------------
+
+  private def pgConfigJson(
+      host: String = "pg.example.com",
+      password: String = "{{secret.PG_PWD}}",
+      schema: Option[String] = None
+  ): String =
+    ai.starlake.quack.ondemand.federation.rdbms
+      .RdbmsConfig(
+        host = host,
+        database = "shop",
+        user = "reader",
+        password = password,
+        schema = schema
+      )
+      .toJson
+
+  private def importRefuses(src: ManifestFederatedSource, expected: String): Unit =
+    val cp   = buildSrc()
+    val fed  = new InMemoryFederatedSourceStore()
+    val base = exportOk(ManifestExporter.build(cp, ExportedAt, AdminVersion, Hostname, Some(fed)))
+    val res  = ManifestImporter.apply(
+      withFederatedSources(base, List(src)),
+      cp,
+      Some(fed),
+      requireEncryption = false
+    )
+    withClue(res) {
+      res.isLeft shouldBe true
+      res.left.toOption.get.exists(_.contains(expected)) shouldBe true
+    }
+    fed.listSources("td-1") shouldBe Nil
+
+  it should "refuse a manifest postgres source with a literal password, without storing it" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "shop",
+        sourceType = "postgres",
+        config = Some(pgConfigJson(password = "hunter2"))
+      ),
+      "password must be a secret placeholder"
+    )
+
+  it should "refuse a manifest postgres source whose host is a socket path" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "shop",
+        sourceType = "postgres",
+        config = Some(pgConfigJson(host = "/var/run/postgresql"))
+      ),
+      "socket path is not accepted"
+    )
+
+  it should "refuse a manifest postgres source carrying setupSql" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "shop",
+        sourceType = "postgres",
+        setupSql = "ATTACH 'x' AS shop;",
+        config = Some(pgConfigJson())
+      ),
+      "setupSql is for sourceType 'sql', not 'postgres'"
+    )
+
+  it should "refuse a manifest mysql source with a postgres-only field" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "shop",
+        sourceType = "mysql",
+        config = Some(pgConfigJson(schema = Some("s")))
+      ),
+      "schema applies only to sourceType 'postgres'"
+    )
+
+  it should "refuse a manifest typed source aliased as its own tenant-db's catalog" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "tpch_tpch1",
+        sourceType = "postgres",
+        config = Some(pgConfigJson())
+      ),
+      "reserved"
+    )
+
+  it should "refuse an invalid iceberg_rest config on import too" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "lake",
+        sourceType = "iceberg_rest",
+        config = Some(IcebergRestConfig(warehouse = "w").toJson)
+      ),
+      "exactly one of authType / endpointType"
+    )
+
+  it should "refuse a sql source naming a secret prefix reserved for typed sources" in
+    importRefuses(
+      ManifestFederatedSource(
+        alias = "legacy",
+        setupSql = "CREATE SECRET qod_pg_shop (TYPE postgres); ATTACH '' AS legacy (TYPE postgres);"
+      ),
+      "reserved for QoD's typed sources"
+    )

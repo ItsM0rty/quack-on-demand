@@ -8108,6 +8108,8 @@ components:
           $ref: '#/components/schemas/IcebergRestConfig'
         readOnly:
           type: boolean
+        connection:
+          $ref: '#/components/schemas/RdbmsConfig'
     FederatedSourceListResponse:
       title: FederatedSourceListResponse
       type: object
@@ -8147,6 +8149,8 @@ components:
           type: boolean
         attachStatus:
           type: string
+        connection:
+          $ref: '#/components/schemas/RdbmsConfig'
     FleetAssignmentDto:
       title: FleetAssignmentDto
       type: object
@@ -9470,6 +9474,30 @@ components:
           format: int64
         truncated:
           type: boolean
+    RdbmsConfig:
+      title: RdbmsConfig
+      type: object
+      required:
+      - host
+      - database
+      - user
+      - password
+      properties:
+        host:
+          type: string
+        port:
+          type: integer
+          format: int32
+        database:
+          type: string
+        user:
+          type: string
+        password:
+          type: string
+        schema:
+          type: string
+        sslMode:
+          type: string
     RecoverableListResponse:
       title: RecoverableListResponse
       type: object

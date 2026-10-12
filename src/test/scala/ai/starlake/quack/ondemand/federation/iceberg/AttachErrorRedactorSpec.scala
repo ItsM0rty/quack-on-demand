@@ -649,3 +649,39 @@ class AttachErrorRedactorSpec extends AnyFlatSpec with Matchers:
     val err = s"rejected $sentinel"
     AttachErrorRedactor.scrub(err, Set(sentinel)) shouldBe "rejected [redacted]"
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // Postgres / MySQL blocks: the same parser, widened from RdbmsSetupSql.CredentialOption
+  // ---------------------------------------------------------------------------------------------
+
+  "credentialsIn" should "recover the PASSWORD a real postgres / mysql block carries, and nothing else" in {
+    for t <- List(FederatedSourceType.Postgres, FederatedSourceType.Mysql) do
+      val src = FederatedSource(
+        id = "fs-db",
+        tenantDbId = "td-1",
+        alias = "shop",
+        sourceType = t,
+        config = Some(
+          ai.starlake.quack.ondemand.federation.rdbms
+            .RdbmsConfig(
+              host = "db.example.com",
+              database = "shop",
+              user = "reader-user-1234",
+              password = "{{secret.PW}}"
+            )
+            .toJson
+        ),
+        readOnly = true
+      )
+      val block = new FederationBlobBuilder(
+        loadEnabled = _ => IO.pure(List(src)),
+        loadSecrets =
+          _ => IO.pure(List(FederatedSecret("sec-pw", src.id, "PW", Some("pw'SENTINEL1"), None))),
+        resolver = new PostgresSecretResolver(),
+        catalogAliasOf = _ => IO.pure(None)
+      ).buildOne(src).unsafeRunSync()
+      withClue(block.sql) {
+        AttachErrorRedactor.credentialsIn(block.sql) shouldBe Set("pw'SENTINEL1")
+        block.secretValues shouldBe Set("pw'SENTINEL1")
+      }
+  }

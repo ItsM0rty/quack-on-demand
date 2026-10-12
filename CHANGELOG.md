@@ -23,6 +23,38 @@
   Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
   unhealthy, draining, quarantined or at its `maxConcurrent` cap.
 
+- **Typed Postgres and MySQL federated sources.** New source types `postgres` and `mysql` attach an
+  external database from typed fields (host, port, database, user, password, plus `sslMode`, and
+  `schema` for Postgres), with no SQL to write: REST `connection` on the federated-source create,
+  `qod federation create --type postgres|mysql` (`--host`, `--port`, `--database`, `--user`,
+  `--schema`, `--ssl-mode`, `--connection`), the MCP `upsert_federated_source` tool, manifests and
+  the admin UI. The password is always a source secret (inline or `externalRef`) named by a
+  `{{secret.NAME}}` placeholder and is required; the CLI's `--password-stdin` / `--password-prompt`
+  and the UI's write-only password field store it for you. The rendered SQL carries the connection
+  on a temporary DuckDB secret and attaches with no credential in the ATTACH path (only
+  `connect_timeout=10` for Postgres), so the password never shows in `duckdb_databases().path` or
+  connection errors, then drops the secret right after the ATTACH so no session can reuse the
+  credentials once the ATTACH returns (a re-attach without `READ_ONLY` would otherwise write through
+  them); the attached catalog keeps working and reconnects without it. New sources default to
+  read-only, enforced by the engine (`READ_ONLY`) and the edge. The SQL ACL and node lockdown are
+  both off by default, so while a pool has a read-only catalog (any source type) the edge refuses,
+  for every caller, superusers included: `postgres_execute`, `postgres_query`, `mysql_execute` and
+  `mysql_query` targeting a read-only catalog or a catalog it cannot read from a string literal;
+  `query` / `query_table` with a computed argument; and `json_execute_serialized_sql`. Through them
+  a session could end the remote's read-only transaction and write. Calls to writable catalogs and
+  constant `query('...')` bodies (judged by the same rule) are unchanged. This screen reads the SQL
+  text only: a table macro or view that already wraps a passthrough, created before the catalog
+  became read-only (a DuckLake catalog keeps such a macro), and macros or views in attached
+  databases are not seen. A database user without write privileges on the remote is the complete
+  guarantee; configure one. The attach verifier now watches these
+  sources like Iceberg ones (`attachStatus`, per-node failures, retry) and drops the secret when a
+  retried attach fails. Manifest import applies the same validation as REST and MCP to every typed
+  source (Iceberg included). Fixed with it: a secret value containing `{{` no longer fails the
+  tenant-db's whole federation setup (the placeholder check now runs before substitution). A `sql`
+  source's setupSql may not mention the reserved secret prefixes `qod_pg_`, `qod_mysql_`,
+  `qod_ice_`. MySQL is implemented and unit tested but not verified live (the DuckDB 2.0 toolchain
+  has no mysql extension), including whether `READ_ONLY` alone refuses writes through it.
+
 - **Security: nodes and the manager no longer load the OS user's persistent DuckDB secrets.**
   DuckDB loads every secret stored under `~/.duckdb/stored_secrets` into an instance on first
   secret use, so a developer's or operator's own cloud keys reached every node (any tenant query

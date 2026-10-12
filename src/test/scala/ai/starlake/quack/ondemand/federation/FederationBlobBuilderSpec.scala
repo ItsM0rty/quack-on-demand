@@ -367,4 +367,146 @@ class FederationBlobBuilderSpec extends AnyFlatSpec with Matchers with OptionVal
     val blob = builderWith(List(s), iceSecrets(s)).build("td-1").unsafeRunSync().value
     blob should not include "READ_ONLY"
   }
+
+  // ---- postgres / mysql -----------------------------------------------------
+
+  private def pgSrc(
+      alias: String = "shop_pg",
+      cfg: Option[String] = None,
+      kind: ai.starlake.quack.model.FederatedSourceType =
+        ai.starlake.quack.model.FederatedSourceType.Postgres
+  ) =
+    FederatedSource(
+      id = "src-" + alias,
+      tenantDbId = "td-1",
+      alias = alias,
+      sourceType = kind,
+      config = cfg.orElse(
+        Some(
+          ai.starlake.quack.ondemand.federation.rdbms
+            .RdbmsConfig(
+              host = "pg.example.com",
+              database = "shop",
+              user = "reader",
+              password = "{{secret.PG_PWD}}"
+            )
+            .toJson
+        )
+      ),
+      readOnly = true
+    )
+
+  "build (postgres / mysql)" should "render the typed block and substitute the escaped password" in {
+    val s    = pgSrc()
+    val secs = Map(s.id -> List(secret(s.id, "PG_PWD", "O'Brien\\x")))
+    val blob = builderWith(List(s), secs).build("td-1").unsafeRunSync().value
+    blob should include("CREATE OR REPLACE TEMPORARY SECRET \"qod_pg_shop_pg\" (")
+    blob should include("PASSWORD 'O''Brien\\x'")
+    blob should include("ATTACH 'connect_timeout=10' AS \"shop_pg\" (")
+    blob should include("DROP SECRET IF EXISTS \"qod_pg_shop_pg\";")
+    blob should not include "{{secret."
+  }
+
+  it should "render a mysql source through the mysql extension" in {
+    val s    = pgSrc(alias = "shop_my", kind = ai.starlake.quack.model.FederatedSourceType.Mysql)
+    val secs = Map(s.id -> List(secret(s.id, "PG_PWD", "pw")))
+    val blob = builderWith(List(s), secs).build("td-1").unsafeRunSync().value
+    blob should include("INSTALL mysql;\nLOAD mysql;")
+    blob should include("TYPE mysql")
+    blob should include("DROP SECRET IF EXISTS \"qod_mysql_shop_my\";")
+  }
+
+  it should "keep the password placeholder in logSafePreview" in {
+    val s    = pgSrc()
+    val secs = Map(s.id -> List(secret(s.id, "PG_PWD", "hunter2")))
+    val prev = builderWith(List(s), secs).logSafePreview("td-1").unsafeRunSync().value
+    prev should include("PASSWORD '{{secret.PG_PWD}}'")
+    prev should not include "hunter2"
+  }
+
+  it should "fail loudly on a config that does not parse, does not validate, or is missing" in {
+    val unparsable = pgSrc(cfg = Some("{ nope"))
+    intercept[RuntimeException](
+      builderWith(List(unparsable), Map.empty).build("td-1").unsafeRunSync()
+    ).getMessage should include("invalid postgres config for source 'shop_pg'")
+    val literal = pgSrc(cfg =
+      Some(
+        ai.starlake.quack.ondemand.federation.rdbms
+          .RdbmsConfig(host = "h", database = "d", user = "u", password = "hunter2")
+          .toJson
+      )
+    )
+    val err = intercept[RuntimeException](
+      builderWith(List(literal), Map.empty).build("td-1").unsafeRunSync()
+    ).getMessage
+    err should include("must be a secret placeholder")
+    err should not include "hunter2"
+    intercept[RuntimeException](
+      builderWith(List(pgSrc().copy(config = None)), Map.empty).build("td-1").unsafeRunSync()
+    ).getMessage should include("has no config")
+  }
+
+  it should "raise on an alias that collides with the tenant-db's own catalog alias" in {
+    val s = pgSrc(alias = "acme_db")
+    intercept[RuntimeException](
+      builderWith(List(s), Map.empty, _ => IO.pure(Some("acme_db"))).build("td-1").unsafeRunSync()
+    ).getMessage should include("reserved")
+  }
+
+  "buildOne (postgres / mysql)" should "carry the secret-drop cleanup, and none for other types" in {
+    val pg    = pgSrc()
+    val secs  = Map(pg.id -> List(secret(pg.id, "PG_PWD", "pw")))
+    val block = builderWith(List(pg), secs).buildOne(pg).unsafeRunSync()
+    block.cleanupSql shouldBe Some("DROP SECRET IF EXISTS \"qod_pg_shop_pg\";")
+    block.secretValues shouldBe Set("pw")
+    val ice = iceSrc()
+    builderWith(List(ice), iceSecrets(ice)).buildOne(ice).unsafeRunSync().cleanupSql shouldBe None
+    val sql = src("plain", "-- x")
+    builderWith(List(sql), Map.empty).buildOne(sql).unsafeRunSync().cleanupSql shouldBe None
+  }
+
+  // ---- secret values are never scanned for placeholders (review I1) -------------------------
+
+  "build" should "splice a secret value holding braces verbatim, for every source type" in {
+    val values = List("Xy{{9#}}z", "{{x}}", "{{secret.Y}}", "a}}b", "{{", "{{alias}}")
+    for v <- values do
+      withClue(v) {
+        val pg   = pgSrc()
+        val sql  = src("plain_sql", "PASSWORD '{{secret.PWD}}';")
+        val secs = Map(
+          pg.id  -> List(secret(pg.id, "PG_PWD", v), secret(pg.id, "Y", "MUST-NOT-RESOLVE")),
+          sql.id -> List(secret(sql.id, "PWD", v))
+        )
+        val blob = builderWith(List(pg, sql), secs).build("td-1").unsafeRunSync().value
+        blob should include(s"PASSWORD '$v'")
+        blob should not include "MUST-NOT-RESOLVE"
+        blob should not include "PASSWORD 'plain_sql'"
+      }
+  }
+
+  it should "still refuse a stray placeholder in the template, without quoting any secret value" in {
+    val s    = src("fedpg", "ATTACH '{{secret.PWD}}' AS {{alias}}; -- {{oops}}")
+    val secs = Map(s.id -> List(secret(s.id, "PWD", "Xy{{9#}}z-SECRET")))
+    val err  = intercept[RuntimeException](
+      builderWith(List(s), secs).build("td-1").unsafeRunSync()
+    ).getMessage
+    err should include("{{oops}}")
+    err should not include "SECRET"
+    err should not include "9#"
+  }
+
+  it should "report the stray before resolving anything, so a resolver is never even called" in {
+    var resolved = 0
+    val counting = new SecretResolver:
+      def resolve(s: FederatedSecret): IO[String] = IO { resolved += 1; "v" }
+    val s = src("fedpg", "PASSWORD '{{secret.PWD}}' {{bad")
+    val b = new FederationBlobBuilder(
+      loadEnabled = _ => IO.pure(List(s)),
+      loadSecrets = _ => IO.pure(List(secret(s.id, "PWD", "v"))),
+      resolver = counting,
+      catalogAliasOf = _ => IO.pure(None)
+    )
+    intercept[RuntimeException](b.build("td-1").unsafeRunSync())
+    resolved shouldBe 0
+  }
 }

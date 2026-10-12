@@ -942,7 +942,7 @@ what the later Execute actually delivers.
 
 ## Federation - external catalogs via DuckDB extensions
 
-Quack-on-Demand supports per-tenant-db federated catalogs that attach external sources (Postgres, S3, Iceberg, any DuckDB extension) under DuckDB catalog aliases. Existing RBAC covers federated tables - a `RolePermission(catalog='fedpg', schema='public', table='orders', verb='RO')` grants read access to a federated alias just like a DuckLake table. Sources come in two flavours: `sql`, where the operator writes the `ATTACH` text, and `iceberg-rest`, a typed source where QoD writes it (see "Register an Iceberg REST catalog").
+Quack-on-Demand supports per-tenant-db federated catalogs that attach external sources (Postgres, S3, Iceberg, any DuckDB extension) under DuckDB catalog aliases. Existing RBAC covers federated tables - a `RolePermission(catalog='fedpg', schema='public', table='orders', verb='RO')` grants read access to a federated alias just like a DuckLake table. Sources come in two flavours: `sql`, where the operator writes the `ATTACH` text, and typed sources where QoD writes it: `iceberg-rest` (see "Register an Iceberg REST catalog") and `postgres` / `mysql` (see "Register a Postgres or MySQL database").
 
 ### Tenant-db kinds
 
@@ -1187,7 +1187,7 @@ Placeholders:
 - `{{alias}}` - replaced with the source's `alias` field.
 - `{{secret.NAME}}` - replaced with the resolved value of the secret named `NAME`.
 
-Alias rules, for **every** source type (`sql` as well as `iceberg-rest`):
+Alias rules, for **every** source type (`sql` as well as the typed ones):
 
 - **An alias must be a plain lowercase identifier**: ASCII letters, digits and
   underscore, starting with a letter or underscore, 1..63 chars. `--alias ext-s3`
@@ -1311,6 +1311,73 @@ qod federation secret set acme acme_fed glue_lake --name AWS_SECRET --value "$AW
 - `--aws-secret-access-key` / `--aws-session-token` must be `{{secret.NAME}}`
   placeholders, like `--client-secret`.
 
+### Register a Postgres or MySQL database
+
+A typed source for an external Postgres or MySQL database: no SQL to write, and
+the password never sits in an `ATTACH` string. QoD renders a temporary DuckDB
+secret holding the connection, an `ATTACH '' AS <alias> (TYPE postgres, SECRET
+..., READ_ONLY)` and a `DROP SECRET` right after it, so no session can reuse
+the credentials once the ATTACH returns (for instance to re-attach the server
+writable).
+
+```bash
+# Read the password from stdin (or --password-prompt): the CLI stores it as the
+# source's secret PASSWORD and puts the {{secret.PASSWORD}} placeholder in the source.
+printf '%s' "$PG_PASSWORD" | qod federation create acme acme_fed --alias shop \
+  --type postgres --host pg.prod.internal --database shop --user qod_reader \
+  --schema sales --ssl-mode require --password-stdin
+
+# MySQL: same flags, no --schema, MySQL TLS mode names
+qod federation create acme acme_fed --alias crm --type mysql \
+  --host mysql.prod.internal --database crm --user qod_reader \
+  --ssl-mode required --password-prompt
+
+# Or point at a secret you manage yourself (an --external-ref one, say)
+qod federation create acme acme_fed --alias shop --type postgres \
+  --host pg.prod.internal --database shop --user qod_reader \
+  --password '{{secret.SHOP_PG}}'
+qod federation secret set acme acme_fed shop --name SHOP_PG --external-ref env:SHOP_PG_PASSWORD
+```
+
+Then recycle the pool's nodes, as for any new source.
+
+- `--host` (a host name or an IP address; a socket path is refused), `--database`,
+  `--user` and a password are required. `--port` defaults to 5432 / 3306.
+- **The password is required and is always a secret.** `--password` takes only a
+  `{{secret.NAME}}` placeholder (a literal is refused: it would land in shell
+  history); `--password-stdin` / `--password-prompt` store the value as the
+  secret named by `--password-secret` (default `PASSWORD`). With no password at
+  all, the client library would fall back to the node's own credentials, which
+  is why QoD refuses that.
+- `--ssl-mode`: postgres `disable | allow | prefer | require | verify-ca |
+  verify-full`; mysql `disabled | preferred | required | verify_ca |
+  verify_identity`. `--schema` (postgres only) attaches just that schema.
+- `--connection '<json>'` passes the whole object (`host`, `port`, `database`,
+  `user`, `password`, `schema`, `sslMode`) instead of the flags.
+- `--read-only` **defaults ON**, enforced by the engine (`READ_ONLY` on the
+  ATTACH) and by the edge. The raw-SQL passthroughs `postgres_execute`,
+  `postgres_query`, `mysql_execute` and `mysql_query` could end the remote's
+  read-only transaction and write, and the SQL ACL and node lockdown are both
+  OFF by default, so while the pool has any read-only catalog the edge
+  refuses, for every caller (superusers included): those four when their
+  first argument names a read-only catalog or is not a plain string literal;
+  `query` / `query_table` with a computed argument; and
+  `json_execute_serialized_sql`. Calls to a writable catalog are unchanged.
+  The screen reads the statement text only: a table macro or view that
+  already wraps a passthrough (for example one created in the DuckLake
+  catalog before the source became read-only), or one in an attached
+  database, is not seen. **Connect as a database user without write
+  privileges**: that is the complete guarantee. For `mysql`, whether
+  `READ_ONLY` alone refuses writes is unverified (the extension is not in the
+  DuckDB 2.0 toolchain).
+- A `sql` source's setup SQL may not mention `qod_pg_`, `qod_mysql_` or
+  `qod_ice_`: those secret-name prefixes belong to the typed sources, whose
+  blocks create and drop them.
+- A manifest import validates typed sources exactly as `create` does.
+- `create` upserts, so re-running it edits the source; a re-run with
+  `--password-stdin` rotates the stored password. Recycle the pool to apply.
+- The attach state is reported like an Iceberg catalog's (next section).
+
 ### Check whether an Iceberg catalog actually attached
 
 A failed `ATTACH` does NOT fail the node: it comes up healthy, serves
@@ -1326,8 +1393,8 @@ qod federation get acme acme_fed icelake     # -> .attachStatus
 qod pool status --tenant acme --db acme_fed --pool bi   # -> .nodes[].catalogAttachFailures
 ```
 
-`attachStatus` is reported only for enabled `iceberg-rest` sources (a `sql` or
-disabled source has no attach state), and both views are **replica-local**: each
+`attachStatus` is reported only for enabled typed sources (`iceberg-rest`,
+`postgres`, `mysql`; a `sql` or disabled source has no attach state), and both views are **replica-local**: each
 manager replica verifies only the nodes it tracks, so under HA the same node can
 read differently depending on which replica answered.
 

@@ -1145,9 +1145,25 @@ export interface MaintenanceRunResponse {
 
 // ----- Federation -----
 
-/** `sql` is a free-form operator-written setupSql block; `iceberg_rest` is the
-  * typed external Iceberg REST catalog whose ATTACH the manager renders itself. */
-export type FederatedSourceType = 'sql' | 'iceberg_rest';
+/** `sql` is a free-form operator-written setupSql block; `iceberg_rest`,
+  * `postgres` and `mysql` are typed sources whose ATTACH the manager renders
+  * itself. */
+export type FederatedSourceType = 'sql' | 'iceberg_rest' | 'postgres' | 'mysql';
+
+/** Typed declaration of one external Postgres or MySQL database (`postgres` /
+  * `mysql` sources). Mirrors the manager's `RdbmsConfig`. `password` is a
+  * `{{secret.NAME}}` placeholder naming one of the source's secrets, never the
+  * value, which is why the manager echoes this back unredacted. `schema` is
+  * postgres-only. */
+export interface RdbmsConnection {
+  host: string;
+  port?: number;
+  database: string;
+  user: string;
+  password: string;
+  schema?: string;
+  sslMode?: string;
+}
 
 /** DuckDB's `AUTHORIZATION_TYPE`. Mutually exclusive with `endpointType`:
   * DuckDB refuses the two ATTACH options together. */
@@ -1193,6 +1209,8 @@ export interface FederatedSourceCreateRequest {
   sourceType?: FederatedSourceType;
   config?: IcebergRestConfig;
   readOnly?: boolean;
+  /** `postgres` / `mysql` only. */
+  connection?: RdbmsConnection;
 }
 
 export interface FederatedSourceResponse {
@@ -1205,10 +1223,11 @@ export interface FederatedSourceResponse {
   sourceType: FederatedSourceType;
   config?: IcebergRestConfig;
   readOnly: boolean;
-  /** Live attach state across the pool's nodes, `iceberg_rest` rows only:
+  /** Live attach state across the pool's nodes, typed rows only:
     * "attached", "unknown", or "failed on N of M nodes". Absent for a `sql`
     * or disabled row, which has no attach state at all. */
   attachStatus?: string;
+  connection?: RdbmsConnection;
 }
 
 export interface FederatedSourceListResponse {
