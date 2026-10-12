@@ -815,3 +815,156 @@ class FederatedSourceHandlersSpec
       // own type/disabled state and not on the whole call.
       out.sources.find(_.alias == "sales_lake").value.attachStatus shouldBe Some("unknown")
     }
+
+  // --- postgres / mysql typed sources ---------------------------------------
+
+  private def pgReq(
+      alias: String = "shop_pg",
+      sourceType: String = "postgres",
+      conn: ai.starlake.quack.ondemand.federation.rdbms.RdbmsConfig =
+        ai.starlake.quack.ondemand.federation.rdbms.RdbmsConfig(
+          host = "pg.example.com",
+          database = "shop",
+          user = "reader",
+          password = "{{secret.PG_PWD}}"
+        ),
+      readOnly: Option[Boolean] = None
+  ) = FederatedSourceCreateRequest(
+    alias = alias,
+    sourceType = Some(sourceType),
+    connection = Some(conn),
+    readOnly = readOnly
+  )
+
+  "createSource (postgres / mysql)" should "accept a typed source, default it read-only and echo the connection" in
+    withHandlers { (h, _) =>
+      for (t, alias) <- List("postgres" -> "shop_pg", "mysql" -> "shop_my") do
+        val out = h
+          .createSource("acme", "acme_prod", pgReq(alias = alias, sourceType = t), None)
+          .unsafeRunSync()
+          .toOption
+          .value
+        out.sourceType shouldBe t
+        out.readOnly shouldBe true
+        out.connection.value.host shouldBe "pg.example.com"
+        out.connection.value.password shouldBe "{{secret.PG_PWD}}"
+        // The Iceberg field stays empty: a connection JSON would otherwise decode as an all-default
+        // IcebergRestConfig.
+        out.config shouldBe None
+        out.setupSql shouldBe None
+        h.getSource("acme", "acme_prod", alias)
+          .unsafeRunSync()
+          .toOption
+          .value
+          .connection
+          .value
+          .database shouldBe "shop"
+    }
+
+  it should "honour an explicit readOnly=false" in withHandlers { (h, _) =>
+    h.createSource("acme", "acme_prod", pgReq(readOnly = Some(false)), None)
+      .unsafeRunSync()
+      .toOption
+      .value
+      .readOnly shouldBe false
+  }
+
+  it should "400 on a missing connection, naming the wire field" in withHandlers { (h, _) =>
+    val (code, err) = h
+      .createSource("acme", "acme_prod", pgReq().copy(connection = None), None)
+      .unsafeRunSync()
+      .left
+      .value
+    code shouldBe StatusCode.BadRequest
+    err.message should include("connection is required for sourceType 'postgres'")
+  }
+
+  it should "400 on a connection sent for another type, and on config or setupSql sent for postgres" in
+    withHandlers { (h, _) =>
+      val onSql = FederatedSourceCreateRequest(
+        alias = "x",
+        setupSql = Some("ATTACH 'x';"),
+        connection = pgReq().connection
+      )
+      h.createSource("acme", "acme_prod", onSql, None).unsafeRunSync().left.value._2.message should
+        include("connection is for sourceType 'postgres' / 'mysql'")
+      val withIce = pgReq().copy(config = Some(IcebergRestConfig(warehouse = "w")))
+      h.createSource("acme", "acme_prod", withIce, None)
+        .unsafeRunSync()
+        .left
+        .value
+        ._2
+        .message should
+        include("use connection")
+      val withSql = pgReq().copy(setupSql = Some("ATTACH 'x';"))
+      h.createSource("acme", "acme_prod", withSql, None)
+        .unsafeRunSync()
+        .left
+        .value
+        ._2
+        .message should
+        include("setupSql is for sourceType 'sql'")
+    }
+
+  it should "400 on a literal password without echoing it" in withHandlers { (h, _) =>
+    val req         = pgReq(conn = pgReq().connection.value.copy(password = "hunter2"))
+    val (code, err) = h.createSource("acme", "acme_prod", req, None).unsafeRunSync().left.value
+    code shouldBe StatusCode.BadRequest
+    err.message should include("password must be a secret placeholder")
+    err.message should not include "hunter2"
+  }
+
+  it should "400 on a socket-path host and on a postgres-only field for mysql" in withHandlers {
+    (h, _) =>
+      val sock = pgReq(conn = pgReq().connection.value.copy(host = "/var/run/postgresql"))
+      h.createSource("acme", "acme_prod", sock, None).unsafeRunSync().left.value._2.message should
+        include("socket path is not accepted")
+      val my = pgReq(sourceType = "mysql", conn = pgReq().connection.value.copy(schema = Some("s")))
+      h.createSource("acme", "acme_prod", my, None).unsafeRunSync().left.value._2.message should
+        include("schema applies only to sourceType 'postgres'")
+  }
+
+  it should "400 on an alias that collides with a sibling or the tenant-db's own alias" in
+    withEnv { (fs, resolver, _) =>
+      val h = new FederatedSourceHandlers(fs, resolver, catalogAliasOf = _ => Some("acme_db"))
+      h.createSource("acme", "acme_prod", pgReq(alias = "acme_db"), None)
+        .unsafeRunSync()
+        .left
+        .value
+        ._2
+        .message should include("reserved")
+      h.createSource("acme", "acme_prod", iceReq(alias = "lake"), None).unsafeRunSync()
+      h.createSource("acme", "acme_prod", pgReq(alias = "lake"), None)
+        .unsafeRunSync()
+        .left
+        .value
+        ._2
+        .message should include("already exists as a 'iceberg_rest' source")
+    }
+
+  it should "upsert a same-type re-POST in place, keeping one row" in withHandlers { (h, _) =>
+    h.createSource("acme", "acme_prod", pgReq(), None).unsafeRunSync()
+    val edited = pgReq(conn = pgReq().connection.value.copy(port = Some(6432)))
+    h.createSource("acme", "acme_prod", edited, None).unsafeRunSync().isRight shouldBe true
+    val rows = h.listSources("acme", "acme_prod").unsafeRunSync().toOption.value.sources
+    rows.count(_.alias == "shop_pg") shouldBe 1
+    rows.find(_.alias == "shop_pg").value.connection.value.port shouldBe Some(6432)
+  }
+
+  it should "report attachStatus for an enabled postgres row" in withEnv { (fs, resolver, tdId) =>
+    val h = new FederatedSourceHandlers(
+      fedStore = fs,
+      resolver = resolver,
+      catalogAliasOf = _ => None,
+      attachStatusOf = (tenantDbId, _) => if tenantDbId == tdId then Some("unknown") else None
+    )
+    h.createSource("acme", "acme_prod", pgReq(), None).unsafeRunSync()
+    h.listSources("acme", "acme_prod")
+      .unsafeRunSync()
+      .toOption
+      .value
+      .sources
+      .find(_.alias == "shop_pg")
+      .value
+      .attachStatus shouldBe Some("unknown")
+  }
