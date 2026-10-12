@@ -379,7 +379,8 @@
   counts as starting for 120 s after its spawn, and replacing a node stops its old process first,
   including one an earlier manager left running. A node's process is recognized by its start time,
   not its pid alone, so a pid reused by another process after a restart is never adopted or
-  signalled. Kubernetes and fleet nodes were not affected: their
+  signalled; such a process's port is kept out of new nodes until it exits, with a warning naming
+  the pid. Kubernetes and fleet nodes were not affected: their
   start returns only once the node is ready, and a pod name or fleet assignment is unique per id.
 
 - **Security: a batched `USE` or `SET search_path` no longer reaches tables outside a user's

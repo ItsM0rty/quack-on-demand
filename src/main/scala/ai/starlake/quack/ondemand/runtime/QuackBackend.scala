@@ -39,6 +39,13 @@ trait QuackBackend:
     */
   def stopStray(node: RunningNode): IO[Unit] = IO.unit
 
+  /** Keep the ports of `nodes` whose process is still running but not held by this backend (left by
+    * an earlier manager) from being handed to a new node. Reconcile calls it with every node row at
+    * the start of each pass, before any spawn. The default has nothing to reserve: pods and fleet
+    * servers do not share a port space with the manager.
+    */
+  def reservePorts(nodes: List[RunningNode]): IO[Unit] = IO.unit
+
   /** `node` as its runtime currently places it. A backend that can move a live node without the
     * supervisor writing the row (fleet: a claim committed, then the manager died before the node
     * row write) answers the real address and token, and reconcile rewrites the row. The same

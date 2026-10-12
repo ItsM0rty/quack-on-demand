@@ -29,6 +29,12 @@ final class LocalQuackBackend(
   // SIGTERM them on stop(). Only identity-verified handles (NodeProcess), so
   // a signal never reaches a process that merely reuses the row's pid.
   private val adoptedProcs = TrieMap.empty[String, ProcessHandle]
+  // Ports of node processes still running that this backend does not hold (left by an earlier
+  // manager), each leased until that process exits: a new node must never be started onto a port a
+  // leftover may still be listening on. Keyed by port; the value is the process holding the lease.
+  private val reserved = TrieMap.empty[Int, ProcessHandle]
+  // The OS reported no start instant for a node: logged once, see start().
+  private val startInstantMissingLogged = new java.util.concurrent.atomic.AtomicBoolean(false)
 
   // A manager killed together with a node it was spawning can leave a secrets directory behind.
   NodeSecretFiles.sweepStale()
@@ -116,6 +122,17 @@ final class LocalQuackBackend(
     processes.put(spec.nodeId, proc)
     tokens.put(spec.nodeId, token)
     nodePorts.put(spec.nodeId, port)
+    val startInstant = proc.toHandle.info().startInstant()
+    if !startInstant.isPresent && proc.isAlive && startInstantMissingLogged.compareAndSet(
+        false,
+        true
+      )
+    then
+      logger.error(
+        "The OS reports no start time for spawned node processes, so a node's process cannot be " +
+          "verified (NodeProcess): reconcile will read every local node as dead and replace it on " +
+          "each pass. Run the manager where ProcessHandle.info().startInstant() is available."
+      )
 
     RunningNode(
       nodeId = spec.nodeId,
@@ -129,7 +146,7 @@ final class LocalQuackBackend(
       // The OS's own start instant when it reports one: NodeProcess matches the row against it, and
       // on Linux the JVM derives it from a boot time read once, so a wall-clock step after the
       // manager started cannot make this node's own row fail its identity check.
-      startedAt = proc.toHandle.info().startInstant().orElse(Instant.now()),
+      startedAt = startInstant.orElse(Instant.now()),
       maxConcurrent = spec.maxConcurrent
     )
   }
@@ -180,6 +197,8 @@ final class LocalQuackBackend(
     * is not the node's and is never recorded, so no stop path can signal it.
     */
   override def adopt(node: RunningNode): IO[Unit] = IO.blocking {
+    // A reservation made by reservePorts passes to the adopted node: its stop releases the port.
+    reserved.remove(node.port)
     ports.markLeased(node.port)
     tokens.put(node.nodeId, node.token)
     nodePorts.put(node.nodeId, node.port)
@@ -187,6 +206,36 @@ final class LocalQuackBackend(
       case Some(h) => adoptedProcs.put(node.nodeId, h)
       case None    => adoptedProcs.remove(node.nodeId)
     ()
+  }
+
+  /** Lease the port of every row whose process is still running but not held here, until that
+    * process exits. A verified leftover is adopted or stopped in its pool's turn; an unverified one
+    * (its start time disagrees with the row: a wall-clock step on Linux across an unclean manager
+    * exit, or a reused pid) is never signalled, so its port stays out of the allocator instead and
+    * an operator is told which pid to check. Without this, a replacement or another pool's spawn
+    * earlier in the same pass could be started onto a port a leftover still listens on, and never
+    * pass its health probe.
+    */
+  override def reservePorts(nodes: List[RunningNode]): IO[Unit] = IO.blocking {
+    nodes.foreach { n =>
+      val heldHere = processes.contains(n.nodeId) || adoptedProcs.contains(n.nodeId)
+      if !heldHere && !reserved.contains(n.port) then
+        n.pid
+          .flatMap(p => Option(ProcessHandle.of(p).orElse(null)))
+          .filter(_.isAlive)
+          .foreach { h =>
+            if ports.tryLease(n.port) then
+              reserved.put(n.port, h)
+              h.onExit().thenRun(() => if reserved.remove(n.port, h) then ports.release(n.port))
+              if NodeProcess.of(n).isEmpty then
+                logger.warn(
+                  s"${n.nodeId}: pid ${h.pid()} is running but is not this node's process as " +
+                    s"recorded (start time differs from the row); it is not signalled, and port " +
+                    s"${n.port} stays reserved until it exits. If it is a leftover quack node, " +
+                    "stop it by hand."
+                )
+          }
+    }
   }
 
   def discoverExisting(): IO[List[RunningNode]] = IO.pure(List.empty)
@@ -222,6 +271,7 @@ final class LocalQuackBackend(
     tokens.clear()
     nodePorts.clear()
     adoptedProcs.clear()
+    reserved.clear()
   }
 
 object LocalQuackBackend:

@@ -590,6 +590,9 @@ final class PoolSupervisor(
           s"${runnable.map(_._2.nodes.size).sum} node(s)"
       )
     ) *> skipLog *>
+      backend.reservePorts(pools.values.toList.flatMap(_.nodes)).handleErrorWith { t =>
+        IO.delay(logger.warn(s"reconcile: reserving leftover node ports failed: ${t.getMessage}"))
+      } *>
       runnable.foldLeft(IO.unit) { case (acc, (key, state)) =>
         acc *> reconcilePool(key, state).void
       }

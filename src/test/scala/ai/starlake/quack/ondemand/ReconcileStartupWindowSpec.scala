@@ -4,6 +4,7 @@ import ai.starlake.quack.edge.adapter.NodeLoadTracker
 import ai.starlake.quack.model.{
   NodeSpec,
   PoolKey,
+  Role,
   RoleDistribution,
   RunningNode,
   Tenant,
@@ -50,13 +51,14 @@ class ReconcileStartupWindowSpec extends AnyFlatSpec with Matchers:
     val started       = new ConcurrentLinkedQueue[Started]()
     def start(spec: NodeSpec): IO[RunningNode] =
       inner.start(spec).flatTap(n => IO(started.add(Started(n, NodeProcess.of(n)))))
-    def stop(k: PoolKey, id: String): IO[Unit]       = inner.stop(k, id)
-    def isAlive(id: String): Boolean                 = inner.isAlive(id)
-    def discoverExisting(): IO[List[RunningNode]]    = inner.discoverExisting()
-    def cleanup(): IO[Unit]                          = inner.cleanup()
-    override def adopt(n: RunningNode): IO[Unit]     = inner.adopt(n)
-    override def stopStray(n: RunningNode): IO[Unit] = inner.stopStray(n)
-    def all: List[Started]                           = started.asScala.toList
+    def stop(k: PoolKey, id: String): IO[Unit]                 = inner.stop(k, id)
+    def isAlive(id: String): Boolean                           = inner.isAlive(id)
+    def discoverExisting(): IO[List[RunningNode]]              = inner.discoverExisting()
+    def cleanup(): IO[Unit]                                    = inner.cleanup()
+    override def adopt(n: RunningNode): IO[Unit]               = inner.adopt(n)
+    override def stopStray(n: RunningNode): IO[Unit]           = inner.stopStray(n)
+    override def reservePorts(ns: List[RunningNode]): IO[Unit] = inner.reservePorts(ns)
+    def all: List[Started]                                     = started.asScala.toList
 
   private def kill(h: ProcessHandle): Unit =
     if h.isAlive then
@@ -186,3 +188,62 @@ class ReconcileStartupWindowSpec extends AnyFlatSpec with Matchers:
         }
       finally kill(stray.toHandle)
     }
+
+  it should "keep an unverified leftover's port out of a new manager's replacement" in:
+    // Linux, unclean manager exit plus a wall-clock step: a leftover node no longer matches its
+    // row's start time, so it is neither adopted nor signalled. Its port must not go to the
+    // replacement either, or the new node fails to bind while the leftover keeps answering there.
+    assume(!LocalQuackBackendSpec.isWindows)
+    val leftover = foreignSleep()
+    val listener = new java.net.ServerSocket()
+    // The leftover's port answers, as a still-listening leftover node would.
+    listener.bind(new java.net.InetSocketAddress("127.0.0.1", 23190))
+    try
+      withPool(23185, 23187, grace = 1.minute) { (sup, backend, store) =>
+        // The row the previous manager wrote: the leftover's pid and port, a start time the
+        // leftover's own does not match.
+        val n = sup.get(poolKey).get.nodes.head
+        store.upsertNode(
+          n.copy(
+            pid = Some(leftover.pid()),
+            port = 23190,
+            startedAt = Instant.now().minusSeconds(30)
+          ),
+          store.snapshot().pools.head.id
+        )
+        // The next manager: a fresh backend whose range starts at the leftover's port.
+        val next    = new RecordingLocal(23190, 23192, LocalQuackBackendSpec.sleepCmd(60))
+        val nextSup =
+          new PoolSupervisor(next, new NodeLoadTracker, store, nodeStartupGrace = 1.minute)
+        try
+          nextSup.restore()
+          nextSup.reconcile().unsafeRunSync()
+          next.all.map(_.node.port) should have size 1
+          withClue("the replacement was started on the leftover's port: ") {
+            next.all.head.node.port should not be 23190
+          }
+          leftover.isAlive shouldBe true
+          nextSup.get(poolKey).get.nodes.map(_.port) should not contain 23190
+          // The reservation ends with the leftover: its port is handed out again afterwards.
+          kill(leftover.toHandle)
+          leftover.waitFor(5, TimeUnit.SECONDS) shouldBe true
+          listener.close()
+          val deadline = System.currentTimeMillis() + 5000
+          var port     = -1
+          while port != 23190 && System.currentTimeMillis() < deadline do
+            val probe = next
+              .start(
+                NodeSpec(poolKey, s"probe-${System.nanoTime()}", Role.Dual, Map.empty, Map.empty)
+              )
+              .unsafeRunSync()
+            port = probe.port
+            next.stop(poolKey, probe.nodeId).unsafeRunSync()
+            if port != 23190 then Thread.sleep(50)
+          port shouldBe 23190
+        finally
+          next.cleanup().unsafeRunSync()
+          next.all.flatMap(_.handle).foreach(kill)
+      }
+    finally
+      kill(leftover.toHandle)
+      listener.close()
