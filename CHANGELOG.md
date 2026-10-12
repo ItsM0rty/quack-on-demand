@@ -23,6 +23,25 @@
   Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
   unhealthy, draining, quarantined or at its `maxConcurrent` cap.
 
+- **Typed Postgres and MySQL federated sources.** New source types `postgres` and `mysql` attach an
+  external database from typed fields (host, port, database, user, password, plus `sslMode`, and
+  `schema` for Postgres), with no SQL to write: REST `connection` on the federated-source create,
+  `qod federation create --type postgres|mysql` (`--host`, `--port`, `--database`, `--user`,
+  `--schema`, `--ssl-mode`, `--connection`), the MCP `upsert_federated_source` tool, manifests and
+  the admin UI. The password is always a source secret (inline or `externalRef`) named by a
+  `{{secret.NAME}}` placeholder and is required; the CLI's `--password-stdin` / `--password-prompt`
+  and the UI's write-only password field store it for you. The rendered SQL carries the connection
+  on a temporary DuckDB secret and attaches with `ATTACH ''`, so the password never shows in
+  `duckdb_databases().path` or connection errors, then drops the secret right after the ATTACH so
+  no node session can reuse the credentials (a re-attach without `READ_ONLY` would otherwise write
+  through them); the attached catalog keeps working and reconnects without it. New sources default
+  to read-only, enforced by the engine (`READ_ONLY`) and the edge screen; whoever may run
+  `postgres_execute` can still end the remote's read-only transaction, so use a database user
+  without write privileges for a hard guarantee. The attach verifier now watches these sources like
+  Iceberg ones (`attachStatus`, per-node failures, retry) and drops the secret when a retried
+  attach fails. MySQL is implemented and unit tested but not yet verified live: the DuckDB 2.0
+  toolchain has no mysql extension.
+
 - **Security: nodes and the manager no longer load the OS user's persistent DuckDB secrets.**
   DuckDB loads every secret stored under `~/.duckdb/stored_secrets` into an instance on first
   secret use, so a developer's or operator's own cloud keys reached every node (any tenant query
