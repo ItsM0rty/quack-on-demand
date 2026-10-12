@@ -4,6 +4,7 @@ import ai.starlake.quack.BuildVersions
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{Files, Path, Paths}
 import scala.sys.process.*
 import scala.util.Try
@@ -86,6 +87,26 @@ class SpawnScriptWindowsInitSpec extends AnyFlatSpec with Matchers with SpawnScr
     path.toString should startWith(tmp.toString)
     // The dry run removes its node directory, read-only secret directory and marker included.
     Files.exists(nodeDir) shouldBe false
+  }
+
+  // A node whose script was killed leaves its read-only secret directory; the next spawn's sweep
+  // gives it back to the current user before removing it (chmod 700 here, the ACL on Windows), and
+  // says so on stderr when a node directory cannot be removed.
+  "a later PowerShell spawn" should "sweep a dead node's read-only secret directory" in {
+    assume(!scala.util.Properties.isWin, "checks the POSIX branch; the ACL branch runs on Windows")
+    val tmp  = Files.createDirectories(tempDir.resolve("t"))
+    val dead = new java.lang.ProcessBuilder("true").start()
+    dead.waitFor()
+    val stale = Files.createDirectories(tmp.resolve("quack-node.deadbeef0001"))
+    val sec   = Files.createDirectories(stale.resolve("secrets"))
+    Files.writeString(stale.resolve("owner.pid"), s"${dead.pid()} 0")
+    Files.createFile(sec.resolve("none"))
+    Files.setPosixFilePermissions(sec.resolve("none"), PosixFilePermissions.fromString("r--------"))
+    Files.setPosixFilePermissions(sec, PosixFilePermissions.fromString("r-x------"))
+    val (rc, _, err) = dryRun(tmp, "windows")
+    withClue(err)(rc shouldBe 0)
+    Files.exists(stale) shouldBe false
+    err should not include "could not remove"
   }
 
   "the Windows outer init" should "hand the CLI only relative, single-quoted paths" in {

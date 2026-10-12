@@ -305,8 +305,27 @@ function New-SecretDirectory([string]$path) {
 
 # Remove a node directory and the spill directory it records.
 function Remove-NodeDirectory([string]$dir) {
-  # Off Windows the secret directory is 0500 around its marker file: writable again first.
-  if (-not $onWindows) { & chmod 700 (Join-Path $dir 'secrets') 2>$null }
+  # The secret directory is read-only around its marker file (New-SecretDirectory): give the current
+  # user full control of it again first, inherited by the marker (on Windows the marker's DACL is
+  # empty once Set-Acl re-propagated the directory's), or chmod 700 elsewhere. The owner may always
+  # rewrite the DACL.
+  $secrets = Join-Path $dir 'secrets'
+  if (Test-Path -LiteralPath $secrets -PathType Container) {
+    if ($onWindows) {
+      try {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+          $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        Set-Acl -LiteralPath $secrets -AclObject $acl
+      } catch {
+        [Console]::Error.WriteLine("WARN: could not restore access to $secrets before removing it: $($_.Exception.Message)")
+      }
+    } else {
+      & chmod 700 $secrets 2>$null
+    }
+  }
   $spillFile = Join-Path $dir 'spill.path'
   if (Test-Path -LiteralPath $spillFile -PathType Leaf) {
     $spill = ([System.IO.File]::ReadAllText($spillFile)).Trim()
@@ -315,6 +334,9 @@ function Remove-NodeDirectory([string]$dir) {
     }
   }
   Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $dir) {
+    [Console]::Error.WriteLine("WARN: could not remove the node directory $dir; remove it by hand")
+  }
 }
 
 # Per-node private state: $nodeDir holds owner.pid (the owning script's PID and its start ticks),
