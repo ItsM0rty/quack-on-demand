@@ -60,6 +60,29 @@ class SpawnScriptWindowsInitSpec extends AnyFlatSpec with Matchers with SpawnScr
   private def dotLines(out: String): Vector[String] =
     out.linesIterator.filter(_.startsWith(".")).toVector
 
+  // DuckDB's secret directory moves to the node's own empty read-only one before anything else, so
+  // the OS user's ~/.duckdb/stored_secrets never loads. The ACL that makes it read-only on Windows
+  // only runs there; elsewhere the script applies 0500.
+  "the PowerShell node payload" should "move the secret directory into the node directory first" in {
+    val tmp            = Files.createDirectories(tempDir.resolve("t"))
+    val (rc, out, err) = dryRun(tmp, "windows")
+    withClue(err)(rc shouldBe 0)
+    val lines = out.linesIterator.filter(_.trim.nonEmpty).toVector
+    lines.take(3) shouldBe Vector(
+      ".bail off",
+      lines(1),
+      "SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();"
+    )
+    lines(1) should startWith("SET secret_directory = '")
+    val dir = Paths.get(lines(1).stripPrefix("SET secret_directory = '").stripSuffix("';"))
+    dir.isAbsolute shouldBe true
+    dir.getFileName.toString shouldBe "secrets"
+    dir.getParent.getFileName.toString should startWith("quack-node.")
+    dir.toString should startWith(tmp.toString)
+    // The dry run removes its node directory, read-only secret directory included.
+    Files.exists(dir.getParent) shouldBe false
+  }
+
   "the Windows outer init" should "hand the CLI only relative, single-quoted paths" in {
     val tmp            = Files.createDirectories(tempDir.resolve("my temp"))
     val (rc, out, err) = dryRun(tmp, "windows")

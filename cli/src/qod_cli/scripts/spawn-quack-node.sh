@@ -250,8 +250,9 @@ done
 
 # Per-node private state, all removed by cleanup() when the node stops: NODE_DIR (0700, from mktemp)
 # holds the init FIFO, the psql passfile while it is needed, owner.pid / spill.path for the stale
-# sweep above, and WORK_DIR, the empty directory duckdb runs in. Created in dry-run mode too, so the
-# SQL below names the same spill directory a real spawn would.
+# sweep above, WORK_DIR, the empty directory duckdb runs in, and SECRET_DIR, duckdb's secret
+# directory. Created in dry-run mode too, so the SQL below names the same directories a real spawn
+# would.
 NODE_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/quack-node.${MARKER:+$MARKER.}XXXXXX)"
 SPILL_DIR=""
 DUCK_PID=""
@@ -272,6 +273,21 @@ trap cleanup EXIT
 printf '%s' "$$" > "$NODE_DIR/owner.pid"
 WORK_DIR="$NODE_DIR/cwd"
 mkdir -m 700 "$WORK_DIR"
+# DuckDB loads every persistent secret of its secret directory on first secret use, and the default
+# is the OS user's ~/.duckdb/stored_secrets, which would put an operator's own cloud keys on every
+# node. The node's secret directory is this one instead: empty and read-only (0500), so nothing
+# loads and CREATE PERSISTENT SECRET fails with an IO error, while persistent secrets stay enabled
+# (with allow_persistent_secrets = false, DuckDB 2.0 refuses every postgres ATTACH that names no
+# SECRET, inline credentials included). Absolute, since duckdb runs in WORK_DIR. On Kubernetes the
+# pod runs as a non-root uid with every capability dropped, so 0500 binds there too; a root node
+# with CAP_DAC_OVERRIDE can still write it, which the warning below names (it starts empty either
+# way, so no OS user's secret loads).
+SECRET_DIR="$NODE_DIR/secrets"
+[[ "$SECRET_DIR" == /* ]] || SECRET_DIR="$START_DIR/$SECRET_DIR"
+mkdir -m 500 "$SECRET_DIR"
+if [[ -w "$SECRET_DIR" ]]; then
+  echo "WARN: the node's secret directory $SECRET_DIR is writable (running as root?); CREATE PERSISTENT SECRET will succeed on this node" >&2
+fi
 # DuckDB's spill directory defaults to `.tmp` under its working directory, which no longer persists
 # across nodes. Give each node its own, on the filesystem it spilled to before: the emptyDir
 # KubernetesQuackBackend mounts on every pod when present, else `.tmp` of the starting directory
@@ -374,7 +390,8 @@ fi
 # (hence a conservative 40%), whereas a node pod runs nothing but DuckDB,
 # so 85% (in line with general DuckDB memory-tuning guidance) is safe.
 # temp_directory is the per-node SPILL_DIR chosen above, on every runtime.
-RESOURCE_SQL="SET temp_directory = '${SPILL_DIR//\'/\'\'}';"$'\n'
+spill_dir_sql=${SPILL_DIR//\'/\'\'}
+RESOURCE_SQL="SET temp_directory = '$spill_dir_sql';"$'\n'
 if [[ -r /sys/fs/cgroup/memory.max ]]; then
   MEM_BYTES="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"        # cgroup v2
 elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
@@ -421,11 +438,13 @@ INIT_SQL=""
 # The CLI exits on the first error of an -init file by default; a node has always carried on past
 # a failing statement (an unreachable federated source, an offline INSTALL), so keep doing that.
 INIT_SQL+=$'.bail off\n'
-# First, before any CREATE SECRET or ATTACH: DuckDB loads every persistent secret of the OS user
-# (~/.duckdb/stored_secrets) on first secret use, which would put an operator's own cloud keys on
-# every node. Reading duckdb_secrets() then puts the secret manager in use, after which DuckDB
-# refuses to change the setting from any session.
-INIT_SQL+=$'SET allow_persistent_secrets = false;\n'
+# First, before any CREATE SECRET or ATTACH: the empty read-only SECRET_DIR (see above) replaces the
+# OS user's ~/.duckdb/stored_secrets. Reading duckdb_secrets() then puts the secret manager in use,
+# after which DuckDB refuses to change secret_directory, allow_persistent_secrets or
+# default_secret_storage from any session.
+# Quotes doubled outside double quotes: inside them bash 3.2 keeps the backslashes of `\'`.
+secret_dir_sql=${SECRET_DIR//\'/\'\'}
+INIT_SQL+="SET secret_directory = '$secret_dir_sql';"$'\n'
 INIT_SQL+=$'SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();\n'
 INIT_SQL+="$PROXY_SQL"$'\n'
 # Cgroup-derived memory_limit / temp_directory / threads (see above) run

@@ -222,7 +222,9 @@ final class KubernetesQuackBackend(
     // level, no privilege escalation + all capabilities dropped + read-only rootfs on the quack
     // container. A pod template's own securityContext fields win field-by-field -- only the
     // fields the template left null are filled in with the default, so an operator's
-    // stricter/looser override on a specific field survives untouched.
+    // stricter/looser override on a specific field survives untouched. The non-root uid with every
+    // capability dropped is also what makes spawn-quack-node.sh's 0500 DuckDB secret directory
+    // binding (root with CAP_DAC_OVERRIDE writes through it; the script WARNs then).
     podSpec.setSecurityContext(mergedPodSecurityContext(Option(podSpec.getSecurityContext)))
     quack.setSecurityContext(mergedContainerSecurityContext(Option(quack.getSecurityContext)))
 

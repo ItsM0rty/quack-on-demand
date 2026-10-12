@@ -26,11 +26,15 @@
 - **Security: nodes and the manager no longer load the OS user's persistent DuckDB secrets.**
   DuckDB loads every secret stored under `~/.duckdb/stored_secrets` into an instance on first
   secret use, so a developer's or operator's own cloud keys reached every node (any tenant query
-  could use them) and the manager's in-process DuckDB. Every node now starts with
-  `SET allow_persistent_secrets = false`, before any secret or ATTACH, then puts the secret manager
-  in use so no session can switch it back; the manager's in-process instances carry the same
-  setting. `CREATE PERSISTENT SECRET` on a node now fails: use a temporary secret, or the database's
-  `objectStore`.
+  could use them) and the manager's in-process DuckDB. Every node now points `secret_directory` at
+  an empty, read-only, private directory of its own (`secrets` in the node's working directory,
+  0500; an owner-only ACL denying file creation on Windows), before any secret or ATTACH, then puts
+  the secret manager in use so no session can move it back. The manager's in-process instances use
+  one such directory per JVM. No persistent secret loads, and `CREATE PERSISTENT SECRET` on a node
+  now fails with an IO error: use a temporary secret, or the database's `objectStore`. Persistent
+  secrets themselves stay enabled, so a postgres or DuckLake ATTACH with inline credentials (for
+  example in federation SQL) keeps working; turning them off instead would have made DuckDB 2.0
+  refuse every such ATTACH ("Unknown secret storage found").
 
 - **Security: node init SQL no longer lands in `shell_history()`.** On DuckDB 2.0 the CLI records
   every statement it reads from stdin, and the spawn scripts fed the node's whole init SQL that way,

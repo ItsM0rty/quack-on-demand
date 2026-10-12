@@ -1,9 +1,11 @@
 package ai.starlake.quack.ondemand
 
+import ai.starlake.quack.ondemand.state.testkit.TestPostgres
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.file.{Files, Paths}
+import java.nio.file.attribute.PosixFilePermissions
+import java.nio.file.{Files, Path, Paths}
 import java.sql.{Connection, DriverManager}
 import scala.jdk.CollectionConverters.*
 import scala.sys.process.*
@@ -66,8 +68,10 @@ class InProcessDuckDbSpec extends AnyFlatSpec with Matchers:
   }
 
   "InProcessDuckDb.url" should "carry the budget as URL options, in memory and on a file" in {
-    InProcessDuckDb.url() shouldBe
-      "jdbc:duckdb:;threads=1;async_threads=1;allow_persistent_secrets=false"
+    InProcessDuckDb.url() should startWith(
+      "jdbc:duckdb:;threads=1;async_threads=1;secret_directory="
+    )
+    InProcessDuckDb.url() should not include "allow_persistent_secrets"
     val mem = DriverManager.getConnection(InProcessDuckDb.url())
     try settingsOf(mem) shouldBe ("1", "1")
     finally mem.close()
@@ -81,35 +85,127 @@ class InProcessDuckDbSpec extends AnyFlatSpec with Matchers:
       Files.deleteIfExists(dir)
   }
 
+  /** Runs [[InProcessSecretProbe]] in a child JVM whose HOME is `home`: DuckDB derives its default
+    * secret directory (`~/.duckdb/stored_secrets`) from the HOME environment variable, which a JVM
+    * cannot change for itself (`home_directory` does not move it). The probe's last output line.
+    */
+  private def probeWithHome(home: Path, mode: String): String =
+    val java = Paths.get(sys.props("java.home"), "bin", "java").toString
+    val out  = new StringBuilder
+    val rc   = Process(
+      Seq(
+        java,
+        "-cp",
+        sys.props("java.class.path"),
+        InProcessSecretProbe.getClass.getName.stripSuffix("$"),
+        mode
+      ),
+      None,
+      "HOME" -> home.toString
+    ) ! ProcessLogger(l => out.append(l).append('\n'), l => out.append(l).append('\n'))
+    withClue(out.toString)(rc shouldBe 0)
+    out.toString.linesIterator.filter(_.nonEmpty).toList.last
+
+  private def deleteTree(root: Path): Unit =
+    if Files.exists(root) then
+      val s = Files.walk(root)
+      try
+        s.sorted(java.util.Comparator.reverseOrder[Path]()).iterator().asScala.foreach { p =>
+          Try(p.toFile.setWritable(true, true))
+          Files.deleteIfExists(p)
+        }
+      finally s.close()
+
+  private def query1(c: Connection, sql: String): String =
+    val st = c.createStatement()
+    try
+      val rs = st.executeQuery(sql)
+      try
+        rs.next()
+        rs.getString(1)
+      finally rs.close()
+    finally st.close()
+
   // DuckDB loads every persistent secret of the OS user (~/.duckdb/stored_secrets) into an instance
   // on first secret use, so an operator's own cloud keys would serve the manager's statements.
-  // `secret_directory` stands in for that home directory here.
-  "An in-process instance" should "not load persistent secrets" in {
-    val dir   = Files.createTempDirectory("qod-inproc-secrets")
-    val plain = new java.util.Properties()
-    plain.setProperty("secret_directory", dir.toString)
-    val maker = DriverManager.getConnection("jdbc:duckdb:", plain)
+  "An in-process instance" should "not load the OS user's persistent secrets" in {
+    val home = Files.createTempDirectory("qod-inproc-home")
     try
-      val st = maker.createStatement()
+      // Seeded through an explicit secret_directory, so nothing here ever resolves the real HOME.
+      val seed = new java.util.Properties()
+      seed.setProperty("secret_directory", home.resolve(".duckdb/stored_secrets").toString)
+      val maker = DriverManager.getConnection("jdbc:duckdb:", seed)
       try
-        st.execute("CREATE PERSISTENT SECRET operator_keys (TYPE s3, KEY_ID 'k', SECRET 's')")
-        val rs = st.executeQuery("SELECT count(*) FROM duckdb_secrets()")
-        rs.next(); rs.getInt(1) shouldBe 1
+        val st = maker.createStatement()
+        try st.execute("CREATE PERSISTENT SECRET operator_keys (TYPE s3, KEY_ID 'k', SECRET 's')")
+        finally st.close()
+      finally maker.close()
+      // Control: a plain instance under that HOME does load it, so the probe really reads HOME.
+      probeWithHome(home, "plain") shouldBe "secrets=1"
+      probeWithHome(home, "qod") shouldBe "secrets=0"
+    finally deleteTree(home)
+  }
+
+  // An empty, owner-only, read-only directory: nothing to load, and CREATE PERSISTENT SECRET fails.
+  it should "use an empty read-only secret directory outside the OS user's home" in {
+    val c =
+      DriverManager.getConnection("jdbc:duckdb:", DuckDbExtensionSource(None).connectionProperties)
+    try
+      val dir = Paths.get(query1(c, "SELECT current_setting('secret_directory')"))
+      // Checked first: the real ~/.duckdb is never inspected.
+      dir.toAbsolutePath.startsWith(Paths.get(sys.props("user.home"))) shouldBe false
+      Files.isDirectory(dir) shouldBe true
+      if Files.getFileStore(dir).supportsFileAttributeView("posix") then
+        PosixFilePermissions.toString(Files.getPosixFilePermissions(dir)) shouldBe "r-x------"
+      val st = c.createStatement()
+      try
+        val e = intercept[java.sql.SQLException](
+          st.execute("CREATE PERSISTENT SECRET tenant_keys (TYPE s3, KEY_ID 'k', SECRET 's')")
+        )
+        e.getMessage should include("IO Error")
       finally st.close()
-    finally maker.close()
-    val p = DuckDbExtensionSource(None).connectionProperties
-    p.setProperty("secret_directory", dir.toString)
-    val c = DriverManager.getConnection("jdbc:duckdb:", p)
+      query1(c, "SELECT count(*) FROM duckdb_secrets()") shouldBe "0"
+      val left = Files.list(dir)
+      try left.iterator().asScala.toList shouldBe empty
+      finally left.close()
+    finally c.close()
+  }
+
+  it should "refuse a change of secret_directory once the secret manager is in use" in {
+    val c =
+      DriverManager.getConnection("jdbc:duckdb:", DuckDbExtensionSource(None).connectionProperties)
+    try
+      query1(c, "SELECT count(*) FROM duckdb_secrets()") shouldBe "0"
+      val st = c.createStatement()
+      try
+        val other = Files.createTempDirectory("qod-inproc-other")
+        try
+          val e = intercept[java.sql.SQLException](
+            st.execute(s"SET secret_directory = '${other.toString.replace("'", "''")}'")
+          )
+          e.getMessage should include("after the secret manager is used")
+        finally deleteTree(other)
+      finally st.close()
+    finally c.close()
+  }
+
+  // On DuckDB 2.0 `allow_persistent_secrets = false` broke every postgres ATTACH that names no
+  // SECRET ("Unknown secret storage found: local_file"), inline credentials included.
+  it should "attach Postgres with an inline password" in {
+    TestPostgres.ensureReachable()
+    val ext = DuckDbExtensionSource.fromEnv
+    val c   = DriverManager.getConnection("jdbc:duckdb:", ext.connectionProperties)
     try
       val st = c.createStatement()
       try
-        val rs = st.executeQuery("SELECT count(*) FROM duckdb_secrets()")
-        rs.next(); rs.getInt(1) shouldBe 0
+        st.execute(ext.loadSql("postgres_scanner"))
+        st.execute(
+          s"ATTACH 'host=${TestPostgres.pgHost} port=${TestPostgres.pgPort} dbname=postgres " +
+            s"user=${TestPostgres.pgUser} password=${TestPostgres.pgPass}' AS pg (TYPE postgres, READ_ONLY)"
+        )
       finally st.close()
-    finally
-      c.close()
-      Files.list(dir).iterator().asScala.foreach(Files.deleteIfExists)
-      Files.deleteIfExists(dir)
+      query1(c, "SELECT * FROM postgres_query('pg', 'SELECT 41 + 1')") shouldBe "42"
+    finally c.close()
   }
 
   "Many open in-process instances" should "cost a small fixed number of native threads" in {
@@ -135,3 +231,19 @@ class InProcessDuckDbSpec extends AnyFlatSpec with Matchers:
       }
     finally closeAll(cs)
   }
+
+/** Child-JVM side of [[InProcessDuckDbSpec]]'s HOME case: opens one instance, `plain` (no settings)
+  * or `qod` (the manager's [[InProcessDuckDb.properties]]), and prints how many secrets it holds.
+  */
+object InProcessSecretProbe:
+  def main(args: Array[String]): Unit =
+    Class.forName("org.duckdb.DuckDBDriver")
+    val p =
+      if args.headOption.contains("qod") then InProcessDuckDb.properties
+      else new java.util.Properties()
+    val c = DriverManager.getConnection("jdbc:duckdb:", p)
+    try
+      val rs = c.createStatement().executeQuery("SELECT count(*) FROM duckdb_secrets()")
+      rs.next()
+      println(s"secrets=${rs.getInt(1)}")
+    finally c.close()

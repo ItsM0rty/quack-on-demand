@@ -1,10 +1,13 @@
 package ai.starlake.quack.ondemand.runtime
 
 import ai.starlake.quack.BuildVersions
+import ai.starlake.quack.ondemand.DuckDbExtensionSource
+import ai.starlake.quack.ondemand.state.testkit.TestPostgres
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.net.{InetSocketAddress, Socket}
+import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{Files, Path, Paths}
 import java.util.concurrent.TimeUnit
 import scala.jdk.CollectionConverters.*
@@ -84,8 +87,10 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
           // A throwaway HOME, so the node never reads the developer's own ~/.duckdb (extensions
           // resolve the same; before the persistent-secrets fix a real HOME also leaked stored
           // secrets into the node).
-          "HOME"                 -> Files.createDirectories(tempDir.resolve("node-home")).toString,
-          NodeSecretFiles.DirEnv -> secrets.toString,
+          "HOME" -> Files.createDirectories(tempDir.resolve("node-home")).toString,
+          // The node directory (and the secret directory in it) lands where the test can see it.
+          "TMPDIR"                     -> nodeTmp.toString,
+          NodeSecretFiles.DirEnv       -> secrets.toString,
           NodeSecretFiles.EphemeralEnv -> "1"
         ) ++ env).toMap.asJava
       )
@@ -96,6 +101,9 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
     withClue(Files.readString(tempDir.resolve("node.log")))(listening(port) shouldBe true)
     (p, port)
 
+  /** Where the script creates its per-node directory (its TMPDIR). */
+  private def nodeTmp: Path = Files.createDirectories(tempDir.resolve("node-tmp"))
+
   /** Start a `memory` node with `extraSetupSql`, run `body(port)` once it listens, then stop it. */
   private def withNode[A](extraSetupSql: String, env: (String, String)*)(body: Int => A): A =
     val (p, port) = startNode(extraSetupSql, env)
@@ -104,6 +112,12 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
 
   /** `sql` run on the node through `quack_query` from a separate DuckDB process; CSV rows. */
   private def onNode(port: Int, sql: String): List[String] =
+    val (rc, out, err) = onNodeResult(port, sql)
+    withClue(err)(rc shouldBe 0)
+    out.linesIterator.toList
+
+  /** [[onNode]] without the success check: (exit code, stdout, stderr). */
+  private def onNodeResult(port: Int, sql: String): (Int, String, String) =
     val inner = sql.replace("'", "''")
     val out   = new StringBuilder
     val err   = new StringBuilder
@@ -119,8 +133,7 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
       "DUCKDB_AGENT_MODE" -> "0",
       "HOME"              -> Files.createDirectories(tempDir.resolve("client-home")).toString
     ) ! ProcessLogger(l => out.append(l).append('\n'), l => err.append(l).append('\n'))
-    withClue(err.toString)(rc shouldBe 0)
-    out.toString.linesIterator.toList
+    (rc, out.toString, err.toString)
 
   // The DuckDB 2.0 CLI records every statement it reads from stdin in shell_history(), which any
   // session of the node can query; the init SQL carries the node token, the catalog password and the
@@ -142,11 +155,11 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
     }
   }
 
-  // DuckDB loads every persistent secret of the OS user (~/.duckdb/stored_secrets) into a node on
-  // first secret use, so an operator's own cloud keys would serve every tenant on the node. The
-  // node starts with persistent secrets off and the secret manager already in use, which DuckDB
-  // then refuses to switch back.
-  it should "not load the OS user's persistent secrets" in {
+  // DuckDB loads every persistent secret of its secret directory into a node on first secret use,
+  // and the default is the OS user's ~/.duckdb/stored_secrets, so an operator's own cloud keys would
+  // serve every tenant on the node. The node's secret directory is an empty read-only one of its
+  // own, and the secret manager is already in use when it serves, so DuckDB refuses to move it.
+  it should "not load the OS user's persistent secrets, nor store one of its own" in {
     assume(pinnedDuckdb.nonEmpty, "the pinned DuckDB CLI is not available")
     val home = Files.createDirectories(tempDir.resolve("home"))
     Process(
@@ -159,13 +172,49 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
       "HOME"              -> home.toString,
       "DUCKDB_AGENT_MODE" -> "0"
     ).!! should include("true")
-    withNode("SELECT 1;", "HOME" -> home.toString) { port =>
+    Files.list(home.resolve(".duckdb/stored_secrets")).count() shouldBe 1
+    val (p, port) = startNode("SELECT 1;", Seq("HOME" -> home.toString))
+    try
       onNode(port, "SELECT count(*) FROM duckdb_secrets()") shouldBe List("0")
-      onNode(port, "SELECT current_setting('allow_persistent_secrets')") shouldBe List("false")
+      val dir = Paths.get(onNode(port, "SELECT current_setting('secret_directory')").head)
+      dir.startsWith(nodeTmp) shouldBe true
+      dir.getFileName.toString shouldBe "secrets"
+      PosixFilePermissions.toString(Files.getPosixFilePermissions(dir)) shouldBe "r-x------"
+      val (rc, _, err) = onNodeResult(
+        port,
+        "CREATE PERSISTENT SECRET tenant_keys (TYPE s3, KEY_ID 'AKIATENANT', SECRET 's')"
+      )
+      rc should not be 0
+      err should include("IO Error")
+      val moved          = home.resolve(".duckdb/stored_secrets").toString.replace("'", "''")
+      val (rc2, _, err2) = onNodeResult(port, s"SET secret_directory = '$moved'")
+      rc2 should not be 0
+      err2 should include("after the secret manager is used")
+      onNode(port, "SELECT count(*) FROM duckdb_secrets()") shouldBe List("0")
+      val left = Files.list(dir)
+      try left.iterator().asScala.toList shouldBe empty
+      finally left.close()
+      // A normal stop (SIGTERM) removes the node directory, read-only secret directory included.
+      p.destroy()
+      p.waitFor(20, TimeUnit.SECONDS) shouldBe true
+      Files.exists(dir) shouldBe false
+    finally hardStop(p)
+  }
+
+  // On DuckDB 2.0, `allow_persistent_secrets = false` refused every postgres ATTACH that names no
+  // SECRET ("Unknown secret storage found: local_file"), so operator federation SQL carrying inline
+  // credentials broke. A read-only secret directory keeps that working.
+  it should "accept an inline-password postgres ATTACH in the operator's init SQL" in {
+    TestPostgres.ensureReachable()
+    val attach =
+      s"ATTACH 'host=${TestPostgres.pgHost} port=${TestPostgres.pgPort} dbname=postgres " +
+        s"user=${TestPostgres.pgUser} password=${TestPostgres.pgPass}' AS fedpg (TYPE postgres, READ_ONLY);"
+    withNode(DuckDbExtensionSource.fromEnv.loadSql("postgres_scanner") + "\n" + attach) { port =>
+      onNode(port, "SELECT * FROM postgres_query('fedpg', 'SELECT 41 + 1')") shouldBe List("42")
     }
   }
 
-  "the node init SQL" should "turn persistent secrets off before anything else" in {
+  "the node init SQL" should "move the secret directory before anything else" in {
     val dir = NodeSecretFiles.writePrivateDir(
       Map(NodeSecretFiles.TokenKey -> Token, "pgPassword" -> "p"),
       Some(tempDir)
@@ -174,6 +223,7 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
       Seq("bash", script, "21999"),
       None,
       "QOD_SPAWN_DRY_RUN"          -> "1",
+      "TMPDIR"                     -> nodeTmp.toString,
       "kind"                       -> "ducklake",
       "schemaName"                 -> "main",
       "dbName"                     -> "acme_lake",
@@ -184,9 +234,13 @@ class SpawnScriptLiveNodeSpec extends AnyFlatSpec with Matchers with SpawnScript
     ).!!.linesIterator.filter(_.trim.nonEmpty).toVector
     lines.take(3) shouldBe Vector(
       ".bail off",
-      "SET allow_persistent_secrets = false;",
+      lines(1),
       "SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();"
     )
+    // An absolute path in the node's own directory, under the script's TMPDIR.
+    val tmp = nodeTmp.toString.replace("'", "''")
+    lines(1) should fullyMatch regex
+      ("""SET secret_directory = '\Q""" + tmp + """\E/quack-node\.[^/']+/secrets';""")
   }
 
   // The node is kept alive by a `.shell` dot-command that waits on the wrapper's pid, not by a
