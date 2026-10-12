@@ -30,6 +30,57 @@ class LocalQuackBackendSpec extends AnyFlatSpec with Matchers with org.scalatest
     backend.stop(PoolKey("t", "t_default", "p"), "node-2").unsafeRunSync()
     backend.isAlive("node-2") shouldBe false
 
+  // Regression for the pool-create spawn race: reconcile respawned a node it judged dead under the
+  // same id, and start() overwrote the held Process handle, so the first process ran on untracked
+  // (holding its port) and its port lease leaked.
+  it should "stop the process it still holds under a node id before starting another one" in:
+    assume(!isWindows)
+    val backend = new LocalQuackBackend(23130, 23131, commandFor = (_, _, _) => sleepCmd(30))
+    val key     = PoolKey("t", "t_default", "p")
+    val spec    = NodeSpec(key, "node-again", Role.Dual, Map.empty, Map.empty)
+    val first   = backend.start(spec).unsafeRunSync()
+    try
+      val second = backend.start(spec).unsafeRunSync()
+      val handle = java.lang.ProcessHandle.of(first.pid.value)
+      handle.isPresent && handle.get().isAlive shouldBe false
+      backend.isAlive("node-again") shouldBe true
+      second.pid should not be first.pid
+      // Two ports: a lease leaked per replacement would refuse this third start.
+      noException should be thrownBy backend.start(spec).unsafeRunSync()
+    finally backend.stop(key, "node-again").unsafeRunSync()
+
+  // A row's pid can name an unrelated process after a manager or container restart. adopt() must
+  // not take it for the node unless its start instant matches the row's startedAt, so neither
+  // stop() nor cleanup() ever signals it.
+  it should "never signal an adopted pid whose process did not start when the node did" in:
+    assume(!isWindows)
+    val unrelated = new java.lang.ProcessBuilder(sleepCmd(30)*).start()
+    val backend   = new LocalQuackBackend(23135, 23136, commandFor = (_, _, _) => sleepCmd(30))
+    val key       = PoolKey("t", "t_default", "p")
+    val row       = ai.starlake.quack.model.RunningNode(
+      nodeId = "adopted-mismatch",
+      poolKey = key,
+      role = Role.Dual,
+      host = "127.0.0.1",
+      port = 23135,
+      token = "tok",
+      pid = Some(unrelated.pid()),
+      podName = None,
+      startedAt = java.time.Instant.now().minusSeconds(60),
+      maxConcurrent = 4
+    )
+    try
+      backend.adopt(row).unsafeRunSync()
+      backend.stop(key, "adopted-mismatch").unsafeRunSync()
+      backend.adopt(row).unsafeRunSync()
+      backend.stopStray(row).unsafeRunSync()
+      backend.cleanup().unsafeRunSync()
+      unrelated.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS)
+      unrelated.isAlive shouldBe true
+    finally
+      unrelated.destroyForcibly()
+      ()
+
   it should "carry NodeSpec.maxConcurrent through to RunningNode" in:
     val backend = new LocalQuackBackend(23030, 23031, commandFor = (_, _, _) => sleepCmd(30))
     val spec    = NodeSpec(

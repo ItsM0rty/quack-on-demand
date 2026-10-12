@@ -371,6 +371,18 @@
   open transaction's node connection too, so a statement after an idle pause longer than the
   node lease no longer fails with "Connection heartbeat lease expired".
 
+- **Fixed: a slow-starting local node is no longer respawned into an orphan.** The local runtime
+  records a node as soon as its process starts, before it listens. A reconcile pass in that window
+  (more likely with a slow init SQL or a short `QOD_RECONCILE_INTERVAL_SEC`) read the node as dead
+  and started a second process under the same node id without stopping the first, which kept
+  running untracked, held its port and outlived the manager. A node whose process is alive now
+  counts as starting for 120 s after its spawn, and replacing a node stops its old process first,
+  including one an earlier manager left running. A node's process is recognized by its start time,
+  not its pid alone, so a pid reused by another process after a restart is never adopted or
+  signalled; such a process's port is kept out of new nodes until it exits, with a warning naming
+  the pid. Kubernetes and fleet nodes were not affected: their
+  start returns only once the node is ready, and a pod name or fleet assignment is unique per id.
+
 - **Security: a batched `USE` or `SET search_path` no longer reaches tables outside a user's
   grants.** The access check resolves a bare table name against the pool's default schema, but a
   `USE`, `SET search_path`, `SET schema` (any spelling, including `SET SESSION`, `TO`, `PRAGMA
