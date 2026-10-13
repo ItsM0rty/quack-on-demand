@@ -330,7 +330,13 @@ object SqlParser:
             Option(mi.getValues).foreach(v.visitExpression)
             Option(mi.getWhereCondition).foreach(v.visitExpression)
             Option(mi.getAndPredicate).foreach(v.visitExpression)
-          case _ => ()
+          // WHEN [NOT MATCHED BY SOURCE |] MATCHED AND (SELECT ...) THEN DELETE: the predicate
+          // runs against the real rows, so its subquery is a read like any other.
+          case md: net.sf.jsqlparser.statement.merge.MergeDelete =>
+            Option(md.getAndPredicate).foreach(v.visitExpression)
+          // A future MergeOperation subtype must not be silently dropped: fail closed.
+          case other =>
+            v.unsupported += s"unrecognized MERGE action ${other.getClass.getSimpleName}"
         })
         Option(mrg.getOnCondition).foreach(v.visitExpression)
         targetPlusReads(index, snippet, mrg.getTable, v.result, Verb.Write, config)

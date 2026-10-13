@@ -101,11 +101,33 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
     ) shouldBe a[Deny]
   }
 
-  it should "deny MERGE/UPDATE/DELETE reading a masked table (fail-closed, no single inner SELECT)" in {
+  it should "deny an UPDATE reading a masked table (fail-closed, no single inner SELECT)" in {
     guardWithCls().check(
       "UPDATE tpch1.audit SET e = (SELECT c_email FROM tpch1.customer LIMIT 1)",
       StatementKind.Dml,
       eff(tenantUser, cols = List(maskEmail)),
+      ctx
+    ) shouldBe a[Deny]
+  }
+
+  it should "deny a MERGE whose THEN DELETE predicate reads a masked table" in {
+    guardWithCls().check(
+      "MERGE INTO tpch1.scratch USING (SELECT 1 AS n) s ON scratch.k = s.n " +
+        "WHEN MATCHED AND (SELECT ascii(substr(c_email, 1, 1)) FROM tpch1.customer LIMIT 1) = 97 " +
+        "THEN DELETE",
+      StatementKind.Dml,
+      eff(tenantUser, cols = List(maskEmail)),
+      ctx
+    ) shouldBe a[Deny]
+  }
+
+  it should "deny a MERGE whose NOT MATCHED BY SOURCE THEN DELETE predicate reads an RLS table" in {
+    guardWithCls().check(
+      "MERGE INTO tpch1.scratch USING (SELECT 1 AS n) s ON scratch.k = s.n " +
+        "WHEN NOT MATCHED BY SOURCE AND EXISTS (SELECT 1 FROM tpch1.customer WHERE c_id = 7) " +
+        "THEN DELETE",
+      StatementKind.Dml,
+      eff(tenantUser, rows = List(rowPolicy)),
       ctx
     ) shouldBe a[Deny]
   }

@@ -43,6 +43,15 @@
   their spawn until fixed), and both spawn scripts refuse it too, so Kubernetes pods and fleet
   servers are covered.
 
+- **Security: a MERGE `THEN DELETE` condition can no longer read past grants and policies.** The
+  subquery in `WHEN MATCHED AND <cond> THEN DELETE` and `WHEN NOT MATCHED BY SOURCE AND <cond>
+  THEN DELETE` was left out of the statement's table reads, so the QoD ACL, the OPA input and the
+  column-mask / row-policy write guard never saw it: a tenant user who could write any table read
+  a table they had no grant on, or the real values behind a mask or row filter (one value at a
+  time through the deleted row count, or whole through an `error((SELECT ...))` message). That
+  subquery is now checked like the `THEN UPDATE` / `THEN INSERT` forms, and an unrecognized MERGE
+  action is refused. The earlier write-guard fix covered MERGE only in those two forms.
+
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
   checkpoint(...)`, behind `EXPLAIN` / `PREPARE`) and the destructive DuckLake maintenance and

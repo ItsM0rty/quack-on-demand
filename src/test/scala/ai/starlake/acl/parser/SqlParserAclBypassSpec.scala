@@ -202,6 +202,31 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
     ) shouldBe true
   }
 
+  test("MERGE matched delete-action AND predicate subquery captures the read source") {
+    val sql =
+      "MERGE INTO db.main.t USING (SELECT 1 AS n) s ON t.k = s.n " +
+        "WHEN MATCHED AND (SELECT count(*) FROM db.main.secret) > 0 THEN DELETE"
+    val accesses = extracted(sql).accesses
+    accesses.exists(a =>
+      a.table == TableRef("db", "main", "secret") && a.verb == Verb.Read
+    ) shouldBe true
+    accesses.exists(a =>
+      a.table == TableRef("db", "main", "t") && a.verb == Verb.Write
+    ) shouldBe true
+  }
+
+  test(
+    "MERGE not-matched-by-source delete-action AND predicate subquery captures the read source"
+  ) {
+    val sql =
+      "MERGE INTO db.main.t USING db.main.s ON t.k = s.k " +
+        "WHEN NOT MATCHED BY SOURCE AND EXISTS (SELECT 1 FROM db.main.secret) THEN DELETE"
+    val accesses = extracted(sql).accesses
+    accesses.exists(a =>
+      a.table == TableRef("db", "main", "secret") && a.verb == Verb.Read
+    ) shouldBe true
+  }
+
   // --- 3f: top-level WITH on DML statements is walked (CTE bodies are read sources,
   //         and an unqualified CTE reference does not launder as a base-table read) ---
 
