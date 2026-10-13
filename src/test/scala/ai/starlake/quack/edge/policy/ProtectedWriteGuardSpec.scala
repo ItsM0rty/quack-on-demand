@@ -504,3 +504,38 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
           ctx
         ) shouldBe a[Deny]
       }
+
+  // F07: the guard's column-policy oracle is the deny-mode rewriter, which unquoted double quotes
+  // only, so a backtick-quoted masked column laundered its raw values into a table of the caller's.
+  "a write reading a backtick-quoted policy table or column" should "be denied like its twin" in
+    List(
+      "CREATE TABLE tpch1.leak AS SELECT upper(`c_email`) AS e FROM tpch1.customer" ->
+        "CREATE TABLE tpch1.leak AS SELECT upper(\"c_email\") AS e FROM tpch1.customer",
+      "CREATE TABLE tpch1.leak AS SELECT `c_email` FROM tpch1.customer" ->
+        "CREATE TABLE tpch1.leak AS SELECT \"c_email\" FROM tpch1.customer",
+      "CREATE TABLE tpch1.leak AS SELECT c_email FROM `tpch1`.`customer`" ->
+        "CREATE TABLE tpch1.leak AS SELECT c_email FROM \"tpch1\".\"customer\"",
+      "INSERT INTO tpch1.t SELECT c_id FROM tpch1.customer WHERE `c_email` = 'x'" ->
+        "INSERT INTO tpch1.t SELECT c_id FROM tpch1.customer WHERE \"c_email\" = 'x'",
+      "CREATE TABLE tpch1.leak AS SELECT * FROM `customer`" ->
+        "CREATE TABLE tpch1.leak AS SELECT * FROM \"customer\""
+    ).foreach { (backtick, twin) =>
+      List(eff(tenantUser, cols = List(maskEmail)), eff(tenantUser, rows = List(rowPolicy)))
+        .foreach { e =>
+          withClue(s"$backtick ${e.columnPolicies.size}/${e.rowPolicies.size}") {
+            val kind =
+              if backtick.startsWith("INSERT") then StatementKind.Dml else StatementKind.Ddl
+            guardWithCls().check(twin, kind, e, ctx) shouldBe a[Deny]
+            guardWithCls().check(backtick, kind, e, ctx) shouldBe a[Deny]
+          }
+        }
+    }
+
+  it should "still allow a write reading only unmasked columns through backticks" in {
+    guardWithCls().check(
+      "INSERT INTO tpch1.scratch SELECT `c_id` FROM `tpch1`.`customer`",
+      StatementKind.Dml,
+      eff(tenantUser, cols = List(maskEmail)),
+      ctx
+    ) shouldBe Allow
+  }

@@ -66,6 +66,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A pre-release DuckDB JDBC or a mavenLocal resolver cannot resolve on a
+      # runner: say so up front instead of failing deep in `sbt update`.
+      - name: Guard - release-grade DuckDB pins
+        run: scripts/release/check-release-pins.sh
+
+      # Same gate release.yml runs: every vendored native's build marker must
+      # match the pin, or the snapshot would ship natives the manager refuses.
+      - name: Verify vendored libquackwire binaries match the pin
+        run: |
+          set -euo pipefail
+          source scripts/release/release-lib.sh
+          verify_quackwire_binaries
+
       - name: Set up Temurin 21
         uses: actions/setup-java@v5
         with:

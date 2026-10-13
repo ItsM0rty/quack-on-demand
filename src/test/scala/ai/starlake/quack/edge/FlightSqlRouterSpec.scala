@@ -1971,10 +1971,10 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         "SET search_path = 'memory.main'",
         "SET TimeZone = 'UTC'",
         "SET http_timeout = 300",
-        "SET preserve_insertion_order = false",
+        "SET SESSION preserve_insertion_order = false",
         "SET enable_progress_bar = false",
         "SET errors_as_json = true",
-        "SET default_order = 'DESC'",
+        "SET SESSION default_order = 'DESC'",
         "SET VARIABLE x = 42"
       ).foreach { sql =>
         val out = router
@@ -1983,6 +1983,47 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         withClue(sql)(out.isRight shouldBe true)
       }
     }
+
+  // DuckDB 2.0 runs an unscoped SET of a GLOBAL-default setting at GLOBAL scope (physical_set.cpp),
+  // so the bare form is as node-wide as SET GLOBAL; an unknown name is refused fail-closed.
+  it should "refuse a bare SET of a GLOBAL-default setting or an unknown one, in every mode" in:
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      Seq(
+        "SET default_collation = 'nocase'" ->
+          NodeSettingScreen.unscopedRefusal("default_collation"),
+        "SET preserve_insertion_order = false" ->
+          NodeSettingScreen.unscopedRefusal("preserve_insertion_order"),
+        "SET extra_http_headers = MAP {'a': 'b'}" ->
+          NodeSettingScreen.unscopedRefusal("extra_http_headers"),
+        "SET ducklake_retry_wait_ms = 86400000" ->
+          NodeSettingScreen.unscopedRefusal("ducklake_retry_wait_ms"),
+        "PRAGMA null_order = 'nulls_first'" -> NodeSettingScreen.unscopedRefusal("null_order"),
+        "SET force_mbedtls_unsafe = true"   -> NodeSettingScreen.NodeWideRefusal,
+        "SET hnsw_ef_search = 10" -> NodeSettingScreen.unknownSettingRefusal("hnsw_ef_search")
+      ).foreach { (sql, reason) =>
+        val out = router
+          .execute("nw-7", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+          .unsafeRunSync()
+        withClue(sql)(out.swap.toOption.get.reason shouldBe s"access denied: node: $reason")
+      }
+      captured() shouldBe ""
+    }
+    val (locked, lockedCaptured, _) = setupWithRewriter(lockdownFor = _ => true)
+    locked
+      .execute("nw-8", "alice", poolKey, "SET default_order = 'DESC'", Some(superuserSet))
+      .unsafeRunSync()
+      .swap
+      .toOption
+      .get
+      .reason shouldBe s"access denied: node: ${NodeSettingScreen.unscopedRefusal("default_order")}"
+    lockedCaptured() shouldBe ""
+    val (open, openCaptured, _) = setupWithRewriter()
+    open
+      .execute("nw-9", "alice", poolKey, "SET default_collation = 'nocase'", Some(superuserSet))
+      .unsafeRunSync()
+      .isRight shouldBe true
+    openCaptured() should include("default_collation")
 
   it should "deny (not forward) a plain read when a stored row policy fails to apply at rewrite time" in:
     // Simulates a row policy stored before RowPredicateValidator rejected splice-unsafe
@@ -2888,8 +2929,9 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     out.isRight shouldBe true
     // A SQL-valued setting is refused only to tenant principals under the ACL and under lockdown.
+    // Session scope: the bare form of this GLOBAL-default option is node-wide (superuser-only).
     val set = router
-      .execute("psr-8", "alice", poolKey, "SET pg_staleness_query = 'SELECT 1'", None)
+      .execute("psr-8", "alice", poolKey, "SET SESSION pg_staleness_query = 'SELECT 1'", None)
       .unsafeRunSync()
     set.isRight shouldBe true
 
@@ -3838,3 +3880,267 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
             .unsafeRunSync() shouldBe a[Right[?, ?]]
         }
     }
+
+  // ---- F07: a backtick-quoted identifier meets the same row filter and column mask ----
+
+  private def maskedAndFiltered = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+    tenantUser,
+    Nil,
+    Nil,
+    List(ai.starlake.quack.ondemand.state.RolePermission("p-1", "r-1", "*", "*", "*", "ALL")),
+    Nil,
+    List(maskCustomerEmail),
+    List(rowPolicyCustomer)
+  )
+
+  private def clsKnowingCustomer =
+    new ai.starlake.quack.edge.cls.ColumnPolicyRewriter(
+      new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+        Map(("memory", "main", "customer") -> List("c_id", "c_email", "c_region"))
+      ),
+      enabled = true
+    )
+
+  "a backtick-quoted table or column" should "be filtered and masked in every ACL mode" in:
+    val twins = List(
+      "SELECT c_id, c_email, c_region FROM `customer`" ->
+        "SELECT c_id, c_email, c_region FROM \"customer\"",
+      "SELECT * FROM `main`.`customer`" -> "SELECT * FROM \"main\".\"customer\"",
+      "SELECT upper(`c_email`) AS e FROM customer" -> "SELECT upper(\"c_email\") AS e FROM customer",
+      "SELECT c_id FROM customer WHERE `c_email` LIKE '%a%'" ->
+        "SELECT c_id FROM customer WHERE \"c_email\" LIKE '%a%'",
+      "SELECT `c` FROM customer c" -> "SELECT \"c\" FROM customer c"
+    )
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(rewriter = clsKnowingCustomer, validator = v)
+      def run(sql: String)      =
+        val out = router.execute("bt-1", "alice", poolKey, sql, Some(maskedAndFiltered))
+        val res = out.unsafeRunSync().map(_ => captured())
+        res
+      twins.foreach { (backtick, twin) =>
+        withClue(s"${v.getClass.getSimpleName}: $backtick") {
+          val b = run(backtick)
+          b.map(_.contains("`")) should not be Right(true)
+          b.map(_.toLowerCase) shouldBe run(twin).map(_.toLowerCase)
+          b.foreach { sent =>
+            sent should include("c_region = 'X'")
+            sent should not include "c_email LIKE"
+          }
+        }
+      }
+      val table = run(twins.head._1)
+      table.toOption.get should (include("'***'") and include("c_region = 'X'"))
+    }
+
+  it should "not launder a masked column into a table through CTAS" in:
+    val (router, captured, _) = setupWithRewriter(
+      rewriter = clsKnowingCustomer,
+      protectedWriteGuard = guardKnowingCustomer
+    )
+    Seq(
+      "CREATE TABLE main.scratch AS SELECT upper(`c_email`) AS e FROM main.customer",
+      "CREATE TABLE main.scratch AS SELECT `c_email` FROM `main`.`customer`"
+    ).foreach { sql =>
+      withClue(sql) {
+        val out = router
+          .execute("bt-2", "alice", poolKey, sql, Some(effWithPolicies(List(maskCustomerEmail))))
+          .unsafeRunSync()
+        out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+        captured() shouldBe ""
+      }
+    }
+
+  // ---- F08: histogram()/histogram_values() over a computed metadata-catalog source ----
+
+  "a reading table macro over a computed source" should "be refused to every non-superuser" in:
+    val leaks = Seq(
+      "SELECT * FROM histogram('__duck' || 'lake_metadata_lake.ducklake_data_file', encryption_key)",
+      "SELECT * FROM histogram_values(concat('__duck', 'lake_metadata_lake.ducklake_data_file'), " +
+        "encryption_key)",
+      "SELECT * FROM histogram_values(chr(95) || '_ducklake_metadata_lake.ducklake_data_file', " +
+        "path)",
+      "SELECT * FROM histogram(source := '__duck' || 'lake_metadata_lake.ducklake_data_file', " +
+        "col_name := encryption_key)",
+      "SELECT * FROM histogram('__ducklake_metadata_lake.ducklake_data_file', encryption_key)"
+    )
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      leaks.foreach { sql =>
+        withClue(s"${v.getClass.getSimpleName}: $sql") {
+          val out = router
+            .execute("hist-c1", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+            .unsafeRunSync()
+          out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+          out.swap.toOption.get.reason should startWith("access denied: catalog: ")
+          captured() shouldBe ""
+        }
+      }
+    }
+    val (open, openCaptured, _) = setupWithRewriter()
+    open
+      .execute("hist-c2", "alice", poolKey, leaks.head, Some(superuserSet))
+      .unsafeRunSync()
+      .isRight shouldBe true
+    openCaptured() should include("histogram(")
+
+  it should "leave the aggregate and a constant source admitted with the ACL off" in:
+    val (router, captured, _) = setupWithRewriter()
+    Seq(
+      "SELECT histogram(c_region) FROM customer",
+      "SELECT * FROM histogram('customer', c_region)"
+    ).foreach { sql =>
+      withClue(sql) {
+        router
+          .execute("hist-c3", "alice", poolKey, sql, Some(wildcardAllSet))
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+        captured() should include("histogram")
+      }
+    }
+
+  // ---- F09: CHECKPOINT and DuckLake's per-schema macros ----
+
+  private val checkpointRefusal =
+    s"access denied: catalog: ${ai.starlake.quack.edge.sql.CheckpointScreen.Refusal}"
+
+  private val checkpoints = Seq(
+    "CHECKPOINT",
+    "CHECKPOINT lake",
+    "CALL checkpoint('lake')",
+    "SELECT * FROM checkpoint('lake')",
+    "FROM checkpoint()",
+    "EXPLAIN ANALYZE CHECKPOINT",
+    "PREPARE p AS CHECKPOINT",
+    "SELECT 1; CHECKPOINT"
+  )
+
+  "CHECKPOINT" should "be refused to every non-superuser in every ACL mode, lockdown or not" in:
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      Seq(false, true).foreach { locked =>
+        val (router, captured, _) = setupWithRewriter(validator = v, lockdownFor = _ => locked)
+        checkpoints.foreach { sql =>
+          withClue(s"${v.getClass.getSimpleName} lockdown=$locked: $sql") {
+            val out = router
+              .execute("ckpt-1", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+              .unsafeRunSync()
+            out.swap.toOption.get.reason shouldBe checkpointRefusal
+            captured() shouldBe ""
+          }
+        }
+      }
+    }
+
+  it should "run for a superuser, routed and classified as DDL, and not under lockdown" in:
+    val (router, captured, _) = setupWithRewriter()
+    router
+      .execute("ckpt-2", "alice", poolKey, "CHECKPOINT", Some(superuserSet))
+      .unsafeRunSync()
+      .isRight shouldBe true
+    captured() should include("CHECKPOINT")
+    router.classifier.classify("CHECKPOINT") shouldBe ai.starlake.quack.model.StatementKind.Ddl
+    val (locked, lockedCaptured, _) = setupWithRewriter(lockdownFor = _ => true)
+    locked
+      .execute("ckpt-3", "alice", poolKey, "CHECKPOINT", Some(superuserSet))
+      .unsafeRunSync()
+      .swap
+      .toOption
+      .get
+      .reason shouldBe checkpointRefusal
+    lockedCaptured() shouldBe ""
+
+  "DuckLake's bare per-schema macros" should "be refused like ducklake_* when the ACL validates" in:
+    val pairs = Seq(
+      "FROM merge_adjacent_files()" -> "FROM ducklake_merge_adjacent_files('lake')",
+      "FROM lake.set_option('delete_older_than', '1 second')" ->
+        "FROM ducklake_set_option('lake', 'delete_older_than', '1 second')",
+      "SELECT * FROM snapshots()" -> "SELECT * FROM ducklake_snapshots('lake')"
+    )
+    Seq(wildcardAcl, allowAllOpa).foreach { v =>
+      val (router, captured, _) = setupWithRewriter(validator = v)
+      pairs.foreach { (bare, explicit) =>
+        withClue(s"${v.getClass.getSimpleName}: $bare") {
+          Seq(bare, explicit).foreach { sql =>
+            router
+              .execute("dlm-m1", "alice", poolKey, sql, Some(wildcardAllSet))
+              .unsafeRunSync()
+              .swap
+              .toOption
+              .get shouldBe a[RouterFailure.AccessDenied]
+          }
+          captured() shouldBe ""
+        }
+      }
+    }
+    // With the ACL off the read-only family is admitted (owner ruling 2026-10-11), bare or
+    // explicit; the maintenance and option-setting ones are refused in every mode (below).
+    val (open, openCaptured, _) = setupWithRewriter()
+    Seq(
+      "SELECT * FROM snapshots()",
+      "SELECT * FROM ducklake_snapshots('lake')",
+      "FROM lake.table_info()",
+      "FROM table_changes('t', 0, 3)",
+      "CALL set_commit_message('a', 'b')"
+    ).foreach { sql =>
+      withClue(sql) {
+        open
+          .execute("dlm-m2", "alice", poolKey, sql, Some(wildcardAllSet))
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+        openCaptured() should include(sql)
+      }
+    }
+
+  private val maintenanceCalls = Seq(
+    "FROM merge_adjacent_files()",
+    "CALL lake.merge_adjacent_files()",
+    "FROM lake.set_option('delete_older_than', '1 second')",
+    "FROM lake.main.set_option('expire_older_than', '1 second')",
+    "CALL ducklake_merge_adjacent_files('lake')",
+    "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)",
+    "CALL ducklake_expire_snapshots('lake', older_than => now())",
+    "CALL ducklake_delete_orphaned_files('lake', cleanup_all => true)",
+    "CALL ducklake_rewrite_data_files('lake', 't')",
+    "CALL ducklake_flush_inlined_data('lake')",
+    "CALL ducklake_set_option('lake', 'delete_older_than', '1 second')",
+    "SELECT * FROM \"DuckLake_Cleanup_Old_Files\"('lake')",
+    "EXPLAIN ANALYZE FROM merge_adjacent_files()",
+    "SELECT 1; FROM lake.set_option('delete_older_than', '1 second')"
+  )
+
+  "DuckLake's maintenance and option-setting calls" should "be refused to every non-superuser" in:
+    Seq(StatementValidator.allowAll, wildcardAcl, allowAllOpa).foreach { v =>
+      Seq(false, true).foreach { locked =>
+        val (router, captured, _) = setupWithRewriter(validator = v, lockdownFor = _ => locked)
+        maintenanceCalls.foreach { sql =>
+          withClue(s"${v.getClass.getSimpleName} lockdown=$locked: $sql") {
+            val out = router
+              .execute("dlm-mt1", "alice", poolKey, sql, effectiveSet = Some(wildcardAllSet))
+              .unsafeRunSync()
+            out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+            // under lockdown the lockdown screen, which runs first, may refuse it for its own reason
+            if !locked then
+              out.swap.toOption.get.reason should (startWith("access denied: catalog: ") and
+                include("reserved to superusers"))
+            captured() shouldBe ""
+          }
+        }
+      }
+    }
+
+  it should "run for a superuser, and not under lockdown" in:
+    val (open, openCaptured, _) = setupWithRewriter()
+    maintenanceCalls.foreach { sql =>
+      withClue(sql) {
+        open
+          .execute("dlm-mt2", "alice", poolKey, sql, Some(superuserSet))
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+        openCaptured() should not be ""
+      }
+    }
+    val (locked, lockedCaptured, _) = setupWithRewriter(lockdownFor = _ => true)
+    locked
+      .execute("dlm-mt3", "alice", poolKey, maintenanceCalls.head, Some(superuserSet))
+      .unsafeRunSync()
+      .swap
+      .toOption
+      .get
+      .reason should include("reserved to superusers")
+    lockedCaptured() shouldBe ""

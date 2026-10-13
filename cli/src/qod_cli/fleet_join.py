@@ -176,7 +176,7 @@ def host_capacity(root: Path = CGROUP_ROOT) -> tuple[int | None, int | None]:
 
 
 def probe_duckdb_version(binary: Path, run=subprocess.run) -> str | None:
-    """The version a caller-supplied duckdb reports (`v1.5.6 (Variegata) <sha>` -> "1.5.6"), or
+    """The version a duckdb binary reports (`v1.5.6 (Variegata) <sha>` -> "1.5.6"), or
     None when it cannot be run or says nothing parsable."""
     try:
         out = run(

@@ -94,13 +94,14 @@ private[sql] object FileReferences:
   def readingTableMacro(sql: String, extraction: ExtractionResult): Option[String] =
     if incomplete(extraction) then
       FunctionCalls.scan(sql).calls.iterator.map(_.name).find(ReadingTableMacros.contains)
-    else
-      extraction.statements
-        .collect { case StatementResult.Extracted(_, _, _, _, markers) => markers }
-        .flatten
-        .flatMap(TableExtractor.tableFunctionName)
-        .map(callName)
-        .find(ReadingTableMacros.contains)
+    else tableFunctionCalls(extraction).map(callName).find(ReadingTableMacros.contains)
+
+  /** Every table function call of a walk, as the parser prints it (`main."histogram"('x', b)`). */
+  def tableFunctionCalls(extraction: ExtractionResult): List[String] =
+    extraction.statements
+      .collect { case StatementResult.Extracted(_, _, _, _, markers) => markers }
+      .flatten
+      .flatMap(TableExtractor.tableFunctionName)
 
   /** The function name of a table function call as the parser prints it: its last name part,
     * unquoted and lowercased (`main."histogram"('x', b)` is `histogram`).
@@ -108,9 +109,4 @@ private[sql] object FileReferences:
   private def callName(call: String): String =
     val head = call.takeWhile(_ != '(').trim
     val last = if head.contains('.') then head.substring(head.lastIndexOf('.') + 1) else head
-    last
-      .stripPrefix("\"")
-      .stripSuffix("\"")
-      .stripPrefix("`")
-      .stripSuffix("`")
-      .toLowerCase(Locale.ROOT)
+    ai.starlake.sql.QuotedIdentifier.unquote(last).toLowerCase(Locale.ROOT)

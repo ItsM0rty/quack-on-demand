@@ -146,6 +146,24 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     sql should include("c_region = 'eu'")
   }
 
+  it should "wrap a backtick-quoted table reference like its double-quoted twin" in
+    // DuckDB 2.0 reads a backtick pair as an identifier quote, and the ACL authorizes
+    // `customer` for it: a match that strips only double quotes left the read unfiltered.
+    Seq(
+      "SELECT * FROM `customer`",
+      "SELECT c_id FROM `tpch1`.`customer`",
+      "SELECT c_id FROM `acme_tpch`.`tpch1`.`customer` AS c",
+      "SELECT c_id FROM `Customer` WHERE c_id > 1",
+      "SELECT * FROM (SELECT c_id FROM `customer`) s",
+      "SELECT c_id FROM customer WHERE c_id IN (SELECT c_id FROM `customer`)"
+    ).foreach { q =>
+      withClue(q) {
+        val sql = rewritten(go(q, eff(tenantUser, List(policy("c_region = 'eu'")))))
+        sql should include("c_region = 'eu'")
+        sql should not include "`"
+      }
+    }
+
   it should "still not match a policy for a different quoted table" in {
     go(
       "select \"o_id\" from \"tpch1\".\"orders\"",

@@ -101,6 +101,22 @@ if [[ -z "$TOKEN" ]]; then
   exit 1
 fi
 
+# A line whose first non-blank character is `.` is a DuckDB CLI dot-command in the -init channel,
+# and `.shell` / `.system` run an OS command as this script's user. The manager refuses one in
+# every tenant-authored value and again before every spawn (InitSqlScreen.scala); refuse it here
+# too, so no launcher (a Kubernetes pod, a fleet server) and no stored row can get one past this
+# script. The script's own dot-commands (`.bail off`, the keep-alive) sit outside every value
+# checked. The leading newline lets the pattern also match a dot on the first line.
+DOT_LINE_RE=$'[\n\r][[:space:]]*\\.'
+has_dot_line() { [[ $'\n'"$1" =~ $DOT_LINE_RE ]]; }
+for key in dbInitSql extraSetupSql objectStoreSql lockdownSql; do
+  if has_dot_line "${!key:-}"; then
+    echo "ERROR: $key holds a line starting with '.', which the DuckDB CLI runs as a dot-command" \
+      "(.shell / .system run OS commands); refusing to start the node" >&2
+    exit 1
+  fi
+done
+
 pgHost="${pgHost:-localhost}"
 pgPort="${pgPort:-5432}"
 pgUser="${pgUser:-postgres}"
@@ -230,24 +246,52 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
   fi
 fi
 
-# Sweep node directories left by an earlier spawn whose script died on SIGKILL (which skips the
-# trap below): the init FIFO carries no secrets to disk, but a spill directory can be large. Only a
-# directory whose recorded owner pid is provably gone is removed, whichever manager made it; a live
-# owner's directory (this manager's or another's) and one still being created (no pid file yet)
-# are left alone.
-for d in "${TMPDIR:-/tmp}"/quack-node.*; do
-  [[ -d "$d" ]] || continue
-  op="$d/owner.pid"
-  if [[ -f "$op" ]]; then
-    owner="$(cat "$op" 2>/dev/null || true)"
-    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-      sp="$(cat "$d/spill.path" 2>/dev/null || true)"
-      [[ -n "$sp" ]] && rm -rf -- "$sp"
-      # The read-only secret directory holds its marker file: writable again before rm -rf.
-      chmod 700 "$d/secrets" 2>/dev/null || true
-      rm -rf -- "$d"
+# The spill directory a stale node directory records (spill.path), removed only when it is one this
+# script makes: `qod-node.XXXXXX` directly under a spill root of this host (see SPILL_ROOT below),
+# a real directory owned by this user, compared on physical paths. Anything else (a planted path, a
+# spill root of another starting directory) is left in place; the `tmp` fallback inside the node
+# directory goes with that directory.
+remove_stale_spill() {
+  local sp name parent root
+  sp="$(cat "$1/spill.path" 2>/dev/null || true)"
+  name="${sp##*/}"
+  [[ "$name" =~ ^qod-node\.[A-Za-z0-9]{6}$ ]] || return 0
+  [[ -d "$sp" && ! -L "$sp" && -O "$sp" ]] || return 0
+  parent="$(cd -P -- "${sp%/*}" 2>/dev/null && pwd -P)" || return 0
+  for root in /duckdb-tmp "$START_DIR/.tmp"; do
+    root="$(cd -P -- "$root" 2>/dev/null && pwd -P)" || continue
+    if [[ "$parent" == "$root" ]]; then
+      rm -rf -- "$parent/$name" 2>/dev/null || true
+      return 0
     fi
+  done
+  return 0
+}
+
+# Sweep node directories left by an earlier spawn whose script died on SIGKILL (which skips the
+# trap below): the init FIFO carries no secrets to disk, but a spill directory can be large. TMPDIR
+# is often the shared, sticky /tmp, where any local user can create a `quack-node.*` entry, so an
+# entry is considered only when it is a real directory (not a symlink) owned by this user, and only
+# once its recorded owner pid is provably gone: `kill -0` also fails on another user's live process
+# (EPERM), so `ps` has the last word. A live owner's directory (this manager's or another's) and one
+# still being created (no pid file yet) are left alone. Every delete is best effort: a stray entry
+# must never abort this spawn under `set -e`.
+for d in "${TMPDIR:-/tmp}"/quack-node.*; do
+  [[ -d "$d" && ! -L "$d" && -O "$d" ]] || continue
+  op="$d/owner.pid"
+  [[ -f "$op" && ! -L "$op" ]] || continue
+  owner="$(cat "$op" 2>/dev/null || true)"
+  [[ "$owner" =~ ^[0-9]+$ ]] || continue
+  if kill -0 "$owner" 2>/dev/null || ps -p "$owner" >/dev/null 2>&1; then
+    continue
   fi
+  remove_stale_spill "$d"
+  # The read-only secret directory holds its marker file: writable again before rm -rf. Never
+  # through a symlink, which would change the mode of whatever it points at.
+  if [[ -d "$d/secrets" && ! -L "$d/secrets" ]]; then
+    chmod 700 "$d/secrets" 2>/dev/null || true
+  fi
+  rm -rf -- "$d" 2>/dev/null || true
 done
 
 # Per-node private state, all removed by cleanup() when the node stops: NODE_DIR (0700, from mktemp)
@@ -459,6 +503,8 @@ INIT_SQL+=$'SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();\n
 # A node has always carried on past a failing statement (an unreachable federated source, an offline
 # INSTALL), so keep doing that from here on.
 INIT_SQL+=$'.bail off\n'
+# Everything after this head is checked for dot-command lines before the keep-alive is appended.
+INIT_HEAD_LEN=${#INIT_SQL}
 INIT_SQL+="$PROXY_SQL"$'\n'
 # Cgroup-derived memory_limit / temp_directory / threads (see above) run
 # right after the proxy settings and before dbInitSql, so an operator's
@@ -559,6 +605,13 @@ NODE_BIND="${QOD_NODE_BIND:-0.0.0.0}"
 # SELECT only listen_url (not the CALL's row), so the node token never reaches the inherited stdout
 # (the manager console locally, `kubectl logs` on K8s).
 INIT_SQL+="SELECT listen_url FROM quack_serve('quack:${NODE_BIND}:$PORT', token := '$TOKEN', allow_other_hostname := true, disable_ssl := true);"$'\n'
+# Backstop for the per-value check at the top: no value this script interpolates (the storage
+# credentials, the proxy, the paths) may smuggle in a dot-command line either.
+if has_dot_line "${INIT_SQL:$INIT_HEAD_LEN}"; then
+  echo "ERROR: the assembled init SQL holds a line starting with '.' outside the script's own" \
+    "dot-commands; refusing to start the node" >&2
+  exit 1
+fi
 # Keep-alive: with stdin on /dev/null the CLI would reach EOF and exit once -init is read. Hold it
 # with a dot-command, NOT a query: a query would pin a DuckDB transaction (blocking CHECKPOINT on a
 # duckdb-file node and holding a catalog Postgres session "idle in transaction" on a DuckLake node),

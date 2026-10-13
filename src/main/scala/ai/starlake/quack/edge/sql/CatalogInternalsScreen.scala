@@ -23,7 +23,8 @@ import java.util.Locale
   *     its `*_encryption_key`, and `ducklake_commit` writes catalog rows by metadata schema name.
   *     The other `ducklake_*` functions (snapshots, table_info, settings, options, table changes,
   *     maintenance) return no key and stay admitted here; [[CatalogReachingCalls]] still denies the
-  *     whole family to tenant-scoped principals when the ACL validates.
+  *     whole family to tenant-scoped principals when the ACL validates, and [[CheckpointScreen]]
+  *     reserves the maintenance and option-setting ones to superusers in every mode.
   *   - `json_execute_serialized_sql` (table function and pragma), whatever its argument: a
   *     serialized plan names its catalogs inside JSON strings that DuckDB decodes after the screen
   *     read them (`\u005f_ducklake_metadata_x` runs, verified on 2.0), so no lexical read of the
@@ -36,6 +37,15 @@ import java.util.Locale
   *     [[RunTimeTargetCalls]] (`query_table('__duck' || 'lake_metadata_x...')` reaches the catalog)
   *     or a `SET search_path` / `SET schema` (verified on 2.0: `SET search_path = '__duck' ||
   *     'lake_metadata_lake'` takes effect) whose arguments are not plain constants.
+  *   - a reading table macro ([[FileReferences.ReadingTableMacros]]: `histogram(source, col)` and
+  *     `histogram_values(source, col)` run `query_table(source)` in their body) called in a table
+  *     position with a source that is not one string literal: `histogram('__duck' ||
+  *     'lake_metadata_x.ducklake_data_file', encryption_key)` returned the per-file keys on 2.0,
+  *     since the split name defeats the text scan above and the macro is not a
+  *     [[RunTimeTargetCalls]] name. Only the FIRST (source) argument is judged, and only in a table
+  *     position ([[computedMacroSource]]): the aggregate `histogram(col)` in a select list shares
+  *     the name and takes a column, so a name-only rule would refuse every histogram aggregate. A
+  *     literal source is screened by the text scan like any other literal.
   *
   * Manager-internal SQL (DuckLakeInitializer, the catalog readers, BranchCloner, MergeFence, the
   * merge and maintenance node calls through the adapter) never goes through the router.
@@ -101,8 +111,40 @@ object CatalogInternalsScreen:
           case c if RunTimeTargetCalls(c.name) && !FunctionCalls.constantArguments(c) =>
             computedRefusal(c.name)
         }
+        .orElse(computedMacroSource(scan))
         .orElse(computedNameSetting(sql))
         .orElse(if scan.truncated then Some(NestingRefusal) else None)
+
+  /** The reading table macro called in a table position, in `scan`, whose source is not one string
+    * literal ([[FunctionCalls.firstStringArgument]]: a concatenation, a cast, a call, a column, a
+    * named parameter), as its refusal. The position is the one [[FileReferences.readingTableMacro]]
+    * reads, per scanned text (the statement, or a literal body `query()` runs): the walk's table
+    * functions when JSqlParser reads the text completely, judged on the call as the parser prints
+    * it; any such call of the text, lexically, when it does not (fail closed: an aggregate there is
+    * refused too). The parse runs only for a text holding a candidate call.
+    */
+  private def computedMacroSource(scan: FunctionCalls.Scan): Option[String] =
+    def computed(c: FunctionCalls.Call): Boolean =
+      FileReferences.ReadingTableMacros.contains(c.name) &&
+        FunctionCalls.firstStringArgument(c).isEmpty
+    val candidates = scan.calls.filter(computed)
+    candidates
+      .map(_.text)
+      .distinct
+      .iterator
+      .flatMap { text =>
+        val extraction = FileReferences.extraction(text)
+        if FileReferences.incomplete(extraction) then candidates.find(_.text == text).map(_.name)
+        else
+          FileReferences
+            .tableFunctionCalls(extraction)
+            .iterator
+            .flatMap(call => FunctionCalls.scan(call).calls.headOption)
+            .find(computed)
+            .map(_.name)
+      }
+      .nextOption()
+      .map(computedRefusal)
 
   /** A `search_path` / `schema` whose value is computed at run time, in any setting form the shared
     * reader ([[NodeSettingScreen.settingAt]]) recognizes: `SET [SESSION | GLOBAL | LOCAL]`,

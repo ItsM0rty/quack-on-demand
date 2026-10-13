@@ -101,6 +101,26 @@ if ([string]::IsNullOrEmpty($Token)) {
   Write-Error "ERROR: no node token: `$QOD_SECRETS_DIR\QOD_NODE_TOKEN is missing or empty"; exit 1
 }
 
+# A line whose first non-blank character is `.` is a DuckDB CLI dot-command in the `.read` payload,
+# and `.shell` / `.system` run an OS command as this script's user. The manager refuses one in every
+# tenant-authored value and again before every spawn (InitSqlScreen.scala); refuse it here too, so
+# no stored row gets one past this script. The script's own dot-commands (`.bail on` / `.bail off`
+# and the outer init) sit outside every value checked. Mirrors has_dot_line in spawn-quack-node.sh.
+function Test-DotCommandLine([string]$sql) {
+  return ("`n$sql" -match '[\r\n]\s*\.')
+}
+$dbInitSql      = [Environment]::GetEnvironmentVariable('dbInitSql')
+$extraSetupSql  = Secret-Or 'extraSetupSql' ''
+$lockdownSql    = [Environment]::GetEnvironmentVariable('lockdownSql')
+$objectStoreSql = Secret-Or 'objectStoreSql' ''
+foreach ($pair in @(@('dbInitSql', $dbInitSql), @('extraSetupSql', $extraSetupSql),
+                    @('objectStoreSql', $objectStoreSql), @('lockdownSql', $lockdownSql))) {
+  if (Test-DotCommandLine $pair[1]) {
+    [Console]::Error.WriteLine("ERROR: $($pair[0]) holds a line starting with '.', which the DuckDB CLI runs as a dot-command (.shell / .system run OS commands); refusing to start the node")
+    exit 1
+  }
+}
+
 # DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
 # (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal; pin the normal output format.
 $env:DUCKDB_AGENT_MODE = '0'
@@ -303,14 +323,41 @@ function New-SecretDirectory([string]$path) {
   return (Join-Path $marker 's')
 }
 
+# Whether $path exists as a real directory, not a symlink or junction (reparse point).
+function Test-RealDirectory([string]$path) {
+  $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+  return ($null -ne $item -and $item.PSIsContainer -and
+    -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint))
+}
+
+# The spill directory a node directory records (spill.path), removed only when it is one this script
+# makes: `qod-node.<id>` directly under `.tmp` of this script's starting directory, a real directory.
+# Anything else (a planted path, the spill root of another starting directory) is left in place; the
+# `tmp` fallback inside the node directory goes with that directory. Mirrors remove_stale_spill in
+# spawn-quack-node.sh.
+function Remove-SpillDirectory([string]$dir) {
+  $spillFile = Join-Path $dir 'spill.path'
+  if (-not (Test-Path -LiteralPath $spillFile -PathType Leaf)) { return }
+  try {
+    $spill = [System.IO.Path]::GetFullPath(([System.IO.File]::ReadAllText($spillFile)).Trim())
+    $root  = [System.IO.Path]::GetFullPath((Join-Path $startDir '.tmp'))
+  } catch { return }
+  $cmp = if ($onWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+  $parent = (Split-Path -Parent $spill).TrimEnd('\', '/')
+  if ((Split-Path -Leaf $spill) -match '^qod-node\.[0-9a-f]{12}$' -and
+      [string]::Equals($parent, $root.TrimEnd('\', '/'), $cmp) -and (Test-RealDirectory $spill)) {
+    Remove-Item -LiteralPath $spill -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 # Remove a node directory and the spill directory it records.
 function Remove-NodeDirectory([string]$dir) {
   # The secret directory is read-only around its marker file (New-SecretDirectory): give the current
   # user full control of it again first, inherited by the marker (on Windows the marker's DACL is
   # empty once Set-Acl re-propagated the directory's), or chmod 700 elsewhere. The owner may always
-  # rewrite the DACL.
+  # rewrite the DACL. Never through a symlink or junction, which would change whatever it points at.
   $secrets = Join-Path $dir 'secrets'
-  if (Test-Path -LiteralPath $secrets -PathType Container) {
+  if (Test-RealDirectory $secrets) {
     if ($onWindows) {
       try {
         $acl = New-Object System.Security.AccessControl.DirectorySecurity
@@ -326,13 +373,7 @@ function Remove-NodeDirectory([string]$dir) {
       & chmod 700 $secrets 2>$null
     }
   }
-  $spillFile = Join-Path $dir 'spill.path'
-  if (Test-Path -LiteralPath $spillFile -PathType Leaf) {
-    $spill = ([System.IO.File]::ReadAllText($spillFile)).Trim()
-    if (-not [string]::IsNullOrEmpty($spill)) {
-      Remove-Item -LiteralPath $spill -Recurse -Force -ErrorAction SilentlyContinue
-    }
-  }
+  Remove-SpillDirectory $dir
   Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath $dir) {
     [Console]::Error.WriteLine("WARN: could not remove the node directory $dir; remove it by hand")
@@ -346,25 +387,41 @@ function Remove-NodeDirectory([string]$dir) {
 # alive only when a process of that PID exists AND started at the recorded time: Windows recycles
 # PIDs, so the start time keeps the sweep from sparing (or killing) an unrelated process's dir. A
 # dir with no owner.pid yet (still being created) or an unparseable one is left alone.
+# Windows gives each user a private temp root; elsewhere (pwsh on Unix) it is often the shared,
+# sticky /tmp, where any local user can create a `quack-node.*` entry, so only a real directory (no
+# symlink or junction) qualifies, and off Windows only one owned by this user. A stray entry never
+# aborts this spawn: anything unexpected skips it.
 $tempRoot = [System.IO.Path]::GetTempPath()
+$myUid = ''
+if (-not $onWindows) { try { $myUid = (& id -u).Trim() } catch {} }
 Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'quack-node.*' -ErrorAction SilentlyContinue |
   ForEach-Object {
-    $ownerFile = Join-Path $_.FullName 'owner.pid'
-    if (Test-Path -LiteralPath $ownerFile -PathType Leaf) {
-      $parts = (([System.IO.File]::ReadAllText($ownerFile)).Trim() -split '\s+')
-      $owner = 0
-      if ($parts.Count -ge 1 -and [int]::TryParse($parts[0], [ref]$owner)) {
-        $proc  = Get-Process -Id $owner -ErrorAction SilentlyContinue
-        $alive = $false
-        if ($null -ne $proc) {
-          if ($parts.Count -ge 2) {
-            try { $alive = ($proc.StartTime.Ticks.ToString() -eq $parts[1]) } catch { $alive = $true }
-          } else {
-            $alive = $true
-          }
-        }
-        if (-not $alive) { Remove-NodeDirectory $_.FullName }
+    try {
+      $dir = $_.FullName
+      $mine = Test-RealDirectory $dir
+      if ($mine -and -not $onWindows) {
+        # `ls -ldn` prints the numeric owner uid as its third field.
+        $mine = ($myUid -ne '' -and ((& ls -ldn -- $dir) -split '\s+')[2] -eq $myUid)
       }
+      $ownerFile = Join-Path $dir 'owner.pid'
+      if ($mine -and (Test-Path -LiteralPath $ownerFile -PathType Leaf)) {
+        $parts = (([System.IO.File]::ReadAllText($ownerFile)).Trim() -split '\s+')
+        $owner = 0
+        if ($parts.Count -ge 1 -and [int]::TryParse($parts[0], [ref]$owner)) {
+          $proc  = Get-Process -Id $owner -ErrorAction SilentlyContinue
+          $alive = $false
+          if ($null -ne $proc) {
+            if ($parts.Count -ge 2) {
+              try { $alive = ($proc.StartTime.Ticks.ToString() -eq $parts[1]) } catch { $alive = $true }
+            } else {
+              $alive = $true
+            }
+          }
+          if (-not $alive) { Remove-NodeDirectory $dir }
+        }
+      }
+    } catch {
+      [Console]::Error.WriteLine("WARN: skipping stale node directory ${dir}: $($_.Exception.Message)")
     }
   }
 $nodeId  = [Guid]::NewGuid().ToString('N').Substring(0, 12)
@@ -415,10 +472,6 @@ if (-not [string]::IsNullOrEmpty($proxyUrl)) {
   $proxySql = "SET http_proxy = '$hostPort';"
 }
 
-$dbInitSql    = [Environment]::GetEnvironmentVariable('dbInitSql')
-$extraSetupSql = Secret-Or 'extraSetupSql' ''
-$lockdownSql  = [Environment]::GetEnvironmentVariable('lockdownSql')
-$objectStoreSql = Secret-Or 'objectStoreSql' ''
 $encrypted    = [Environment]::GetEnvironmentVariable('encrypted')
 $encryptionKey = Secret-Or 'encryptionKey' ''
 
@@ -437,6 +490,8 @@ $sb = [System.Text.StringBuilder]::new()
 # A node has always carried on past a failing statement (an unreachable federated source, an offline
 # INSTALL), so keep doing that from here on.
 [void]$sb.AppendLine('.bail off')
+# Everything after this head is checked for dot-command lines once the payload is complete.
+$headLen = $sb.Length
 if (-not [string]::IsNullOrEmpty($proxySql))  { [void]$sb.AppendLine($proxySql) }
 # Before dbInitSql, so an operator's own SET temp_directory still wins.
 [void]$sb.AppendLine("SET temp_directory = '$($spillDir.Replace("'", "''"))';")
@@ -520,6 +575,13 @@ if (-not [string]::IsNullOrEmpty($lockdownSql)) { [void]$sb.AppendLine($lockdown
 [void]$sb.AppendLine("SELECT listen_url FROM quack_serve('quack:0.0.0.0:$Port', token := '$Token', allow_other_hostname := true, disable_ssl := true);")
 
 $payloadSql = $sb.ToString()
+# Backstop for the per-value check at the top: no value this script interpolates (the storage
+# credentials, the proxy, the paths) may smuggle in a dot-command line either.
+if (Test-DotCommandLine $payloadSql.Substring($headLen)) {
+  [Console]::Error.WriteLine("ERROR: the assembled init SQL holds a line starting with '.' outside the script's own dot-commands; refusing to start the node")
+  Remove-NodeDirectory $nodeDir
+  exit 1
+}
 
 # The init SQL goes through `-init <file>` (the CLI records stdin in shell_history(), not -init).
 # Windows has no FIFO that -init accepts, so to keep the credentials off disk the init is SPLIT:

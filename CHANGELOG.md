@@ -2,13 +2,22 @@
 
 ## Unreleased
 
-- **DuckDB 2.0.** Engine, nodes, JDBC and libquackwire move to DuckDB 2.0 and Quack protocol v3.
+- **DuckDB 2.0.** Engine, nodes and JDBC move to DuckDB 2.0 and Quack protocol v3. libquackwire
+  follows on osx-aarch64 only for now (rebuilt against the locally built 2.0 pre-release engine);
+  the linux-x86_64, linux-aarch64, osx-x86_64 and windows-x86_64 natives remain DuckDB 1.5.6 /
+  Quack v1 builds until the v2.0.0 release zips exist, and the manager refuses to boot on them (see
+  the build marker below).
   BREAKING: the manager and every node upgrade together (restart every node). The native front
   door requires DuckDB 2.0 clients; a 1.x client gets "requires a DuckDB 2.0 client". It also
   admits a 2.0 client's `BEGIN TRANSACTION` and its INSERT data path (`scan_data_from_quack_client`,
   scoped to the client's own connection). DuckLake catalogs older than the latest version are
-  migrated by the manager's DuckLake initializer, once per boot under its advisory lock; nodes,
-  loaders and the demo seed attach as-is. The migration is one-way: back up catalog databases
+  migrated once by the manager's DuckLake initializer, under its advisory lock. A catalog already at
+  the latest development version is migrated again only when the DuckLake build changes (recorded
+  in a `qod_meta.ducklake_migration` table in the catalog's database), and a current catalog
+  attaches with no DDL, so a boot no longer re-runs the migration DDL (ACCESS EXCLUSIVE in Postgres)
+  on every catalog. The initializer waits at most 5 s for a catalog table lock: when a long-running
+  read holds one, it logs a WARN naming the database and retries on the next reconcile pass instead
+  of stalling boot. Nodes, loaders and the demo seed attach as-is. The migration is one-way: back up catalog databases
   before upgrading, there is no downgrade. Until DuckDB v2.0.0 is released the toolchain is built
   from source with `scripts/dev/build-duckdb-prerelease.sh`.
   A DuckDB 2.0 client on the native front door gives up on a statement after its `http_timeout`
@@ -22,6 +31,79 @@
   oids, were routed to different nodes. A session's catalog reads now stay on one node. A FlightSQL
   Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
   unhealthy, draining, quarantined or at its `maxConcurrent` cap.
+
+- **Security: boot SQL can no longer run OS commands on the node host.** Database and pool
+  `initSql`, and a `sql` federated source's `setupSql`, may no longer contain a line whose first
+  non-blank character is `.`: the DuckDB CLI runs such a line from its `-init` channel as a
+  dot-command, and `.shell` / `.system` ran an OS command as the node's OS user (the manager's user
+  on the local backend, the join process's on a fleet server), so a tenant admin could reach the
+  host and the control-plane secrets. Every write path (REST, CLI, MCP, manifest import) answers
+  400. The manager also refuses to start a node whose resolved boot SQL holds one (this covers
+  `{{secret.NAME}}` values spliced in at spawn and rows stored before this release, which now fail
+  their spawn until fixed), and both spawn scripts refuse it too, so Kubernetes pods and fleet
+  servers are covered.
+
+- **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
+  CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
+  checkpoint(...)`, behind `EXPLAIN` / `PREPARE`) and the destructive DuckLake maintenance and
+  retention calls (`ducklake_merge_adjacent_files`, `ducklake_rewrite_data_files`,
+  `ducklake_flush_inlined_data`, `ducklake_expire_snapshots`, `ducklake_cleanup_old_files`,
+  `ducklake_delete_orphaned_files`, `ducklake_set_option`, and the bare or catalog-qualified
+  `merge_adjacent_files()` / `set_option(...)` macros) are refused to tenant principals in every ACL
+  mode, and to every caller under lockdown, like `FORCE CHECKPOINT`. Before, a tenant user could run
+  DuckLake's whole maintenance chain (the default `qod_all_tables` role covered it, and with the ACL
+  off nothing checked it) and delete parent files a live branch or time travel still reads. QoD's
+  own maintenance and branch merges do not go through the edge and are unaffected. DuckLake's other
+  per-schema macros (`snapshots`, `table_info`, `table_changes`, `table_insertions`,
+  `table_deletions`, `current_snapshot`, `last_committed_snapshot`, `options`, `settings`,
+  `set_commit_message`) are now gated like the `ducklake_*` family whenever the ACL validates.
+  CHECKPOINT classifies as DDL (it joins the default `QOD_CLASSIFIER_DDL` list), so a superuser's
+  reaches a writer and is stamped and audited.
+
+- **Security: `histogram()` / `histogram_values()` with a computed source no longer reach the
+  DuckLake metadata catalog.** These table macros run `query_table(source)`, so a source built at
+  run time (`'__duck' || 'lake_metadata_<alias>.ducklake_data_file'`) passed the metadata-catalog
+  screen in the default ACL-off posture and returned the per-file encryption keys. A non-constant
+  source in a table position is now refused to non-superusers, and a constant one is screened for
+  the metadata prefix; the `histogram(col)` aggregate is unaffected.
+
+- **Security: a backtick-quoted table or column no longer defeats column masks and row filters.**
+  On DuckDB 2.0 a backtick quotes an identifier, and the access checks read it as one, but the
+  policy rewriters only unquoted double quotes: `` FROM `orders` `` skipped the row filter and
+  `` upper(`email`) `` read a masked column raw (and a CTAS laundered it into another table). One
+  shared unquote now serves every policy site, and the edge renders backtick identifiers as double
+  quoted before the checks. A double-quoted masked column inside an expression (`upper("email")`) is
+  now masked instead of refused.
+
+- **Security: the spawn script's stale-directory sweep no longer trusts shared `/tmp`.** It now
+  considers only real directories owned by the current user, never follows a symlink (nor chmods
+  through a symlinked `secrets`), deletes a recorded spill directory only when it is a `qod-node.*`
+  directory directly under the host's spill root, treats another user's live process as alive, and
+  can no longer abort a spawn. Before, any local user sharing `/tmp` with a bare-host manager or
+  fleet server could make the next node spawn `rm -rf` an arbitrary path and block every later
+  spawn. The PowerShell twin gets the same hardening.
+
+- **Fixed: `qod serve --demo`, and `qod start` / `qod serve` with macOS `/usr/bin/java` or on
+  Windows, refused to boot ("native Quack client cannot run on this host").** The launcher never
+  told the manager where its libduckdb was: the demo did not provision libduckdb at all, SIP strips
+  `DYLD_LIBRARY_PATH` from `/usr/bin/java`, and on Windows the lib directory never reached `PATH`.
+  Every launcher path now provisions libduckdb and exports `DUCKDB_CACHE_DIR`, so the manager
+  preloads it by absolute path; on Windows the lib directory is also put on `PATH`. When libduckdb
+  was found but the native still fails, the boot error says provisioning worked, and its hint names
+  the qod CLI cache and `DUCKDB_CACHE_DIR`.
+
+- **Fixed: an upgraded qod CLI kept running the DuckDB it cached for an earlier release.** The
+  manager refused to boot, nodes spoke Quack v1, and `qod fleet join` reported the pin rather than
+  the engine it ran. The CLI cache is now versioned, `<user cache>/qod/duckdb/<version>/{bin,lib}`
+  (the same layout as `DUCKDB_CACHE_DIR`), and `DUCKDB_VERSION` is honoured. Existing qod caches
+  are re-downloaded into the versioned layout on first run; the old unversioned `duckdb/bin` and
+  `duckdb/lib` directories are no longer read and can be deleted. `qod fleet join` reports the
+  version the duckdb binary itself prints.
+
+- **Fixed: `scripts/stop-jar.sh` exited 1 silently, before stopping anything,** when no unmarked
+  `spawn-quack-node.sh` wrapper was running (always the case with this release's own wrappers), so
+  a manual stop left the manager and its nodes running and `run-jar.sh NUKE=1` wiped state under a
+  live manager.
 
 - **Typed Postgres and MySQL federated sources.** New source types `postgres` and `mysql` attach an
   external database from typed fields (host, port, database, user, password, plus `sslMode`, and
@@ -78,7 +160,8 @@
   `-init` (a FIFO on Linux and macOS; on Windows a current-user-only secrets file that DuckDB itself
   deletes the instant it has read it, named from a no-secrets outer init file), which the CLI does
   not record. The node's stdin is the null device, so no statement or dot-command can be injected on
-  the node's own connection. The node is kept alive by a `.shell` dot-command that waits for the
+  the node's own connection. The `-init` channel itself still interprets dot-commands, which is why
+  boot SQL is screened for them (see the init SQL entry below). The node is kept alive by a `.shell` dot-command that waits for the
   wrapper process to exit, not by a query: a query pinned a DuckDB transaction (blocking CHECKPOINT
   on a duckdb-file node and holding a catalog Postgres session idle-in-transaction on a DuckLake
   node) and on 2.0 could spin a CPU core for the node's life. The wait also means a node no longer
@@ -126,6 +209,17 @@
   found), refuses to boot with a message naming the platform, the expected
   `libquackwire/binaries/<platform>/` binary and `DUCKDB_CACHE_DIR`, instead of falling back. The
   demo no longer pins the fallback either.
+  Every native now carries a build marker (Quack protocol, DuckDB version and source id,
+  duckdb-quack commit). The manager refuses to boot with a "stale libquackwire native" message when
+  the marker disagrees with `/native/VERSION` or with the loaded libduckdb, or when the native
+  predates markers, instead of booting on a stamp that vouches for a stale binary (on Linux such a
+  native used to boot and then kill the JVM with "symbol lookup error" at the first node contact).
+  Linux natives link with `-z now`, so a missing symbol fails at load. `verify_quackwire_binaries`
+  and `refresh-quackwire-binaries.sh` check every binary's marker, and the refresh takes the
+  `quackwire.yml` run of the commit being released (or `QUACKWIRE_CI_RUN=<id>`) instead of the
+  latest green run on main. A new `release pins` check, also run before every snapshot and release
+  publish (node and worker images included), refuses a pre-release DuckDB JDBC or a `mavenLocal`
+  resolver on main.
 
 - **Security: DuckDB 2.0 hardening.**
   - Data-modifying CTEs classify as writes and fail closed in the ACL.
@@ -203,9 +297,20 @@
     `truncate_duckdb_logs`, `enable_profiling` / `disable_profiling`, `force_checkpoint`. One
     session changing them starved or slowed every session of the pool. Operators set them at node
     start (database / pool `initSql`, `qod pool set-resources`). Session settings a client sends
-    (`search_path`, `schema`, `TimeZone`, `Calendar`, `http_timeout`, `default_order`,
-    `preserve_insertion_order`, `enable_progress_bar`, `errors_as_json`, `SET VARIABLE`, ...) are
-    unchanged. The list is shared with lockdown's protected settings (one source).
+    (`search_path`, `schema`, `TimeZone`, `Calendar`, `http_timeout`, `enable_progress_bar`,
+    `errors_as_json`, `max_execution_time`, `s3_*`, `SET VARIABLE`, ...) are unchanged.
+    BREAKING: on DuckDB 2.0 a `SET` / `RESET` / `PRAGMA x = v` without a scope writes a
+    GLOBAL-default setting node-wide, exactly like `SET GLOBAL`, so for non-superusers (and every
+    caller under lockdown) a bare `SET` of such a setting (`default_order`, `null_order`,
+    `default_collation`, `preserve_insertion_order`, `enable_optimizer`,
+    `immediate_transaction_mode`, `extra_http_headers`, `ducklake_*`, `pg_staleness_query*`,
+    `iceberg_use_metadata_log`, ...) is refused: use `SET SESSION <name>` / `RESET SESSION <name>`.
+    Aliases are judged as the setting they name (`force_mbedtls_unsafe` is
+    `debug_force_mbedtls_unsafe`), and a setting name the gateway does not know is refused (fail
+    closed). The scopes come from the engine source (`scripts/dev/gen-duckdb-setting-scopes.py`,
+    regenerated at every pin bump). The `mysql_pool_*` and `mysql_debug_show_queries` settings and
+    `mysql_clear_cache()` join the node-wide set. The list is shared with lockdown's protected
+    settings (one source).
   - No secret reaches a node process's environment or command line, on any backend: a node user
     with SQL could read `getenv()` or `/proc/<pid>/environ` of duckdb and of its wrapper script.
     The catalog password, the encryption key, the federation and object-store SQL, the node token
@@ -440,7 +545,10 @@
   macro named after it the text between two backticks runs: statement separators and function
   calls there were hidden from the access checks. The screen is keyed on the DuckDB version the
   build pins and is inert on DuckDB 2.0, where a backtick quotes an identifier and the edge's lexer
-  reads it as one.
+  reads it as one. On 2.0 the edge renders a backtick-quoted identifier as the equivalent
+  double-quoted one before the access checks and the column and row policy rewriters see the
+  statement, so a backtick-quoted table or column is masked and filtered like its double-quoted
+  twin.
 
 - **Security: `SET VARIABLE` can no longer read a table without a grant.** Its value is a query,
   so `SET VARIABLE x = (SELECT ... FROM any_table); SELECT getvariable('x')` returned rows from any

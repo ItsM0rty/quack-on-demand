@@ -122,14 +122,19 @@ class DuckLakeEncryptionGuardSpec extends AnyFlatSpec with Matchers:
         DuckLakeInitializer.MetadataRead.Value("true")
     }
 
-  // ---------- readEncryptionState: both answers from ONE snapshot ----------
+  // ---------- readCatalogState: every answer from ONE snapshot ----------
 
-  "readEncryptionState" should "report not-established before the creating ATTACH recorded data_path" in
+  /** The (encrypted, established) projection the encryption guard reads. */
+  private def encryptionState(conn: Connection): (DuckLakeInitializer.MetadataRead, Boolean) =
+    val s = DuckLakeInitializer.readCatalogState(conn)
+    (s.encrypted, s.established)
+
+  "readCatalogState" should "report not-established before the creating ATTACH recorded data_path" in
     withFreshDb { conn =>
-      DuckLakeInitializer.readEncryptionState(conn) shouldBe
+      encryptionState(conn) shouldBe
         (DuckLakeInitializer.MetadataRead.NoTable, false)
       createMetadata(conn)
-      DuckLakeInitializer.readEncryptionState(conn) shouldBe
+      encryptionState(conn) shouldBe
         (DuckLakeInitializer.MetadataRead.NoRow, false)
     }
 
@@ -137,10 +142,10 @@ class DuckLakeEncryptionGuardSpec extends AnyFlatSpec with Matchers:
     withFreshDb { conn =>
       createMetadata(conn)
       established(conn)
-      DuckLakeInitializer.readEncryptionState(conn) shouldBe
+      encryptionState(conn) shouldBe
         (DuckLakeInitializer.MetadataRead.NoRow, true)
       seed(conn, "encrypted", "true")
-      DuckLakeInitializer.readEncryptionState(conn) shouldBe
+      encryptionState(conn) shouldBe
         (DuckLakeInitializer.MetadataRead.Value("true"), true)
     }
 

@@ -5,8 +5,11 @@ package ai.starlake.quack.edge.sql
   *
   *   - Run-time-target table functions: `query('<sql>')`, `query_table('<name>')`,
   *     `json_execute_serialized_sql(...)` and the DuckLake `ducklake_*` family
-  *     (`ducklake_table_insertions('<catalog>', '<schema>', '<table>', ...)`, ...). The ACL parser
-  *     sees only the table function call, never the table it reaches.
+  *     (`ducklake_table_insertions('<catalog>', '<schema>', '<table>', ...)`, ...), with the
+  *     per-schema macros DuckLake resolves in every schema of its catalogs
+  *     ([[DuckLakeSchemaMacros]]: `merge_adjacent_files()`, `lake.set_option(...)`, `snapshots()`,
+  *     ...), each a call of a `ducklake_*` function on the catalog it is resolved in. The ACL
+  *     parser sees only the table function call, never the table it reaches.
   *   - Node-escaping calls that run raw SQL on another server, open a connection to a caller-chosen
   *     target, or read the node's process environment: `postgres_query` / `postgres_execute` (raw
   *     SQL on an attached Postgres with the node's role), `postgres_scan` /
@@ -59,6 +62,34 @@ object CatalogReachingCalls:
     "remove_iceberg_table_properties",
     "set_iceberg_schema_properties",
     "remove_iceberg_schema_properties"
+  )
+
+  /** DuckLake's per-schema table macros (`ducklake_default_functions.cpp` of the DuckLake built for
+    * the 2.0 pin): `DuckLakeSchemaEntry::LookupEntry` resolves each of these names in every schema
+    * of a DuckLake catalog, so `merge_adjacent_files()` under `USE lake`,
+    * `lake.set_option('delete_older_than', '1 second')` and `lake.main.snapshots()` all run the
+    * `ducklake_*` function of the same name on that catalog (checked on the 2.0 CLI). The bare
+    * names escaped the `ducklake_` prefix: a `*.*.* ALL` grant admitted the maintenance and the
+    * option writes the explicit calls are refused for. (`merge_adjacent_files` and `set_option`,
+    * with the explicit maintenance calls, are also reserved to superusers in every ACL mode by
+    * [[CheckpointScreen.MaintenanceCalls]].)
+    *
+    * `PRAGMA table_info('t')` is DuckDB's own pragma (it resolves the core pragma, not the macro,
+    * on 2.0) and stays admitted: [[isReaching]] skips a `table_info` call right after `PRAGMA`.
+    */
+  val DuckLakeSchemaMacros: Set[String] = Set(
+    "merge_adjacent_files",
+    "set_option",
+    "set_commit_message",
+    "options",
+    "settings",
+    "current_snapshot",
+    "last_committed_snapshot",
+    "snapshots",
+    "table_info",
+    "table_changes",
+    "table_deletions",
+    "table_insertions"
   )
 
   /** Calls that run raw SQL elsewhere, open an arbitrary connection, read node env vars, or invoke
@@ -141,12 +172,26 @@ object CatalogReachingCalls:
   def find(sql: String): Option[String] =
     val scan = FunctionCalls.scan(sql)
     scan.calls.iterator
-      .map(_.name)
       .find(isReaching)
+      .map(_.name)
       .orElse(if scan.truncated then Some(NestingTooDeep) else None)
 
-  private def isReaching(name: String): Boolean =
-    Fixed.contains(name) || NodeEscaping.contains(name) || name.startsWith("ducklake_")
+  private def isReaching(call: FunctionCalls.Call): Boolean =
+    val name = call.name
+    Fixed.contains(name) || NodeEscaping.contains(name) || name.startsWith("ducklake_") ||
+    (DuckLakeSchemaMacros.contains(name) && !(name == "table_info" && afterPragma(call)))
+
+  /** True when the significant token before `call`'s name is the word PRAGMA. */
+  private def afterPragma(call: FunctionCalls.Call): Boolean =
+    val toks = ai.starlake.sql.SqlLexer
+      .tokens(call.text)
+      .filter(t => !t.isTrivia && t.end <= call.argsFrom)
+    // ..., <before>, <name>, `(`
+    toks.length >= 3 && {
+      val before = toks(toks.length - 3)
+      before.kind == ai.starlake.sql.SqlLexer.Kind.Word &&
+      call.text.substring(before.start, before.end).equalsIgnoreCase("pragma")
+    }
 
   def denyReason(fn: String): String =
     if fn == NestingTooDeep then
@@ -155,6 +200,9 @@ object CatalogReachingCalls:
     else if NodeEscaping.contains(fn) then
       s"$fn reaches data or connections the gateway cannot authorize; " +
         "not available to tenant-scoped principals (deny, fail-closed)"
+    else if DuckLakeSchemaMacros.contains(fn) then
+      s"$fn is DuckLake's ducklake_$fn on the catalog it resolves in, whose access cannot be " +
+        "authorized table by table; not available to tenant-scoped principals (deny, fail-closed)"
     else
       s"table function $fn resolves its target at run time, so its access cannot be authorized; " +
         "not available to tenant-scoped principals (deny, fail-closed)"

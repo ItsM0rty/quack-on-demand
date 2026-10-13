@@ -4,17 +4,32 @@ name: quackwire native build
 # the manager runs on and uploads each as a build artifact. Binaries are
 # vendored in git under libquackwire/binaries/ (see build.sbt's
 # resourceGenerator); scripts/release/refresh-quackwire-binaries.sh builds the host
-# platform locally and downloads the rest from the latest green run of this
-# workflow on main, then a developer reviews and commits the diff. No
-# Central publish, no GPG, no Sonatype.
+# platform locally and downloads the rest from a green run of this workflow
+# for the same commit, checks every binary's build marker against the pin,
+# then a developer reviews and commits the diff. No Central publish, no GPG,
+# no Sonatype.
 #
-# Co-pinned versions (single source of truth: design doc §9.9):
-#   - duckdb-quack : 7e80f7ffcc98d0b3e81d0e1df8cc1c2da240a64b
-#                    (branch v1.5-variegata, short 7e80f7ffcc98)
-#   - libduckdb    : v1.5.6 official release zips on every platform:
+# Co-pinned versions, read from the tree by the `pin` job (nothing is
+# hard-coded here):
+#   - duckdb-quack : the native/quackwire/thirdparty/duckdb-quack submodule
+#                    commit (its short sha is the middle segment of
+#                    build.sbt's libquackwireVersion)
+#   - libduckdb    : the official release zips of project/Versions.scala's
+#                    `val duckdb` (X.Y.Z.W -> tag vX.Y.Z) on every platform:
 #                    libduckdb-{linux-amd64,linux-arm64,osx-universal,
-#                    windows-amd64}.zip. Homebrew is NOT used (its bottle
-#                    lags releases; it was still 1.5.4 on 2026-07-22).
+#                    windows-amd64}.zip, plus the internal headers from the
+#                    duckdb repo at the same tag. Homebrew is NOT used (its
+#                    bottle lags releases).
+#
+# DuckDB 2.0 pre-release (until v2.0.0 ships): there are no v2.0.0 release
+# zips or tag yet, so every build leg fails at "Install libduckdb" with a 404.
+# That is deliberate: this workflow must not produce natives against any other
+# DuckDB than the pin. Until then only osx-aarch64 is rebuilt, on a developer
+# host against the locally built engine (.duckdb/2.0.0), and the other four
+# vendored binaries are stale 1.5.6 builds the manager refuses at boot. The
+# 2.0 legs of this file (zip names, header staging, the Windows shim in
+# native/quackwire/src/win_duckdb_compat.cpp) are UNVERIFIED until the
+# release zips exist.
 #
 # Runner labels (verified 2026-06-01):
 #   - ubuntu-22.04        : standard linux/x86_64, free on public repos
@@ -32,12 +47,16 @@ on:
       - 'native/quackwire/**'
       - 'libquackwire/**'
       - 'build.sbt'
+      - 'project/Versions.scala'
+      - 'scripts/release/quackwire-build-info.sh'
       - '.github/workflows/quackwire.yml'
   pull_request:
     paths:
       - 'native/quackwire/**'
       - 'libquackwire/**'
       - 'build.sbt'
+      - 'project/Versions.scala'
+      - 'scripts/release/quackwire-build-info.sh'
       - '.github/workflows/quackwire.yml'
   workflow_dispatch:
 
@@ -48,12 +67,42 @@ concurrency:
 jobs:
 
   # -----------------------------------------------------------------------
+  # 0. The pins, read from the tree so the legs cannot drift from them
+  # -----------------------------------------------------------------------
+  pin:
+    name: read the DuckDB pin
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      duckdb: ${{ steps.pin.outputs.duckdb }}
+      libquackwire: ${{ steps.pin.outputs.libquackwire }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: pin
+        run: |
+          set -euo pipefail
+          # `val duckdb = "X.Y.Z.W"` (not duckdbJdbc) -> X.Y.Z, the release tag's version.
+          duckdb="$(sed -nE 's/^[[:space:]]*val duckdb[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+".*/\1/p' project/Versions.scala)"
+          libquackwire="$(grep -E '^val libquackwireVersion' build.sbt | sed -E 's/.*"([^"]+)".*/\1/')"
+          [[ -n "$duckdb" && -n "$libquackwire" ]] \
+            || { echo "::error::cannot read val duckdb (project/Versions.scala) or libquackwireVersion (build.sbt)"; exit 1; }
+          [[ "$libquackwire" == "$duckdb-"* ]] \
+            || { echo "::error::libquackwireVersion $libquackwire does not start with the DuckDB pin $duckdb"; exit 1; }
+          echo "DuckDB pin: v$duckdb, libquackwire: $libquackwire"
+          echo "duckdb=$duckdb" >> "$GITHUB_OUTPUT"
+          echo "libquackwire=$libquackwire" >> "$GITHUB_OUTPUT"
+
+  # -----------------------------------------------------------------------
   # 1. Per-platform native build
   # -----------------------------------------------------------------------
   build:
     name: build ${{ matrix.platform }}
+    needs: pin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      DUCKDB_VERSION: ${{ needs.pin.outputs.duckdb }}
+      LIBQUACKWIRE_VERSION: ${{ needs.pin.outputs.libquackwire }}
     strategy:
       fail-fast: false
       matrix:
@@ -90,14 +139,14 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # --- libduckdb v1.5.6 install ---------------------------------------
+      # --- pinned libduckdb install (v$DUCKDB_VERSION) ----------------------
       # macOS: assemble DUCKDB_HOME from the official release zip, same
       # pattern as Windows. We deliberately do NOT use Homebrew: its bottle
       # lags DuckDB releases (it was still 1.5.4 the day 1.5.5 shipped) and the
       # macOS leg must link the exact pinned ABI. CMakeLists probes
       # $ENV{DUCKDB_HOME}{,/include,/lib} FIRST, so this wins over any
       # /opt/homebrew leftovers on the runner.
-      - name: Install libduckdb v1.5.6 (macOS)
+      - name: Install libduckdb v${{ env.DUCKDB_VERSION }} (macOS)
         if: matrix.os == 'macos'
         env:
           DUCKDB_ZIP: ${{ matrix.duckdb_zip }}
@@ -107,14 +156,15 @@ jobs:
           mkdir -p "$home/include" "$home/lib"
           tmp=$(mktemp -d)
           curl -fsSL -o "$tmp/$DUCKDB_ZIP" \
-            "https://github.com/duckdb/duckdb/releases/download/v1.5.6/$DUCKDB_ZIP"
+            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/$DUCKDB_ZIP" \
+            || { echo "::error::no DuckDB v$DUCKDB_VERSION release zip $DUCKDB_ZIP (not released yet?)"; exit 1; }
           unzip -o "$tmp/$DUCKDB_ZIP" -d "$tmp/extracted"
           cp "$tmp/extracted/duckdb.h"   "$home/include/duckdb.h"
           cp "$tmp/extracted/duckdb.hpp" "$home/include/duckdb.hpp"
           cp "$tmp/extracted/libduckdb.dylib" "$home/lib/libduckdb.dylib"
           # Nested INTERNAL headers (duckdb/common/serializer/*.hpp etc.),
           # same reason as the Linux step below.
-          git clone --depth 1 --branch v1.5.6 https://github.com/duckdb/duckdb "$tmp/duckdb-src"
+          git clone --depth 1 --branch "v$DUCKDB_VERSION" https://github.com/duckdb/duckdb "$tmp/duckdb-src"
           cp -r "$tmp/duckdb-src/src/include/duckdb" "$home/include/"
           echo "DUCKDB_HOME=$home" >> "$GITHUB_ENV"
           ls -l "$home/lib/libduckdb.dylib" "$home/include/duckdb.hpp"
@@ -123,11 +173,12 @@ jobs:
       # Linux: download the official libduckdb release zip and stage into
       # /usr/local. The CMake `find_path / find_library` hints in
       # native/quackwire/CMakeLists.txt cover /usr/local/{include,lib}.
-      # Verified asset names on the v1.5.6 release page:
+      # Asset names, verified on the v1.5.6 release page (re-check on the
+      # pinned release: gh api repos/duckdb/duckdb/releases/tags/v<pin>
+      # .assets[].name):
       #   libduckdb-linux-amd64.zip   (x86_64)
       #   libduckdb-linux-arm64.zip   (aarch64)
-      # (gh api repos/duckdb/duckdb/releases/tags/v1.5.6 .assets[].name)
-      - name: Install libduckdb v1.5.6 (Linux)
+      - name: Install libduckdb v${{ env.DUCKDB_VERSION }} (Linux)
         if: matrix.os == 'linux'
         env:
           DUCKDB_ZIP: ${{ matrix.duckdb_zip }}
@@ -138,7 +189,8 @@ jobs:
           tmp=$(mktemp -d)
           # 1. Binary + amalgamated public headers from the official release.
           curl -fsSL -o "$tmp/$DUCKDB_ZIP" \
-            "https://github.com/duckdb/duckdb/releases/download/v1.5.6/$DUCKDB_ZIP"
+            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/$DUCKDB_ZIP" \
+            || { echo "::error::no DuckDB v$DUCKDB_VERSION release zip $DUCKDB_ZIP (not released yet?)"; exit 1; }
           unzip -o "$tmp/$DUCKDB_ZIP" -d "$tmp/extracted"
           sudo install -m 0644 "$tmp/extracted/duckdb.h"   /usr/local/include/duckdb.h
           sudo install -m 0644 "$tmp/extracted/duckdb.hpp" /usr/local/include/duckdb.hpp
@@ -148,7 +200,7 @@ jobs:
           # duckdb-quack message layer pulls `duckdb/common/serializer/
           # binary_serializer.hpp` directly; we grab them from a shallow
           # clone at the same tag.
-          git clone --depth 1 --branch v1.5.6 https://github.com/duckdb/duckdb "$tmp/duckdb-src"
+          git clone --depth 1 --branch "v$DUCKDB_VERSION" https://github.com/duckdb/duckdb "$tmp/duckdb-src"
           sudo cp -r "$tmp/duckdb-src/src/include/duckdb" /usr/local/include/
           sudo ldconfig
           ls -l /usr/local/lib/libduckdb.so /usr/local/include/duckdb.hpp
@@ -174,6 +226,18 @@ jobs:
               nm    "${{ matrix.libname }}" 2>/dev/null | grep -i smokeAnswer || \
               echo "warn: smokeAnswer symbol not found via nm"
           fi
+          # The build marker must name the pin (protocol, DuckDB release,
+          # duckdb-quack commit); the refresh script and the release gate
+          # check the same thing on the vendored files.
+          source "$GITHUB_WORKSPACE/scripts/release/quackwire-build-info.sh"
+          quackwire_build_marker "${{ matrix.libname }}"
+          quackwire_check_build_marker "${{ matrix.libname }}" "$LIBQUACKWIRE_VERSION"
+          # Linux: -z now, so a missing libduckdb symbol fails System.load
+          # (a boot refusal) instead of killing the JVM at the first call.
+          if [[ "${{ matrix.os }}" == linux ]]; then
+            readelf -d "${{ matrix.libname }}" | grep -E 'BIND_NOW|FLAGS.*NOW' \
+              || { echo "::error::${{ matrix.libname }} is not linked with -z now"; exit 1; }
+          fi
 
       - name: Upload native artifact
         uses: actions/upload-artifact@v7
@@ -194,8 +258,12 @@ jobs:
   # picks it up when it downloads from the latest green run on main.
   build-windows:
     name: build windows-x86_64
+    needs: pin
     runs-on: windows-2022
     timeout-minutes: 40
+    env:
+      DUCKDB_VERSION: ${{ needs.pin.outputs.duckdb }}
+      LIBQUACKWIRE_VERSION: ${{ needs.pin.outputs.libquackwire }}
     steps:
       - name: Checkout (with duckdb-quack submodule)
         uses: actions/checkout@v7
@@ -212,9 +280,9 @@ jobs:
       # FULL duckdb/ include tree. The release zip ships only the amalgamated
       # duckdb.{h,hpp}; the duckdb-quack message layer also pulls internal
       # headers (duckdb/common/serializer/binary_serializer.hpp), grabbed from a
-      # shallow clone at the same v1.5.6 tag. Runs in git-bash for parity with
+      # shallow clone at the same pinned tag. Runs in git-bash for parity with
       # the Linux step.
-      - name: Install libduckdb v1.5.6 (Windows)
+      - name: Install libduckdb v${{ env.DUCKDB_VERSION }} (Windows)
         shell: bash
         run: |
           set -euo pipefail
@@ -222,17 +290,21 @@ jobs:
           mkdir -p "$home/include" "$home/lib"
           tmp="$(mktemp -d)"
           curl -fsSL -o "$tmp/libduckdb.zip" \
-            "https://github.com/duckdb/duckdb/releases/download/v1.5.6/libduckdb-windows-amd64.zip"
+            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/libduckdb-windows-amd64.zip" \
+            || { echo "::error::no DuckDB v$DUCKDB_VERSION release zip libduckdb-windows-amd64.zip (not released yet?)"; exit 1; }
           unzip -o "$tmp/libduckdb.zip" -d "$tmp/dl"
           cp "$tmp/dl/duckdb.h"   "$home/include/duckdb.h"
           cp "$tmp/dl/duckdb.hpp" "$home/include/duckdb.hpp"
           cp "$tmp/dl/duckdb.lib" "$home/lib/duckdb.lib"
           cp "$tmp/dl/duckdb.dll" "$home/lib/duckdb.dll"
-          git clone --depth 1 --branch v1.5.6 https://github.com/duckdb/duckdb "$tmp/duckdb-src"
+          git clone --depth 1 --branch "v$DUCKDB_VERSION" https://github.com/duckdb/duckdb "$tmp/duckdb-src"
           cp -r "$tmp/duckdb-src/src/include/duckdb" "$home/include/"
           ls "$home/lib/duckdb.lib" "$home/include/duckdb.hpp"
           ls "$home/include/duckdb/common/serializer/binary_serializer.hpp"
           echo "DUCKDB_HOME=$home" >> "$GITHUB_ENV"
+          # CMakeLists.txt runs a configure-time probe linked to duckdb.dll to
+          # read the version and source id the build marker records.
+          cygpath -w "$home/lib" >> "$GITHUB_PATH"
 
       - name: CMake configure (Visual Studio 2022)
         working-directory: native/quackwire
@@ -254,6 +326,15 @@ jobs:
           } else {
             Write-Host "dumpbin not on PATH; skipping export check"
           }
+
+      - name: Verify build marker
+        working-directory: native/quackwire/build/Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          source ../../../../scripts/release/quackwire-build-info.sh
+          quackwire_build_marker quackwire.dll
+          quackwire_check_build_marker quackwire.dll "$LIBQUACKWIRE_VERSION"
 
       - name: Upload native artifact
         uses: actions/upload-artifact@v7

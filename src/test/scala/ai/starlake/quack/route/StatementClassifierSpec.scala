@@ -45,6 +45,35 @@ class StatementClassifierSpec extends AnyFlatSpec with Matchers:
         "'0f8e2c3a-1b2c-4d5e-8f90-0123456789ab', NULL::STRUCT(col0 BIGINT), ordered := true)"
     ) shouldBe StatementKind.Dml
 
+  it should "classify every CHECKPOINT statement form as DDL, so it reaches a writer" in:
+    // F09: on DuckLake a checkpoint merges and deletes data files; as Other it ran on a ReadOnly
+    // node with no author stamp and no data-write audit.
+    Seq(
+      "CHECKPOINT",
+      "checkpoint lake;",
+      "/* c */ CHECKPOINT",
+      "FORCE CHECKPOINT",
+      "force checkpoint lake",
+      "CALL checkpoint()",
+      "CALL checkpoint('lake')",
+      "CALL \"CHECKPOINT\"('lake')",
+      "CALL `force_checkpoint`('lake')",
+      "CALL system.main.checkpoint('lake')",
+      "EXPLAIN ANALYZE CHECKPOINT"
+    ).foreach(sql => withClue(sql)(StatementClassifier.classify(sql) shouldBe StatementKind.Ddl))
+    StatementClassifier.classify("CALL pragma_version()") shouldBe StatementKind.Other
+    StatementClassifier.classify("FORCE INSTALL httpfs") shouldBe StatementKind.Other
+    StatementClassifier.classify("EXPLAIN CHECKPOINT") shouldBe StatementKind.Select
+    // an operator who takes CHECKPOINT out of the ddl bucket keeps control of all three forms
+    val tuned = new StatementClassifier(
+      StatementClassifierConfig.Defaults.copy(
+        ddl = StatementClassifierConfig.Defaults.ddl - "CHECKPOINT"
+      )
+    )
+    Seq("CHECKPOINT", "FORCE CHECKPOINT", "CALL checkpoint()").foreach { sql =>
+      withClue(sql)(tuned.classify(sql) shouldBe StatementKind.Other)
+    }
+
   it should "classify unknown / DuckDB-specific as Other" in:
     StatementClassifier.classify("PRAGMA threads = 4") shouldBe StatementKind.Other
     StatementClassifier.classify("SET search_path = 'main'") shouldBe StatementKind.Other

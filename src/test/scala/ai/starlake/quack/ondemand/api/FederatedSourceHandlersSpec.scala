@@ -131,7 +131,7 @@ class FederatedSourceHandlersSpec
       h.createSource(
         "acme",
         "acme_prod",
-        FederatedSourceCreateRequest(alias = "src1", setupSql = Some("...")),
+        FederatedSourceCreateRequest(alias = "src1", setupSql = Some("SELECT 1")),
         None
       ).unsafeRunSync()
 
@@ -159,7 +159,7 @@ class FederatedSourceHandlersSpec
       h.createSource(
         "acme",
         "acme_prod",
-        FederatedSourceCreateRequest(alias = "todel", setupSql = Some("...")),
+        FederatedSourceCreateRequest(alias = "todel", setupSql = Some("SELECT 1")),
         None
       ).unsafeRunSync()
       val del = h.deleteSource("acme", "acme_prod", "todel", None).unsafeRunSync()
@@ -288,7 +288,7 @@ class FederatedSourceHandlersSpec
     h.createSource(
       "acme",
       "acme_prod",
-      FederatedSourceCreateRequest(alias = "blanksec", setupSql = Some("...")),
+      FederatedSourceCreateRequest(alias = "blanksec", setupSql = Some("SELECT 1")),
       None
     ).unsafeRunSync()
     val r = h

@@ -207,7 +207,7 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
         val list   = finder.getTableList(parsed)
         scala.jdk.CollectionConverters.ListHasAsScala(list).asScala.toList
       catch case _: Throwable => Nil
-    def unquote(s: String) = s.stripPrefix("\"").stripSuffix("\"")
+    def unquote(s: String) = ai.starlake.sql.QuotedIdentifier.unquote(s)
     // Known = the caller's catalog produced a NON-EMPTY column list for the name (an
     // unknown table lands in the schema map with Nil, which the resolver also refuses
     // to register), or the name is a seeded system-schema table.
@@ -406,11 +406,11 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
   private def collectFromTables(ps: PlainSelect): List[(String, String)] =
     val buf = scala.collection.mutable.ListBuffer.empty[(String, String)]
     def add(t: net.sf.jsqlparser.schema.Table): Unit =
-      val raw = t.getName
-      val key = Option(t.getAlias).map(_.getName).getOrElse(raw)
+      val raw = unquoteName(t.getName)
+      val key = Option(t.getAlias).map(a => unquoteName(a.getName)).getOrElse(raw)
       buf += (key -> raw)
     def addSub(sub: net.sf.jsqlparser.statement.select.ParenthesedSelect): Unit =
-      Option(sub.getAlias).map(_.getName).foreach(name => buf += (name -> name))
+      Option(sub.getAlias).map(a => unquoteName(a.getName)).foreach(name => buf += (name -> name))
     Option(ps.getFromItem).foreach {
       case t: net.sf.jsqlparser.schema.Table                       => add(t)
       case s: net.sf.jsqlparser.statement.select.ParenthesedSelect => addSub(s)
@@ -438,7 +438,7 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
       sub: net.sf.jsqlparser.statement.select.ParenthesedSelect,
       policies: List[RoleColumnPolicy]
   ): List[RoleColumnPolicy] =
-    val subAlias = Option(sub.getAlias).map(_.getName).getOrElse("")
+    val subAlias = Option(sub.getAlias).map(a => unquoteName(a.getName)).getOrElse("")
     if subAlias.isEmpty then Nil
     else
       sub.getSelect match
@@ -453,14 +453,14 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
                 val si = it.next()
                 si.getExpression match
                   case col: net.sf.jsqlparser.schema.Column =>
-                    val baseTable = Option(col.getTable).map(_.getName) match
+                    val baseTable = Option(col.getTable).map(t => unquoteName(t.getName)) match
                       case Some(key) =>
                         innerFromTables.find(_._1.equalsIgnoreCase(key)).map(_._2).getOrElse(key)
                       case None =>
                         if innerFromTables.size == 1 then innerFromTables.head._2 else ""
-                    val baseCol     = col.getColumnName
+                    val baseCol     = unquoteName(col.getColumnName)
                     val exposedName =
-                      Option(si.getAlias).map(_.getName).getOrElse(baseCol)
+                      Option(si.getAlias).map(a => unquoteName(a.getName)).getOrElse(baseCol)
                     matchingPolicy(baseTable, baseCol, policies).foreach { p =>
                       buf += p.copy(tableName = subAlias, columnName = exposedName)
                     }
@@ -482,7 +482,7 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
 
     /** Resolve the physical table for a Column reference. */
     private def resolveTable(col: net.sf.jsqlparser.schema.Column): String =
-      Option(col.getTable).map(_.getName) match
+      Option(col.getTable).map(t => unquoteName(t.getName)) match
         case Some(key) =>
           // Alias or table-name qualifier - local FROM items first, then the outer scope
           // (a correlated subquery referencing the outer query's alias).
@@ -746,15 +746,23 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
 
         case other => other
 
+  /** Names are compared unquoted ([[ai.starlake.sql.QuotedIdentifier]]): the parser keeps the
+    * quotes of `"c_email"` on the column it hands the visitor, and a quoted name that matched no
+    * policy was left in place for the backstop to deny instead of being masked.
+    */
   private def matchingPolicy(
       table: String,
       column: String,
       policies: List[RoleColumnPolicy]
   ): Option[RoleColumnPolicy] =
+    val t = unquoteName(table)
+    val c = unquoteName(column)
     policies.find { p =>
-      (p.tableName == RoleColumnPolicy.Wildcard || p.tableName.equalsIgnoreCase(table)) &&
-      p.columnName.equalsIgnoreCase(column)
+      (p.tableName == RoleColumnPolicy.Wildcard || p.tableName.equalsIgnoreCase(t)) &&
+      p.columnName.equalsIgnoreCase(c)
     }
+
+  private def unquoteName(s: String): String = ai.starlake.sql.QuotedIdentifier.unquote(s)
 
 /** The fail-closed backstop behind [[JsqltranspilerRewriter]]'s masking visitor, which models a
   * fixed set of expression types (columns, functions, CASE, CAST, IN, IS NULL, TRIM, ...) and
@@ -862,7 +870,7 @@ private[cls] object ResidualColumns:
         Some(star)
       case _ => None
 
-  private def unquote(s: String): String = s.stripPrefix("\"").stripSuffix("\"")
+  private def unquote(s: String): String = ai.starlake.sql.QuotedIdentifier.unquote(s)
 
   private def lower(s: String): String = s.toLowerCase(java.util.Locale.ROOT)
 

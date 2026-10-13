@@ -4,6 +4,7 @@ import java.util.Locale
 import ai.starlake.quack.edge.adapter.NodeLoadTracker
 import ai.starlake.quack.model.{
   BranchStatus,
+  InitSqlScreen,
   Names,
   NodePlacement,
   NodeSpec,
@@ -184,6 +185,13 @@ final class PoolSupervisor(
   // restart also clears it and re-attempts on the next boot.
   private val dataPathBlocked = TrieMap.empty[String, String]
 
+  // tenant-db.id -> the CatalogLockTimeoutException message of its last DuckLake init: a table
+  // lock on the catalog was not granted in time (a long read or an open transaction on a node).
+  // Transient, so unlike dataPathBlocked it never skips the tenant-db's pools: reconcileLoop just
+  // re-runs the init before each pass until it succeeds. Cleared by that success and by
+  // deleteTenantDb; in-memory only, like dataPathBlocked (the next boot re-runs every init anyway).
+  private val duckLakeInitPending = TrieMap.empty[String, String]
+
   /** Module-contributed veto hooks (quota policy). Set once by Main after moduleStart; empty in
     * zero-module boots and in every existing test, so default behavior is unchanged.
     */
@@ -341,6 +349,10 @@ final class PoolSupervisor(
   private[ondemand] def isDataPathBlockedForTest(tenantDbId: String): Boolean =
     dataPathBlocked.contains(tenantDbId)
 
+  /** Test-only seam: read back [[duckLakeInitPending]] membership. */
+  private[ondemand] def isDuckLakeInitPendingForTest(tenantDbId: String): Boolean =
+    duckLakeInitPending.contains(tenantDbId)
+
   /** Test-only seam: run the per-kind metastore resolution without spawning anything. */
   private[ondemand] def effectiveMetastoreForTest(td: TenantDb): Map[String, String] =
     effectiveMetastoreFor(td)
@@ -383,6 +395,7 @@ final class PoolSupervisor(
     // A tenant-db a peer deleted directly in the store can no longer spawn anything, so any
     // dataPath block held for it is moot; drop it rather than leaking it forever.
     dataPathBlocked.keys.toList.filterNot(snapTenantDbIds).foreach(dataPathBlocked.remove)
+    duckLakeInitPending.keys.toList.filterNot(snapTenantDbIds).foreach(duckLakeInitPending.remove)
 
     snap.tenants.foreach(t => tenants.put(t.id, t))
     snap.tenantDbs.foreach(td => tenantDbs.put(td.id, td))
@@ -548,24 +561,49 @@ final class PoolSupervisor(
     */
   def ensureDuckLakeInitialized(): IO[Unit] = IO.blocking {
     tenantDbs.values.toList.foreach { td =>
-      if td.kind == TenantDbKind.DuckLake then
-        try
-          DuckLakeInitializer.initBlocking(effectiveMetastoreFor(td), td.encrypted)
-          dataPathBlocked.remove(td.id)
-        catch
-          case t: DuckLakeInitializer.PreInitMismatchException =>
-            // Not transient: every future node spawn hits the same DuckDB DATA_PATH or encryption
-            // error, so log loudly and block this tenant-db's pools from reconcile()'s spawns (see
-            // isDataPathBlocked). The loop continues: one bad tenant-db must not abort boot.
-            dataPathBlocked.put(td.id, t.getMessage)
-            logger.error(s"ensureDuckLakeInitialized: '${td.name}' ${t.getMessage}")
-          case t: Throwable =>
-            logger.warn(
-              s"ensureDuckLakeInitialized: '${td.name}' pre-init raised ${t.getClass.getSimpleName}: " +
-                s"${t.getMessage}. First pool spawn will retry."
-            )
+      if td.kind == TenantDbKind.DuckLake then initDuckLake(td, "ensureDuckLakeInitialized")
     }
   }
+
+  /** Re-run the DuckLake init of every tenant-db whose last one hit a catalog lock timeout (see
+    * [[duckLakeInitPending]]). Run by [[reconcileLoop]] before each pass, so behind the same leader
+    * gate as reconcile; a no-op when nothing is pending.
+    */
+  def retryPendingDuckLakeInit(): IO[Unit] = IO.blocking {
+    duckLakeInitPending.keys.toList.foreach { id =>
+      tenantDbs.get(id) match
+        case Some(td) => initDuckLake(td, "retryPendingDuckLakeInit")
+        case None     => duckLakeInitPending.remove(id)
+    }
+  }
+
+  /** One tenant-db's DuckLake init with its outcome recorded. Never throws: one bad tenant-db must
+    * not abort the loop over the others, nor boot.
+    */
+  private def initDuckLake(td: TenantDb, ctx: String): Unit =
+    try
+      duckLakeInitializer(effectiveMetastoreFor(td), td.encrypted)
+      dataPathBlocked.remove(td.id)
+      duckLakeInitPending.remove(td.id)
+    catch
+      case t: DuckLakeInitializer.PreInitMismatchException =>
+        // Not transient: every future node spawn hits the same DuckDB DATA_PATH or encryption
+        // error, so log loudly and block this tenant-db's pools from reconcile()'s spawns (see
+        // isDataPathBlocked).
+        dataPathBlocked.put(td.id, t.getMessage)
+        logger.error(s"$ctx: '${td.name}' ${t.getMessage}")
+      case t: DuckLakeInitializer.CatalogLockTimeoutException =>
+        // Transient: the lock holder is a read or a transaction that ends. Retry later rather than
+        // block anything; the bounded wait already happened inside the initializer.
+        duckLakeInitPending.put(td.id, t.getMessage)
+        logger.warn(s"$ctx: tenant-db '${td.name}': ${t.getMessage}")
+      case t: Throwable =>
+        // Not retried before the next manager boot or leader promotion. A node spawn creates a
+        // catalog that does not exist yet, but never migrates one.
+        logger.warn(
+          s"$ctx: '${td.name}' pre-init raised ${t.getClass.getSimpleName}: ${t.getMessage}. " +
+            "Not retried until the next boot; node spawns attach the catalog as it is."
+        )
 
   /** Re-check every persisted node; respawn dead ones. */
   def reconcile(): IO[Unit] = IO.defer {
@@ -601,13 +639,14 @@ final class PoolSupervisor(
   /** Run [[reconcile]] forever, sleeping `interval` between passes, so a node that dies while the
     * manager is up is respawned on the next tick. A throwing tick is logged and swallowed so one
     * bad pass doesn't kill the loop. Started as a cancelable fiber by `Main`; cancellation is
-    * normal shutdown. Drained pools (zero distribution) are left alone.
+    * normal shutdown. Drained pools (zero distribution) are left alone. Each pass first retries the
+    * DuckLake inits a catalog lock timeout left pending ([[retryPendingDuckLakeInit]]).
     */
   def reconcileLoop(
       interval: scala.concurrent.duration.FiniteDuration,
       gate: () => Boolean = () => true
   ): IO[Unit] =
-    ((if gate() then reconcile() else IO.unit).handleErrorWith { t =>
+    ((if gate() then retryPendingDuckLakeInit() *> reconcile() else IO.unit).handleErrorWith { t =>
       IO.delay(logger.warn(s"reconcile loop: pass failed, continuing: ${t.getMessage}"))
     } *> IO.sleep(interval)).foreverM.void
 
@@ -1811,6 +1850,10 @@ final class PoolSupervisor(
                                       s"createTenantDb: DuckLake pre-init for '$full' failed; " +
                                         s"first pool spawn will retry the ATTACH. Cause: ${t.getMessage}"
                                     )
+                                    t match
+                                      case _: DuckLakeInitializer.CatalogLockTimeoutException =>
+                                        duckLakeInitPending.put(td.id, t.getMessage)
+                                      case _ => ()
                                     store.upsertTenantDb(td)
                                     recordManagedPrefix()
                                     tenantDbs.put(td.id, td)
@@ -1905,6 +1948,7 @@ final class PoolSupervisor(
                   stampManagedPrefixDeleted(td.id, tenantDbName, purgeManagedData)
                   tenantDbs.remove(td.id)
                   dataPathBlocked.remove(td.id)
+                  duckLakeInitPending.remove(td.id)
                   try onTenantDbDeleted(tn, tenantDbName)
                   catch case _: Throwable => ()
                   dbAdmin.dropDatabase(td.name) match
@@ -2135,6 +2179,10 @@ final class PoolSupervisor(
           )
           require(size > 0, s"role distribution must sum to at least 1: $dist")
           require(dist.isValidFor(size), s"role distribution does not sum to $size")
+          // Every create path (REST and MCP refuse it with a 400 first, the branch service, any
+          // module) lands here, so this is the choke point for the pool's own boot SQL.
+          val initSqlErr = InitSqlScreen.error("initSql", initSql)
+          require(initSqlErr.isEmpty, initSqlErr.getOrElse(""))
           // Cohorts are always persisted as authored so a local-defined pool can be exported and
           // replayed on K8s with placement intact. K8s reads `NodeSpec.placement`; local backends
           // ignore it (the UI warns before submit).

@@ -1116,3 +1116,54 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       ctx
     ).unsafeRunSync() shouldBe a[Denied]
   }
+
+  // DuckDB 2.0 reads a backtick pair as an identifier quote, and the ACL (getUnquotedName) strips
+  // it: every match below used to strip only double quotes, so a backtick-quoted table or column
+  // met no mask while the gate authorized the read (F07).
+  private val backtickTwins = List(
+    "SELECT c_id, c_email FROM `customer`" -> "SELECT c_id, c_email FROM \"customer\"",
+    "SELECT c_id, c_email FROM `tpch1`.`customer`" -> "SELECT c_id, c_email FROM \"tpch1\".\"customer\"",
+    "SELECT * FROM `customer`"                -> "SELECT * FROM \"customer\"",
+    "SELECT `c_email` FROM customer"          -> "SELECT \"c_email\" FROM customer",
+    "SELECT c.`c_email` FROM customer c"      -> "SELECT c.\"c_email\" FROM customer c",
+    "SELECT `c`.c_email FROM customer AS `c`" -> "SELECT \"c\".c_email FROM customer AS \"c\"",
+    "SELECT upper(`c_email`) FROM customer"   -> "SELECT upper(\"c_email\") FROM customer",
+    "SELECT `c_email` || '' FROM customer"    -> "SELECT \"c_email\" || '' FROM customer",
+    "SELECT CAST(`c_email` AS VARCHAR) FROM customer" -> "SELECT CAST(\"c_email\" AS VARCHAR) FROM customer",
+    "SELECT c_id FROM customer WHERE `c_email` LIKE '%a%'" -> "SELECT c_id FROM customer WHERE \"c_email\" LIKE '%a%'",
+    "SELECT c_id FROM customer ORDER BY `c_email`" -> "SELECT c_id FROM customer ORDER BY \"c_email\"",
+    "SELECT `c` FROM customer c"          -> "SELECT \"c\" FROM customer c",
+    "SELECT to_json(`c`) FROM customer c" -> "SELECT to_json(\"c\") FROM customer c",
+    "SELECT (SELECT `c_email` FROM `customer` LIMIT 1)" -> "SELECT (SELECT \"c_email\" FROM \"customer\" LIMIT 1)",
+    "SELECT x FROM (SELECT `c_email` AS x FROM `customer`) s" -> "SELECT x FROM (SELECT \"c_email\" AS x FROM \"customer\") s"
+  )
+
+  it should "treat a backtick-quoted table or column exactly like its double-quoted twin" in
+    List(UnresolvedMode.Pass, UnresolvedMode.Deny).foreach { mode =>
+      val r = new ColumnPolicyRewriter(defaultCat, unresolvedMode = mode, enabled = true)
+      List(maskEmail, maskEmail.copy(action = RoleColumnPolicy.ActionDeny, transformSql = None))
+        .foreach { p =>
+          backtickTwins.foreach { (backtick, twin) =>
+            withClue(s"$mode ${p.action}: $backtick") {
+              val run = (sql: String) =>
+                r.rewrite(sql, StatementKind.Select, eff(tenantUser, List(p)), ctx).unsafeRunSync()
+              val out = run(backtick)
+              out shouldBe run(twin)
+              out should not be Passthrough
+              out should not be PassthroughParseFailed
+            }
+          }
+        }
+    }
+
+  it should "mask a backtick-quoted table and column, in a projection and in an expression" in {
+    val effSet           = eff(tenantUser, List(maskEmail))
+    def run(sql: String) = rw.rewrite(sql, StatementKind.Select, effSet, ctx).unsafeRunSync()
+    run("SELECT c_id, c_email FROM `customer`") shouldBe
+      Rewritten("SELECT c_id, '***' AS c_email FROM \"customer\"")
+    run("SELECT `c_email` FROM customer") shouldBe
+      Rewritten("SELECT '***' AS \"c_email\" FROM customer")
+    run("SELECT upper(`c_email`) FROM customer") shouldBe
+      Rewritten("SELECT upper('***') FROM customer")
+    run("SELECT c_id FROM customer WHERE `c_email` LIKE '%a%'") should not be Passthrough
+  }

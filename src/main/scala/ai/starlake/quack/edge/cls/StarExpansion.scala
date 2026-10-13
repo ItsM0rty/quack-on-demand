@@ -38,7 +38,7 @@ import scala.util.Try
   */
 private[cls] object StarExpansion:
 
-  private def unquote(s: String): String = s.stripPrefix("\"").stripSuffix("\"")
+  private def unquote(s: String): String = ai.starlake.sql.QuotedIdentifier.unquote(s)
 
   private def lower(s: String): String = s.toLowerCase(java.util.Locale.ROOT)
 

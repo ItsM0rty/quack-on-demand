@@ -37,7 +37,8 @@ edge_pid=$(lsof -nP -iTCP:"$EDGE_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 ||
 SPAWN_RE="spawn-quack-node\.sh [0-9]+ ${MGR_PORT}-[0-9a-f]+"
 DUCK_RE="duckdb .*-init .*quack-node\.${MGR_PORT}-[0-9a-f]+\."
 spawn_pids=$(pgrep -f "$SPAWN_RE" 2>/dev/null || true)
-unmarked=$(pgrep -f 'spawn-quack-node\.sh [0-9]+$' 2>/dev/null | wc -l | tr -d ' ')
+# pgrep exits 1 when nothing matches, which pipefail + set -e would turn into a silent abort here.
+unmarked=$( (pgrep -f 'spawn-quack-node\.sh [0-9]+$' 2>/dev/null || true) | wc -l | tr -d ' ')
 if [[ "$unmarked" != "0" ]]; then
   echo "note: leaving $unmarked unmarked spawn-quack-node.sh process(es) alone (an older manager's;" \
     "kill-quack-nodes.sh --unmarked stops them)."

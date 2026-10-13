@@ -99,12 +99,12 @@ object RowPolicyRewriter:
   /** SQL-escape a scalar value into a quoted literal: `O'Brien` -> `'O''Brien'`. */
   private def lit(v: String): String = "'" + v.replace("'", "''") + "'"
 
-  /** jsqlparser keeps the double quotes on quoted identifiers (`"customer"`), so policy matching
-    * must strip them or a quoted reference silently escapes its row policies (fail-open). Mirrors
-    * ColumnPolicyRewriter's unquote; only the MATCH uses the stripped form - the rewritten SQL
-    * keeps the caller's original (possibly quoted) identifiers.
+  /** jsqlparser keeps the quotes on quoted identifiers (`"customer"`), so policy matching must
+    * strip them or a quoted reference silently escapes its row policies (fail-open). The shared
+    * reading of both DuckDB 2.0 delimiters ([[ai.starlake.sql.QuotedIdentifier]]); only the MATCH
+    * uses the stripped form - the rewritten SQL keeps the caller's quoted identifiers.
     */
-  private def unquote(s: String): String = s.stripPrefix("\"").stripSuffix("\"")
+  private def unquote(s: String): String = ai.starlake.sql.QuotedIdentifier.unquote(s)
 
   /** Build the identity-token substitution map for one principal. List tokens that resolve to an
     * empty set collapse to `NULL` so `col IN (${groups})` becomes `col IN (NULL)` - a predicate

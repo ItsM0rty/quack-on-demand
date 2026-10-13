@@ -23,6 +23,16 @@ class LibDuckDbPreloadSpec extends AnyFunSpec with Matchers:
     it("ships next to the natives and names a DuckDB version") {
       LibDuckDbPreload.bundledAbi shouldBe defined
     }
+    it("names the version directory the qod CLI provisions libduckdb into") {
+      // The CLI lays its cache out <root>/<DUCKDB_CLI_VERSION>/lib and exports DUCKDB_CACHE_DIR at
+      // <root>; the preload looks under <root>/<abi>/lib, so the two must be the same string.
+      val launcher = Files.readString(Path.of("cli/src/qod_cli/launcher.py"))
+      val pin      = """DUCKDB_CLI_VERSION = "([^"]+)"""".r
+        .findFirstMatchIn(launcher)
+        .map(_.group(1))
+        .getOrElse(fail("could not parse DUCKDB_CLI_VERSION from cli/src/qod_cli/launcher.py"))
+      LibDuckDbPreload.bundledAbi shouldBe Some(pin)
+    }
 
   describe("candidates"):
     val cwd = Path.of("/work/repo")
@@ -56,6 +66,23 @@ class LibDuckDbPreloadSpec extends AnyFunSpec with Matchers:
       )
       got shouldBe Some(cache.resolve("1.5.6").resolve("lib").resolve(lib))
       loaded.result() shouldBe List(got.get.toString)
+      LibDuckDbPreload.lastLoaded shouldBe got
+    }
+
+    it("records nothing loaded after a miss or a failed load") {
+      val cache = cacheWith("1.5.6")
+      val env   = Map("DUCKDB_CACHE_DIR" -> cache.toString)
+      LibDuckDbPreload.preload(Some("1.5.6"), env, Path.of("/nonexistent"), _ => ())
+      LibDuckDbPreload.preload(Some("1.5.6"), Map.empty, Path.of("/nonexistent"), _ => ())
+      LibDuckDbPreload.lastLoaded shouldBe None
+      LibDuckDbPreload.preload(Some("1.5.6"), env, Path.of("/nonexistent"), _ => ())
+      LibDuckDbPreload.preload(
+        Some("1.5.6"),
+        env,
+        Path.of("/nonexistent"),
+        _ => throw new UnsatisfiedLinkError("wrong architecture")
+      )
+      LibDuckDbPreload.lastLoaded shouldBe None
     }
 
     it("loads nothing when no candidate exists, leaving resolution to the loader path") {
@@ -130,4 +157,6 @@ class LibDuckDbPreloadSpec extends AnyFunSpec with Matchers:
       tried.foreach(p => msg should include(p.toString))
       msg should include("scripts/run-jar.sh")
       msg should include("DUCKDB_CACHE_DIR")
+      msg should include("qod/duckdb/1.5.6/lib")
+      msg should include("DUCKDB_VERSION")
     }

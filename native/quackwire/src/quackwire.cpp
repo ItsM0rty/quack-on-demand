@@ -42,6 +42,41 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_smokeAnswer(JNIEnv*,
   return 42;
 }
 
+// Build marker: what this binary was compiled against, as one literal so the
+// release scripts can read it straight from the file (grep -a) without loading
+// it, and QuackNativeSupport.bootCheck can read it through buildInfo() below.
+// CMakeLists.txt supplies every value: the protocol generation parsed from
+// quack_message.hpp (cross-checked by the static_assert), the DuckDB version
+// and source id asked of the libduckdb being linked, and the quack submodule
+// commit. Keep the format in step with QuackNativeBridge.scala's NativeBuildInfo
+// and scripts/release/quackwire-build-info.sh.
+#if !defined(QUACKWIRE_PROTOCOL) || !defined(QUACKWIRE_DUCKDB_VERSION) || \
+    !defined(QUACKWIRE_DUCKDB_SOURCE_ID) || !defined(QUACKWIRE_QUACK_SHA)
+#error "build through native/quackwire/CMakeLists.txt: it defines the QUACKWIRE_* build marker"
+#endif
+#define QUACKWIRE_STR2(x) #x
+#define QUACKWIRE_STR(x) QUACKWIRE_STR2(x)
+static_assert(duckdb::QUACK_VERSION == QUACKWIRE_PROTOCOL,
+              "QUACKWIRE_PROTOCOL disagrees with quack_message.hpp's QUACK_VERSION");
+static const char kQuackwireBuildInfo[] =
+    "quackwire-build-info:protocol=" QUACKWIRE_STR(QUACKWIRE_PROTOCOL)
+    ";duckdb=" QUACKWIRE_DUCKDB_VERSION ";duckdb_source=" QUACKWIRE_DUCKDB_SOURCE_ID
+    ";quack=" QUACKWIRE_QUACK_SHA;
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_buildInfo(JNIEnv* env, jobject) {
+  return env->NewStringUTF(kQuackwireBuildInfo);
+}
+
+// The libduckdb actually loaded into the process, in the marker's key=value
+// form, for bootCheck to compare against the one this binary was built for.
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_linkedDuckDb(JNIEnv* env, jobject) {
+  std::string out = std::string("duckdb=") + duckdb::DuckDB::LibraryVersion() +
+                    ";duckdb_source=" + duckdb::DuckDB::SourceID();
+  return env->NewStringUTF(out.c_str());
+}
+
 namespace {
 
 jbyteArray to_jbyte_array(JNIEnv* env, const duckdb::MemoryStream& s) {

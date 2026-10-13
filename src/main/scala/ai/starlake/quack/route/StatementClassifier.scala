@@ -53,7 +53,10 @@ object StatementClassifierConfig:
     *   - `dml` - write-side verbs. `COPY` covers DuckDB's data-load / data-export. `UPSERT` /
     *     `REPLACE` are dialect variants of INSERT-with-conflict-resolution.
     *   - `ddl` - schema-mutating. `ATTACH` / `DETACH` are DuckDB catalog manipulation;
-    *     `COMMENT ON ...` is metadata DDL; `GRANT` / `REVOKE` mutate ACL state.
+    *     `COMMENT ON ...` is metadata DDL; `GRANT` / `REVOKE` mutate ACL state. `CHECKPOINT` runs
+    *     DuckLake's maintenance chain on a DuckLake catalog (it merges and deletes data files), so
+    *     it must reach a writer and be stamped and audited; while it is listed, `FORCE CHECKPOINT`
+    *     and `CALL checkpoint(...)` / `CALL force_checkpoint(...)` classify with it.
     *   - `begin` - transaction start. `START TRANSACTION` is ANSI.
     *   - `commit` - transaction end. `END` is the Postgres alias.
     *   - `rollback` - transaction abort. `ABORT` is the Postgres alias.
@@ -64,8 +67,18 @@ object StatementClassifierConfig:
   val Defaults: StatementClassifierConfig = StatementClassifierConfig(
     select = Set("SELECT", "WITH", "VALUES", "SHOW", "DESCRIBE", "EXPLAIN", "FROM"),
     dml = Set("INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "REPLACE", "COPY"),
-    ddl =
-      Set("CREATE", "DROP", "ALTER", "TRUNCATE", "ATTACH", "DETACH", "COMMENT", "GRANT", "REVOKE"),
+    ddl = Set(
+      "CREATE",
+      "DROP",
+      "ALTER",
+      "TRUNCATE",
+      "ATTACH",
+      "DETACH",
+      "COMMENT",
+      "GRANT",
+      "REVOKE",
+      "CHECKPOINT"
+    ),
     begin = Set("BEGIN", "START"),
     commit = Set("COMMIT", "END"),
     rollback = Set("ROLLBACK", "ABORT")
@@ -142,8 +155,34 @@ final class StatementClassifier(
         executedByExplain(original) match
           case Some(stmt) => classify(stmt)
           case None       => StatementKind.Select
+      // FORCE CHECKPOINT and CALL checkpoint(...) run a checkpoint like CHECKPOINT does (see the
+      // `ddl` bucket's doc); only while CHECKPOINT sits in that bucket, so an operator who moves it
+      // keeps control.
+      case Some("FORCE" | "CALL") if cfg.ddl.contains("CHECKPOINT") && checkpoints(original) =>
+        StatementKind.Ddl
       case Some(tok) => kindOf(tok)
       case None      => StatementKind.Other
+
+  /** `FORCE CHECKPOINT ...`, or `CALL <name>(...)` naming `checkpoint` / `force_checkpoint` (bare,
+    * quoted with either delimiter or qualified: DuckDB 2.0 runs `CALL system.main."checkpoint"()`),
+    * read on DuckDB 2.0's tokens over the original text.
+    */
+  private def checkpoints(original: String): Boolean =
+    val view                         = SqlLexer.engineView(original)
+    val toks                         = SqlLexer.tokens(view).filterNot(_.isTrivia)
+    def text(t: SqlLexer.Token)      = view.substring(t.start, t.end)
+    def word(k: Int): Option[String] =
+      toks.lift(k).filter(_.kind == SqlLexer.Kind.Word).map(text(_).toUpperCase(Locale.ROOT))
+    def ident(t: SqlLexer.Token): Option[String] =
+      if t.kind == SqlLexer.Kind.Word then Some(text(t).toLowerCase(Locale.ROOT))
+      else if t.kind == SqlLexer.Kind.Literal && (view.charAt(t.start) == '"' ||
+          view.charAt(t.start) == '`')
+      then Some(ai.starlake.sql.QuotedIdentifier.unquote(text(t)).toLowerCase(Locale.ROOT))
+      else None
+    val open = toks.indexWhere(t => t.kind == SqlLexer.Kind.Punct && text(t) == "(")
+    (word(0).contains("FORCE") && word(1).contains("CHECKPOINT")) ||
+    (word(0).contains("CALL") && open >= 2 &&
+      ident(toks(open - 1)).exists(StatementClassifier.CheckpointCalls))
 
   private def kindOf(tok: String): StatementKind =
     if cfg.select.contains(tok) then StatementKind.Select
@@ -309,6 +348,9 @@ object StatementClassifier:
     * non-blank character is `(`.
     */
   private final case class WordToken(upper: String, depth: Int, beforeParen: Boolean)
+
+  /** The table functions that run a checkpoint, as `CALL` names them. */
+  private val CheckpointCalls: Set[String] = Set("checkpoint", "force_checkpoint")
 
   /** DuckDB 2.0's `AnalyzeKeyword <- 'ANALYZE' / 'ANALYSE'`. */
   private val AnalyzeKeywords: Set[String] = Set("ANALYZE", "ANALYSE")

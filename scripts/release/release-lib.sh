@@ -19,6 +19,10 @@
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_DIR"
 
+# quackwire_check_build_marker, used by verify_quackwire_binaries.
+# shellcheck source=SCRIPTDIR/quackwire-build-info.sh
+source "$REPO_DIR/scripts/release/quackwire-build-info.sh"
+
 REGISTRY_IMAGE="${REGISTRY_IMAGE:-starlakeai/quack-on-demand}"
 # Larger heap/stack for the signed publish + scaladoc steps.
 SBT_OPTS="${SBT_OPTS:--Xss8M -Xmx5g -XX:+UseG1GC}"
@@ -90,9 +94,11 @@ sha256_of() {
 # Replaces the old Maven-Central-availability gate: binaries are vendored in
 # git now (refreshed by scripts/release/refresh-quackwire-binaries.sh), so "is
 # libquackwire safe to ship with this manager release" means "does the
-# working tree's libquackwire/binaries/ match the pinned version and its own
-# checksums" rather than "is it on Central". Shared by release.sh's phase 1
-# and by release.yml before any CI channel publishes.
+# working tree's libquackwire/binaries/ match the pinned version, its own
+# checksums and, per binary, its compiled build marker" rather than "is it on
+# Central". The VERSION stamp alone vouches for the whole set, so only the
+# marker catches a binary left over from an earlier DuckDB. Shared by
+# release.sh's phase 1 and by release.yml before any CI channel publishes.
 verify_quackwire_binaries() {
   local version stamped
   version="$(grep -E '^val libquackwireVersion' build.sbt | sed -E 's/.*"(.*)".*/\1/')"
@@ -127,6 +133,7 @@ verify_quackwire_binaries() {
     [[ -f "$f.sha256" ]] || { echo "missing checksum $f.sha256. Run scripts/release/refresh-quackwire-binaries.sh." >&2; return 1; }
     [[ "$(sha256_of "$f")" == "$(cat "$f.sha256")" ]] \
       || { echo "checksum mismatch for $f. Run scripts/release/refresh-quackwire-binaries.sh." >&2; return 1; }
+    quackwire_check_build_marker "$f" "$version" || return 1
   done
   echo "phase 1 OK: vendored libquackwire binaries match $version"
 }

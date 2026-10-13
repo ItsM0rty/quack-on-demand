@@ -3,66 +3,84 @@
 // ============================================================================
 //  !! VERSION-PINNED FILE - REVISIT ON EVERY DUCKDB / duckdb-quack BUMP !!
 //
-//  Pinned to: duckdb @ 069cc9f9b5  (libduckdb v1.5.6, build.sbt
-//             libquackwireVersion "1.5.6-7e80f7ffcc98-*").
-//  Re-verified 2026-07-22 at v1.5.5 and 2026-09-29 at v1.5.6: Default() still
-//  FromString("v0.10.2"), storage_info.cpp still maps {"v0.10.2", 64}, the
-//  SerializationCompatibility bodies in config.cpp are unchanged; no constant
-//  changes needed.
+//  Pinned to: DuckDB 2.0 (engine b15358c371, build.sbt libquackwireVersion
+//             "2.0.0-974927a394b1-*"), re-derived 2026-10-13 from that
+//             engine's src/common/storage_compatibility.cpp. UNVERIFIED on
+//             Windows: no v2.0.0 release zip (duckdb.dll / duckdb.lib) exists
+//             yet, so this file has not been compiled or linked. Re-check it
+//             against the v2.0.0 sources when the release zips ship.
 //
-//  The values below are COPIED from that exact DuckDB source. When you bump the
+//  DuckDB 2.0 renamed SerializationCompatibility to StorageCompatibility
+//  (src/include/duckdb/common/storage_compatibility.hpp, its own translation
+//  unit src/common/storage_compatibility.cpp, which reaches the attached
+//  database and storage manager), indexed by the StorageVersion enum instead
+//  of an idx_t serialization version. The class carries no DUCKDB_API, so
+//  duckdb.dll does not export it. LogicalType's copy constructor and
+//  destructor became inline in 2.0 (types.hpp), so they no longer need an
+//  export either.
+//
+//  The bodies below are COPIED from the pinned DuckDB source. When you bump the
 //  duckdb-quack submodule / libduckdb ABI in build.sbt, re-derive them or the
 //  Windows quackwire.dll will link against stale constants (silent wire-format
 //  mismatch with the node), or fail to link with a fresh batch of unresolved
 //  externals. To re-derive at the new pin <SHA>:
-//    * SerializationCompatibility::{Default,FromIndex,Compare}
-//        src/main/config.cpp
-//    * the serialization_version index for Default()'s version string
-//        src/storage/storage_info.cpp  (version -> index table)
+//    * StorageCompatibility::{Default,FromIndex,Compare}
+//        src/common/storage_compatibility.cpp
+//    * the default storage version
+//        src/include/duckdb/storage/storage_info.hpp
+//        (StorageVersionInfo::GetStorageVersionDefault, constexpr)
 //    * ValueOperations::NotDistinctFrom
 //        src/common/value_operations/comparison_operations.cpp
 //  If the Windows link surfaces NEW unresolved duckdb symbols, add their leaf
 //  definitions here the same way (or compile their source if self-contained).
+//  The serializer sources CMakeLists.txt compiles come from duckdb-quack's own
+//  duckdb submodule: check it vendors the same engine as the pin.
 // ============================================================================
 //
 // Why this file exists: the vendored duckdb serializer sources we compile on
 // Windows (see CMakeLists.txt) reference a few DuckDB internals that the
 // prebuilt duckdb.dll does not export and whose real source files
-// (src/main/config.cpp, comparison_operations.cpp) would drag in most of DuckDB
-// if compiled. Kept WIN32-only via CMakeLists.txt; on Linux/macOS libduckdb
+// (src/common/storage_compatibility.cpp, comparison_operations.cpp) would drag
+// in most of DuckDB if compiled. Kept WIN32-only via CMakeLists.txt; on Linux/macOS libduckdb
 // already provides these.
 //
 // DUCKDB_STATIC_BUILD is defined for the whole Windows build, so DUCKDB_API is
 // empty here and these definitions have plain linkage matching the callers.
 
-#include "duckdb/main/config.hpp"
+#include "duckdb/common/storage_compatibility.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/storage/storage_info.hpp"
 
 namespace duckdb {
 
-// src/main/config.cpp: Default() == FromString("v0.10.2") with manually_set
-// cleared. src/storage/storage_info.cpp's version table maps "v0.10.2" ->
-// serialization_version 64.
-SerializationCompatibility SerializationCompatibility::Default() {
-	SerializationCompatibility result;
-	result.duckdb_version = "v0.10.2";
-	result.serialization_version = 64;
+// src/common/storage_compatibility.cpp, release-build branch (neither
+// DUCKDB_ALTERNATIVE_VERIFY nor DUCKDB_LATEST_STORAGE): FromIndex(the default
+// storage version) relabelled "latest". Written out instead of calling FromIndex
+// so the label does not need GetStorageVersionString (see below).
+StorageCompatibility StorageCompatibility::Default() {
+	StorageCompatibility result;
+	result.storage_version = StorageVersionInfo::GetStorageVersionDefault();
+	result.duckdb_version = "latest";
 	result.manually_set = false;
 	return result;
 }
 
-// src/main/config.cpp verbatim.
-SerializationCompatibility SerializationCompatibility::FromIndex(const idx_t version) {
-	SerializationCompatibility result;
+// src/common/storage_compatibility.cpp, except duckdb_version: upstream sets it
+// from StorageVersionInfo::GetStorageVersionString (storage_info.cpp, not
+// exported). Only CompareVersionString reads it, and the serializer never calls
+// that: it decides through Compare(StorageVersion) alone. The quack message
+// layer serializes with FromIndex(StorageVersion::V2_0_0).
+StorageCompatibility StorageCompatibility::FromIndex(StorageVersion storage_version_p) {
+	StorageCompatibility result;
+	result.storage_version = storage_version_p;
 	result.duckdb_version = "";
-	result.serialization_version = version;
 	result.manually_set = false;
 	return result;
 }
 
-// src/main/config.cpp verbatim.
-bool SerializationCompatibility::Compare(idx_t property_version) const {
-	return property_version <= serialization_version;
+// src/common/storage_compatibility.cpp verbatim.
+bool StorageCompatibility::Compare(StorageVersion property_version) const {
+	return property_version <= storage_version;
 }
 
 // Only reached from the serializer's optional-property default-skip path.

@@ -35,6 +35,7 @@ on:
       - 'docker/quack-node/**'
       - 'scripts/spawn-quack-node.sh'
       - 'version.sbt'
+      - 'project/Versions.scala'
       - '.github/workflows/quack-node-snapshot.yml'
   workflow_dispatch:
 
@@ -57,6 +58,14 @@ jobs:
       version: ${{ steps.extract.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+
+      # Every later job needs this one, so nothing publishes when the guard
+      # fails. Without it a merge that only the developer's machine can build
+      # (pre-release DuckDB JDBC from ~/.m2) would still republish the node
+      # image as latest-snapshot on the new engine while the manager snapshot,
+      # whose sbt build cannot resolve, stays on the previous one.
+      - name: Guard - release-grade DuckDB pins
+        run: scripts/release/check-release-pins.sh
 
       - name: Extract version from version.sbt
         id: extract

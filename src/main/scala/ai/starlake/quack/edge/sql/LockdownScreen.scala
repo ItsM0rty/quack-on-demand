@@ -153,13 +153,15 @@ object LockdownScreen:
 
   // Table functions with a string-like first argument that lockdown ADMITS, each judged: none opens
   // a caller-named file or connection or runs caller SQL. Parse or tokenize text only
-  // (check_peg_parser, sql_tokenize, json_each, json_tree); name a catalog object, not a file, the
-  // ACL gating catalog access (checkpoint, force_checkpoint, the pragma_* table introspection
-  // functions; the ducklake_* catalog functions are admitted by family below, except ducklake_scan
-  // and ducklake_add_data_files, denied above; duckdb_table_sample is denied through
-  // CatalogReachingCalls.LockdownNames); act on the client side of an attached quack catalog
-  // (quack_cancel, quack_identify: this screen opens no file or connection for them, but
-  // NodeSettingScreen.NodeWideCalls refuses both, with force_checkpoint, to non-superusers and to
+  // (check_peg_parser, sql_tokenize, json_each, json_tree); name a catalog object, not a file (the
+  // pragma_* table introspection functions, gated by the ACL; checkpoint and force_checkpoint,
+  // which CheckpointScreen and NodeSettingScreen.NodeWideCalls refuse to non-superusers in every
+  // ACL mode and to every caller under lockdown; the ducklake_* catalog functions are admitted by
+  // family below, except ducklake_scan and ducklake_add_data_files, denied above, and the
+  // maintenance and option-setting ones CheckpointScreen.MaintenanceCalls refuses beside it;
+  // duckdb_table_sample is denied through CatalogReachingCalls.LockdownNames); act on the client
+  // side of an attached quack catalog (quack_cancel, quack_identify: this screen opens no file or
+  // connection for them, but NodeSettingScreen.NodeWideCalls refuses both to non-superusers and to
   // every caller under lockdown); read the front door's own client stream
   // (scan_data_from_quack_client); match a path against secrets without opening it (which_secret);
   // take an arbitrary value (repeat, unnest, test_vector_types).

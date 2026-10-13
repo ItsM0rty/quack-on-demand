@@ -36,10 +36,20 @@ JDBC disables Arrow export): `QuackNativeSupport.bootCheck` loads it early in `M
 and a platform with no bundled binary (Windows ARM64 until it gets a build) or a native that
 cannot load refuses to boot, naming `os.name`/`os.arch`, the expected
 `libquackwire/binaries/<platform>/` file and the `DUCKDB_CACHE_DIR` hint.
+Each libquackwire binary embeds `quackwire-build-info:protocol=..;duckdb=..;duckdb_source=..;quack=..`
+(set by `native/quackwire/CMakeLists.txt`, which probes the linked libduckdb); `bootCheck` compares it
+with `/native/VERSION` and the loaded libduckdb and refuses a stale native, and
+`scripts/release/quackwire-build-info.sh` checks the same marker on the files. Until DuckDB v2.0.0
+ships only osx-aarch64 is a 2.0 build: the other four vendored natives are refused at boot, so this
+branch runs only on Apple Silicon. `scripts/release/check-release-pins.sh` (workflow `release pins`)
+keeps the pre-release JDBC and `mavenLocal` off main. The qod CLI caches DuckDB per release
+(`<user cache>/qod/duckdb/<version>/{bin,lib}`, the `DUCKDB_CACHE_DIR` layout) and exports
+`DUCKDB_CACHE_DIR` to the manager JVM on every launcher path, so the preload never depends on
+`DYLD_*` (stripped by SIP from `/usr/bin/java`) or a baked rpath.
 
 **DuckDB 2.0 pre-release toolchain.** Until DuckDB v2.0.0 is released, the engine and JDBC are built from source with `scripts/dev/build-duckdb-prerelease.sh` (engine `b15358c371`, JDBC `2.0.0.0-pre-b15358c` installed into `~/.m2`). Run it once before `sbt compile` on a fresh machine.
 
-**DuckLake migration.** Only the manager's DuckLake initializer attaches with `AUTOMATIC_MIGRATION`: it migrates a catalog older than the latest DuckLake once per manager boot, under its advisory lock. Nodes, loaders and the demo seed attach as-is (DuckDB 2.0 attaches any catalog >= 1.0 without migrating). Migration is one-way: back up catalog databases before upgrading.
+**DuckLake migration.** Only the manager's DuckLake initializer attaches with `AUTOMATIC_MIGRATION`, and only when the catalog needs it (`DuckLakeInitializer.migrationPlan`, decided under its advisory lock): a catalog older than the latest DuckLake, or one at the latest dev version last migrated by another engine build (recorded in `qod_meta.ducklake_migration` in the catalog's database; `LatestDuckLakeVersion` is pinned by a spec). A current catalog attaches with no DDL. The initializer's catalog connection carries `lock_timeout=5000`; a timeout is retry-later (`CatalogLockTimeoutException`, `PoolSupervisor.duckLakeInitPending`, retried by the leader's reconcile loop), never a blocking mismatch. Nodes, loaders and the demo seed attach as-is (DuckDB 2.0 attaches any catalog >= 1.0 without migrating). Migration is one-way: back up catalog databases before upgrading.
 
 UI dev loop (proxies `/api/*` to `localhost:20900`):
 
@@ -397,6 +407,8 @@ Two security-critical knobs should be pinned before any non-localhost deploy: `Q
 ## Things to avoid
 
 - **Don't disable JVM forking** in build.sbt - see "JVM forking" above.
+- **Don't let a tenant-authored value reach a node's init without the dot-command screen.** The DuckDB CLI runs a line starting with `.` in its `-init` channel as a dot-command (`.shell` runs OS commands). Boot SQL is screened by `InitSqlScreen` (`model/`) at every write path (`TenantDb.validateSafety`, `FederatedSourceRules.errors`, `PoolHandlers.createPoolInner`, `PoolSupervisor.createPool`, `ManifestImporter.validate`), again in `QuackBackend.screenBootSql` (every backend's `start` runs it first), and in both spawn scripts (`has_dot_line` / `Test-DotCommandLine`). A new value must go through `InitSqlScreen.error` at its write path and be added to `InitSqlScreen.nodeSpecError` and to the scripts' checked-value list.
+- **Regenerate the setting-scope table at every DuckDB pin bump.** `NodeSettingScreen` reserves an unscoped `SET` of a GLOBAL-default setting from `DuckDbSettingScopes.scala`, generated from the engine and extension sources by `python3 scripts/dev/gen-duckdb-setting-scopes.py` (then `sbt "scalafmtOnly src/main/scala/ai/starlake/quack/edge/sql/DuckDbSettingScopes.scala"`); `DuckDbSettingScopesSpec` fails until it is regenerated.
 - **Don't invoke `scripts/spawn-quack-node.sh` directly** - it's spawned by `LocalQuackBackend` with the right port + token + env contract. Manual invocation will leak ports and confuse the supervisor.
 - **Refresh the bundled copies whenever you touch `scripts/` or the operator skill.** The CLI wheel ships its own copies at `cli/src/qod_cli/scripts/spawn-quack-node.{sh,ps1}` and `cli/src/qod_cli/skills/quack-on-demand/SKILL.md`. Nothing generates them: a plain `cp` is the mechanism, and `cli/tests/test_demo.py` / `test_skill_freshness.py` are the only enforcement. Editing a canonical script without refreshing its copy fails those tests in a way that reads like an unrelated pre-existing failure.
 - **Never put two statements on one line of SQL fed to the DuckDB CLI.** When a statement fails, the CLI skips the rest of that line, so a failing `INSTALL` would silently skip the `LOAD` after it. A single statement may span several lines (the spawn script spreads one ATTACH over two).

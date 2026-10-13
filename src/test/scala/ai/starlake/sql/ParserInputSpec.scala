@@ -30,9 +30,21 @@ class ParserInputSpec extends AnyFlatSpec with Matchers:
     text("SELECT $x$'$x$ AS a") shouldBe "SELECT '''' AS a"
     text("SELECT $$it's$$ AS a") shouldBe "SELECT 'it''s' AS a"
 
-  it should "replace comments with a space and keep quoted identifiers" in:
+  it should "replace comments with a space and keep double-quoted identifiers" in:
     text("SELECT 1 /* a /* b */ c */ AS \"x--y\" -- tail") shouldBe "SELECT 1   AS \"x--y\"  "
-    text("SELECT `a``b` FROM t") shouldBe "SELECT `a``b` FROM t"
+    text("SELECT \"a\"\"b\" FROM t") shouldBe "SELECT \"a\"\"b\" FROM t"
+
+  it should "render a backtick-quoted identifier as the double-quoted one DuckDB 2.0 reads" in:
+    // The ACL (getUnquotedName) strips backticks, every policy match unquotes double quotes:
+    // one spelling for both, or `FROM \`orders\`` meets no row filter and no column mask.
+    text("SELECT `email` FROM `orders`") shouldBe "SELECT \"email\" FROM \"orders\""
+    text("SELECT `a``b` FROM t") shouldBe "SELECT \"a`b\" FROM t"
+    // JSqlParser does not undouble `""`: the ACL would read `a""b`, so a backtick name holding a
+    // double quote keeps its backticks (the policy matchers unquote both delimiters)
+    text("SELECT `a\"b` FROM t") shouldBe "SELECT `a\"b` FROM t"
+    text("SELECT `s`.`t`.`c` FROM `s`.`t`") shouldBe "SELECT \"s\".\"t\".\"c\" FROM \"s\".\"t\""
+    text("SELECT '`x`' AS \"`y`\"") shouldBe "SELECT '`x`' AS \"`y`\""
+    exact("SELECT `email` FROM `orders`") shouldBe true
 
   it should "set a string literal off from a preceding word" in:
     // JSqlParser reads q'{...}' as an Oracle quote; DuckDB reads the word q, then a literal
@@ -92,7 +104,10 @@ class ParserInputSpec extends AnyFlatSpec with Matchers:
       "SELECT café FROM (SELECT 3 AS café) t",
       "SELECT 'nbsp in' AS a, 1 + 1 AS b",
       // implicit column names, which a client reads as much as the values
-      "SELECT E'x', $$y$$, N'n', 'a'\n'b', 1 + 1, café FROM (SELECT 3 AS café) t"
+      "SELECT E'x', $$y$$, N'n', 'a'\n'b', 1 + 1, café FROM (SELECT 3 AS café) t",
+      // a backtick-quoted identifier is the double-quoted one, embedded quotes and case included
+      "SELECT `a``b`, `C\"d`, `MiXed` FROM (SELECT 1 AS \"a`b\", 2 AS \"C\"\"d\", 3 AS mixed) `t`",
+      "SELECT `T`.`x` FROM (SELECT 4 AS x) AS t"
     )
     Class.forName("org.duckdb.DuckDBDriver")
     val conn = DriverManager.getConnection("jdbc:duckdb:", InProcessDuckDb.properties)

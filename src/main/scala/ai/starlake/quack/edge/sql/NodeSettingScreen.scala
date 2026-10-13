@@ -82,24 +82,32 @@ object NodeSettingScreen:
 
   // ---- node-wide settings: superuser-only ----
 
-  /** Settings that act on the whole shared node, refused by [[screenNodeWide]] to every caller who
-    * is not a superuser (whatever the ACL mode and the grants: a setting is not a table) and to
-    * every caller on a pool under lockdown. One session changing them starves or slows every other
-    * session of the pool, changes how the node stores or checkpoints data, or turns on logging and
-    * profiling that capture other sessions' statements. Operators set them at node start (database
-    * / pool `initSql`, `qod pool set-resources`), which never goes through the router.
+  /** Settings that act on the whole shared node in EVERY scope, refused by [[screenNodeWide]] to
+    * every caller who is not a superuser (whatever the ACL mode and the grants: a setting is not a
+    * table) and to every caller on a pool under lockdown, `SET SESSION` included. One session
+    * changing them starves or slows every other session of the pool, changes how the node stores or
+    * checkpoints data, or turns on logging and profiling that capture other sessions' statements.
+    * Operators set them at node start (database / pool `initSql`, `qod pool set-resources`), which
+    * never goes through the router.
     *
     * Built from the DuckDB 2.0 CLI (`duckdb_settings()` with httpfs, postgres, ducklake and quack
     * loaded): every setting 2.0 refuses at session scope ("can only be set globally" / "cannot be
     * set locally"), plus the ones it accepts per session but that act on shared machinery (the
-    * allocator, WAL checkpointing, the postgres connection pool, profiling and its output), plus
-    * the PRAGMA names that toggle the same machinery. [[NodeWidePrefixes]] covers every `quack_*`
-    * (server limits, timeouts, `quack_debug_*` fault injection), `debug_*` and `verify_*` setting.
-    * Excludes what [[Settings]] already refuses for everyone. Session-scoped settings a client
-    * legitimately sends (search_path, schema, TimeZone, Calendar, http_timeout, default_order,
-    * null_order, preserve_insertion_order, enable_progress_bar, errors_as_json, max_execution_time,
-    * s3_* per-session credentials, SET VARIABLE, ...) are not listed and stay admitted, except at
-    * GLOBAL scope (see [[GlobalScopeRefusal]]).
+    * allocator, WAL checkpointing, the postgres and mysql connection pools, profiling and its
+    * output), plus the PRAGMA names that toggle the same machinery. [[NodeWidePrefixes]] covers
+    * every `quack_*` (server limits, timeouts, `quack_debug_*` fault injection), `debug_*` and
+    * `verify_*` setting. Excludes what [[Settings]] already refuses for everyone.
+    *
+    * This list is the stricter of two rules. The other is scope: a bare `SET x` / `RESET x` /
+    * `PRAGMA x = v` lands where DuckDB 2.0 registered `x` ([[DuckDbSettingScopes]]), which for a
+    * GLOBAL-default setting is the shared DBConfig, exactly like `SET GLOBAL`. So a bare statement
+    * of a GLOBAL-default setting (default_order, null_order, default_collation,
+    * preserve_insertion_order, enable_optimizer, extra_http_headers, the ducklake_* options, ...)
+    * is refused too, while its `SET SESSION` stays admitted; a name the table does not hold is
+    * refused (fail closed: an extension loaded later can register a GLOBAL option). Session-scoped
+    * settings a client legitimately sends (search_path, schema, TimeZone, Calendar, http_timeout,
+    * enable_progress_bar, errors_as_json, max_execution_time, s3_* per-session credentials, ...)
+    * and `SET VARIABLE` stay admitted bare, except at GLOBAL scope (see [[GlobalScopeRefusal]]).
     */
   val NodeWideSettings: Set[String] = Set(
     // Threads and scheduling.
@@ -173,6 +181,17 @@ object NodeSettingScreen:
     "pg_pool_max_lifetime_millis",
     "pg_pool_wait_timeout_millis",
     "pg_debug_show_queries",
+    // The mysql connection pool, and its query printer (a process-wide flag: every session's
+    // queries to the node's stdout).
+    "mysql_pool_acquire_mode",
+    "mysql_pool_connection_idle_timeout_millis",
+    "mysql_pool_connection_max_lifetime_millis",
+    "mysql_pool_enable_reaper_thread",
+    "mysql_pool_enable_thread_local_cache",
+    "mysql_pool_health_check_query",
+    "mysql_pool_size",
+    "mysql_pool_wait_timeout_millis",
+    "mysql_debug_show_queries",
     // Extension loading and security posture (also lockdown-protected).
     "allow_community_extensions",
     "allow_extension_repositories",
@@ -234,8 +253,19 @@ object NodeSettingScreen:
     */
   val NodeWidePrefixes: Seq[String] = Seq("quack_", "debug_", "verify_", "disable_verify_")
 
+  /** `name` or the setting it is a DuckDB alias of (`force_mbedtls_unsafe` is
+    * `debug_force_mbedtls_unsafe`, `null_order` is `default_null_order`) is in [[NodeWideSettings]]
+    * or under [[NodeWidePrefixes]].
+    */
   def isNodeWide(name: String): Boolean =
-    NodeWideSettings(name) || NodeWidePrefixes.exists(name.startsWith)
+    Seq(name, canonical(name)).exists(n =>
+      NodeWideSettings(n) || NodeWidePrefixes.exists(n.startsWith)
+    )
+
+  /** The lowercased setting DuckDB 2.0 resolves `name` (lowercased) to: a core alias maps to the
+    * setting it names, anything else to itself.
+    */
+  def canonical(name: String): String = DuckDbSettingScopes.Aliases.getOrElse(name, name)
 
   /** Calls that act on the node itself rather than on data: start / stop / cancel its quack server
     * or rename it, list the other sessions it serves, clear the shared caches, turn the logger or
@@ -258,6 +288,7 @@ object NodeSettingScreen:
     "quack_server_list",
     "quack_clear_cache",
     "pg_clear_cache",
+    "mysql_clear_cache",
     "enable_logging",
     "disable_logging",
     "truncate_duckdb_logs",
@@ -275,13 +306,27 @@ object NodeSettingScreen:
   val GlobalScopeRefusal =
     "SET GLOBAL / RESET GLOBAL changes every session on the node and is reserved to superusers"
 
+  /** A bare SET / RESET / `PRAGMA name = value` of a setting DuckDB registers as GLOBAL-default. */
+  def unscopedRefusal(name: String): String =
+    s"$name without a scope changes it for every session on the node, which is reserved to " +
+      s"superusers; use SET SESSION $name (RESET SESSION $name) to change it for this session"
+
+  /** A setting [[DuckDbSettingScopes]] does not hold, so its scope is unknown. */
+  def unknownSettingRefusal(name: String): String =
+    s"setting $name is not one the gateway knows the scope of; changing it is reserved to " +
+      "superusers"
+
+  val UnreadableSettingRefusal =
+    "the setting this statement changes cannot be read; changing it is reserved to superusers"
+
   def nodeWideCallRefusal(fn: String): String =
     s"$fn acts on the whole node and is reserved to superusers"
 
   /** The refusal for the first statement of `sql` that sets, resets or pragmas a node-wide setting
-    * ([[isNodeWide]]) in any form, uses GLOBAL scope for any setting, runs FORCE CHECKPOINT, or
-    * calls one of [[NodeWideCalls]] anywhere (literal bodies included). Read like [[screen]]:
-    * DuckDB 2.0 tokens, glued quotes, the statement an EXPLAIN / PREPARE carries.
+    * ([[isNodeWide]]) in any form, uses GLOBAL scope for any setting, changes a GLOBAL-default
+    * setting without a scope or a setting of unknown scope ([[settingRefusal]]), runs FORCE
+    * CHECKPOINT, or calls one of [[NodeWideCalls]] anywhere (literal bodies included). Read like
+    * [[screen]]: DuckDB 2.0 tokens, glued quotes, the statement an EXPLAIN / PREPARE carries.
     */
   def screenNodeWide(sql: String): Option[String] =
     LockdownScreen
@@ -302,12 +347,76 @@ object NodeSettingScreen:
     if h.word(i).contains("force") && h.word(i + 1).contains("checkpoint") then
       Some(NodeWideRefusal)
     else if installsCode(h, i) then Some(ExtensionRefusal)
-    else
-      settingAt(h).flatMap { (name, at) =>
-        // The name sits past a scope word exactly when the statement is scoped.
-        if at == i + 2 && h.word(i + 1).contains("global") then Some(GlobalScopeRefusal)
-        else Option.when(isNodeWide(name))(NodeWideRefusal)
-      }
+    else settingStatement(h).flatMap(settingRefusal)
+
+  /** How a setting statement picks the scope it writes. */
+  private enum Form:
+    /** `SET x`, `RESET x`, `SET TIME ZONE`, `PRAGMA x = v` (2.0 lowers it to an unscoped SET): the
+      * scope DuckDB registered for `x` (`PhysicalSet::GetSettingScope`).
+      */
+    case Unscoped
+
+    /** `SET SESSION`, `RESET SESSION`, and `SET LOCAL` / `RESET LOCAL` (not implemented on 2.0). */
+    case Session
+
+    case Global
+
+    /** `PRAGMA x` / `PRAGMA x(...)`: calls the pragma function `x`, never assigns a setting (2.0
+      * fails with "Pragma Function with name x does not exist" for a setting name).
+      */
+    case PragmaCall
+
+  /** The setting a SET / RESET / PRAGMA statement targets (None when its name cannot be read) and
+    * its [[Form]]; None for any other statement and for `SET VARIABLE` / `RESET VARIABLE`, which
+    * set a client variable, not a setting. Read like [[settingAt]].
+    */
+  private def settingStatement(h: StatementHead.Head): Option[(Option[String], Form)] =
+    val i = h.start
+    h.word(i) match
+      case Some("set" | "reset") =>
+        val scope = h.word(i + 1).filter(_ => h.identifier(i + 2).isDefined)
+        if scope.contains("variable") then None
+        else if h.word(i).contains("set") && h.word(i + 1).contains("time") &&
+          h.word(i + 2).contains("zone")
+        then Some(Some("timezone") -> Form.Unscoped)
+        else
+          val form = scope match
+            case Some("global")            => Form.Global
+            case Some("session" | "local") => Form.Session
+            case _                         => Form.Unscoped
+          Some(settingAt(h).map(_._1) -> form)
+      case Some("pragma") =>
+        settingAt(h) match
+          case Some((name, at)) =>
+            // `PRAGMA table_info = 't'` is SQLite's spelling of the call, kept as one on 2.0.
+            val assigns = at + 1 < h.toks.length &&
+              h.view.substring(h.toks(at + 1).start, h.toks(at + 1).end).startsWith("=")
+            Some(
+              Some(name) -> (if assigns && name != "table_info" then Form.Unscoped
+                             else Form.PragmaCall)
+            )
+          case None => Some(None -> Form.PragmaCall)
+      case _ => None
+
+  /** GLOBAL scope is refused for any setting, and [[isNodeWide]] in every form. Otherwise the scope
+    * DuckDB 2.0 registered decides ([[DuckDbSettingScopes]]): GLOBAL-only is refused, a
+    * GLOBAL-default setting is refused unscoped and admitted with `SET SESSION`, a session-default
+    * one is admitted, and a name the table does not hold is refused (fail closed). A pragma call
+    * assigns nothing and is refused only for the node-wide pragmas.
+    */
+  private def settingRefusal(target: Option[String], form: Form): Option[String] =
+    target match
+      case None => Option.when(form != Form.PragmaCall)(UnreadableSettingRefusal)
+      case Some(_) if form == Form.Global     => Some(GlobalScopeRefusal)
+      case Some(name) if isNodeWide(name)     => Some(NodeWideRefusal)
+      case Some(_) if form == Form.PragmaCall => None
+      case Some(name)                         =>
+        DuckDbSettingScopes.Settings.get(canonical(name)).map(_.scope) match
+          case None                                          => Some(unknownSettingRefusal(name))
+          case Some(DuckDbSettingScopes.Scope.GlobalOnly)    => Some(NodeWideRefusal)
+          case Some(DuckDbSettingScopes.Scope.GlobalDefault) =>
+            Option.when(form == Form.Unscoped)(unscopedRefusal(name))
+          case Some(_) => None
 
   /** `INSTALL` (any form: it downloads extension code onto the shared node, from the default
     * repository too), `FORCE INSTALL`, `UPDATE EXTENSIONS`, and a `LOAD` naming a path or URL (code
@@ -361,7 +470,7 @@ object NodeSettingScreen:
     if h.word(h.start).contains("import") && h.word(h.start + 1).contains("database") then
       Some(ImportRefusalMessage)
     else
-      settingTarget(h).collect {
+      settingTarget(h).map(canonical).collect {
         case n if ParserSettings(n) => RefusalMessage
         case n if SecretSettings(n) => SecretRefusalMessage
       }

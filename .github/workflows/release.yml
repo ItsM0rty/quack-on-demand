@@ -107,6 +107,9 @@ jobs:
         with:
           sbt-runner-version: '1.12.11'
 
+      - name: Guard - release-grade DuckDB pins
+        run: scripts/release/check-release-pins.sh
+
       - name: Verify vendored libquackwire binaries match the pin
         run: |
           set -euo pipefail

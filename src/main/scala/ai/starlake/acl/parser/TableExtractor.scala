@@ -112,7 +112,7 @@ object TableExtractor:
     */
   def catalogFunctionName(raw: String): Option[String] =
     Option(raw)
-      .map(_.trim.stripPrefix("\"").stripSuffix("\"").toLowerCase(Locale.ROOT))
+      .map(r => ai.starlake.sql.QuotedIdentifier.unquote(r.trim).toLowerCase(Locale.ROOT))
       .filter(DuckDbCatalogFunctions.contains)
 
   /** Some(canonical name) when `call` is exactly the argument-free call `name()` of one of

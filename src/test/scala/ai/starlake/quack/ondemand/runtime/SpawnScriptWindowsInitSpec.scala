@@ -36,15 +36,17 @@ class SpawnScriptWindowsInitSpec extends AnyFlatSpec with Matchers with SpawnScr
 
   /** Dry run of the ps1 with its node directories under `tmp`; returns (exit code, stdout, stderr).
     */
-  private def dryRun(tmp: Path, target: String): (Int, String, String) =
+  private def dryRun(
+      tmp: Path,
+      target: String,
+      extraEnv: Seq[(String, String)] = Nil
+  ): (Int, String, String) =
     assume(pwsh.nonEmpty, "no PowerShell on this host")
     val secrets =
       NodeSecretFiles.writePrivateDir(Map(NodeSecretFiles.TokenKey -> "tok"), Some(tempDir))
     val out = new StringBuilder
     val err = new StringBuilder
-    val rc  = Process(
-      Seq(pwsh.get, "-NoProfile", "-File", ps1, "21999"),
-      Files.createDirectories(tempDir.resolve("start")).toFile,
+    val env = Seq(
       "QOD_SPAWN_DRY_RUN"          -> "1",
       "QOD_SPAWN_TARGET_OS"        -> target,
       "TMPDIR"                     -> tmp.toString,
@@ -55,8 +57,18 @@ class SpawnScriptWindowsInitSpec extends AnyFlatSpec with Matchers with SpawnScr
       "schemaName"                 -> "main",
       NodeSecretFiles.DirEnv       -> secrets.toString,
       NodeSecretFiles.EphemeralEnv -> "1"
+    ) ++ extraEnv
+    val rc = Process(
+      Seq(pwsh.get, "-NoProfile", "-File", ps1, "21999"),
+      Files.createDirectories(tempDir.resolve("start")).toFile,
+      env*
     ) ! ProcessLogger(l => out.append(l).append('\n'), l => err.append(l).append('\n'))
     (rc, out.toString, err.toString)
+
+  private def deadPid(): Long =
+    val dead = new java.lang.ProcessBuilder("true").start()
+    dead.waitFor()
+    dead.pid()
 
   private def dotLines(out: String): Vector[String] =
     out.linesIterator.filter(_.startsWith(".")).toVector
@@ -107,6 +119,57 @@ class SpawnScriptWindowsInitSpec extends AnyFlatSpec with Matchers with SpawnScr
     withClue(err)(rc shouldBe 0)
     Files.exists(stale) shouldBe false
     err should not include "could not remove"
+  }
+
+  // F01: a line starting with `.` is a CLI dot-command in the `.read` payload (`.shell` runs an OS
+  // command); the script refuses one in any value it did not author, before writing anything.
+  "the PowerShell spawn" should "refuse a dot-command line in the init SQL" in {
+    val tmp = Files.createDirectories(tempDir.resolve("t"))
+    List("SET a = 1;\n  .shell id", "SET a = 1;\r.system id").foreach { sql =>
+      val (rc, out, err) = dryRun(tmp, "windows", Seq("dbInitSql" -> sql))
+      withClue(err)(rc should not be 0)
+      err should include("dbInitSql holds a line starting with '.'")
+      out shouldBe ""
+    }
+    val (rc, out, err) = dryRun(tmp, "windows", Seq("HTTP_PROXY" -> "proxy:3128\n.shell id"))
+    withClue(err)(rc should not be 0)
+    err should include("the assembled init SQL holds a line starting with '.'")
+    out shouldBe ""
+    Files.list(tmp).count() shouldBe 0
+  }
+
+  // F06: off Windows the temp root is often the shared /tmp, so the sweep must not follow a planted
+  // symlink nor delete a spill path a node directory merely names.
+  "a later PowerShell spawn" should "sweep only real directories and spill directories it made" in {
+    assume(!scala.util.Properties.isWin, "symlinks need privileges on Windows")
+    val tmp       = Files.createDirectories(tempDir.resolve("t"))
+    val spillRoot = Files.createDirectories(tempDir.resolve("start").resolve(".tmp"))
+    // Spill paths are written physical, as the script itself writes them (its starting directory is
+    // the process's getcwd, e.g. /private/var/... for a macOS temp dir).
+    // A symlinked entry pointing at a directory that looks stale, naming a real spill directory.
+    val victim = Files.createDirectories(tempDir.resolve("victim"))
+    Files.writeString(victim.resolve("owner.pid"), s"${deadPid()} 0")
+    val linkedSpill = Files.createDirectories(spillRoot.resolve("qod-node.aaaaaaaaaaaa"))
+    Files.writeString(victim.resolve("spill.path"), linkedSpill.toRealPath().toString)
+    Files.createSymbolicLink(tmp.resolve("quack-node.deadbeef0002"), victim)
+    // A stale directory naming a path outside every spill root.
+    val planted = Files.createDirectories(tmp.resolve("quack-node.deadbeef0003"))
+    Files.writeString(planted.resolve("owner.pid"), s"${deadPid()} 0")
+    val outside = Files.createDirectories(tempDir.resolve("data").resolve("qod-node.bbbbbbbbbbbb"))
+    Files.writeString(planted.resolve("spill.path"), outside.toRealPath().toString)
+    // A stale directory of this host with its own spill directory.
+    val real = Files.createDirectories(tmp.resolve("quack-node.deadbeef0004"))
+    Files.writeString(real.resolve("owner.pid"), s"${deadPid()} 0")
+    val realSpill = Files.createDirectories(spillRoot.resolve("qod-node.cccccccccccc"))
+    Files.writeString(real.resolve("spill.path"), realSpill.toRealPath().toString)
+    val (rc, _, err) = dryRun(tmp, "windows")
+    withClue(err)(rc shouldBe 0)
+    Files.exists(victim.resolve("owner.pid")) shouldBe true
+    Files.exists(linkedSpill) shouldBe true
+    Files.exists(planted) shouldBe false
+    Files.exists(outside) shouldBe true
+    Files.exists(real) shouldBe false
+    Files.exists(realSpill) shouldBe false
   }
 
   "the Windows outer init" should "hand the CLI only relative, single-quoted paths" in {

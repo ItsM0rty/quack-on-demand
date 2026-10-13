@@ -27,7 +27,18 @@ import SqlLexer.{Kind, Token}
   *     non-ASCII) becomes a double-quoted identifier;
   *   - an operator holding `//` has it collapsed to `/` (the one change that alters the statement,
   *     see [[Rendered.exact]]);
-  *   - identifiers keep their quoting, everything else is copied as is.
+  *   - a backtick-quoted identifier holding no double quote becomes the double-quoted identifier
+  *     DuckDB 2.0 reads it as (`` `a``b` `` is `"a`b"`, the same name: [[QuotedIdentifier]]). One
+  *     holding a double quote keeps its backticks: JSqlParser does not undouble `""`, so `"a""b"`
+  *     would reach the ACL as `a""b`, a name DuckDB never reads, while it reads `` `a"b` `` as
+  *     `a"b`; the policy matchers unquote both delimiters anyway. JSqlParser's own
+  *     `getUnquotedName` strips backticks, so the ACL authorized `` FROM `orders` `` as `orders`,
+  *     while every policy match unquoted double quotes only: a backtick-quoted table or column met
+  *     no row filter and no column mask. Rendered once here, the gate, the policy rewriters and the
+  *     protected-write guard read the one spelling, and a rewrite printed from it is still the
+  *     caller's statement on 2.0 (the engine pin; [[ai.starlake.quack.edge.sql.BacktickScreen]]
+  *     refuses a backtick on 1.x, where it is an operator);
+  *   - double-quoted identifiers keep their quoting, everything else is copied as is.
   *
   * JSqlParser then never extends a literal past the point where DuckDB closes it: every quote it
   * meets inside one is doubled, and its backslash handling only ever ends a literal EARLIER (into
@@ -178,11 +189,16 @@ private[starlake] object ParserInput:
       t.kind match
         case Kind.Literal =>
           // a quoted identifier: string literals were taken by `string`
-          if SqlLexer.unterminated(view, t) then error = Some("unterminated quoted identifier")
-          s
-        case Kind.Word if !s.forall(isPlainWordChar) =>
-          "\"" + s.replace("\"", "\"\"") + "\""
-        case Kind.Operator if s.contains("//") =>
+          if SqlLexer.unterminated(view, t) then
+            error = Some("unterminated quoted identifier")
+            s
+          else if s.charAt(0) == '`' && !s.contains('"') then
+            // the same identifier only where a backtick quotes one (2.0 and later)
+            if ai.starlake.quack.edge.sql.BacktickScreen.active then exact = false
+            QuotedIdentifier.doubleQuoted(QuotedIdentifier.unquote(s))
+          else s
+        case Kind.Word if !s.forall(isPlainWordChar) => QuotedIdentifier.doubleQuoted(s)
+        case Kind.Operator if s.contains("//")       =>
           exact = false
           s.replaceAll("/{2,}", "/")
         case Kind.Punct if s == "$" && t.end < text.length && text.charAt(t.end) == '$' =>

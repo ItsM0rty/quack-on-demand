@@ -204,6 +204,9 @@ class NodeSettingScreenSpec extends AnyFlatSpec with Matchers:
       Some(NodeSettingScreen.RefusalMessage)
   }
 
+object NodeWideSettingScreenSpec:
+  val nodeWide: String = NodeSettingScreen.NodeWideRefusal
+
 class NodeWideSettingScreenSpec extends AnyFlatSpec with Matchers:
 
   private def refused(sql: String): Boolean = NodeSettingScreen.screenNodeWide(sql).isDefined
@@ -283,24 +286,179 @@ class NodeWideSettingScreenSpec extends AnyFlatSpec with Matchers:
     Seq(
       "SET search_path = 'lake.main'",
       "SET schema = 'main'",
+      "SET SCHEMA 'main'",
       "SET TimeZone = 'Europe/Paris'",
+      "SET timezone TO 'UTC'",
       "SET SESSION TimeZone = 'UTC'",
+      "SET TIME ZONE 'UTC'",
+      "SET TIME ZONE LOCAL",
+      "RESET TimeZone",
       "SET Calendar = 'gregorian'",
       "SET http_timeout = 300",
-      "SET default_order = 'DESC'",
-      "SET default_null_order = 'nulls_first'",
-      "SET preserve_insertion_order = false",
+      "SET http_retries = 5",
+      "SET s3_endpoint = 'minio:9000'",
+      "SET s3_region = 'eu-west-1'",
+      "SET s3_access_key_id = 'k'",
+      "SET pg_oauth_token = 't'",
+      "SET SESSION default_order = 'DESC'",
+      "SET SESSION default_null_order = 'nulls_first'",
+      "SET SESSION null_order = 'nulls_first'",
+      "SET SESSION preserve_insertion_order = false",
+      "RESET SESSION default_order",
+      "SET LOCAL default_order = 'DESC'",
       "SET enable_progress_bar = false",
       "SET errors_as_json = true",
       "SET max_execution_time = '10s'",
+      "SET integer_division = true",
+      "SET streaming_buffer_size = '1GB'",
+      "SET binary_as_string = true",
       "SET VARIABLE x = 42",
+      "SET VARIABLE default_order = 42",
       "RESET VARIABLE x",
       "RESET search_path",
       "CHECKPOINT",
+      "PRAGMA table_info('t')",
+      "PRAGMA table_info = 't'",
+      "PRAGMA show_tables",
+      "PRAGMA database_size",
+      "PRAGMA version",
+      "PRAGMA enable_progress_bar",
+      "PRAGMA default_order('DESC')",
       "SELECT current_setting('threads')",
       "SELECT * FROM duckdb_settings() WHERE name = 'memory_limit'",
-      "UPDATE t SET threads = 2"
+      "UPDATE t SET threads = 2",
+      "UPDATE t SET default_order = 2"
     ).foreach(sql => withClue(sql)(refused(sql) shouldBe false))
+
+  // DuckDB 2.0 resolves an unscoped SET / RESET (and `PRAGMA x = v`, lowered to one) to the scope
+  // the setting registered (physical_set.cpp): GLOBAL for a GLOBAL-default core setting and for an
+  // extension option added with SetScope::GLOBAL, i.e. the node's shared DBConfig. A bare
+  // `SET default_collation = 'nocase'` made every other session's `=` case-insensitive.
+  private val globalDefault = Seq(
+    "default_collation"                        -> "'nocase'",
+    "default_order"                            -> "'DESC'",
+    "default_null_order"                       -> "'nulls_first'",
+    "null_order"                               -> "'nulls_first'",
+    "enable_optimizer"                         -> "false",
+    "preserve_insertion_order"                 -> "false",
+    "immediate_transaction_mode"               -> "true",
+    "old_implicit_casting"                     -> "true",
+    "extra_http_headers"                       -> "MAP {'x-amz-x': 'y'}",
+    "ducklake_retry_wait_ms"                   -> "86400000",
+    "ducklake_max_retry_count"                 -> "0",
+    "ducklake_retry_backoff"                   -> "10",
+    "ducklake_target_file_size"                -> "'1KB'",
+    "ducklake_default_data_inlining_row_limit" -> "0",
+    "pg_staleness_query_enabled"               -> "false",
+    "iceberg_use_metadata_log"                 -> "false"
+  )
+
+  "a GLOBAL-default setting" should "be refused unscoped, in every SET / RESET / PRAGMA form" in
+    globalDefault.foreach { case (name, value) =>
+      val upper = name.toUpperCase(java.util.Locale.ROOT)
+      val msg   = Some(NodeSettingScreen.unscopedRefusal(name))
+      withClue(name) {
+        NodeSettingScreen.screenNodeWide(s"SET $name = $value") shouldBe msg
+        NodeSettingScreen.screenNodeWide(s"SET $name TO $value") shouldBe msg
+        NodeSettingScreen.screenNodeWide(s"SET $name = DEFAULT") shouldBe msg
+        NodeSettingScreen.screenNodeWide(s"RESET $name") shouldBe msg
+        NodeSettingScreen.screenNodeWide(s"PRAGMA $name = $value") shouldBe msg
+        NodeSettingScreen.screenNodeWide(s"""PRAGMA"$name"=$value""") shouldBe msg
+        refused(s"set $upper = $value") shouldBe true
+        refused(s"""SET"$name"=$value""") shouldBe true
+        refused(s"SET`$name`=$value") shouldBe true
+        refused(s"SET/* c */$name = $value") shouldBe true
+        refused(s"EXPLAIN ANALYZE SET $name = $value") shouldBe true
+        refused(s"SELECT 1; SET $name = $value") shouldBe true
+        refused(s"SET GLOBAL $name = $value") shouldBe true
+        refused(s"RESET GLOBAL $name") shouldBe true
+      }
+    }
+
+  it should "be admitted at session scope" in
+    globalDefault.foreach { case (name, value) =>
+      withClue(name) {
+        refused(s"SET SESSION $name = $value") shouldBe false
+        refused(s"SET SESSION\"$name\" TO $value") shouldBe false
+        refused(s"RESET SESSION $name") shouldBe false
+        refused(s"SET LOCAL $name = $value") shouldBe false
+        refused(s"EXPLAIN ANALYZE SET SESSION $name = $value") shouldBe false
+      }
+    }
+
+  it should "tell the caller to scope it to the session" in {
+    NodeSettingScreen.unscopedRefusal("default_order") should include("SET SESSION default_order")
+  }
+
+  // The parser and credential settings are refused to every caller by `screen`, not judged here.
+  "every setting the generated table holds" should "be judged by the scope it registers" in
+    DuckDbSettingScopes.Settings.filterNot((n, _) => NodeSettingScreen.Settings(n)).foreach {
+      case (name, entry) =>
+        withClue(s"$name (${entry.scope})") {
+          val nodeWide = NodeSettingScreen.isNodeWide(name)
+          import DuckDbSettingScopes.Scope.*
+          refused(s"SET \"$name\" = 1") shouldBe (nodeWide || entry.scope == GlobalOnly ||
+            entry.scope == GlobalDefault)
+          refused(s"SET SESSION \"$name\" = 1") shouldBe (nodeWide || entry.scope == GlobalOnly)
+          refused(s"SET GLOBAL \"$name\" = 1") shouldBe true
+        }
+    }
+
+  // `force_mbedtls_unsafe` is the alias of `debug_force_mbedtls_unsafe` (config.cpp); the alias
+  // applies on 2.0 and duckdb_settings() hides debug rows, so the debug_ prefix never saw it.
+  "an alias" should "be judged as the setting it names" in {
+    Seq(
+      "SET force_mbedtls_unsafe = true",
+      "SET SESSION force_mbedtls_unsafe = true",
+      "RESET force_mbedtls_unsafe",
+      "PRAGMA force_mbedtls_unsafe = true",
+      "SET force_bitpacking_mode = 'constant'",
+      "SET enable_caching_operators = true",
+      "SET wal_autocheckpoint = '1GB'"
+    ).foreach { sql =>
+      withClue(sql)(
+        NodeSettingScreen.screenNodeWide(sql) shouldBe Some(NodeWideSettingScreenSpec.nodeWide)
+      )
+    }
+    NodeSettingScreen.canonical("null_order") shouldBe "default_null_order"
+    NodeSettingScreen.canonical("default_order") shouldBe "default_order"
+  }
+
+  // Fail closed: an extension loaded after this table was generated can register a GLOBAL option.
+  "a setting the table does not hold" should "be refused unscoped and at session scope" in {
+    Seq(
+      "SET hnsw_ef_search = 10",
+      "SET SESSION hnsw_ef_search = 10",
+      "RESET hnsw_ef_search",
+      "PRAGMA hnsw_ef_search = 10",
+      "SET enable_legacy_parser = true",
+      "SET no_such_setting = 1",
+      "SET variable = 1"
+    ).foreach(sql => withClue(sql)(refused(sql) shouldBe true))
+    NodeSettingScreen.screenNodeWide("SET no_such_setting = 1") shouldBe
+      Some(NodeSettingScreen.unknownSettingRefusal("no_such_setting"))
+    Seq("SET = 1", "RESET", "SET 'default_order' = 'DESC'").foreach { sql =>
+      withClue(sql)(
+        NodeSettingScreen.screenNodeWide(sql) shouldBe Some(
+          NodeSettingScreen.UnreadableSettingRefusal
+        )
+      )
+    }
+    // a pragma call assigns nothing: an unknown name there is a pragma function
+    refused("PRAGMA no_such_pragma") shouldBe false
+  }
+
+  // mysql_scanner's twin of the reserved postgres pool and debug printer settings, and of
+  // pg_clear_cache.
+  "the mysql pool and debug settings" should "be reserved in every scope" in
+    Seq(
+      "SET mysql_pool_size = 1",
+      "SET SESSION mysql_pool_size = 1",
+      "SET SESSION mysql_pool_health_check_query = 'SELECT 1'",
+      "SET mysql_debug_show_queries = true",
+      "SET SESSION mysql_debug_show_queries = true",
+      "SELECT * FROM mysql_clear_cache()"
+    ).foreach(sql => withClue(sql)(refused(sql) shouldBe true))
 
   "NodeWideSettings" should "not overlap the settings refused for every caller" in {
     NodeSettingScreen.NodeWideSettings.intersect(NodeSettingScreen.Settings) shouldBe empty

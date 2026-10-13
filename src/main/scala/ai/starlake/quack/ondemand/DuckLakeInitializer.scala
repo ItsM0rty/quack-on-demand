@@ -36,6 +36,13 @@ import java.sql.DriverManager
   * `ducklake_metadata.data_path` is a no-op. Re-init with a different dataPath is rejected by
   * DuckLake itself.
   *
+  * Migration: the ATTACH passes `AUTOMATIC_MIGRATION TRUE` only when [[migrationPlan]] says the
+  * catalog needs it (older than [[LatestDuckLakeVersion]], or at that dev version but last migrated
+  * by another engine build, recorded in `qod_meta.ducklake_migration` inside the catalog's own
+  * database). A current catalog attaches with no DDL at all. Every metadata statement waits at most
+  * [[CatalogLockTimeoutMs]] for a table lock ([[initializerConnstr]]); past it the init fails with
+  * [[CatalogLockTimeoutException]], which the supervisor retries rather than blocking on.
+  *
   * Pure JVM - no `duckdb` CLI on the manager host required (the duckdb JDBC driver ships its own
   * embedded engine), no shell-out, no extra script in the image.
   */
@@ -153,12 +160,12 @@ object DuckLakeInitializer extends LazyLogging:
         stmt.execute(ext.loadSql("ducklake"))
         stmt.execute(ext.loadSql("postgres_scanner"))
         storageSqlFor(dataPath, ext).foreach(stmt.execute)
+        val build = engineBuild(conn)
         // The password never rides the ATTACH string (DuckDB keeps an attach path verbatim and
         // prints it in errors): it goes into a temporary secret the ATTACH names, dropped right
         // after the ATTACH ([[CatalogPgSecret]]). The path's values are libpq-quoted
         // ([[CatalogPgSecret.libpqValue]]) inside a DuckDB literal ([[duckdbLiteral]]).
-        val connstr = CatalogPgSecret.connstr(pgHost, pgPort, dbName, pgUser)
-        val attach  = attachSql(connstr, dbName, dataPath, encrypted)
+        val connstr = initializerConnstr(pgHost, pgPort, dbName, pgUser)
 
         // Side-channel Postgres connection that holds the per-dbname
         // advisory lock only for the duration of the DuckLake ATTACH.
@@ -191,11 +198,64 @@ object DuckLakeInitializer extends LazyLogging:
             try lockStmt.close()
             catch case _: Throwable => ()
 
-          stmt.execute(CatalogPgSecret.createSql(CatalogPgSecret.Name, pgPassword))
-          try stmt.execute(attach)
-          finally stmt.execute(CatalogPgSecret.dropSql(CatalogPgSecret.Name))
-          stmt.execute(s"USE ${quoteIdent(dbName)}")
-          stmt.execute(s"CREATE SCHEMA IF NOT EXISTS ${quoteIdent(schemaName)}")
+          // Decided under the lock: every other writer of this catalog (initializers, node
+          // spawns) holds the same lock around its ATTACH, so what is read here is what the
+          // ATTACH below will find.
+          val state = readCatalogState(pgConn)
+          val plan  = migrationPlan(
+            state.version,
+            state.established,
+            state.schema.flatMap(readMigrationStamp(pgConn, _)),
+            build,
+            LatestDuckLakeVersion
+          )
+          val attach =
+            attachSql(connstr, dbName, dataPath, encrypted, plan == MigrationPlan.Migrate)
+          if plan == MigrationPlan.Migrate then
+            val from = state.version match
+              case MetadataRead.Value(v) => v
+              case _                     => "unrecorded"
+            logger.info(
+              s"DuckLake pre-init: migrating '$dbName' from catalog version $from " +
+                s"(engine ${build.getOrElse("unknown")})"
+            )
+
+          try
+            stmt.execute(CatalogPgSecret.createSql(CatalogPgSecret.Name, pgPassword))
+            // The drop runs on a fresh statement: DuckDB's JDBC closes a statement whose execute
+            // failed, so dropping through `stmt` after a failed ATTACH threw "Statement was
+            // closed" and masked the ATTACH's own error (a lock timeout, a DATA_PATH mismatch).
+            val attached = scala.util.Try(stmt.execute(attach))
+            val dropped  = scala.util.Try {
+              val drop = conn.createStatement()
+              try drop.execute(CatalogPgSecret.dropSql(CatalogPgSecret.Name))
+              finally drop.close()
+            }
+            attached.get
+            dropped.get
+            stmt.execute(s"USE ${quoteIdent(dbName)}")
+            stmt.execute(s"CREATE SCHEMA IF NOT EXISTS ${quoteIdent(schemaName)}")
+          catch
+            case t: Throwable if isLockTimeout(t) =>
+              val what = if plan == MigrationPlan.Migrate then "migration" else "attach"
+              throw CatalogLockTimeoutException(
+                s"DuckLake catalog '$dbName': a catalog table lock was not granted within " +
+                  s"$CatalogLockTimeoutMs ms (a long-running read or an open transaction on a " +
+                  s"node holds it); the $what is retried on the next reconcile pass",
+                t
+              )
+          // A stamp that fails to write only costs one redundant migration on the next pass, so it
+          // never fails an init that already succeeded.
+          if plan != MigrationPlan.AsIs then
+            build.foreach { b =>
+              try writeMigrationStamp(pgConn, b)
+              catch
+                case t: Throwable =>
+                  logger.warn(
+                    s"DuckLake pre-init: '$dbName' attached, but recording the migrating engine " +
+                      s"build failed (${t.getMessage}); the next pass migrates again"
+                  )
+            }
           logger.info(s"DuckLake pre-init OK: $dbName.$schemaName ready at $dataPath")
 
           // Release the lock. pg_advisory_lock is session-scoped so closing
@@ -297,17 +357,237 @@ object DuckLakeInitializer extends LazyLogging:
       connstr: String,
       dbName: String,
       dataPath: String,
-      encrypted: Boolean
+      encrypted: Boolean,
+      migrate: Boolean
   ): String =
-    // The initializer migrates a catalog older than the latest DuckLake version once per manager
-    // boot, under the per-dbname advisory lock. On DuckDB 2.0 an attach without the flag accepts
-    // any catalog >= 1.0 as-is; nodes never pass it, because each flagged attach re-runs the
-    // migration DDL (ACCESS EXCLUSIVE in Postgres) on every spawn.
-    val opts =
-      if encrypted then s"DATA_PATH ${duckdbLiteral(dataPath)}, ENCRYPTED, AUTOMATIC_MIGRATION TRUE"
-      else s"DATA_PATH ${duckdbLiteral(dataPath)}, AUTOMATIC_MIGRATION TRUE"
     val secret = CatalogPgSecret.metadataParameters(CatalogPgSecret.Name)
-    s"ATTACH ${duckdbLiteral(connstr)} AS ${quoteIdent(dbName)} ($opts, $secret)"
+    s"ATTACH ${duckdbLiteral(connstr)} AS ${quoteIdent(dbName)} " +
+      s"(${attachOptions(dataPath, encrypted, migrate)}, $secret)"
+
+  /** The option list of [[attachSql]] without the metadata secret, which only a Postgres catalog
+    * takes; `DuckLakeInitializerMigrationSpec` runs it against a DuckDB-file catalog.
+    */
+  private[ondemand] def attachOptions(
+      dataPath: String,
+      encrypted: Boolean,
+      migrate: Boolean
+  ): String =
+    // AUTOMATIC_MIGRATION rides only the attach [[migrationPlan]] says needs it. On a catalog
+    // already at the latest DEV version DuckLake re-runs the in-place dev migration on every
+    // flagged attach (6 ALTER TABLE ... ADD COLUMN IF NOT EXISTS, a CREATE TABLE IF NOT EXISTS
+    // and an UPDATE), and Postgres takes ACCESS EXCLUSIVE on each altered table BEFORE checking
+    // IF NOT EXISTS, so an unconditional flag queued every boot behind any open read of those
+    // tables. Without the flag DuckDB 2.0 accepts any catalog >= 1.0 as-is and runs no DDL; nodes
+    // never pass it.
+    val base = s"DATA_PATH ${duckdbLiteral(dataPath)}"
+    val enc  = if encrypted then s"$base, ENCRYPTED" else base
+    if migrate then s"$enc, AUTOMATIC_MIGRATION TRUE" else enc
+
+  /** The DuckLake catalog version the pinned extension creates and migrates to (its
+    * `DUCKLAKE_LATEST_VERSION`). DuckLake exposes it to SQL only through a catalog it created, so
+    * it is a constant here, and `DuckLakeInitializerMigrationSpec` creates a fresh catalog through
+    * the in-process DuckDB and asserts it: a pin bump that moves the version fails that spec
+    * instead of silently skipping migrations.
+    */
+  val LatestDuckLakeVersion: String = "1.1-dev1"
+
+  /** Postgres `lock_timeout`, in ms, on the initializer's catalog connection only (never on a
+    * node's). Bounds how long one migration DDL statement waits behind an open read of the table it
+    * alters, and so how long every later reader of that table queues behind the pending ACCESS
+    * EXCLUSIVE. Past it the init fails with [[CatalogLockTimeoutException]] and is retried later.
+    */
+  val CatalogLockTimeoutMs: Int = 5000
+
+  /** The initializer's DuckLake attach path: [[CatalogPgSecret.connstr]] plus a libpq `options`
+    * keyword setting [[CatalogLockTimeoutMs]] on every metadata connection DuckLake opens through
+    * it. Nodes keep the plain connstr: a node's attach runs no DDL, and a lock timeout there would
+    * only turn a slow read into a failed one.
+    */
+  private[ondemand] def initializerConnstr(
+      host: String,
+      port: String,
+      dbName: String,
+      user: String
+  ): String =
+    CatalogPgSecret.connstr(host, port, dbName, user) +
+      s" options=${libpqValue(s"-c lock_timeout=$CatalogLockTimeoutMs")}"
+
+  /** What one initializer ATTACH has to do to a catalog. */
+  private[ondemand] enum MigrationPlan:
+    /** No established catalog: the ATTACH creates one at [[LatestDuckLakeVersion]]. */
+    case Create
+
+    /** The catalog needs `AUTOMATIC_MIGRATION TRUE`. */
+    case Migrate
+
+    /** The catalog is current for this engine build: attach without the flag, no DDL. */
+    case AsIs
+
+  /** Parsed DuckLake version: `major.minor[-devN]`, a dev build ordering before its release. */
+  private val VersionRe = """(\d+)\.(\d+)(?:-dev(\d+))?""".r
+
+  /** Orders two DuckLake version strings, or None when either does not parse. */
+  private[ondemand] def compareVersions(a: String, b: String): Option[Int] =
+    def key(v: String): Option[(Int, Int, Int)] = v.trim match
+      case VersionRe(major, minor, dev) =>
+        // A release sorts after every dev build of the same major.minor.
+        Some((major.toInt, minor.toInt, Option(dev).fold(Int.MaxValue)(_.toInt)))
+      case _ => None
+    for
+      ka <- key(a)
+      kb <- key(b)
+    yield Ordering[(Int, Int, Int)].compare(ka, kb)
+
+  /** Whether the initializer's ATTACH passes `AUTOMATIC_MIGRATION TRUE`.
+    *
+    *   - no `ducklake_metadata`, or one with no committed `data_path` yet:
+    *     [[MigrationPlan.Create]].
+    *   - catalog older than `latest`, or a version that does not parse, or an established catalog
+    *     with no recorded version: Migrate (DuckLake decides what to run).
+    *   - catalog at `latest` when `latest` is a dev version: DuckLake deliberately re-runs its dev
+    *     migration on every flagged attach, because a dev schema evolves in place under the same
+    *     version string. So migrate only when the engine build that last migrated this catalog
+    *     (`stamp`) is not the current one (`build`); an unknown current build always migrates.
+    *   - catalog at a released `latest`, or newer than `latest`: AsIs (DuckLake refuses a catalog
+    *     newer than the engine with or without the flag).
+    */
+  private[ondemand] def migrationPlan(
+      version: MetadataRead,
+      established: Boolean,
+      stamp: Option[String],
+      build: Option[String],
+      latest: String
+  ): MigrationPlan =
+    version match
+      case MetadataRead.NoTable  => MigrationPlan.Create
+      case _ if !established     => MigrationPlan.Create
+      case MetadataRead.NoRow    => MigrationPlan.Migrate
+      case MetadataRead.Value(v) =>
+        compareVersions(v, latest) match
+          case None                               => MigrationPlan.Migrate
+          case Some(c) if c < 0                   => MigrationPlan.Migrate
+          case Some(c) if c > 0                   => MigrationPlan.AsIs
+          case Some(_) if latest.contains("-dev") =>
+            if build.isDefined && stamp == build then MigrationPlan.AsIs
+            else MigrationPlan.Migrate
+          case Some(_) => MigrationPlan.AsIs
+
+  /** The build of the DuckLake code that would run a migration on `conn`: the engine's `source_id`
+    * and the loaded `ducklake` extension's version, e.g. `duckdb=b15358c371 ducklake=e8924cfc9c`.
+    * None when either is unknown, which [[migrationPlan]] reads as "always migrate a dev catalog".
+    */
+  private[ondemand] def engineBuild(conn: java.sql.Connection): Option[String] =
+    val st = conn.createStatement()
+    try
+      val rs = st.executeQuery(
+        "SELECT (SELECT source_id FROM pragma_version()), " +
+          "(SELECT extension_version FROM duckdb_extensions() " +
+          "WHERE extension_name = 'ducklake' AND loaded)"
+      )
+      try
+        if rs.next() then
+          for
+            engine   <- Option(rs.getString(1)).map(_.trim).filter(_.nonEmpty)
+            ducklake <- Option(rs.getString(2)).map(_.trim).filter(_.nonEmpty)
+          yield s"duckdb=$engine ducklake=$ducklake"
+        else None
+      finally rs.close()
+    finally st.close()
+
+  /** QoD's own schema in a catalog's Postgres database, next to DuckLake's tables. Its own schema,
+    * like the merge fence's, so [[ai.starlake.quack.ondemand.branch.BranchCloner]] (which copies
+    * the metadata schema only) never carries it into a branch: a branch migrates once, on its first
+    * pass, and records its own stamp.
+    */
+  private[ondemand] val StampSchema: String = "qod_meta"
+
+  /** The table holding, per DuckLake metadata schema, the [[engineBuild]] that last migrated (or
+    * created) the catalog, so the next pass can tell whether a dev catalog is current.
+    */
+  private[ondemand] val StampTable: String = "ducklake_migration"
+
+  /** The recorded [[engineBuild]] for the catalog in `metadataSchema`, or None when nothing was
+    * recorded (no table yet, or no row). Two statements, which is safe here: it is read under the
+    * advisory lock every writer of the stamp holds, and a stale answer can only cost a redundant
+    * migration, never skip a needed one.
+    */
+  private[ondemand] def readMigrationStamp(
+      pgConn: java.sql.Connection,
+      metadataSchema: String
+  ): Option[String] =
+    val exists =
+      val st = pgConn.prepareStatement("SELECT to_regclass(?) IS NOT NULL")
+      try
+        st.setString(1, s"${quoteIdent(StampSchema)}.${quoteIdent(StampTable)}")
+        val rs = st.executeQuery()
+        try rs.next() && rs.getBoolean(1)
+        finally rs.close()
+      finally st.close()
+    if !exists then None
+    else
+      val st = pgConn.prepareStatement(
+        s"SELECT engine_build FROM ${quoteIdent(StampSchema)}.${quoteIdent(StampTable)} " +
+          "WHERE metadata_schema = ?"
+      )
+      try
+        st.setString(1, metadataSchema)
+        val rs = st.executeQuery()
+        try if rs.next() then Option(rs.getString(1)) else None
+        finally rs.close()
+      finally st.close()
+
+  /** Records `build` as the engine build that last migrated (or created) the catalog. Resolves the
+    * metadata schema afresh, since a creating ATTACH has only just made it; skips silently when
+    * there is still none.
+    */
+  private[ondemand] def writeMigrationStamp(pgConn: java.sql.Connection, build: String): Unit =
+    metadataSchema(pgConn).foreach { schema =>
+      val table = s"${quoteIdent(StampSchema)}.${quoteIdent(StampTable)}"
+      val ddl   = pgConn.createStatement()
+      try
+        ddl.execute(s"CREATE SCHEMA IF NOT EXISTS ${quoteIdent(StampSchema)}")
+        ddl.execute(
+          s"CREATE TABLE IF NOT EXISTS $table (metadata_schema text PRIMARY KEY, " +
+            "engine_build text NOT NULL, migrated_at timestamptz NOT NULL DEFAULT now())"
+        )
+      finally ddl.close()
+      val up = pgConn.prepareStatement(
+        s"INSERT INTO $table (metadata_schema, engine_build) VALUES (?, ?) " +
+          "ON CONFLICT (metadata_schema) DO UPDATE " +
+          "SET engine_build = EXCLUDED.engine_build, migrated_at = now()"
+      )
+      try
+        up.setString(1, schema)
+        up.setString(2, build)
+        up.executeUpdate()
+      finally up.close()
+    }
+
+  /** Postgres `lock_not_available` (SQLSTATE 55P03), the error `lock_timeout` raises, anywhere in
+    * the cause chain. DuckDB relays a postgres_scanner failure as an SQLException whose message
+    * carries Postgres's text ("canceling statement due to lock timeout"), not its SQLSTATE, so both
+    * are matched.
+    */
+  private[ondemand] def isLockTimeout(t: Throwable): Boolean =
+    Iterator
+      .iterate(t)(_.getCause)
+      .takeWhile(_ != null)
+      .take(16)
+      .exists { c =>
+        val msg   = Option(c.getMessage).getOrElse("").toLowerCase(Locale.ROOT)
+        val state = c match
+          case s: java.sql.SQLException => Option(s.getSQLState).getOrElse("")
+          case _                        => ""
+        state == "55P03" || msg.contains("lock timeout") || msg.contains("55p03")
+      }
+
+  /** The initializer could not get a catalog table lock within [[CatalogLockTimeoutMs]]. Transient
+    * by construction (the holder is a read or a transaction that ends), so unlike a
+    * [[PreInitMismatchException]] it never blocks the tenant-db: `PoolSupervisor` logs it at WARN
+    * and retries the init on its next reconcile pass.
+    */
+  final case class CatalogLockTimeoutException(message: String, cause: Throwable)
+      extends RuntimeException(message, cause)
 
   /** Compares the catalog's recorded `ducklake_metadata.encrypted` against what the tenant-db row
     * asks for. `None` recorded means a fresh catalog, which the ATTACH is about to stamp. Same role
@@ -335,9 +615,9 @@ object DuckLakeInitializer extends LazyLogging:
 
   /** A permanent disagreement between what the control-plane row says about a catalog and what the
     * catalog itself already recorded. Callers (`PoolSupervisor`) catch this type to log at ERROR
-    * and refuse to proceed, unlike the generic "first pool spawn will retry" handling for other
-    * init failures: none of these is transient, and retrying only reproduces the same DuckDB error
-    * on every node spawn, forever.
+    * and refuse to proceed, unlike the log-and-continue handling for other init failures (and the
+    * retry of a [[CatalogLockTimeoutException]]): none of these is transient, and retrying only
+    * reproduces the same DuckDB error on every node spawn, forever.
     */
   sealed abstract class PreInitMismatchException(message: String) extends RuntimeException(message)
 
@@ -476,27 +756,35 @@ object DuckLakeInitializer extends LazyLogging:
           finally rs.close()
         finally valueStmt.close()
 
-  /** Both answers [[guardEncryption]] needs, from ONE statement: what the catalog recorded for
-    * `encrypted`, and whether it is established (has recorded its own `data_path`, i.e. a DuckLake
-    * ATTACH has committed the metadata rows).
+  /** What one read of a catalog's `ducklake_metadata` found: the schema holding it (None for a
+    * fresh catalog), the recorded `encrypted` and `version`, and whether the catalog is established
+    * (has recorded its own `data_path`, i.e. a DuckLake ATTACH has committed the metadata rows).
+    */
+  private[ondemand] final case class CatalogState(
+      schema: Option[String],
+      encrypted: MetadataRead,
+      established: Boolean,
+      version: MetadataRead
+  )
+
+  /** Every answer [[guardEncryption]] and [[migrationPlan]] need, from ONE statement.
     *
-    * One statement rather than two because this guard runs BEFORE the advisory lock, so it can
-    * observe a concurrent initializer mid-creation. Read separately, a competing ATTACH committing
-    * between them yields `encrypted` = NoRow followed by `data_path` = present, which
+    * One statement rather than several because the encryption guard runs BEFORE the advisory lock,
+    * so it can observe a concurrent initializer mid-creation. Read separately, a competing ATTACH
+    * committing between them yields `encrypted` = NoRow followed by `data_path` = present, which
     * [[recordedEncryption]] reads as "established and unencrypted": a genuinely encrypted catalog
     * then fails an encrypted tenant-db row with a spurious mismatch, and since the resulting block
-    * is in-memory, it holds until a manager restart. Reading both keys in one snapshot makes that
-    * interleaving unrepresentable.
+    * is in-memory, it holds until a manager restart. Reading every key in one snapshot makes that
+    * interleaving unrepresentable. The migration decision reads it again under the lock.
     */
-  private[ondemand] def readEncryptionState(
-      pgConn: java.sql.Connection
-  ): (MetadataRead, Boolean) =
+  private[ondemand] def readCatalogState(pgConn: java.sql.Connection): CatalogState =
     metadataSchema(pgConn) match
-      case None         => (MetadataRead.NoTable, false)
+      case None =>
+        CatalogState(None, MetadataRead.NoTable, established = false, MetadataRead.NoTable)
       case Some(schema) =>
         val stmt = pgConn.prepareStatement(
           s"SELECT key, value FROM ${quoteIdent(schema)}.ducklake_metadata " +
-            "WHERE key IN ('encrypted', 'data_path')"
+            "WHERE key IN ('encrypted', 'data_path', 'version')"
         )
         try
           val rs = stmt.executeQuery()
@@ -507,9 +795,14 @@ object DuckLakeInitializer extends LazyLogging:
             while rs.next() do
               val k = rs.getString(1)
               Option(rs.getString(2)).foreach(v => found.put(k, v))
-            val read =
-              found.get("encrypted").fold[MetadataRead](MetadataRead.NoRow)(MetadataRead.Value(_))
-            (read, found.contains("data_path"))
+            def read(key: String): MetadataRead =
+              found.get(key).fold[MetadataRead](MetadataRead.NoRow)(MetadataRead.Value(_))
+            CatalogState(
+              Some(schema),
+              read("encrypted"),
+              found.contains("data_path"),
+              read("version")
+            )
           finally rs.close()
         finally stmt.close()
 
@@ -553,7 +846,8 @@ object DuckLakeInitializer extends LazyLogging:
       dbName: String,
       encrypted: Boolean
   ): Unit =
-    val (read, established) = readEncryptionState(pgConn)
-    encryptionMismatch(recordedEncryption(read, established), encrypted).foreach { msg =>
-      throw EncryptionMismatchException(s"DuckLake catalog '$dbName': $msg")
+    val state = readCatalogState(pgConn)
+    encryptionMismatch(recordedEncryption(state.encrypted, state.established), encrypted).foreach {
+      msg =>
+        throw EncryptionMismatchException(s"DuckLake catalog '$dbName': $msg")
     }

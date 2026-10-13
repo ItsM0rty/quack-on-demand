@@ -185,7 +185,7 @@ final class ColumnPolicyRewriter(
       ctx: SchemaContext
   ): Map[String, (String, String, String)] =
     val tables             = Try(TableExtractor.extract(stmt).tables).getOrElse(Nil)
-    def unquote(s: String) = s.stripPrefix("\"").stripSuffix("\"")
+    def unquote(s: String) = ai.starlake.sql.QuotedIdentifier.unquote(s)
     tables.flatMap { t =>
       t.getNameParts.asScala.toList.reverse.map(unquote) match
         case tab :: Nil =>

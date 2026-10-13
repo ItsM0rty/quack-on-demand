@@ -172,3 +172,51 @@ class CatalogInternalsScreenSpec extends AnyFlatSpec with Matchers:
       "SET schema = 'main';",
       "SET http_timeout = 300"
     ).foreach(sql => withClue(sql)(refused(sql) shouldBe false))
+
+  // F08: histogram / histogram_values run query_table(source) in their body (2.0 CLI), and a split
+  // name defeated the text scan while neither macro was a RunTimeTargetCalls name.
+  private val computedMacroSources = Seq(
+    "SELECT * FROM histogram('__duck' || 'lake_metadata_lake.ducklake_data_file', encryption_key)",
+    "SELECT * FROM histogram_values('__duck' || 'lake_metadata_lake.ducklake_data_file', " +
+      "encryption_key)",
+    "SELECT * FROM histogram(concat('__duck', 'lake_metadata_lake.ducklake_data_file'), path)",
+    "SELECT * FROM histogram_values(chr(95) || '_ducklake_metadata_lake.ducklake_data_file', path)",
+    "SELECT * FROM histogram(source := '__duck' || 'lake_metadata_lake.ducklake_data_file', " +
+      "col_name := encryption_key)",
+    "SELECT * FROM histogram_values('x'::VARCHAR, b)",
+    "SELECT * FROM main.\"histogram\"(getvariable('t'), b)",
+    "SELECT * FROM `HISTOGRAM_VALUES`('__duck' || 'lake_metadata_lake.ducklake_data_file', b)",
+    "SELECT * FROM t, histogram(t.src, b)",
+    "WITH h AS (SELECT * FROM histogram('__duck' || 'lake_metadata_lake.x', b)) SELECT * FROM h",
+    "EXPLAIN ANALYZE SELECT * FROM histogram('__duck' || 'lake_metadata_lake.x', b)",
+    "SELECT * FROM query('SELECT * FROM histogram(''__duck'' || ''lake_metadata_lake.x'', b)')",
+    // a statement JSqlParser does not read completely: judged lexically, fail closed
+    "SELECT * FROM histogram('__duck' || 'lake_metadata_lake.x', b) QUALIFY ?? 1"
+  )
+
+  it should "refuse a reading table macro whose source is computed" in
+    computedMacroSources.foreach { sql =>
+      withClue(sql)(CatalogInternalsScreen.screen(sql).exists(_.contains("computed")) shouldBe true)
+    }
+
+  it should "refuse a reading table macro over a literal metadata-catalog source" in
+    Seq(
+      "SELECT * FROM histogram('__ducklake_metadata_lake.ducklake_data_file', encryption_key)",
+      "SELECT * FROM histogram_values('__ducklake_metadata_lake.ducklake_data_file', path)",
+      "SELECT * FROM histogram('__duck'\n'lake_metadata_lake.ducklake_data_file', path)"
+    ).foreach { sql =>
+      withClue(sql)(
+        CatalogInternalsScreen.screen(sql) shouldBe Some(CatalogInternalsScreen.MetadataRefusal)
+      )
+    }
+
+  it should "admit the histogram aggregate and a reading table macro over a constant source" in
+    Seq(
+      "SELECT histogram(c_region) FROM customer",
+      "SELECT histogram(c_region, [1, 2, 3]) FROM customer",
+      "SELECT c_id, histogram(c_region || 'x') FROM customer GROUP BY c_id",
+      "SELECT histogram(bin) FROM histogram_values('customer', c_region)",
+      "SELECT * FROM histogram('customer', c_region)",
+      "SELECT * FROM histogram_values('lake.main.customer', c_region, bin_count := 5)",
+      "SELECT * FROM histogram_values(e'cust\\x6fmer', c_region)"
+    ).foreach(sql => withClue(sql)(refused(sql) shouldBe false))
