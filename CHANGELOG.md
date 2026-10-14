@@ -131,6 +131,15 @@
   ACL already refuses it when on: "ambiguous two-part name 'acme_tpch.customer': 'acme_tpch' is an
   attached catalog; qualify fully as 'acme_tpch.<schema>.<table>'". Users without a policy are not
   affected; a user with one writes `customer`, `main.customer` or `acme_tpch.main.customer`.
+- **Security: row filters hold for PIVOT sources and EXPLAIN.** The row-policy rewrite wraps a
+  table in the positions it knows (FROM, JOIN, FROM-first, a parenthesized TABLE statement) and
+  passed everything else through unchanged, so `SELECT * FROM (PIVOT customer ON ...)`, in any
+  position (a CTE body, a scalar, EXISTS or IN subquery, beside a filtered read of the same table),
+  pivoted every row, and `EXPLAIN ANALYZE SELECT ... FROM customer` ran its query unfiltered,
+  leaking hidden rows through row counts and error messages. A row policy holder's statement is now
+  refused when a table their policy covers is read anywhere the filter cannot reach ("pivot a
+  subquery instead: PIVOT (SELECT * FROM t) ..."), and an EXPLAIN of a statement reading such a
+  table is refused. A pivoted subquery is filtered as before.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM

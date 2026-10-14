@@ -9,6 +9,7 @@ import com.typesafe.scalalogging.LazyLogging
 import net.sf.jsqlparser.expression.{Alias, Expression}
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.schema.Table
+import net.sf.jsqlparser.statement.ExplainStatement
 import net.sf.jsqlparser.statement.piped.FromQuery
 import net.sf.jsqlparser.statement.select.{
   AllColumns,
@@ -92,6 +93,14 @@ object RowPolicyRewriter:
   private val StatementSourceRefusal =
     "a parenthesized statement in table position reads a row-policy table; select from it instead"
 
+  private val UnfilteredRefusal =
+    "a row-policy table is read where the row filter cannot reach it (a PIVOT or UNPIVOT " +
+      "source); pivot a subquery instead: PIVOT (SELECT * FROM t) ..."
+
+  private val ExplainRefusal =
+    "EXPLAIN of a statement reading a row-policy table is refused (EXPLAIN ANALYZE runs it " +
+      "unfiltered, and a plan reports row counts); run the statement itself"
+
   private val TableStatementRefusal =
     "a TABLE statement in expression position (ARRAY(TABLE t), ANY (TABLE t)) reads a " +
       "row-policy table; use a subquery selecting from it instead"
@@ -161,10 +170,20 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
           val values  = tokenValues(eff)
           val changed = new java.util.concurrent.atomic.AtomicBoolean(false)
           try
-            new DeepWalker(eff, ctx, values, changed).walk(stmt)
+            // Taken before the walk replaces them: every policy table the ACL parser's
+            // depth-complete walk sees, as the very AST nodes the rewrite walk wraps.
+            val policyReads = TableExtractor.extract(stmt).tables.filter { t =>
+              matchingPolicies(t, eff, ctx).nonEmpty
+            }
+            val walker = new DeepWalker(eff, ctx, values, changed)
+            walker.walk(stmt)
+            // Completeness (audit F21): a policy table in a position the walk holds no slot for
+            // (a PIVOT / UNPIVOT source) would reach the node unfiltered. Refused, never passed.
+            if policyReads.exists(t => !walker.wrappedTables.contains(t)) then
+              Refused(UnfilteredRefusal)
             // The rewrite is printed from the parser input; when that is not the caller's
             // statement (ParserInput.Rendered.exact) shipping it would run a different one.
-            if !changed.get() then Passthrough
+            else if !changed.get() then Passthrough
             else if exact then Rewritten(stmt.toString)
             else Refused(InexactRefusal)
           catch
@@ -182,7 +201,24 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
                 eff.user.username
               )
               Failed("row policy failed to apply")
+        // An executing EXPLAIN classifies as its statement (Select): DuckDB runs it under EXPLAIN
+        // ANALYZE, and any plan reports row counts, so one reading a policy table is refused.
+        case Some((ex: ExplainStatement, _)) =>
+          if explainReadsPolicyTable(ex, eff, ctx) then Refused(ExplainRefusal) else Passthrough
+        // DESCRIBE / SHOW: no row reaches the caller. Any other kind never gets here (not Select),
+        // and the protected-write guard analyses it instead.
         case Some(_) => Passthrough
+
+  private def explainReadsPolicyTable(
+      ex: ExplainStatement,
+      eff: EffectiveSet,
+      ctx: SchemaContext
+  ): Boolean =
+    Option(ex.getTable).exists(t => matchingPolicies(t, eff, ctx).nonEmpty) ||
+      (ex.getStatement match
+        case sel: Select =>
+          TableExtractor.extract(sel).tables.exists(t => matchingPolicies(t, eff, ctx).nonEmpty)
+        case _ => false)
 
   // ---------- table-occurrence walk ----------
 
@@ -208,6 +244,10 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
       java.util.Collections.newSetFromMap(
         new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
       )
+
+    /** The base tables this walk wrapped, by identity: the completeness check's other side. */
+    val wrappedTables: java.util.Set[Table] =
+      java.util.Collections.newSetFromMap(new java.util.IdentityHashMap[Table, java.lang.Boolean]())
 
     def walk(node: AnyRef): Unit =
       if node != null && visited.add(node) then
@@ -245,6 +285,7 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
           if w eq t then None
           else
             visited.add(w): Unit
+            wrappedTables.add(t): Unit
             Some(w)
         case _ => None
 

@@ -435,3 +435,53 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     rewritten(go("SELECT json_object('a', (SELECT count(*) FROM customer))", effSet)) should
       include("c_region = 'eu'")
   }
+
+  // ---- audit F21: reads the walk cannot filter are refused, never passed through -----------
+
+  private val frOnly = eff(tenantUser, List(policy("c_nation = 'FR'")))
+
+  "a PIVOT or UNPIVOT source naming a policy table" should "be refused in every position" in
+    // JSqlParser holds `PIVOT customer ...` as a PivotQuery with customer as a bare child: no
+    // slot the walk wraps, while DuckDB pivots every row of customer.
+    List(
+      "SELECT * FROM (PIVOT customer ON c_nation USING count(*))",
+      "FROM (PIVOT customer ON c_nation USING count(*))",
+      "WITH p AS (PIVOT customer ON c_nation USING count(*)) SELECT * FROM p",
+      "SELECT (SELECT count(*) FROM (PIVOT customer ON c_nation USING count(*)))",
+      "SELECT * FROM customer c JOIN (PIVOT customer ON c_nation USING count(*)) p ON true",
+      "SELECT 1 WHERE EXISTS (SELECT 1 FROM (PIVOT customer ON c_nation USING count(*)) p " +
+        "WHERE p.c_email LIKE 'bob%')",
+      "SELECT * FROM (PIVOT tpch1.customer ON c_nation USING count(*))"
+    ).foreach { sql =>
+      withClue(sql)(go(sql, frOnly) shouldBe a[Refused])
+    }
+
+  it should "leave UNPIVOT, which JSqlParser cannot parse, to the router's parse-failed denial" in {
+    go(
+      "SELECT * FROM (UNPIVOT customer ON c_email, c_phone INTO NAME k VALUE v)",
+      frOnly
+    ) shouldBe PassthroughParseFailed
+  }
+
+  it should "still filter a pivoted subquery, and pass a table with no policy" in {
+    rewritten(
+      go("SELECT * FROM (PIVOT (SELECT * FROM customer) ON c_nation USING count(*))", frOnly)
+    ) should include("c_nation = 'fr'")
+    go("SELECT * FROM (PIVOT orders ON o_status USING count(*))", frOnly) shouldBe Passthrough
+  }
+
+  "an EXPLAIN of a statement reading a policy table" should "be refused" in
+    // DuckDB runs the statement under EXPLAIN ANALYZE, unfiltered, and every plan reports row
+    // counts; the walk never entered an ExplainStatement.
+    List(
+      "EXPLAIN ANALYZE SELECT count(*) FROM customer",
+      "EXPLAIN ANALYZE SELECT error(string_agg(c_email, ',')) FROM customer",
+      "EXPLAIN SELECT * FROM customer",
+      "EXPLAIN ANALYZE SELECT * FROM orders o WHERE EXISTS (SELECT 1 FROM customer)"
+    ).foreach { sql =>
+      withClue(sql)(go(sql, frOnly) shouldBe a[Refused])
+    }
+
+  it should "pass when the explained statement reads no policy table" in {
+    go("EXPLAIN ANALYZE SELECT count(*) FROM orders", frOnly) shouldBe Passthrough
+  }

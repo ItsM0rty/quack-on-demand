@@ -1636,6 +1636,28 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out shouldBe a[Right[?, ?]]
     capturedSql() should include("c_region = 'X'")
 
+  it should "deny a PIVOT source or an EXPLAIN over an RLS table end-to-end (audit F21)" in:
+    // The row rewrite had no slot for a PIVOT source and never entered an ExplainStatement, so
+    // both reached the node unfiltered; EXPLAIN ANALYZE runs its statement on every row.
+    List(
+      "SELECT * FROM (PIVOT main.customer ON c_region USING count(*))",
+      "SELECT 1 WHERE EXISTS (SELECT 1 FROM (PIVOT customer ON c_region USING count(*)))",
+      "EXPLAIN ANALYZE SELECT error(string_agg(c_email, ',')) FROM customer",
+      "EXPLAIN SELECT * FROM customer",
+      "PIVOT customer ON c_region USING count(*)",
+      "SUMMARIZE customer"
+    ).foreach { sql =>
+      val (router, capturedSql, _) =
+        setupWithRewriter(protectedWriteGuard = guardKnowingCustomer)
+      val out = router
+        .execute("rls-f21", "alice", poolKey, sql, Some(effWithRowPolicies(List(rowPolicyCustomer))))
+        .unsafeRunSync()
+      withClue(sql) {
+        out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+        capturedSql() shouldBe ""
+      }
+    }
+
   it should "deny a SELECT that reaches an RLS table through query_table / query end-to-end" in:
     // The row rewriter wraps base tables; a table named in a string is invisible to it, so
     // without the guard these reads reach the node unfiltered.
