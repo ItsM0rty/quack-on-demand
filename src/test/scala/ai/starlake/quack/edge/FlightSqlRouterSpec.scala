@@ -1675,6 +1675,23 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "refuse a string-named PREPARE of COPY ... TO under lockdown (audit F24)" in:
+    // The prepare skip took identifier names only, so with `'p'` the screens judged the word
+    // `prepare`, and the EXECUTE in the same batch wrote the file on the node.
+    List(
+      "PREPARE 'p' AS COPY (SELECT 1) TO '/tmp/leak.csv'; EXECUTE p",
+      "PREPARE $$p$$ AS COPY (SELECT 1) TO '/tmp/leak.csv'; EXECUTE p"
+    ).foreach { sql =>
+      val (router, capturedSql, _) = setupWithRewriter(lockdownFor = _ => true)
+      val out = router
+        .execute("ld-f24", "alice", poolKey, sql, Some(effWithPolicies(Nil)))
+        .unsafeRunSync()
+      withClue(sql) {
+        out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+        capturedSql() shouldBe ""
+      }
+    }
+
   it should "deny a SELECT that reaches an RLS table through query_table / query end-to-end" in:
     // The row rewriter wraps base tables; a table named in a string is invisible to it, so
     // without the guard these reads reach the node unfiltered.

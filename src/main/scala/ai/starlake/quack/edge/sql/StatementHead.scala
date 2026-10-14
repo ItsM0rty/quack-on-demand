@@ -74,11 +74,18 @@ private[sql] object StatementHead:
     * `from` unchanged when there is no such head or no `AS` follows the name. DuckDB 2.0 has no
     * parameter-type list form (`PREPARE p(INT) AS ...` is "TypeList ... not implemented"), so only
     * the bare `PREPARE <name> AS` shape is skipped.
+    *
+    * The name is any one word or literal token: DuckDB's grammar takes `ColIdOrString`, so `'p'`,
+    * `E'p'`, `$$p$$` and `$t$p$t$` name a statement as `p` and `"p"` do (each prepares and runs a
+    * COPY on 2.0). Accepting identifiers only left the screens judging the wrapper word `prepare`,
+    * and a prepared COPY ... TO a path or bucket was admitted (audit F24).
     */
   private def skipPrepareHead(h: Head, from: Int): Int =
-    if h.word(from).contains("prepare") && h.identifier(from + 1).isDefined &&
-      h.word(from + 2).contains("as")
-    then from + 3
+    val named = from + 1 < h.toks.length && {
+      val k = h.toks(from + 1).kind
+      k == SqlLexer.Kind.Word || k == SqlLexer.Kind.Literal
+    }
+    if h.word(from).contains("prepare") && named && h.word(from + 2).contains("as") then from + 3
     else from
 
   private val ExplainWords = Set("explain", "analyze", "analyse")

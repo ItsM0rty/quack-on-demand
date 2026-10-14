@@ -1121,3 +1121,21 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     deniedB("EXPORT DATABASE 's3://staging/dump' (FORMAT CSV, DELIMITER '|')") shouldBe false
     deniedB("EXPORT DATABASE lake TO 's3://staging/dump'") shouldBe false
   }
+
+  // Audit F24: DuckDB 2.0's PREPARE takes a string as its name too (`PREPARE 'p' AS ...`, a
+  // dollar-quoted or E-string name), so the prepare skip has to pass any one-token name, or every
+  // screen judges the wrapper word `prepare` and a prepared COPY ... TO is admitted.
+  "a PREPARE named by a string" should "have its prepared COPY judged" in {
+    val names = List("'p'", "$$p$$", "$t$p$t$", "E'p'", "e'p'")
+    names.foreach { n =>
+      withClue(n) {
+        denied(
+          s"PREPARE $n AS COPY (SELECT * FROM lineitem) TO '/tmp/leak.csv'; EXECUTE p"
+        ) shouldBe
+          true
+        deniedB(s"PREPARE $n AS COPY (SELECT 1) TO 's3://lakebucket/x.parquet'") shouldBe true
+        deniedB(s"PREPARE $n AS COPY (SELECT 1) TO 's3://staging/x.parquet'") shouldBe false
+        denied(s"EXPLAIN PREPARE $n AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+      }
+    }
+  }

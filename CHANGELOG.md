@@ -146,6 +146,13 @@
   local disk (on a pool with a local data path) or into the denied DuckLake data bucket, both of
   which `COPY ... TO` is refused. Its target is now judged as a COPY path is: a local path or a
   denied bucket is refused, another object-store URL is admitted.
+- **Security: a PREPARE named by a string no longer hides the statement it prepares.** DuckDB
+  takes a string as a prepared statement's name (`PREPARE 'p' AS ...`, and `E'p'`, `$$p$$`,
+  `$t$p$t$`), but the screens skipped a `PREPARE <name> AS` head only for an identifier name, so
+  they judged the word `PREPARE` and admitted `PREPARE 'p' AS COPY (...) TO '/tmp/x.csv'; EXECUTE
+  p`: a node-local file write and a write into the denied DuckLake bucket under lockdown, and,
+  with the ACL on, a COPY to any path or URL for a tenant user holding the wildcard ALL grant. The
+  prepared statement is now judged whatever the name's form.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM

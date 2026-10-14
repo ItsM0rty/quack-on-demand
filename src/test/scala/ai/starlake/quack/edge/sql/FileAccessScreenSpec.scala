@@ -182,6 +182,21 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
     validate(scan, tenantAll) shouldBe Allowed
   }
 
+  // Audit F24: a string or dollar-quoted PREPARE name hid the prepared COPY from the verb check,
+  // and the statement JSqlParser cannot read was then covered by a wildcard ALL grant.
+  private val stringPrepares = List(
+    "PREPARE 'p' AS COPY (SELECT 1) TO '/tmp/x.csv'",
+    "PREPARE $$p$$ AS COPY (SELECT 1) TO 's3://other/x.parquet'",
+    "PREPARE $t$p$t$ AS COPY (SELECT 1) TO '/tmp/x.csv'",
+    "PREPARE E'p' AS COPY (SELECT 1) TO '/tmp/x.csv'"
+  )
+
+  "a PREPARE named by a string" should "have its prepared COPY found" in
+    stringPrepares.foreach(sql => withClue(sql)(FileAccessScreen.find(sql) shouldBe defined))
+
+  it should "be denied to a tenant principal holding *.*.* ALL" in
+    stringPrepares.foreach(sql => withClue(sql)(validate(sql, tenantAll) shouldBe a[Denied]))
+
   "ProtectedWriteGuard" should "deny it to a principal with a row policy" in {
     val guard = new ProtectedWriteGuard(
       new ColumnCatalog.MapCatalog(Map(("lake", "main", "customer") -> List("c_id"))),
