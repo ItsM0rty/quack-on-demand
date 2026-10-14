@@ -641,3 +641,70 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
         withClue(sql)(classified(sql, e) shouldBe Allow)
       }
     }
+
+  // Audit F19: JSqlParser hangs a statement-level WITH on the Insert, not on its Select, so the
+  // CLS oracle used to see `SELECT * FROM leak` with the CTE stripped, resolve `leak` to the
+  // physical (unpoliced) table and allow, while DuckDB binds `FROM leak` to the CTE that reads
+  // the masked column.
+
+  // A catalog that also knows the unpoliced sinks, so a stripped CTE name resolves physically.
+  private def guardWithSinks: ProtectedWriteGuard =
+    val cat = new ColumnCatalog.MapCatalog(
+      Map(
+        ("acme_tpch", "tpch1", "customer") -> List("c_id", "c_email", "c_region"),
+        ("acme_tpch", "tpch1", "leak")     -> List("c_email"),
+        ("acme_tpch", "tpch1", "scratch")  -> List("c_id", "c_email")
+      )
+    )
+    new ProtectedWriteGuard(cat, clsEnabled = true, rlsEnabled = true)
+
+  private val maskDeny = maskEmail.copy(id = "cp-2", action = "deny", transformSql = None)
+
+  "an INSERT with a statement-level WITH" should "be denied when a CTE shadowing a table reads " +
+    "a masked column" in
+    List(
+      "WITH leak AS (SELECT c_email FROM tpch1.customer) INSERT INTO leak SELECT * FROM leak",
+      "WITH leak AS (SELECT c_email FROM tpch1.customer) " +
+        "INSERT INTO tpch1.leak SELECT * FROM leak",
+      "WITH leak AS (SELECT c_email FROM tpch1.customer) " +
+        "INSERT INTO leak SELECT c_email FROM leak",
+      "WITH leak AS (SELECT c_email FROM tpch1.customer) " +
+        "INSERT INTO leak BY NAME SELECT * FROM leak",
+      "WITH leak AS MATERIALIZED (SELECT c_email FROM tpch1.customer) " +
+        "INSERT INTO leak SELECT * FROM leak",
+      "WITH scratch AS (SELECT c_id, c_email FROM tpch1.customer) " +
+        "INSERT INTO leak SELECT c_email FROM scratch",
+      "WITH customer AS (SELECT c_email AS c_id FROM tpch1.customer) " +
+        "INSERT INTO scratch SELECT c_id FROM customer"
+    ).foreach { sql =>
+      List(maskEmail, maskDeny).foreach { p =>
+        withClue(s"$sql [${p.action}]") {
+          guardWithSinks.check(
+            sql,
+            StatementKind.Dml,
+            eff(tenantUser, cols = List(p)),
+            ctx
+          ) shouldBe
+            a[Deny]
+        }
+      }
+    }
+
+  it should "still allow a CTE that reads only unmasked columns" in {
+    guardWithSinks.check(
+      "WITH x AS (SELECT c_id FROM tpch1.customer) INSERT INTO scratch SELECT c_id FROM x",
+      StatementKind.Dml,
+      eff(tenantUser, cols = List(maskEmail)),
+      ctx
+    ) shouldBe Allow
+  }
+
+  it should "be denied when both the statement and its SELECT carry a WITH" in {
+    guardWithSinks.check(
+      "WITH leak AS (SELECT c_email FROM tpch1.customer) " +
+        "INSERT INTO scratch WITH y AS (SELECT 1 AS c_id) SELECT c_id FROM y, leak",
+      StatementKind.Dml,
+      eff(tenantUser, cols = List(maskEmail)),
+      ctx
+    ) shouldBe a[Deny]
+  }

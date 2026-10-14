@@ -1565,6 +1565,32 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out shouldBe a[Right[?, ?]]
     capturedSql() should include("INSERT INTO main.scratch SELECT c_id FROM main.customer")
 
+  it should "deny an INSERT whose statement-level CTE shadows the target (audit F19)" in:
+    // DuckDB binds `FROM leak` to the CTE reading the masked column; the guard used to analyse
+    // the Insert's Select without the WITH and resolve `leak` to the physical, unpoliced table.
+    val guard = new ai.starlake.quack.edge.policy.ProtectedWriteGuard(
+      new ai.starlake.quack.edge.cls.ColumnCatalog.MapCatalog(
+        Map(
+          ("memory", "main", "customer") -> List("c_id", "c_email", "c_region"),
+          ("memory", "main", "leak")     -> List("c_email")
+        )
+      ),
+      clsEnabled = true,
+      rlsEnabled = true
+    )
+    val (router, capturedSql, _) = setupWithRewriter(protectedWriteGuard = guard)
+    val out = router
+      .execute(
+        "pw-f19",
+        "alice",
+        poolKey,
+        "WITH leak AS (SELECT c_email FROM main.customer) INSERT INTO leak SELECT * FROM leak",
+        effectiveSet = Some(effWithPolicies(List(maskCustomerEmail)))
+      )
+      .unsafeRunSync()
+    out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+    capturedSql() shouldBe ""
+
   it should "deny a SELECT that reaches an RLS table through query_table / query end-to-end" in:
     // The row rewriter wraps base tables; a table named in a string is invisible to it, so
     // without the guard these reads reach the node unfiltered.

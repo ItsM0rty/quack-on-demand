@@ -197,10 +197,23 @@ final class ProtectedWriteGuard(
       // An INSERT ... VALUES exposes a Values node (a Select subtype), not a query the
       // oracle can mask. Exclude it so a VALUES that embeds a subquery read of a covered
       // table has no isolable query select and fails closed.
-      case i: Insert      => Option(i.getSelect).filterNot(_.isInstanceOf[Values])
+      case i: Insert =>
+        Option(i.getSelect).filterNot(_.isInstanceOf[Values]).flatMap(withStatementCtes(i, _))
       case c: CreateTable => Option(c.getSelect)
       case v: CreateView  => Option(v.getSelect)
       case _              => None
+
+  /** JSqlParser hangs a statement-level `WITH x AS (...) INSERT INTO t SELECT * FROM x` on the
+    * Insert, not on its Select, so the bare Select reads `x` as a physical table while DuckDB binds
+    * it to the CTE (audit F19). Re-attach those CTEs so the oracle sees what DuckDB reads. A Select
+    * that carries its own WITH too has two scopes one list cannot model: None, so it denies.
+    */
+  private def withStatementCtes(i: Insert, sel: Select): Option[Select] =
+    val outer = Option(i.getWithItemsList).map(_.asScala.toList).getOrElse(Nil)
+    val inner = Option(sel.getWithItemsList).map(_.asScala.toList).getOrElse(Nil)
+    if outer.isEmpty then Some(sel)
+    else if inner.nonEmpty then None
+    else Some(sel.withWithItemsList(outer.asJava))
 
   /** Re-parse the whole (stripped, lexer-canonical: the input `SqlParser.extract` parses) input
     * into its statement list, or None on any rendering or parse failure.

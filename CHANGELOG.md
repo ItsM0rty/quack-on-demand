@@ -110,6 +110,15 @@
   every statement analysed, whatever leads it: a write reading a protected table is refused as a
   single one is, and so is a plain read of a protected table after the first statement ("cannot be
   read in a multi-statement batch; send that query on its own"), which the rewriters never saw.
+- **Security: a CTE shadowing a table can no longer launder a masked column through an INSERT.**
+  In `WITH leak AS (SELECT c_email FROM customer) INSERT INTO leak SELECT * FROM leak` the
+  protected-write guard checked the INSERT's SELECT without its leading WITH, so `leak` resolved to
+  the physical, unpoliced table and the statement was allowed, while DuckDB read the CTE and wrote
+  the raw masked (or `deny`-policied) values into `leak` for the policy holder to read back. The
+  guard now checks the SELECT together with the statement-level WITH, so that INSERT is refused
+  like `INSERT INTO leak SELECT c_email FROM customer`; a CTE reading only unmasked columns is still
+  allowed. An INSERT carrying a WITH both before `INSERT` and inside its SELECT is refused when it
+  reads a masked table.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
