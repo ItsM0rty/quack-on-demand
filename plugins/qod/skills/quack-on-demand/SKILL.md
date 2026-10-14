@@ -1385,8 +1385,19 @@ Then recycle the pool's nodes, as for any new source.
   `qod_ice_`: those secret-name prefixes belong to the typed sources, whose
   blocks create and drop them.
 - A manifest import validates typed sources exactly as `create` does.
-- `create` upserts, so re-running it edits the source; a re-run with
-  `--password-stdin` rotates the stored password. Recycle the pool to apply.
+- `create` upserts, so re-running it edits the source, and every field it
+  leaves out is RESET (see "Register a federated source"). A re-run that
+  repeats only the required flags puts `--port`, `--schema`, `--ssl-mode` and
+  `--description` back to their defaults (no `--ssl-mode` means the client
+  library's own default, which for postgres is `prefer` and falls back to
+  plaintext), and enables a disabled source; the manager warns only about a
+  `--read-only` downgrade. So to rotate the password, re-run `create` with
+  `--password-stdin` (or `--password-prompt`) **and every flag you want kept**,
+  `--password-secret` included if you changed it. To rotate the secret alone,
+  `qod federation secret set ... --name PASSWORD --value ...` leaves the source
+  untouched but puts the password on the command line; the admin UI (its edit
+  form keeps every stored field) and the MCP `set_federated_secret` tool rotate
+  it without that exposure. Recycle the pool to apply.
 - The attach state is reported like an Iceberg catalog's (next section).
 
 ### Check whether an Iceberg catalog actually attached
