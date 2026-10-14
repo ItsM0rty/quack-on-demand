@@ -600,15 +600,16 @@
     default lenient resolver. Alias each column in the select list instead; a column list on a
     derived table or a CTE stays accepted, its values masked inside it.
   - BREAKING: a table name DuckDB reads as a file is refused like the string literal it stands
-    for (`FROM 's3://b/x.parquet'`): only a wildcard ALL grant (`*.*.* ALL`) covers it, in every
+    for (`FROM 's3://b/x.parquet'`): whenever the ACL validates, it is refused to every
+    tenant-scoped principal, `*.*.* ALL` included (see the file-access entry below), in every
     position (FROM, DESCRIBE / SUMMARIZE, write and DDL targets). DuckDB 2.0 replacement-scans a
     name it cannot resolve, its parts joined with dots, so a quoted URL (`"s3://b/*.parquet"`,
     `` `file:///d/x.csv` ``) or a quoted path (`"/d/x"."csv"`) read the object or file with the
     node's credentials, while the access check saw a table a wildcard read grant (`*.*.* RO`,
     `<db>.*.* RO`) admits: a raw read of the pool's DuckLake data files, past any row policy.
     Refused now: a name with a part holding `/`, `\`, `*`, `?`, `[` or `{` (a URL's `://`
-    included). A real table named like one (`"data_*"`) is reachable only under a wildcard ALL
-    grant; rename it. Known gap: an unquoted relative file name (`x.parquet`, schema `x` and table
+    included). A real table named like one (`"data_*"`) is unreachable for tenant principals;
+    rename it. Known gap: an unquoted relative file name (`x.parquet`, schema `x` and table
     `parquet` not found) is still read as a file under a wildcard read grant.
   - BREAKING for quoted names JSqlParser misreads: the quoted-identifier screen no longer lists
     characters but reads each quoted name back through the access check's parser and refuses it
@@ -634,7 +635,8 @@
     after it; `x IS DISTINCT FROM 'y'` is a value, not a file); one that does not parse is judged
     lexically and conservatively (any string literal after FROM, JOIN, USING, TABLE, a comma or
     such an opening parenthesis is refused). A quoted name part holding a glob character
-    (`"*".csv`, `"data_*"`) is a file read whatever its position or extension. Superusers, an
+    (`"*".csv`, `"data_*"`) is refused whatever its position or extension (a conservative
+    refusal: DuckDB reads `"data_*"` without an extension as a table name). Superusers, an
     ACL turned off, the native front door's client data (`scan_data_from_quack_client`),
     federated and Iceberg catalogs read by table name are unchanged.
   - BREAKING: tenant users can no longer install extensions or set path-resolution settings, ACL
