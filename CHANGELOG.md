@@ -79,6 +79,17 @@
   forms, in every clause and both unresolved-table modes, are now refused. A qualifier that names
   a covered column is refused even where DuckDB would bind it to the table (`SELECT c_addr.c_id
   FROM customer AS c_addr`): alias the table differently.
+- **Fixed: a FlightSQL `executeUpdate` whose COMMIT fails is no longer acknowledged.** On a
+  DuckLake pool a write runs inside a stamped transaction whose COMMIT is deferred until its result
+  is read. The DoPut path (JDBC `executeUpdate`, and the prepared-update calls of Arrow JDBC, ADBC
+  and DBeaver) read only the row count, closed the result and then acknowledged it, so a COMMIT
+  that failed there (a DuckLake write-write conflict with a concurrent writer, a node stopped right
+  after the statement, a lapsed lease) was logged at WARN and swallowed: the client got its row
+  count for a write the node had rolled back. The result is now read to the end, committing,
+  before the count is acknowledged; a conflict fails the update with a retryable UNAVAILABLE ("retry
+  the statement"), any other COMMIT failure with INTERNAL, as DoGet already did. A COMMIT failure
+  on a stream nobody reads to the end is now logged at ERROR. Statement history and the write audit
+  still record such a statement as `ok`.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM

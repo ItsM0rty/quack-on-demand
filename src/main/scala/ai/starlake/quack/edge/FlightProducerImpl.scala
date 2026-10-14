@@ -218,7 +218,8 @@ final class FlightProducerImpl(
 
   /** #106 signature 1: a stamped write's COMMIT (see the `adapter.StampedCommitArrowReader` doc)
     * fires from INSIDE `streamArrow`'s `loadNextBatch()` loop, after the statement's own result has
-    * already been streamed to the client. When that COMMIT loses a genuine DuckLake
+    * already been streamed to the client, and from DoPut's drain before the update count is
+    * acknowledged ([[ackUpdateResult]]). When that COMMIT loses a genuine DuckLake
     * optimistic-concurrency race, the exception used to fall into the generic [[internalError]]
     * bucket: a scary opaque "internal error" for what is, underneath, an ordinary concurrent-write
     * conflict.
@@ -943,6 +944,13 @@ final class FlightProducerImpl(
 
   /** Shared tail of the two update entrypoints: outcome -> DoPutUpdateResult ack or typed error on
     * the ack stream. Closes the result either way.
+    *
+    * The result is drained to exhaustion BEFORE the count is acknowledged: a stamped write's
+    * deferred COMMIT (`adapter.StampedCommitArrowReader`) fires on exhaustion and propagates a
+    * failure there, while on close it is best-effort and swallowed. Acknowledging after a bare
+    * close told the client a write had landed that the node rolled back (a DuckLake write-write
+    * conflict, a node gone, a lapsed lease). A failure while draining is classified like DoGet's
+    * ([[commitConflictOrInternal]]).
     */
   private def ackUpdateResult(
       attempt: scala.util.Try[Either[RouterFailure, QueryResult]],
@@ -951,29 +959,36 @@ final class FlightProducerImpl(
   ): Unit =
     attempt match
       case scala.util.Success(Right(result)) =>
-        val count =
-          try updateCountOf(result.rows)
+        val drained =
+          try Right(drainUpdateCount(result.rows))
+          catch case t: Throwable => Left(t)
           finally result.close()
-        emitUpdateCount(count, ackStream)
+        drained match
+          case Right(count) => emitUpdateCount(count, ackStream)
+          case Left(t)      => ackStream.onError(commitConflictOrInternal(label, t))
       case scala.util.Success(Left(f)) =>
         ackStream.onError(toFlightException(f))
       case scala.util.Failure(t) =>
         ackStream.onError(internalError(label, t))
 
-  /** Best-effort affected-row count: DuckDB's single-row Count cell, or -1 (accepted by FlightSQL
-    * clients as "unknown").
+  /** Drain `reader` to exhaustion and return the affected-row count: DuckDB's single-row Count cell
+    * of the first batch, or -1 (accepted by FlightSQL clients as "unknown"). A failure to read the
+    * stream (the deferred COMMIT among them) propagates; only an unreadable count cell is -1.
     */
-  private def updateCountOf(reader: org.apache.arrow.vector.ipc.ArrowReader): Long =
-    try
-      if reader.loadNextBatch() then
-        val root = reader.getVectorSchemaRoot
-        if root.getRowCount >= 1 && !root.getFieldVectors.isEmpty then
-          root.getFieldVectors.get(0).getObject(0) match
-            case n: java.lang.Number => n.longValue()
-            case _                   => -1L
-        else -1L
-      else -1L
-    catch case _: Throwable => -1L
+  private def drainUpdateCount(reader: org.apache.arrow.vector.ipc.ArrowReader): Long =
+    if reader.loadNextBatch() then
+      val root  = reader.getVectorSchemaRoot
+      val count =
+        try
+          if root.getRowCount >= 1 && !root.getFieldVectors.isEmpty then
+            root.getFieldVectors.get(0).getObject(0) match
+              case n: java.lang.Number => n.longValue()
+              case _                   => -1L
+          else -1L
+        catch case _: Throwable => -1L
+      while reader.loadNextBatch() do ()
+      count
+    else -1L
 
   /** Ack the update count; the buffer is released only after onNext + onCompleted have consumed it.
     */

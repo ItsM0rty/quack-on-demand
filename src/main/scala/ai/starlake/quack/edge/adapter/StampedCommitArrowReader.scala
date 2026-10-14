@@ -14,10 +14,12 @@ import java.util.concurrent.atomic.AtomicBoolean
   *   - On stream exhaustion (`loadNextBatch` returning false): COMMIT runs synchronously and a
   *     failure propagates to the caller as a stream error BEFORE the stream completes, so a commit
   *     conflict is never a silent success.
-  *   - On `close()` without a full drain (e.g. a JDBC caller that read the Count row and moved on):
+  *   - On `close()` without a full drain (a client that abandoned the stream, an error mid-stream):
   *     COMMIT is attempted best-effort BEFORE the underlying close cascades DISCONNECT (the wire
-  *     connection must still be alive for the round-trip); a failure at that point is logged, as
-  *     the result has already been streamed.
+  *     connection must still be alive for the round-trip); a failure at that point is logged at
+  *     ERROR and swallowed, as nobody is left to tell. A consumer that reports the outcome AFTER
+  *     closing (FlightSQL DoPut acknowledges the update count) must drain to exhaustion first, or a
+  *     failed COMMIT is acknowledged as a success.
   *
   * `commitSync` MUST be idempotent (the caller guards with its own AtomicBoolean) because both
   * paths can run for one reader. Delegation mirrors [[ChainedQuackArrowReader]]: the parent class's
@@ -49,8 +51,8 @@ private[adapter] final class StampedCommitArrowReader(
       try commitSync()
       catch
         case t: Throwable =>
-          logger.warn(
-            s"COMMIT at close failed for a stamped write (result already streamed): ${t.getMessage}"
+          logger.error(
+            s"COMMIT at close failed for a stamped write; the write was rolled back: ${t.getMessage}"
           )
     underlying.close(closeReadSource)
 
