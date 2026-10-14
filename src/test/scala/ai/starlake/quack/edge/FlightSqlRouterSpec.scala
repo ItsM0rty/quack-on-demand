@@ -964,7 +964,8 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       stub: () => QuackResponse = defaultStub,
       protectedWriteGuard: ai.starlake.quack.edge.policy.ProtectedWriteGuard =
         ai.starlake.quack.edge.policy.ProtectedWriteGuard.disabled,
-      lockdownFor: PoolKey => Boolean = _ => false
+      lockdownFor: PoolKey => Boolean = _ => false,
+      attachedCatalogsOf: PoolKey => Set[String] = _ => Set.empty
   ) =
     val backend = new ai.starlake.quack.ondemand.runtime.QuackBackend:
       private val n          = TrieMap.empty[String, RunningNode]
@@ -1019,7 +1020,8 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       columnPolicyRewriter = rewriter,
       metadataFilterRewriter = metadataFilter,
       protectedWriteGuard = protectedWriteGuard,
-      lockdownFor = lockdownFor
+      lockdownFor = lockdownFor,
+      attachedCatalogsOf = attachedCatalogsOf
     )
     (router, () => capturedSql, node)
 
@@ -1590,6 +1592,49 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
     capturedSql() shouldBe ""
+
+  it should "deny a two-part name headed by the pool's catalog alias with the ACL off (audit F20)" in:
+    // DuckDB binds `memory.customer` catalog-first, under the USE prelude, to main.customer;
+    // read schema-first it matched no policy keyed on schema main, so a write copied the masked
+    // or filtered rows out and an RLS-only principal's plain SELECT went out unfiltered (F22).
+    List(
+      "CREATE TABLE main.mine AS SELECT c_email FROM memory.customer" ->
+        effWithPolicies(List(maskCustomerEmail)),
+      "CREATE TABLE main.mine AS SELECT * FROM memory.customer" ->
+        effWithRowPolicies(List(rowPolicyCustomer)),
+      "SELECT * FROM memory.customer" -> effWithRowPolicies(List(rowPolicyCustomer)),
+      "SELECT count(*) FROM memory.customer" -> effWithRowPolicies(List(rowPolicyCustomer))
+    ).foreach { (sql, eff) =>
+      val (router, capturedSql, _) = setupWithRewriter(
+        protectedWriteGuard = guardKnowingCustomer,
+        attachedCatalogsOf = _ => Set("memory")
+      )
+      val out = router.execute("pw-f20", "alice", poolKey, sql, Some(eff)).unsafeRunSync()
+      withClue(sql) {
+        out.left.toOption.get match
+          case RouterFailure.AccessDenied(reason) =>
+            reason should include("ambiguous two-part name")
+          case other => fail(s"expected AccessDenied, got $other")
+        capturedSql() shouldBe ""
+      }
+    }
+
+  it should "still filter a schema-qualified read of the same table (audit F20)" in:
+    val (router, capturedSql, _) = setupWithRewriter(
+      protectedWriteGuard = guardKnowingCustomer,
+      attachedCatalogsOf = _ => Set("memory")
+    )
+    val out = router
+      .execute(
+        "pw-f20-ok",
+        "alice",
+        poolKey,
+        "SELECT * FROM main.customer",
+        effectiveSet = Some(effWithRowPolicies(List(rowPolicyCustomer)))
+      )
+      .unsafeRunSync()
+    out shouldBe a[Right[?, ?]]
+    capturedSql() should include("c_region = 'X'")
 
   it should "deny a SELECT that reaches an RLS table through query_table / query end-to-end" in:
     // The row rewriter wraps base tables; a table named in a string is invisible to it, so

@@ -30,7 +30,11 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
     EffectiveSet(user, Nil, Nil, Nil, Nil, cols, rows)
 
   private val ctx =
-    SchemaContext(defaultDatabase = Some("acme_tpch"), defaultSchema = Some("tpch1"))
+    SchemaContext(
+      defaultDatabase = Some("acme_tpch"),
+      defaultSchema = Some("tpch1"),
+      attachedCatalogs = Set.empty
+    )
 
   // A catalog that knows customer's columns, so SELECT * expands and masks c_email.
   private def guardWithCls(clsOn: Boolean = true, rlsOn: Boolean = true): ProtectedWriteGuard =
@@ -707,4 +711,75 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
       eff(tenantUser, cols = List(maskEmail)),
       ctx
     ) shouldBe a[Deny]
+  }
+
+  // Audit F20 / F22: DuckDB binds a two-part `X.t` catalog-first when X is an attached catalog
+  // (the tenant-db alias, a federated alias), under the USE prelude to the very table a bare name
+  // reads. Read schema-first, the name matched no policy keyed on the real schema: a write copied
+  // masked or filtered data out, and a plain SELECT read every row past a row policy. With the ACL
+  // on the gate refuses the name; the guard now refuses it for a policy holder with the ACL off.
+
+  private val attachedCtx = ctx.copy(attachedCatalogs = Set("acme_tpch", "pg_src"))
+
+  private def withAttached(sql: String, e: EffectiveSet): GuardOutcome =
+    guardWithCls().check(
+      sql,
+      ai.starlake.quack.route.StatementClassifier.classify(sql),
+      e,
+      attachedCtx
+    )
+
+  "a two-part name headed by an attached catalog" should "be denied in a write" in
+    List(
+      "CREATE TABLE tpch1.mine AS SELECT c_email FROM acme_tpch.customer",
+      "CREATE TABLE tpch1.mine AS SELECT * FROM acme_tpch.customer",
+      "INSERT INTO tpch1.scratch SELECT c_email FROM acme_tpch.customer",
+      "CREATE VIEW tpch1.v AS SELECT c_email FROM acme_tpch.customer",
+      "CREATE TABLE tpch1.mine AS SELECT c_email FROM pg_src.customer",
+      "CREATE TABLE tpch1.mine AS SELECT c_email FROM \"ACME_TPCH\".customer"
+    ).foreach { sql =>
+      maskAndRow.foreach { e =>
+        withClue(s"$sql ${e.columnPolicies.size}/${e.rowPolicies.size}") {
+          withAttached(sql, e) match
+            case Deny(reason) => reason should include("ambiguous two-part name")
+            case other        => fail(s"expected Deny, got $other")
+        }
+      }
+    }
+
+  it should "be denied in a plain SELECT, before the rewriters read it schema-first" in
+    List(
+      "SELECT * FROM acme_tpch.customer",
+      "SELECT 1 FROM acme_tpch.customer",
+      "SELECT 1 WHERE EXISTS (SELECT 1 FROM acme_tpch.customer WHERE c_region = 'Y')",
+      "SELECT 1 WHERE 7 IN (SELECT c_id FROM acme_tpch.customer)",
+      "SELECT c_id FROM tpch1.nation JOIN acme_tpch.customer ON true",
+      "SELECT * FROM pg_src.customer"
+    ).foreach { sql =>
+      maskAndRow.foreach { e =>
+        withClue(s"$sql ${e.columnPolicies.size}/${e.rowPolicies.size}") {
+          withAttached(sql, e) match
+            case Deny(reason) => reason should include("ambiguous two-part name")
+            case other        => fail(s"expected Deny, got $other")
+        }
+      }
+    }
+
+  it should "still leave a fully qualified, a schema-qualified or a bare name to the rewriters" in
+    List(
+      "SELECT * FROM acme_tpch.tpch1.customer",
+      "SELECT * FROM tpch1.customer",
+      "SELECT * FROM customer"
+    ).foreach { sql =>
+      maskAndRow.foreach { e =>
+        withClue(sql)(withAttached(sql, e) shouldBe Allow)
+      }
+    }
+
+  it should "change nothing for a principal holding no policy" in {
+    withAttached("SELECT * FROM acme_tpch.customer", eff(tenantUser)) shouldBe Allow
+    withAttached(
+      "CREATE TABLE tpch1.mine AS SELECT c_email FROM acme_tpch.customer",
+      eff(tenantUser)
+    ) shouldBe Allow
   }

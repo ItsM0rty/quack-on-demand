@@ -95,7 +95,11 @@ class QuackClientSyncFunctionsSpec extends AnyFlatSpec with Matchers:
       List(RolePermission("rp-1", "r-1", "acme_tpch", "tpch1", "customer", "RO")),
       Nil
     )
-    val ctx = SchemaContext(defaultDatabase = Some("acme_tpch"), defaultSchema = Some("tpch1"))
+    val ctx = SchemaContext(
+      defaultDatabase = Some("acme_tpch"),
+      defaultSchema = Some("tpch1"),
+      attachedCatalogs = Set.empty
+    )
     queries.foreach { (file, sql) =>
       withClue(s"$file load query:\n$sql\n") {
         new MetadataFilterRewriter(enabled = true).rewrite(sql, eff, ctx) match

@@ -263,7 +263,10 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
         case leaf if AstChildren.isLeaf(leaf)      => ()
         case _                                     => throw new Refusal(UnwalkedRefusal)
 
-  /** The principal's row policies covering `t`, its bare parts qualified by the session defaults.
+  /** The principal's row policies covering `t`, its bare parts qualified by the session defaults. A
+    * two-part name is read schema-first; one headed by an attached catalog, which DuckDB binds
+    * catalog-first, never reaches here for a policy holder: the protected-write guard refuses it on
+    * every statement kind (audit F20, F22).
     */
   private def matchingPolicies(
       t: Table,

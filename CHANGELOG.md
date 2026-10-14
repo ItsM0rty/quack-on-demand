@@ -119,6 +119,18 @@
   like `INSERT INTO leak SELECT c_email FROM customer`; a CTE reading only unmasked columns is still
   allowed. An INSERT carrying a WITH both before `INSERT` and inside its SELECT is refused when it
   reads a masked table.
+- **Security: BREAKING: column masks and row filters hold for `<catalog alias>.table` with the ACL
+  off.** DuckDB reads `acme_tpch.customer` as catalog `acme_tpch`, current schema, so it is the same
+  table as a bare `customer`, but the mask and row-filter checks read `acme_tpch` as a schema and
+  matched no policy. With `QOD_ACL_ENABLED=false` (the default outside `qod serve`), a user holding
+  a column or row policy could copy the raw masked values or the filtered-out rows into a table of
+  their own (`CREATE TABLE mine AS SELECT c_email FROM acme_tpch.customer`), and a user holding a
+  row policy could read every row with a plain `SELECT * FROM acme_tpch.customer`. The same held for
+  a federated alias (`pg_src.customer`). For a user holding a column or row policy, a two-part name
+  whose first part is a catalog attached on the pool is now refused whatever the ACL setting, as the
+  ACL already refuses it when on: "ambiguous two-part name 'acme_tpch.customer': 'acme_tpch' is an
+  attached catalog; qualify fully as 'acme_tpch.<schema>.<table>'". Users without a policy are not
+  affected; a user with one writes `customer`, `main.customer` or `acme_tpch.main.customer`.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM

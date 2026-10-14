@@ -384,9 +384,7 @@ object CatalogWriteScreen extends LazyLogging:
     * for the same `DenyReason` so an operator sees one consistent message across both gates.
     */
   private def describe(reason: DenyReason): String = reason match
-    case DenyReason.AmbiguousCatalogRef(tableName, catalog) =>
-      s"ambiguous two-part name '$tableName': '$catalog' is an attached catalog; " +
-        s"qualify fully as '$catalog.<schema>.<table>'"
+    case a: DenyReason.AmbiguousCatalogRef                   => AccessGate.ambiguousNameReason(a)
     case DenyReason.UnqualifiedTable(tableName, missingPart) =>
       s"unqualified table '$tableName' (missing $missingPart)"
     case DenyReason.NestedSchemaRef(tableName) =>

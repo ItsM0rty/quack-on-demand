@@ -56,7 +56,11 @@ class DeepNestingSpec extends AnyFunSuite with Matchers:
   private val rows = RoleRowPolicy("rp-1", "r-1", "*", "tpch1", "customer", "c_region = 'X'")
   private val eff  = EffectiveSet(user, Nil, Nil, Nil, Nil, List(mask), List(rows))
   private val ctx  =
-    SchemaContext(defaultDatabase = Some("acme_tpch"), defaultSchema = Some("tpch1"))
+    SchemaContext(
+      defaultDatabase = Some("acme_tpch"),
+      defaultSchema = Some("tpch1"),
+      attachedCatalogs = Set.empty
+    )
   private val cat = new ColumnCatalog.MapCatalog(
     Map(("acme_tpch", "tpch1", "customer") -> List("c_id", "c_email", "c_region"))
   )

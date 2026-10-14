@@ -191,7 +191,7 @@ class FileAccessScreenSpec extends AnyFlatSpec with Matchers:
     val withRows = tenantAll.copy(rowPolicies =
       List(RoleRowPolicy("rp-1", "r-1", "*", "main", "customer", "c_id = 1"))
     )
-    val ctx = SchemaContext(Some("lake"), Some("main"))
+    val ctx = SchemaContext(Some("lake"), Some("main"), Set.empty)
     List("SELECT * FROM read_parquet('x.parquet')", "SELECT * FROM 'x.csv'").foreach { sql =>
       withClue(sql) {
         guard.check(sql, StatementKind.Select, withRows, ctx) match

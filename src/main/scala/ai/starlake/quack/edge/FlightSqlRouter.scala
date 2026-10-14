@@ -688,7 +688,8 @@ final class FlightSqlRouter(
     // Column-level security: enforce per-column policies before routing.
     val schemaCtx = ai.starlake.quack.edge.cls.SchemaContext(
       defaultDatabase = ctx.defaultDatabase,
-      defaultSchema = ctx.defaultSchema
+      defaultSchema = ctx.defaultSchema,
+      attachedCatalogs = ctx.attachedCatalogs
     )
 
     // Protected-write guard: runs AFTER the ACL gate, BEFORE the CLS/RLS rewriters. A

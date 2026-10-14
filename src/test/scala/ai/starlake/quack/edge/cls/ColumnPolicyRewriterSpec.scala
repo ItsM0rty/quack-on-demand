@@ -27,7 +27,11 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     )
   private def rw: ColumnPolicyRewriter = new ColumnPolicyRewriter(defaultCat, enabled = true)
   private val ctx                      =
-    SchemaContext(defaultDatabase = Some("acme_tpch"), defaultSchema = Some("tpch1"))
+    SchemaContext(
+      defaultDatabase = Some("acme_tpch"),
+      defaultSchema = Some("tpch1"),
+      attachedCatalogs = Set.empty
+    )
 
   "rewrite" should "passthrough when the feature is disabled" in {
     val policies = List(

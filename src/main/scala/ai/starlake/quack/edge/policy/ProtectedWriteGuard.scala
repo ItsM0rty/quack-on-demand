@@ -1,8 +1,9 @@
 package ai.starlake.quack.edge.policy
 
-import ai.starlake.acl.model.{Config, TableRef}
+import ai.starlake.acl.model.{Config, DenyReason, TableRef}
 import ai.starlake.acl.parser.{SqlParser, StatementResult, TableExtractor, Verb}
 import ai.starlake.quack.edge.sql.{
+  AccessGate,
   BacktickScreen,
   CatalogReachingCalls,
   DottedIdentifierScreen,
@@ -39,6 +40,10 @@ enum GuardOutcome:
   * fail-closed. Never rewrites; only allows or denies. On EVERY statement kind, a plain SELECT
   * included, it also denies a [[CatalogReachingCalls]] call (`query_table('t')`, `query('...')`):
   * the rewriters cannot see a table named in a string, so that read would bypass them entirely.
+  * Likewise on every kind it denies a two-part name headed by an attached catalog
+  * (`acme_tpch.customer`), which DuckDB binds catalog-first while the rewriters and this guard's
+  * policy match read it schema-first (audit F20, F22): the ACL gate refuses it when it runs, and
+  * this keeps the refusal for a policy holder when the ACL is off.
   *
   * The guard owns its CLS detection oracle: it builds a `ColumnPolicyRewriter` internally in
   * `UnresolvedMode.Deny`, so a table whose columns the catalog cannot enumerate denies rather than
@@ -85,8 +90,26 @@ final class ProtectedWriteGuard(
         .orElse(CatalogReachingCalls.find(sql).map(CatalogReachingCalls.denyReason))
         .orElse(FileAccessScreen.find(sql)) match
         case Some(reason) => Deny(s"access denied: $reason")
-        case None if kind == StatementKind.Select && !isBatch(sql) => Allow
-        case None => checkWrite(sql, eff, ctx, colPolicies, rowPolicies, clientDataScans)
+        case None         =>
+          val config =
+            Config.forDuckDB(ctx.defaultDatabase, ctx.defaultSchema, ctx.attachedCatalogs)
+          val results = SqlParser.extract(sql, config).statements
+          ambiguousName(results) match
+            case Some(reason) => Deny(s"access denied: $reason")
+            case None if kind == StatementKind.Select && !isBatch(sql) => Allow
+            case None                                                  =>
+              checkWrite(sql, results, eff, ctx, colPolicies, rowPolicies, clientDataScans)
+
+  /** The first two-part name headed by an attached catalog, in any statement. The policy match keys
+    * it on the session catalog with the head as its schema, while DuckDB reads the head as the
+    * catalog and the table from the current schema: the protected table a bare name reads. Refused
+    * whatever the table, like the ACL gate does, since which table DuckDB binds is not known here.
+    */
+  private def ambiguousName(results: List[StatementResult]): Option[String] =
+    results.iterator
+      .collect { case e: StatementResult.Extracted => e.qualificationErrors }
+      .flatten
+      .collectFirst { case a: DenyReason.AmbiguousCatalogRef => AccessGate.ambiguousNameReason(a) }
 
   /** More than one statement, as the lexer separates them (a `;` inside a literal, a quoted name or
     * a comment does not count, nor does a trailing one). `kind` describes only a batch's first
@@ -100,14 +123,13 @@ final class ProtectedWriteGuard(
 
   private def checkWrite(
       sql: String,
+      results: List[StatementResult],
       eff: EffectiveSet,
       ctx: SchemaContext,
       colPolicies: List[ai.starlake.quack.ondemand.state.RoleColumnPolicy],
       rowPolicies: List[ai.starlake.quack.ondemand.state.RoleRowPolicy],
       clientDataScans: Boolean
   ): GuardOutcome =
-    val config  = Config.forDuckDB(ctx.defaultDatabase, ctx.defaultSchema, Set.empty)
-    val results = SqlParser.extract(sql, config).statements
     // Re-parse the same stripped text with the same feature config so the ASTs line up 1:1 with
     // the extractor's per-statement results by index. Anything that breaks that pairing is a read
     // we cannot isolate, so it denies.

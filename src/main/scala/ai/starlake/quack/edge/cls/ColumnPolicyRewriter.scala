@@ -15,10 +15,16 @@ import scala.util.{Failure, Success, Try}
 
 /** Resolves the schema/catalog defaults in scope when parsing a SQL statement so the rewriter can
   * qualify bare table references (`customer` -> `acme_tpch.tpch1.customer`).
+  *
+  * `attachedCatalogs`: the catalogs attached on the pool's nodes (the tenant-db alias, federated
+  * aliases, DuckDB's built-ins), as `ValidationContext.attachedCatalogs`. DuckDB binds a two-part
+  * `X.t` catalog-first when `X` is one of them, so the protected-write guard refuses that name
+  * instead of reading it schema-first (audit F20). Required: an empty set disables that refusal.
   */
 final case class SchemaContext(
     defaultDatabase: Option[String],
-    defaultSchema: Option[String]
+    defaultSchema: Option[String],
+    attachedCatalogs: Set[String]
 )
 
 object ColumnPolicyRewriter:

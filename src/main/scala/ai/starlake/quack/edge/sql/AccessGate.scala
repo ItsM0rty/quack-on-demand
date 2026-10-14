@@ -28,6 +28,13 @@ enum GateOutcome:
   */
 object AccessGate:
 
+  /** The refusal of a two-part name headed by an attached catalog, worded once for every step that
+    * refuses it (this gate, [[CatalogWriteScreen]], the protected-write guard).
+    */
+  def ambiguousNameReason(a: DenyReason.AmbiguousCatalogRef): String =
+    s"ambiguous two-part name '${a.tableName}': '${a.catalog}' is an attached catalog; " +
+      s"qualify fully as '${a.catalog}.<schema>.<table>'"
+
   /** The SQL parser configuration for a session: the pool's metastore catalog / schema fill in
     * unqualified references, falling back to the validator's defaults.
     */
@@ -200,12 +207,7 @@ object AccessGate:
       )
     else if ambiguous.nonEmpty then
       GateOutcome.Refuse(
-        ambiguous
-          .map(a =>
-            s"ambiguous two-part name '${a.tableName}': '${a.catalog}' is an attached " +
-              s"catalog; qualify fully as '${a.catalog}.<schema>.<table>'"
-          )
-          .mkString("; "),
+        ambiguous.map(ambiguousNameReason).mkString("; "),
         false,
         ""
       )

@@ -12,7 +12,11 @@ class MetadataFilterRewriterSpec extends AnyFlatSpec with Matchers:
 
   private val rw  = new MetadataFilterRewriter(enabled = true)
   private val ctx =
-    SchemaContext(defaultDatabase = Some("acme_tpch"), defaultSchema = Some("tpch1"))
+    SchemaContext(
+      defaultDatabase = Some("acme_tpch"),
+      defaultSchema = Some("tpch1"),
+      attachedCatalogs = Set.empty
+    )
 
   private val tenantUser =
     RbacUser(id = "u-1", tenant = Some("acme"), username = "alice", kind = "user")
