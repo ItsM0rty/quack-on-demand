@@ -1179,11 +1179,50 @@ Two operator cautions:
 
 ### Register a federated source
 
+A `sql` source runs the setup SQL you write, verbatim, on every node of the
+tenant-db. For a Postgres or MySQL database, prefer the typed source ("Register a
+Postgres or MySQL database" below): QoD writes this same block for you and the
+source is read-only by default. A hand-written one looks like this:
+
 ```bash
+# One statement per line. --setup-sql takes the text itself (there is no file
+# option), so read it from a heredoc.
+SETUP_SQL=$(cat <<'SQL'
+INSTALL postgres;
+LOAD postgres;
+CREATE OR REPLACE TEMPORARY SECRET {{alias}}_pg (TYPE postgres, HOST 'pg.prod', PORT 5432, DATABASE 'warehouse', USER 'svc_qod', PASSWORD '{{secret.PG_PWD}}');
+ATTACH '' AS {{alias}} (TYPE postgres, SECRET {{alias}}_pg, READ_ONLY);
+DROP SECRET IF EXISTS {{alias}}_pg;
+SQL
+)
+
+# 1. Save it disabled: the PG_PWD secret can only be set once the source exists.
 qod federation create acme acme_fed --alias fedpg \
-  --description "Prod warehouse Postgres" \
-  --setup-sql "INSTALL postgres; LOAD postgres; CREATE OR REPLACE SECRET fedpg_sec (TYPE POSTGRES, HOST 'pg.prod', PORT 5432, DATABASE 'warehouse', USER 'svc_qod', PASSWORD '{{secret.PG_PWD}}'); ATTACH '' AS {{alias}} (TYPE POSTGRES, SECRET fedpg_sec, READ_ONLY);"
+  --description "Prod warehouse Postgres" --read-only --disabled \
+  --setup-sql "$SETUP_SQL"
+# 2. Set the secret ("Add a Postgres-backed secret" below).
+qod federation secret set acme acme_fed fedpg --name PG_PWD --value "$PG_PWD"
+# 3. Enable it: the same create, without --disabled.
+qod federation create acme acme_fed --alias fedpg \
+  --description "Prod warehouse Postgres" --read-only \
+  --setup-sql "$SETUP_SQL"
 ```
+
+Why it is shaped this way:
+- **A temporary secret, dropped right after the ATTACH.** A DuckDB secret is
+  visible to every session on the node and outlives the ATTACH. Left in place,
+  any session could re-attach the database with it, writable, under the
+  service account's credentials.
+- **One statement per line.** The node keeps going past a failed statement, so
+  a `DROP SECRET` on its own line still runs when the ATTACH fails (the remote is
+  down at node start, say). On the ATTACH's line it would be skipped and the
+  secret would stay.
+- **`--read-only`.** A `sql` source defaults to writable: `READ_ONLY` on the
+  ATTACH binds that one attachment only, and `--read-only` makes the edge refuse
+  writes to the catalog too.
+- **Disabled until its secret exists.** An enabled source whose
+  `{{secret.NAME}}` names a missing secret fails the whole tenant-db federation
+  blob at node spawn, not just this catalog.
 
 Placeholders:
 - `{{alias}}` - replaced with the source's `alias` field.
