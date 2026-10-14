@@ -34,10 +34,16 @@
   current user, and which this script deletes as soon as the values are read
   (QOD_SECRETS_DIR_EPHEMERAL=1). A key still present in the environment is ignored with a warning.
 
-  Unlike the bash version there is no FIFO: DuckDB is fed its init SQL over a
-  redirected stdin that this script leaves OPEN, so the background quack
-  thread keeps serving until the process tree is terminated (LocalQuackBackend
-  uses `taskkill /T` from stop()/cleanup()).
+  The init SQL reaches DuckDB through `-init`, never through stdin (the 2.0 CLI records stdin in
+  shell_history()). Unlike the bash version there is no FIFO: the -init file is an outer init that
+  holds no secrets, `.read`s a secrets file, deletes it once read, then runs the keep-alive.
+  DuckDB's stdin is a pipe closed right after start, so nothing can be injected on the node's own
+  connection. The keep-alive is a final `.shell` dot-command waiting on this script's pid
+  (Wait-Process), then `.exit`: it holds no transaction, and it returns when this script dies, so
+  the node ends with it. Best-effort against pid reuse: Wait-Process only holds a handle on this
+  script's process (which keeps Windows from reusing the pid) once it starts, so a force-kill of
+  this script during the node's init can let a reused pid keep the node alive. A normal stop
+  terminates the whole process tree (LocalQuackBackend uses `taskkill /T` from stop()/cleanup()).
 
   The Postgres `CREATE DATABASE` step the bash script performs as a fallback is
   intentionally omitted here: the manager JVM already provisions the tenant-db

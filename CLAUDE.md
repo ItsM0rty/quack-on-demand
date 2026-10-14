@@ -26,8 +26,10 @@ QOD_VERSION=LOCAL ./scripts/run-jar.sh   # newest distrib/ jar, no rebuild
 
 On **Windows** the manager runs natively (no WSL/Docker) via PowerShell twins:
 `scripts/run-jar.ps1` / `scripts/stop-jar.ps1`, and nodes spawn through
-`scripts/spawn-quack-node.ps1` (a mirror of the bash spawn script; keeps DuckDB
-alive by holding stdin open instead of a FIFO). Teardown uses `taskkill /T` so
+`scripts/spawn-quack-node.ps1` (a mirror of the bash spawn script; init SQL goes
+through `-init`, an outer file that `.read`s a secrets file and deletes it, stdin is
+closed, and a `.shell` dot-command waiting on the wrapper's pid keeps DuckDB alive,
+as the bash script's FIFO-fed `-init` does). Teardown uses `taskkill /T` so
 the `duckdb.exe` grandchild dies with its wrapper. The native `quackwire.dll` is
 bundled automatically whenever `libquackwire/binaries/windows-x86_64/quackwire.dll`
 exists in the checkout. The native client is the manager's only client to its nodes (the embedded

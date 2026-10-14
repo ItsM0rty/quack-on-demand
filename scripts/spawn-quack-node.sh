@@ -42,8 +42,10 @@
 # duckdb's stdin is /dev/null: nothing is ever fed to it, so no statement or dot-command can be
 # injected on the node's own connection (COPY ... TO '/proc/self/fd/0' then lands on /dev/null),
 # and there is no reopenable FIFO in the working directory's parent. The node is instead kept alive
-# by a last init statement that blocks forever (quack_serve has already started its background
-# thread); SIGTERM from LocalQuackBackend.stop ends it.
+# by a final `.shell` dot-command at the end of the init that waits on this wrapper's pid, then
+# `.exit` (quack_serve has already started its background thread). It holds no transaction, and it
+# returns when the wrapper dies, so the node ends with it (best-effort against pid reuse, see the
+# keep-alive note below); SIGTERM from LocalQuackBackend.stop ends it.
 #
 # duckdb runs in an empty, private (0700) directory of its own, created here and removed when the
 # node stops: DuckDB 2.0 replacement-scans an unquoted dotted name as a file (`SELECT * FROM x.csv`

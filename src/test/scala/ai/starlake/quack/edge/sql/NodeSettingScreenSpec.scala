@@ -464,10 +464,12 @@ class NodeWideSettingScreenSpec extends AnyFlatSpec with Matchers:
     NodeSettingScreen.NodeWideSettings.intersect(NodeSettingScreen.Settings) shouldBe empty
   }
 
-  // A node's init SQL reaches its DuckDB CLI through stdin, so every line lands in the CLI's shell
-  // history: CREATE SECRET with the object-store keys, the ATTACH carrying the catalog password,
-  // quack_serve with the node token. On the 2.0 CLI a quack client's
-  // `quack_query(.., 'SELECT id, sql FROM shell_history()')` printed all of them.
+  // The spawn scripts used to feed a node's init SQL to its DuckDB CLI through stdin, so every line
+  // landed in the CLI's shell history: CREATE SECRET with the object-store keys, the ATTACH
+  // carrying the catalog password, quack_serve with the node token. On the 2.0 CLI a quack client's
+  // `quack_query(.., 'SELECT id, sql FROM shell_history()')` printed all of them. The init SQL now
+  // goes through `-init` with stdin carrying nothing, which the history does not record; the
+  // refusal stays as defense in depth.
   "shell_history" should "be refused to every caller, in every spelling" in
     List(
       "SELECT * FROM shell_history()",

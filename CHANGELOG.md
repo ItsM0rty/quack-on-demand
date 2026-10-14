@@ -648,10 +648,12 @@
     and fills tables in any catalog at any scale) is reserved to superusers too. Known gap: only
     lockdown turns off `autoinstall_known_extensions`, so off lockdown a function call or a bare
     `LOAD` of a known extension still installs it.
-  - `shell_history()` is refused to every caller, superusers included: a node's init SQL reaches
-    its DuckDB CLI through stdin, so the history held the object-store secret keys, the catalog
-    password and the node token, readable by any tenant user with `*.*.* ALL`, and by everyone
-    with the ACL off.
+  - `shell_history()` is refused to every caller, superusers included: before this release a
+    node's init SQL reached its DuckDB CLI through stdin, so the history held the object-store
+    secret keys, the catalog password and the node token, readable by any tenant user with
+    `*.*.* ALL`, and by everyone with the ACL off. The init SQL now goes through `-init`, which the
+    CLI does not record (see the `shell_history()` entry above); the refusal stays as defense in
+    depth.
   - BREAKING: tenant users can no longer read node state, ACL on or off: `duckdb_secrets()`,
     `which_secret()`, `whoami()`, `duckdb_settings()` / `pg_settings` and `current_setting()`
     (except over a session setting such as `TimeZone` or `search_path`), `duckdb_logs*`,

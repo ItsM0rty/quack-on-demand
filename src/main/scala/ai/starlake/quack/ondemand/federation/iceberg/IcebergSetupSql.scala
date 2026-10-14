@@ -108,8 +108,9 @@ object IcebergSetupSql:
     cfg.isAwsSigned && cfg.awsCredentials.isDefined
 
   /** The s3 secret type lives in httpfs, and `PROVIDER credential_chain` in the aws extension.
-    * Loaded explicitly rather than trusting autoload: the CLI reading piped stdin carries on past a
-    * failed statement, so a missing extension would surface later as a confusing attach error.
+    * Loaded explicitly rather than trusting autoload: the node's CLI reads its init SQL through
+    * `-init` with `.bail off` and carries on past a failed statement, so a missing extension would
+    * surface later as a confusing attach error.
     */
   private def extensionPrelude(cfg: IcebergRestConfig): String =
     if !awsSecret(cfg) then ""

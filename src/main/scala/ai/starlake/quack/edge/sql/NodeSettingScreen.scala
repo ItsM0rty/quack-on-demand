@@ -10,8 +10,9 @@ package ai.starlake.quack.edge.sql
   * one session's SET also changes how every other session's statements parse on that node. No
   * caller may hold that switch: a superuser setting it breaks the ACL for everyone on the pool.
   *
-  * `shell_history()` prints the node CLI's history, which holds the node's init SQL and so its
-  * credentials ([[SecretCalls]]).
+  * `shell_history()` prints the node CLI's history, which held the node's init SQL and so its
+  * credentials while the spawn scripts fed it through stdin; refused as defense in depth
+  * ([[SecretCalls]]).
   *
   * `redact_http_logs = false` writes HTTP header values unredacted into the node's log (verified on
   * 2.0: with an http secret carrying `Authorization: Bearer ...`, a read logs the bearer token in
@@ -69,11 +70,14 @@ object NodeSettingScreen:
   /** The settings that would print node credentials in clear. */
   val SecretSettings: Set[String] = Set("redact_http_logs", "allow_unredacted_secrets")
 
-  /** Calls that print node credentials. `shell_history()` returns the node CLI's shell history, and
-    * a node's init SQL reaches its CLI through stdin, so the history holds every line of it:
-    * `CREATE SECRET` with the object-store keys, the `ATTACH` carrying the catalog password,
-    * `quack_serve` with the node token (a quack client's `SELECT * FROM shell_history()` printed
-    * them on the 2.0 CLI). It takes no argument, so no path-based list ever judged it.
+  /** Calls that print node credentials. `shell_history()` returns the node CLI's shell history,
+    * which records every line the CLI reads from stdin. The spawn scripts used to feed a node's
+    * init SQL through stdin, so the history held every line of it: `CREATE SECRET` with the
+    * object-store keys, the `ATTACH` carrying the catalog password, `quack_serve` with the node
+    * token (a quack client's `SELECT * FROM shell_history()` printed them on the 2.0 CLI). They now
+    * hand it over through `-init` with stdin carrying nothing, which the history does not record,
+    * so the refusal is defense in depth (a launcher that feeds stdin again would reopen it). It
+    * takes no argument, so no path-based list ever judged it.
     */
   val SecretCalls: Set[String] = Set("shell_history")
 

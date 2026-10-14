@@ -2062,7 +2062,8 @@ opt-in except pod security:
   tenant users must not pull in extensions at all. Nor can a tenant user set
   `file_search_path`, `home_directory`, `allow_asterisks_in_http_paths`, `ca_cert_file`
   or the server certificate verification settings, and `shell_history()` is refused to
-  every caller, superusers included (the node CLI's history holds its init SQL).
+  every caller, superusers included (it held the node's init SQL when nodes read it from
+  stdin; kept as defense in depth).
 - **Node-state introspection, superuser-only in every mode** - a tenant user cannot read
   `duckdb_secrets()`, `which_secret()`, `whoami()`, `duckdb_settings()` / `pg_settings`,
   `current_setting(..)` (except session settings such as `TimeZone` or `search_path`), the
