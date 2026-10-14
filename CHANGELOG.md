@@ -323,7 +323,8 @@
   wrapper process to exit, not by a query: a query pinned a DuckDB transaction (blocking CHECKPOINT
   on a duckdb-file node and holding a catalog Postgres session idle-in-transaction on a DuckLake
   node) and on 2.0 could spin a CPU core for the node's life. The wait also means a node no longer
-  outlives a forced kill of its wrapper. A crash before the Windows secrets file is read leaves it
+  outlives a forced kill of its wrapper, best effort: it polls the wrapper's pid, so if the OS hands
+  that pid to another process before the next poll, the node lives until that process exits. A crash before the Windows secrets file is read leaves it
   only until a later spawn's sweep, and the wrapper stops a node that fails to delete it. On Windows
   the CLI is only ever handed paths relative to the node's working directory, in ASCII, so a temp
   directory under a profile with an accented or other non-ASCII name (or a quote) works. A failing init statement still does not stop the node. `-init`

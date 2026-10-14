@@ -617,11 +617,14 @@ fi
 # duckdb-file node and holding a catalog Postgres session "idle in transaction" on a DuckLake node),
 # and on 2.0 its worker/main-thread handshake can spin a core for the node's life. `.shell` holds no
 # transaction and no scheduler task: it waits for this wrapper's pid ($$) to disappear, so a SIGKILL
-# of the wrapper (which skips the trap) ends the loop, `.shell` returns, the CLI reads EOF from
-# /dev/null and exits - the node no longer outlives its wrapper. `.exit` right after keeps any bytes
-# a later writer could append to the init pipe from ever being read. GNU `tail --pid` (Linux, the
-# node image) waits without forking; where it is missing (macOS, busybox) it fails at once and the
-# `kill -0` loop, one `sleep 1` fork a second, takes over.
+# of the wrapper (which skips the trap) ends the loop, `.shell` returns and the CLI exits, so the
+# node does not outlive its wrapper. Best-effort only: the wait polls a bare pid, so if a
+# force-killed wrapper's pid is reused before the next poll (or before the keep-alive even starts),
+# the node lives on until that unrelated process exits. Only a force-kill from outside the manager
+# can hit this: when LocalQuackBackend force-kills a wrapper it kills the duckdb child with it.
+# `.exit` right after keeps any bytes a later writer could append to the init pipe from ever being
+# read. GNU `tail --pid` (Linux, the node image) waits without forking; where it is missing (macOS,
+# busybox) it fails at once and the `kill -0` loop, one `sleep 1` fork a second, takes over.
 INIT_SQL+=$'.shell "tail --pid='"$$"$' -f /dev/null 2>/dev/null || while kill -0 '"$$"$' 2>/dev/null; do sleep 1; done"\n.exit\n'
 
 # Test seam: print the assembled init SQL and exit without launching duckdb.
