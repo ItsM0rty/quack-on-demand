@@ -111,7 +111,10 @@ QoD calls `POST {opaUrl}/v1/data/{policyPath}/connect` and
 }}
 ```
 
-- `statement.class` is `READ`, `WRITE` or `DDL`.
+- `statement.class` is `READ`, `WRITE` or `DDL`. It is advisory: it reflects only the first
+  statement of a batch, judged by its first keyword, so `SELECT 1; DELETE FROM t` (or
+  `(SELECT 1); DELETE FROM t`) arrives as `READ` while `accesses` carries the `write`. Never
+  authorize on it: decide on the `accesses` verbs, as the starter policy does.
 - `accesses` is the exact table set QoD's SQL parser extracts (the same parser and catalog
   qualification as QoD's own grant check), fully qualified, sorted, deduplicated, with lowercase
   verbs `read | write | ddl`.
