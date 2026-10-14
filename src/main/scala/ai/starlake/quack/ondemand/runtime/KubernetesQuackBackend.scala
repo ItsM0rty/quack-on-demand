@@ -271,9 +271,10 @@ final class KubernetesQuackBackend(
   /** The read-only projected volume carrying every [[NodeSecretFiles.Keys]] value the node needs,
     * one file per key named after it: the per-pod token Secret, the per-pool node-env Secret
     * ([[nodeEnvSecretValues]]), the per-pool federation Secret and the per-pod object-store Secret,
-    * each only when start() creates it. Mode 0400; with the pod's `fsGroup` (defaulted to its
-    * runAsUser) kubelet makes them 0440 group fsGroup, so a template dropping `fsGroup` leaves them
-    * unreadable by the node's uid.
+    * each only when start() creates it. Mode 0400; `fsGroup` is always set
+    * ([[mergedPodSecurityContext]] defaults it to `k8s.runAsUser` when the template sets none), so
+    * kubelet makes them 0440 root:fsGroup, readable by the node's uid through that supplementary
+    * group.
     */
   private def secretsVolume(spec: NodeSpec): Volume =
     def projection(secretName: String, items: Seq[(String, String)]): VolumeProjection =

@@ -100,10 +100,11 @@ unzip -d /usr/local/bin /tmp/duckdb-cli.zip
 chmod +x /usr/local/bin/duckdb
 rm /tmp/duckdb-cli.zip
 
-# libduckdb.so is required at runtime by libquackwire (the JNI shim that
-# powers QOD_NATIVE_CLIENT=true) because the shim links against
-# DuckDB::LibraryVersion / ArrowConverter / etc. The duckdb CLI above is
-# self-contained and does not provide a system-installed libduckdb.so.
+# libduckdb.so is required at runtime by libquackwire (the JNI shim that is
+# the manager's only client to its nodes), which links the pinned libduckdb
+# dynamically (DuckDB::LibraryVersion / ArrowConverter / etc.). The duckdb
+# CLI above is self-contained and does not provide a system-installed
+# libduckdb.so.
 curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-${DUCKDB_ARCH}.zip" \
   -o /tmp/libduckdb.zip
 unzip -d /tmp/libduckdb /tmp/libduckdb.zip
