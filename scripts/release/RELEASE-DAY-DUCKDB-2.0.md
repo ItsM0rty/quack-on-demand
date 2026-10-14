@@ -1,0 +1,75 @@
+# DuckDB 2.0 release day
+
+`feat/duckdb-2.0` runs a DuckDB 2.0 pre-release (engine `b15358c371`, which reports
+`v2.0.0-alpha46057`), while every pin outside the JDBC already says `2.0.0`. It builds only on a
+developer machine that ran `scripts/dev/build-duckdb-prerelease.sh`. The `release pins` check
+(`scripts/release/check-release-pins.sh`, job `release-grade DuckDB pins`) refuses it until the
+steps below are done. For that check to block a merge it must be required on `main`, which needs
+the workflow on `main` first: a required check that a PR cannot report blocks every PR. Each step names the audit finding it closes (2026-10-13 audit of the branch).
+
+## 0. Preconditions
+
+All of these must exist upstream before step 1:
+
+- the `v2.0.0` tag on `duckdb/duckdb`;
+- `org.duckdb:duckdb_jdbc:2.0.0.0` on Maven Central
+  (`curl -s https://repo1.maven.org/maven2/org/duckdb/duckdb_jdbc/maven-metadata.xml`);
+- the release zips under `https://github.com/duckdb/duckdb/releases/download/v2.0.0/` (the CLI and
+  libduckdb for every platform the Dockerfiles, the qod CLI launcher, `run-jar.sh` and
+  `quackwire.yml` download);
+- signed v2.0.0 extensions in the extension repository: ducklake, quack, httpfs, postgres, iceberg,
+  avro and the others nodes load.
+
+## 1. Pins (F26)
+
+- `project/Versions.scala`: `val duckdbJdbc = duckdb` (Versions.duckdbJdbc from Maven Central).
+- `build.sbt`: drop `resolvers += Resolver.mavenLocal` and its comment.
+- The `quack` submodule: the commit the published v2.0.0 quack extension was built from.
+- The Docker images (`Dockerfile`, `docker/quack-node/Dockerfile`, `docker/fleet-worker/Dockerfile`)
+  already pin `ARG DUCKDB_VERSION=2.0.0`, and the qod CLI launcher and `run-jar.sh` already
+  provision from the release URLs; `DuckDbPinParitySpec` binds them together. Confirm each download
+  now resolves.
+- `scripts/release/check-release-pins.sh` passes.
+
+## 2. Native binaries (F05, F30)
+
+Only `osx-aarch64` is a 2.0 build today, made on a developer machine. The other four
+(`linux-x86_64`, `linux-aarch64`, `osx-x86_64`, `windows-x86_64`) are 1.5.6 / Quack v1 builds, and
+the manager refuses them at boot (the embedded build marker).
+
+- Before rebuilding, land the F30 fix (each decoded PREPARE / FETCH leaks its 40-byte
+  `ArrowArrayStream` shell, `native/quackwire/src/quackwire.cpp`), so the rebuilt natives carry it.
+- Run `quackwire.yml` on the release commit. It derives the DuckDB version from the pin and stages
+  the release zips. `native/quackwire/src/win_duckdb_compat.cpp` was re-derived for 2.0 but never
+  built: check the Windows leg.
+- Vendor all five with `scripts/release/refresh-quackwire-binaries.sh`, which takes the CI run of
+  HEAD and checks each binary's build marker against the pin.
+
+## 3. Developer caches (F62)
+
+The alpha is installed under the release's name, and the version checks accept it as `2.0.0`.
+
+- Delete `<main checkout>/.duckdb/2.0.0`.
+- Delete `~/.m2/repository/org/duckdb/duckdb_jdbc/2.0.0.0-pre-*`.
+- Unset `QOD_DUCKDB_EXTENSION_DIR` and the `PATH` export `build-duckdb-prerelease.sh` asked for.
+- F62's fix (stamp each cache with its engine source id, exact version match in `run-jar.sh`) is
+  still open; until it lands, nothing else catches a leftover alpha.
+
+## 4. Re-verify on the released engine
+
+- The full `sbt test`, and `QuackCompatibilitySpec` with the released `duckdb` CLI on `PATH`.
+- A real boot on Linux, Intel macOS and Windows (only osx-aarch64 was ever booted on 2.0).
+- F11: re-test that a manager boot no longer re-runs DuckLake's `AUTOMATIC_MIGRATION` on a current
+  catalog (the `qod_meta.ducklake_migration` stamp).
+- If the release moved DuckLake past `1.1-dev1`, alpha-built nodes fail with
+  `Unsupported ducklake_version`: restart every node after the manager.
+- The mysql, azure and aws setting scopes (`DuckDbSettingScopes`) against a 2.0 binary.
+- The pin-bump re-checks (items 1 to 7 of the local DuckDB pin-bump checklist).
+
+## 5. Release notes (F55, F56)
+
+- The HA upgrade guidance in the DuckDB 2.0 CHANGELOG entry: no rolling upgrade across this
+  release. Back up the catalogs, scale the manager to one replica and stop writers, upgrade, restart
+  every node once no old-version replica is left, then scale back up.
+- The BREAKING per-manager stop scoping (F56), with its `--unmarked` fix.
+- Remove the "osx-aarch64 only for now" wording from the DuckDB 2.0 entry once step 2 is done.

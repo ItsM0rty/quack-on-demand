@@ -168,3 +168,21 @@ class ReleaseGateScriptsSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     code shouldBe 1
     out should include("build.sbt:1 resolves from ~/.m2")
   }
+
+  // Audit F26: the release-day list lived only in gitignored files; the red check now names the
+  // tracked one, and that one covers what the check refuses.
+  private val releaseDay = "scripts/release/RELEASE-DAY-DUCKDB-2.0.md"
+
+  it should "name the tracked release-day checklist when it refuses" in {
+    val (code, out) = checkPins(pinsTree("\"2.0.0.0-pre-b15358c\"", ""))
+    code shouldBe 1
+    out should include(releaseDay)
+  }
+
+  "the release-day checklist" should "be tracked and cover the pins the guard refuses" in {
+    val doc = Paths.get(releaseDay)
+    Files.exists(doc) shouldBe true
+    val text = Files.readString(doc)
+    List("Versions.duckdbJdbc", "Resolver.mavenLocal", "check-release-pins.sh", "refresh-quackwire")
+      .foreach(term => withClue(term)(text should include(term)))
+  }

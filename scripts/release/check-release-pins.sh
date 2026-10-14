@@ -38,6 +38,7 @@ done
 if [[ ${#problems[@]} -gt 0 ]]; then
   echo "release-pin guard: this tree cannot build outside a developer machine:" >&2
   for p in "${problems[@]}"; do echo "  - $p" >&2; done
+  echo "The release-day steps: scripts/release/RELEASE-DAY-DUCKDB-2.0.md" >&2
   [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::error::release-pin guard failed: pre-release DuckDB JDBC or mavenLocal resolver (see log)"
   exit 1
 fi
