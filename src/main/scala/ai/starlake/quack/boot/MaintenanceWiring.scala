@@ -51,7 +51,7 @@ final class MaintenanceWiring(
       isLeader = isLeader
     )
 
-  private val pinnedSetResolver = new PinnedSetResolver(store, catalogReader)
+  private val pinnedSetResolver = new PinnedSetResolver(store)
 
   private val runner =
     new MaintenanceRunner(
@@ -98,18 +98,23 @@ final class MaintenanceWiring(
               }
           case None => IO.pure(None),
       stop = node => backend.stop(node.poolKey, node.nodeId).handleErrorWith(_ => IO.unit),
+      // Right(rows returned): ducklake_cleanup_old_files returns one row per file it deleted.
       exec = (node, sql) =>
-        adapter.send(node, sql, session = None, recordLoad = false).map {
+        adapter.send(node, sql, session = None, recordLoad = false).flatMap {
           case QuackResponse.Ok(r, _, close) =>
-            close(); Right(())
+            IO.blocking {
+              var rows = 0L
+              while r.loadNextBatch() do rows += r.getVectorSchemaRoot.getRowCount
+              rows
+            }.guarantee(IO(close()))
+              .attempt
+              .map(_.left.map(e => s"reading the result: ${e.getMessage}"))
           case QuackResponse.Failed(e, _) =>
-            Left(e.toString)
+            IO.pure(Left(e.toString))
         },
       snapshotsOlderThan = (t, td, cutoff) => catalogReader(t, td).snapshotsOlderThan(cutoff),
       pinnedSnapshotsOf = pinnedSetResolver.pinnedSnapshots,
-      pinnedFilesOf = pinnedSetResolver.pinnedFiles,
       hasLiveBranchOf = pinnedSetResolver.hasLiveBranch,
-      scheduledForDeletion = (t, td) => catalogReader(t, td).filesScheduledForDeletion(),
       totalBytesOf = (t, td) => catalogReader(t, td).totalDataFileBytes(),
       effectivePolicyOf = (t, td, s, tb) =>
         PolicyMath.effective(store.listMaintenancePolicies(t, td), s, tb),

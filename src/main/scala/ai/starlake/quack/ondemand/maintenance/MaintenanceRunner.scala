@@ -19,12 +19,10 @@ final class MaintenanceRunner(
     store: ControlPlaneStore,
     spawn: (String, String) => IO[Option[RunningNode]], // (tenant, tenantDb) -> node
     stop: RunningNode => IO[Unit],
-    exec: (RunningNode, String) => IO[Either[String, Unit]],
+    exec: (RunningNode, String) => IO[Either[String, Long]], // Right(rows the statement returned)
     snapshotsOlderThan: (String, String, Instant) => List[Long],
     pinnedSnapshotsOf: (String, String) => Set[Long],
-    pinnedFilesOf: (String, String) => Set[String],
     hasLiveBranchOf: (String, String) => Boolean, // merge + cleanup skipped while true (F25)
-    scheduledForDeletion: (String, String) => List[String],
     totalBytesOf: (String, String) => Long,
     effectivePolicyOf: (String, String, Option[String], Option[String]) => EffectivePolicy,
     catalogAlias: (String, String) => String, // ATTACH alias on the node = dbName
@@ -138,10 +136,11 @@ final class MaintenanceRunner(
         // would be this caller overwriting a status it no longer owns. sweptRef records that
         // this is why the chain stopped, so the finish path below skips the finish-write and
         // success audit instead of clobbering the sweeper's row.
-        step = (name: String, sql: String, onOk: RunCounters => RunCounters) =>
+        // `onOk` gets the counters and the number of rows the statement returned.
+        step = (name: String, sql: String, onOk: (RunCounters, Long) => RunCounters) =>
           exec(node, sql).flatMap {
-            case Right(()) =>
-              countersRef.update(onOk) *>
+            case Right(rows) =>
+              countersRef.update(onOk(_, rows)) *>
                 countersRef.get
                   .flatMap(c => IO.blocking(store.heartbeatMaintenanceRun(run.id, c)))
                   .flatMap { stillOwned =>
@@ -168,7 +167,7 @@ final class MaintenanceRunner(
               .as(true)
 
         flushIO = IO.defer {
-          if wants(run, "flush") then step("flush", MaintenanceChainSql.flush(alias), identity)
+          if wants(run, "flush") then step("flush", MaintenanceChainSql.flush(alias), (c, _) => c)
           else IO.pure(true)
         }
 
@@ -178,7 +177,7 @@ final class MaintenanceRunner(
             step(
               "expire",
               MaintenanceChainSql.expireVersions(alias, toExpire),
-              _.copy(snapshotsExpired = toExpire.size)
+              (c, _) => c.copy(snapshotsExpired = toExpire.size)
             )
         }
 
@@ -189,7 +188,7 @@ final class MaintenanceRunner(
             step(
               "merge",
               MaintenanceChainSql.mergeAdjacent(alias),
-              c => c.copy(filesMerged = c.filesMerged + 1)
+              (c, _) => c.copy(filesMerged = c.filesMerged + 1)
             )
         }
 
@@ -199,39 +198,27 @@ final class MaintenanceRunner(
               step(
                 "rewrite",
                 MaintenanceChainSql.rewriteTable(alias, ts.schema, ts.table),
-                c => c.copy(filesRewritten = c.filesRewritten + 1)
+                (c, _) => c.copy(filesRewritten = c.filesRewritten + 1)
               )
             case _ => IO.pure(true)
         }
 
+        // No pinned-file check here: the one this replaced compared paths in two forms that never
+        // match (data_path-relative scheduled paths, table-relative file paths) against pins read
+        // after the merge had deleted the rows behind them, so it never fired (audit F25). A
+        // protected tag's files need none (time travel at the tag reads the merged file); a live
+        // branch's are kept by skipping merge and cleanup above. `filesCleaned` is what cleanup
+        // reports deleting (one row per file), not what was scheduled: files inside the grace
+        // window stay scheduled.
         cleanupIO = IO.defer {
           if tableScope.isDefined || !wants(run, "cleanup") then IO.pure(true)
+          else if hasLiveBranchOf(run.tenant, run.tenantDb) then skipForBranch("cleanup")
           else
-            // Pinned-file fail-safe guard, read immediately before issuing cleanup (spec
-            // section 4 step 5): this run's own expire+merge steps can newly schedule files
-            // for deletion, so the guard must see the post-chain state, not a prelude snapshot.
-            // One read of scheduledForDeletion is reused for both the guard and the
-            // reclaimable count below.
-            val scheduled = scheduledForDeletion(run.tenant, run.tenantDb)
-            val pf        = pinnedFilesOf(run.tenant, run.tenantDb)
-            val pinnedHit = if pf.isEmpty then Nil else scheduled.filter(pf.contains)
-            if hasLiveBranchOf(run.tenant, run.tenantDb) then skipForBranch("cleanup")
-            else if pinnedHit.nonEmpty then
-              statusRef.set("partial") *>
-                errorRef
-                  .set(
-                    Some(
-                      s"cleanup skipped: pinned files scheduled for deletion: " +
-                        s"${pinnedHit.take(5).mkString(", ")}"
-                    )
-                  )
-                  .as(true)
-            else
-              step(
-                "cleanup",
-                MaintenanceChainSql.cleanupOldFiles(alias, pol.cleanupGraceDays),
-                c => c.copy(filesCleaned = scheduled.size)
-              )
+            step(
+              "cleanup",
+              MaintenanceChainSql.cleanupOldFiles(alias, pol.cleanupGraceDays),
+              (c, deleted) => c.copy(filesCleaned = deleted.toInt)
+            )
         }
 
         orphanIO = IO.defer {
@@ -240,7 +227,7 @@ final class MaintenanceRunner(
             step(
               "orphans",
               MaintenanceChainSql.deleteOrphans(alias, pol.orphanMinAgeDays),
-              c => c.copy(orphansDeleted = c.orphansDeleted + 1)
+              (c, _) => c.copy(orphansDeleted = c.orphansDeleted + 1)
             )
         }
 

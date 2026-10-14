@@ -159,8 +159,11 @@
   the branch could no longer scan its pre-fork data, and its unmerged work could no longer be
   merged. The pinned-file check meant to prevent this could never match. While a database has a
   live (open or proposed) branch, maintenance now skips the merge and cleanup steps and records the
-  run `partial`, saying why; they resume once the branch is merged, discarded or expired. A DuckLake
-  `CHECKPOINT` run by a superuser still merges and cleans up on its own.
+  run `partial`, saying why; they resume once the branch is merged, discarded or expired. The
+  pinned-file check is removed, and a run's `filesCleaned` now counts the files cleanup actually
+  deleted rather than every file scheduled for deletion (files inside the grace window stay
+  scheduled and used to be counted too). A DuckLake `CHECKPOINT` run by a superuser still merges
+  and cleans up on its own.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
