@@ -4,11 +4,14 @@ package ai.starlake.sql
   * splits a submission into its top-level statements, mirroring DuckDB's own lexer rather than
   * approximating it.
   *
-  * Mirrors the implementation from the Starlake codebase (`ai.starlake.sql.SqlCommentStripper`) so
-  * SQL-handling utilities stay consistent across projects; the lexer fidelity below is this
-  * project's own, driven by what a real DuckDB 1.5.4 accepts.
+  * `stripComments` and `removeEmptyLines` keep the names of the Starlake codebase's
+  * `ai.starlake.sql.SqlCommentStripper`, and `removeEmptyLines` mirrors its implementation, so
+  * SQL-handling utilities stay consistent across projects. Comment and quote boundaries come from
+  * `SqlLexer`, ported from the DuckDB 2.0 source.
   *
-  * Three properties, each verified by execution against DuckDB 1.5.4 rather than assumed:
+  * Three properties, each verified by execution rather than assumed, and each holding on DuckDB
+  * 2.0. Properties 1 and 2 were first probed on DuckDB 1.5.4; property 3 is 2.0's (1.5 has four
+  * quoting forms, 2.0 adds backtick identifiers):
   *
   *   1. A comment is a SEPARATOR, not a weld. `INSERT/*x*/INTO t VALUES (1)` runs and writes the
   *      row, because DuckDB treats the comment as whitespace between the two keywords rather than
