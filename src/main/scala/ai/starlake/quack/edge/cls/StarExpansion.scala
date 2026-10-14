@@ -92,7 +92,7 @@ private[cls] object StarExpansion:
     walk(root)
     out.toList
 
-  private def plainSelects(root: AnyRef): List[PlainSelect] =
+  private[cls] def plainSelects(root: AnyRef): List[PlainSelect] =
     nodes(root).collect { case ps: PlainSelect => ps }
 
   /** Every CTE name of the statement, whatever its scope: a star over one is never expanded. */

@@ -837,51 +837,12 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     out shouldBe Passthrough
   }
 
-  // -------- KNOWN GAP (ignored below): unaliased aggregate produces broken SQL at the node --------
-  //
-  // Live repro (against a real DuckDB node, not reproducible at this unit level): with a mask
-  // policy on customer.c_phone,
-  //
-  //   SELECT c_mktsegment, min(c_phone) FROM tpch1.customer GROUP BY 1
-  //
-  // fails at the node. jsqltranspiler's star-expansion / result-set-metadata machinery names the
-  // unaliased aggregate projection slot "min" (DuckDB's own synthesized column name), and the
-  // Prepare-time LIMIT-0 probe wrapper built around the rewritten SQL then breaks because DuckDB
-  // rejects that shape. The aliased form
-  //
-  //   SELECT c_mktsegment, min(c_phone) AS phone FROM tpch1.customer GROUP BY 1
-  //
-  // works fine end-to-end. Exact node-side error (captured from the live repro): DuckDB's binder
-  // rejects the wrapped/probed SELECT with a reference to the synthetic "min" column name colliding
-  // with the aggregate-function keyword once the probe wrapper re-projects it.
-  //
-  // Unit-level finding (this test, no live DuckDB involved): JsqltranspilerRewriter never
-  // synthesizes an alias for an unaliased projection expression. Walking
-  // ColumnPolicyRewriter -> JsqltranspilerRewriter -> the vendored JSQLColumResolver
-  // (getResolvedStatementText) confirms new SelectItems are only ever constructed for `*` / `t.*`
-  // expansion, and even then the ORIGINAL (possibly-null) alias is carried through unchanged; the
-  // PolicyVisitor's mask substitution (JsqltranspilerRewriter.scala PolicyVisitor.visit) replaces
-  // the Column expression in place and never touches SelectItem.alias either. So the unaliased
-  // aggregate keeps flowing through the rewriter with NO alias while the aliased form keeps its
-  // alias - the rewriter faithfully preserves the caller's aliasing choice rather than ever adding
-  // one. The breakage is therefore real but only manifests once the wrapped SQL reaches the engine
-  // (Prepare-time LIMIT-0 probe / DuckDB binder), which this unit test cannot exercise.
-  //
-  // This test pins the current (broken-downstream) rewritten SQL verbatim as a characterization:
-  // the unaliased form's masked aggregate still carries no alias. Any future change that makes the
-  // rewriter auto-alias bare aggregate/function projections (the likely fix) will change this
-  // output and this test will need updating alongside the fix - that's the point of un-ignoring it
-  // when the fix lands.
-  //
-  // NOTE on the enabled-first protocol: unlike TEST 1 and TEST 2 (which fail today and will pass
-  // once fixed), this test currently PASSES when enabled - it documents/characterizes today's
-  // rewriter output rather than asserting a unit-level failure, because the actual defect only
-  // manifests once the rewritten SQL reaches the live DuckDB node (see the live repro above, which
-  // is NOT reproducible without a running node). It is ignored anyway so it reads consistently
-  // alongside TEST 1/2 as a pinned KNOWN GAP, and so a future rewriter change that starts
-  // auto-aliasing bare aggregates doesn't silently drift this characterization without a human
-  // reviewing whether the live breakage is now fixed.
-  ignore should "leave an unaliased aggregate projection unaliased after masking (KNOWN GAP, breaks at the node)" in {
+  // An unaliased aggregate over a masked column (`min(c_phone)`) stays unaliased: DuckDB names the
+  // slot itself. It used to fail at the node through the FlightSQL prepare probe
+  // `SELECT * FROM (<query>) AS _qod_probe LIMIT 0`: the resolver expanded the probe's star under
+  // its own name for the slot (`_qod_probe.min`), which DuckDB does not bind. The probe's star is
+  // now kept as written (JsqltranspilerRewriterSpec runs both shapes on DuckDB).
+  it should "leave an unaliased aggregate projection unaliased after masking" in {
     val catWithPhone = new ColumnCatalog.MapCatalog(
       Map(("acme_tpch", "tpch1", "customer") -> List("c_mktsegment", "c_phone"))
     )
@@ -906,13 +867,25 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       )
       .unsafeRunSync()
 
+    val probedOut = r
+      .rewrite(
+        "SELECT * FROM (SELECT c_mktsegment, min(c_phone) FROM tpch1.customer GROUP BY 1) " +
+          "AS _qod_probe LIMIT 0",
+        StatementKind.Select,
+        eff(tenantUser, List(maskPhone)),
+        ctx
+      )
+      .unsafeRunSync()
+
     unaliasedOut match
       case Rewritten(sql) =>
-        // Verbatim characterization of the current (broken-downstream) shape: the masked
-        // aggregate is rewritten in place but the projection slot is STILL not given an
-        // explicit alias, unlike the working aliased form asserted below.
         sql shouldBe "SELECT c_mktsegment, min('***') FROM tpch1.customer GROUP BY 1"
-        sql should not include " AS "
+      case other => fail(s"expected Rewritten, got $other")
+
+    probedOut match
+      case Rewritten(sql) =>
+        sql shouldBe "SELECT * FROM (SELECT c_mktsegment, min('***') FROM tpch1.customer " +
+          "GROUP BY 1) AS _qod_probe LIMIT 0"
       case other => fail(s"expected Rewritten, got $other")
 
     aliasedOut match

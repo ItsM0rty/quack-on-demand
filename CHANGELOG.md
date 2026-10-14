@@ -685,6 +685,14 @@
     (`(customer) AS c(a, b, e)`, `(customer JOIN orders ..) AS j(..)`) is refused like one on
     the table itself: it renamed a masked column out of the policy's reach.
 
+- **Fixed: an unaliased expression over a masked column no longer fails under column policies.**
+  For a user with a column mask, a query projecting a masked column through an unaliased
+  expression (`SELECT min(c_phone) FROM customer`, `c_phone || 'x'`) failed on FlightSQL with
+  `Binder Error: Values list "_qod_probe" does not have a column named "min"`, and so did any
+  `SELECT * FROM (<such a query>) s`: the column-policy rewrite expanded a star over a derived
+  table under its own name for the unaliased column, which DuckDB does not bind. A star over
+  derived tables only is now kept as written; the derived tables are masked inside it.
+
 - **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
   open transaction's node connection too, so a statement after an idle pause longer than the
   node lease no longer fails with "Connection heartbeat lease expired".

@@ -162,6 +162,9 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
     * the real table `t` that the ACL gate never checked (it saw the CTE). The router runs the
     * statement under the session's default catalog and schema, so the caller's own spelling already
     * resolves where the gate assumed; the rewrite must change nothing but the masked expressions.
+    *
+    * A select list of plain stars over derived tables only keeps its stars too (see
+    * [[derivedStarSelects]]).
     */
   private def resolvedText(
       resolver: JSQLColumResolver,
@@ -173,6 +176,8 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
       case select: Select =>
         val written =
           ResidualColumns.tablesOf(select).map(t => t -> new java.util.ArrayList(t.getNameParts))
+        val stars =
+          derivedStarSelects(select).map(ps => ps -> new java.util.ArrayList(ps.getSelectItems))
         select.accept(
           resolver: net.sf.jsqlparser.statement.select.SelectVisitor[
             ai.starlake.transpiler.schema.JdbcResultSetMetaData
@@ -180,10 +185,37 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
           JdbcMetaData.copyOf(metaData)
         )
         written.foreach((t, parts) => t.setNameParts(parts))
+        stars.foreach((ps, items) => ps.setSelectItems(items))
       case _ => ()
     val builder = new java.lang.StringBuilder()
     statement.accept(new net.sf.jsqlparser.util.deparser.StatementDeParser(builder))
     builder.toString
+
+  /** The selects, at any depth, whose items are all plain stars (`*`, `t.*`: no EXCLUDE, REPLACE or
+    * alias) and whose FROM items are all derived tables. The resolver expands such a star to the
+    * derived table's outputs under its own name for an unaliased expression (`min(c_email)` became
+    * `s.min`, `c_email || 'x'` became `s.Concat`), which DuckDB does not bind: the query, and the
+    * FlightSQL prepare probe `SELECT * FROM (<query>) AS _qod_probe LIMIT 0` wrapping any query,
+    * failed with a binder error. Such a star needs no expansion to be masked: it exposes only the
+    * derived tables' outputs, and each derived table is masked inside it. A star that also covers a
+    * base table or a CTE reference is left to the resolver, which the masking needs.
+    */
+  private def derivedStarSelects(select: Select): List[PlainSelect] =
+    import net.sf.jsqlparser.statement.select.{AllColumns, AllTableColumns, ParenthesedSelect}
+    def plainStar(si: SelectItem[?]): Boolean =
+      si.getAlias == null && (si.getExpression match
+        case star: AllColumns
+            if star.getClass == classOf[AllColumns] || star.getClass == classOf[AllTableColumns] =>
+          Option(star.getExceptColumns).forall(_.isEmpty) &&
+          Option(star.getReplaceExpressions).forall(_.isEmpty)
+        case _ => false)
+    StarExpansion.plainSelects(select).filter { ps =>
+      val items = Option(ps.getSelectItems).map(_.asScala.toList).getOrElse(Nil)
+      val from  = Option(ps.getFromItem).toList ++
+        Option(ps.getJoins).toList.flatMap(_.asScala).map(_.getFromItem)
+      items.nonEmpty && items.forall(plainStar) &&
+      from.nonEmpty && from.forall(_.isInstanceOf[ParenthesedSelect])
+    }
 
   /** First table reference, at ANY depth, that neither the caller-provided schema nor the
     * system-schema seeds know. CTE names are excluded by [[TablesNamesFinder]] itself. Matching is

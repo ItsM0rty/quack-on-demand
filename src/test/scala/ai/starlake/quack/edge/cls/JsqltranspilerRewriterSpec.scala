@@ -835,3 +835,58 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
   "a FROM-first statement" should "fail closed instead of throwing" in {
     outcome("FROM customer") shouldBe RewriteOutcome.ParseFailed
   }
+
+  // A star over a derived table: the resolver expanded it to the inner select's outputs under its
+  // own name for an unaliased expression (`min(c_email)` as `s.min`, `c_email || 'x'` as
+  // `s.Concat`), which DuckDB does not bind, so `SELECT * FROM (SELECT min(c_phone) ..) s` and the
+  // FlightSQL prepare probe `SELECT * FROM (<query>) AS _qod_probe LIMIT 0` failed with a binder
+  // error whenever a masked column sat under such an expression. Each rewrite runs on DuckDB here.
+  private def runMasked(sql: String): List[List[String]] =
+    val out = outcome(sql) match
+      case RewriteOutcome.Rewritten(s) => s
+      case other                       => fail(s"expected Rewritten for: $sql, got $other")
+    Class.forName("org.duckdb.DuckDBDriver")
+    scala.util.Using.resource(
+      java.sql.DriverManager
+        .getConnection("jdbc:duckdb:", ai.starlake.quack.ondemand.InProcessDuckDb.properties)
+    ) { c =>
+      scala.util.Using.resource(c.createStatement()) { st =>
+        List(
+          "CREATE SCHEMA tpch1",
+          "USE tpch1",
+          "CREATE TABLE customer (c_id INT, c_name VARCHAR, c_email VARCHAR, c_phone VARCHAR)",
+          "INSERT INTO customer VALUES (1, 'n', 'secret@x', '555')",
+          "CREATE TABLE orders (o_id INT, c_id INT, c_email VARCHAR, o_total INT)",
+          "CREATE TABLE lineitem (l_id INT, o_id INT)"
+        ).foreach(st.execute)
+        withClue(s"$sql\n  rewritten: $out\n") {
+          scala.util.Using.resource(st.executeQuery(out)) { rs =>
+            val n = rs.getMetaData.getColumnCount
+            Iterator
+              .continually(rs.next())
+              .takeWhile(identity)
+              .map(_ => (1 to n).map(i => rs.getString(i)).toList)
+              .toList
+          }
+        }
+      }
+    }
+
+  "a star over derived tables" should "bind on DuckDB with the masked values" in
+    List(
+      "SELECT * FROM (SELECT min(c_email) FROM customer) s",
+      "SELECT * FROM (SELECT min(c_email) FROM customer) AS _qod_probe LIMIT 0",
+      "SELECT * FROM (SELECT min(c_email), max(c_id) FROM customer) AS _qod_probe LIMIT 0",
+      "SELECT * FROM (SELECT c_email || 'x' FROM customer) s",
+      "SELECT s.* FROM (SELECT upper(c_email) FROM customer) s",
+      "SELECT * FROM (SELECT min(c_email) FROM customer) a, (SELECT count(*) FROM customer) b",
+      "SELECT * FROM (SELECT * FROM (SELECT lower(c_email) FROM customer) i) o"
+    ).foreach { sql =>
+      runMasked(sql).flatten.filter(_ != null).foreach(v => v should not include "secret")
+    }
+
+  it should "still expand and mask a star that also covers a base table" in {
+    val rows = runMasked("SELECT * FROM customer, (SELECT 1 AS one) s")
+    rows.flatten should contain("***")
+    rows.flatten.filter(_ != null).foreach(v => v should not include "secret")
+  }
