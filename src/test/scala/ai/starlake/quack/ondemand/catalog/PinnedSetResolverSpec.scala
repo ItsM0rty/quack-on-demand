@@ -1,6 +1,6 @@
 package ai.starlake.quack.ondemand.catalog
 
-import ai.starlake.quack.model.{Names, SnapshotTag}
+import ai.starlake.quack.model.{Branch, BranchStatus, Names, SnapshotTag, TenantDb, TenantDbKind}
 import ai.starlake.quack.ondemand.state.InMemoryControlPlaneStore
 import ai.starlake.quack.ondemand.state.testkit.PostgresFixture
 import org.scalatest.flatspec.AnyFlatSpec
@@ -33,3 +33,37 @@ class PinnedSetResolverSpec extends AnyFlatSpec with Matchers with PostgresFixtu
       resolver.pinnedFiles("acme", "acme_db") shouldBe reader.filesReferencedAt(s)
       resolver.pinnedFiles("acme", "empty_db") shouldBe empty
     }
+
+  "hasLiveBranch" should "be true only while the tenant-db has an open or proposed branch" in {
+    val store  = new InMemoryControlPlaneStore()
+    val parent = TenantDb("tdb-1", "acme", "acme_db", TenantDbKind.DuckLake, Map.empty, "/d")
+    store.upsertTenantDb(parent)
+    store.upsertTenantDb(
+      TenantDb("tdb-2", "acme", "acme_other", TenantDbKind.DuckLake, Map.empty, "/o")
+    )
+    def branch(name: String, status: BranchStatus) =
+      Branch(
+        Names.newSurrogateId("br"),
+        "acme",
+        parent.id,
+        parent.name,
+        name,
+        s"td-$name",
+        s"acme_db__br_$name",
+        s"__br_$name",
+        s"/d__br_$name/",
+        5L,
+        "alice",
+        status,
+        None
+      )
+    val resolver = new PinnedSetResolver(store, (_, _) => fail("no reader needed"))
+    resolver.hasLiveBranch("acme", "acme_db") shouldBe false
+    store.createBranch(branch("gone", BranchStatus.Discarded)).isRight shouldBe true
+    store.createBranch(branch("done", BranchStatus.Merged)).isRight shouldBe true
+    resolver.hasLiveBranch("acme", "acme_db") shouldBe false
+    store.createBranch(branch("prop", BranchStatus.Proposed)).isRight shouldBe true
+    resolver.hasLiveBranch("acme", "acme_db") shouldBe true
+    resolver.hasLiveBranch("acme", "acme_other") shouldBe false
+    resolver.hasLiveBranch("acme", "acme_missing") shouldBe false
+  }

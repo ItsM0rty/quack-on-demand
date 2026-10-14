@@ -23,6 +23,7 @@ final class MaintenanceRunner(
     snapshotsOlderThan: (String, String, Instant) => List[Long],
     pinnedSnapshotsOf: (String, String) => Set[Long],
     pinnedFilesOf: (String, String) => Set[String],
+    hasLiveBranchOf: (String, String) => Boolean, // merge + cleanup skipped while true (F25)
     scheduledForDeletion: (String, String) => List[String],
     totalBytesOf: (String, String) => Long,
     effectivePolicyOf: (String, String, Option[String], Option[String]) => EffectivePolicy,
@@ -151,6 +152,21 @@ final class MaintenanceRunner(
               statusRef.set("failed") *> errorRef.set(Some(s"$name: $msg")).as(false)
           }
 
+        // A live branch reads the parent's Parquet files by absolute path. Merge hard-deletes the
+        // rows of the files it merges away and schedules them for cleanup, so no pin derived from
+        // the parent can see them, and the next cleanup would delete what the branch still scans
+        // (audit F25). Both steps are skipped while the database has a live branch; the run is
+        // recorded partial with the reason. Read at each step, not in the prelude: a branch cloned
+        // while the merge ran forks over the files it just scheduled.
+        skipForBranch = (what: String) =>
+          statusRef.set("partial") *>
+            errorRef
+              .update { prev =>
+                val msg = s"$what skipped: the database has a live branch reading its files"
+                Some(prev.fold(msg)(p => s"$p; $msg"))
+              }
+              .as(true)
+
         flushIO = IO.defer {
           if wants(run, "flush") then step("flush", MaintenanceChainSql.flush(alias), identity)
           else IO.pure(true)
@@ -168,6 +184,7 @@ final class MaintenanceRunner(
 
         mergeIO = IO.defer {
           if !pol.compactionEnabled || !wants(run, "merge") then IO.pure(true)
+          else if hasLiveBranchOf(run.tenant, run.tenantDb) then skipForBranch("merge")
           else
             step(
               "merge",
@@ -198,7 +215,8 @@ final class MaintenanceRunner(
             val scheduled = scheduledForDeletion(run.tenant, run.tenantDb)
             val pf        = pinnedFilesOf(run.tenant, run.tenantDb)
             val pinnedHit = if pf.isEmpty then Nil else scheduled.filter(pf.contains)
-            if pinnedHit.nonEmpty then
+            if hasLiveBranchOf(run.tenant, run.tenantDb) then skipForBranch("cleanup")
+            else if pinnedHit.nonEmpty then
               statusRef.set("partial") *>
                 errorRef
                   .set(

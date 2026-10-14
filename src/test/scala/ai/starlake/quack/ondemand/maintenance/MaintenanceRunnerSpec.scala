@@ -23,7 +23,10 @@ class MaintenanceRunnerSpec extends AnyFlatSpec with Matchers:
       // (merge_adjacent_files) has actually executed -- simulates THIS run's own expire+merge
       // being what schedules the pinned file for deletion in the first place, so a test can
       // prove the guard's read happens after that step, not in the prelude (F2).
-      scheduledVisibleAfterMerge: Boolean = false
+      scheduledVisibleAfterMerge: Boolean = false,
+      // Answers hasLiveBranchOf, call by call (the last answer repeats): a live branch reads the
+      // parent's files by absolute path, so merge and cleanup must not run under it (audit F25).
+      liveBranch: List[Boolean] = List(false)
   ):
     val store              = new InMemoryControlPlaneStore()
     var executed           = List.empty[String]
@@ -57,6 +60,13 @@ class MaintenanceRunnerSpec extends AnyFlatSpec with Matchers:
       snapshotsOlderThan = (_, _, _) => List(1L, 2L, 3L, 4L), // 4 candidates
       pinnedSnapshotsOf = (_, _) => pinnedSnaps,
       pinnedFilesOf = (_, _) => pinnedFiles,
+      hasLiveBranchOf = {
+        val answers = liveBranch.iterator
+        var last    = false
+        (_, _) =>
+          if answers.hasNext then last = answers.next()
+          last
+      },
       scheduledForDeletion = (_, _) =>
         scheduledCallCount += 1
         if scheduledVisibleAfterMerge && !mergeRan then Nil else scheduled
@@ -169,6 +179,7 @@ class MaintenanceRunnerSpec extends AnyFlatSpec with Matchers:
       snapshotsOlderThan = (_, _, _) => Nil,
       pinnedSnapshotsOf = (_, _) => Set.empty,
       pinnedFilesOf = (_, _) => Set.empty,
+      hasLiveBranchOf = (_, _) => false,
       scheduledForDeletion = (_, _) => Nil,
       totalBytesOf = (_, _) => 0L,
       effectivePolicyOf = (_, _, _, _) => EffectivePolicy.defaults.copy(enabled = true),
@@ -233,6 +244,7 @@ class MaintenanceRunnerSpec extends AnyFlatSpec with Matchers:
         snapshotsOlderThan = (_, _, _) => List(1L, 2L, 3L, 4L),
         pinnedSnapshotsOf = (_, _) => Set.empty,
         pinnedFilesOf = (_, _) => Set.empty,
+        hasLiveBranchOf = (_, _) => false,
         scheduledForDeletion = (_, _) => Nil,
         totalBytesOf = (_, _) => 100L,
         effectivePolicyOf = (_, _, _, _) => EffectivePolicy.defaults.copy(enabled = true),
@@ -258,3 +270,37 @@ class MaintenanceRunnerSpec extends AnyFlatSpec with Matchers:
       finalRun.status shouldBe "failed"
       finalRun.error shouldBe Some("stale: heartbeat timeout")
     }
+
+  // Audit F25: a branch's catalog points at the parent's Parquet files by absolute path, and
+  // merge_adjacent_files hard-deletes the merged rows, so no pin derived from the parent can see
+  // what a later cleanup removes from under the branch.
+  "a database with a live branch" should "skip merge and cleanup, and record partial" in {
+    val f   = new Fixture(liveBranch = List(true), scheduled = List("s/t/ducklake-a.parquet"))
+    val fin = f.enqueueAndRun()
+    f.executed.exists(_.contains("merge_adjacent_files")) shouldBe false
+    f.executed.exists(_.contains("cleanup_old_files")) shouldBe false
+    f.executed.head should include("ducklake_flush_inlined_data")
+    f.executed.exists(_.contains("ducklake_expire_snapshots")) shouldBe true
+    f.executed.last should include("ducklake_delete_orphaned_files")
+    fin.status shouldBe "partial"
+    fin.error.getOrElse("") should (include("merge skipped") and include("cleanup skipped"))
+    fin.error.getOrElse("") should include("live branch")
+  }
+
+  it should "skip cleanup when the branch appears after the merge step" in {
+    // Read at cleanup time, not in the prelude: a branch cloned while the merge ran forks over
+    // files the merge just scheduled.
+    val f   = new Fixture(liveBranch = List(false, true))
+    val fin = f.enqueueAndRun()
+    f.executed.exists(_.contains("merge_adjacent_files")) shouldBe true
+    f.executed.exists(_.contains("cleanup_old_files")) shouldBe false
+    fin.status shouldBe "partial"
+  }
+
+  it should "leave a database without a live branch on the full chain" in {
+    val f   = new Fixture(liveBranch = List(false))
+    val fin = f.enqueueAndRun()
+    f.executed.exists(_.contains("merge_adjacent_files")) shouldBe true
+    f.executed.exists(_.contains("cleanup_old_files")) shouldBe true
+    fin.status shouldBe "succeeded"
+  }

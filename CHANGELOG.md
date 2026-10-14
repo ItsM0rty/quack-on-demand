@@ -153,6 +153,14 @@
   p`: a node-local file write and a write into the denied DuckLake bucket under lockdown, and,
   with the ACL on, a COPY to any path or URL for a tenant user holding the wildcard ALL grant. The
   prepared statement is now judged whatever the name's form.
+- **Fix: maintenance no longer deletes files a live branch still reads.** A branch reads its
+  parent's Parquet files by absolute path. The parent's merge step folds small files into one,
+  deleting their catalog rows and scheduling them for cleanup, and a later cleanup deleted them:
+  the branch could no longer scan its pre-fork data, and its unmerged work could no longer be
+  merged. The pinned-file check meant to prevent this could never match. While a database has a
+  live (open or proposed) branch, maintenance now skips the merge and cleanup steps and records the
+  run `partial`, saying why; they resume once the branch is merged, discarded or expired. A DuckLake
+  `CHECKPOINT` run by a superuser still merges and cleans up on its own.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
