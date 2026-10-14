@@ -31,7 +31,31 @@ All of these must exist upstream before step 1:
   now resolves.
 - `scripts/release/check-release-pins.sh` passes.
 
-## 2. Native binaries (F05, F30)
+## 2. Developer caches (F62)
+
+Do this right after step 1, before step 3 and before any other build, boot or test. The alpha is
+installed under the release's directory name (`.duckdb/2.0.0`, the name the libduckdb preload
+derives from the VERSION stamp), and every version check accepts it as `2.0.0`: `run-jar.sh`'s
+fast path, the presence-only header check of `refresh-quackwire-binaries.sh` and
+`QOD_VERSION=BUILD`, and the build marker check, which compares only `x.y.z`. Left in place, the
+host native of step 3 is compiled against the alpha headers with nothing flagging it, and step 4
+validates the alpha engine.
+
+- Delete `<main checkout>/.duckdb/2.0.0` (and the same directory under any `DUCKDB_CACHE_DIR` you
+  pointed `build-duckdb-prerelease.sh` at).
+- Delete `~/.m2/repository/org/duckdb/duckdb_jdbc/2.0.0.0-pre-*`.
+- Unset `QOD_DUCKDB_EXTENSION_DIR` and remove the `PATH` export pointing at the alpha's
+  `.duckdb/2.0.0/bin` that `build-duckdb-prerelease.sh` asked for (shell profile included), then
+  open a fresh shell.
+- Repopulate the cache from the release zips with one `QOD_VERSION=BUILD ./scripts/run-jar.sh`
+  boot from the main checkout, and check that `<main checkout>/.duckdb/2.0.0/bin/duckdb -version`
+  prints `v2.0.0` with no `-alpha` suffix.
+- Never run `build-duckdb-prerelease.sh` again: it deletes the cache it writes to, the release's
+  included.
+- F62's fix (stamp each cache with its engine source id, exact version match in `run-jar.sh`) is
+  still open; until it lands, nothing else catches a leftover alpha.
+
+## 3. Native binaries (F05, F30)
 
 Only `osx-aarch64` is a 2.0 build today, made on a developer machine. The other four
 (`linux-x86_64`, `linux-aarch64`, `osx-x86_64`, `windows-x86_64`) are 1.5.6 / Quack v1 builds, and
@@ -44,16 +68,6 @@ the manager refuses them at boot (the embedded build marker).
   built: check the Windows leg.
 - Vendor all five with `scripts/release/refresh-quackwire-binaries.sh`, which takes the CI run of
   HEAD and checks each binary's build marker against the pin.
-
-## 3. Developer caches (F62)
-
-The alpha is installed under the release's name, and the version checks accept it as `2.0.0`.
-
-- Delete `<main checkout>/.duckdb/2.0.0`.
-- Delete `~/.m2/repository/org/duckdb/duckdb_jdbc/2.0.0.0-pre-*`.
-- Unset `QOD_DUCKDB_EXTENSION_DIR` and the `PATH` export `build-duckdb-prerelease.sh` asked for.
-- F62's fix (stamp each cache with its engine source id, exact version match in `run-jar.sh`) is
-  still open; until it lands, nothing else catches a leftover alpha.
 
 ## 4. Re-verify on the released engine
 
@@ -72,4 +86,4 @@ The alpha is installed under the release's name, and the version checks accept i
   release. Back up the catalogs, scale the manager to one replica and stop writers, upgrade, restart
   every node once no old-version replica is left, then scale back up.
 - The BREAKING per-manager stop scoping (F56), with its `--unmarked` fix.
-- Remove the "osx-aarch64 only for now" wording from the DuckDB 2.0 entry once step 2 is done.
+- Remove the "osx-aarch64 only for now" wording from the DuckDB 2.0 entry once step 3 is done.
