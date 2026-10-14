@@ -1334,11 +1334,20 @@ qod federation create acme acme_fed --alias crm --type mysql \
   --host mysql.prod.internal --database crm --user qod_reader \
   --ssl-mode required --password-prompt
 
-# Or point at a secret you manage yourself (an --external-ref one, say)
+# Or point at a secret you manage yourself (an --external-ref one, say).
+# 1. Save the source disabled: its secret can only be set once the source exists,
+#    and an enabled source naming a missing secret fails the whole tenant-db
+#    federation blob at node spawn.
+qod federation create acme acme_fed --alias shop --type postgres \
+  --host pg.prod.internal --database shop --user qod_reader \
+  --password '{{secret.SHOP_PG}}' --disabled
+# 2. Set the secret. --external-ref needs a superuser session: a tenant admin gets
+#    403 superuser_required and stores an inline --value instead.
+qod federation secret set acme acme_fed shop --name SHOP_PG --external-ref env:SHOP_PG_PASSWORD
+# 3. Enable it: the same create, without --disabled.
 qod federation create acme acme_fed --alias shop --type postgres \
   --host pg.prod.internal --database shop --user qod_reader \
   --password '{{secret.SHOP_PG}}'
-qod federation secret set acme acme_fed shop --name SHOP_PG --external-ref env:SHOP_PG_PASSWORD
 ```
 
 Then recycle the pool's nodes, as for any new source.
