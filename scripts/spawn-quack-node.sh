@@ -495,9 +495,12 @@ fi
 INIT_SQL=""
 # First, before any CREATE SECRET or ATTACH: SECRET_PATH (see above) replaces the OS user's
 # ~/.duckdb/stored_secrets. Reading duckdb_secrets() then puts the secret manager in use, after which
-# DuckDB refuses to change secret_directory, allow_persistent_secrets or default_secret_storage from
-# any session. Both run before `.bail off`, while the CLI still exits on the first error of an -init
-# file: if either failed, the node must not start on the default secret directory.
+# DuckDB refuses to change secret_directory or allow_persistent_secrets from any session
+# (default_secret_storage stays changeable, which is harmless: a plain CREATE SECRET is temporary
+# and a persistent one can name its storage anyway). The real control is SECRET_PATH itself, which
+# can never exist as a directory, so CREATE PERSISTENT SECRET fails (see above). Both run before
+# `.bail off`, while the CLI still exits on the first error of an -init file: if either failed, the
+# node must not start on the default secret directory.
 # Quotes doubled outside double quotes: inside them bash 3.2 keeps the backslashes of `\'`.
 secret_path_sql=${SECRET_PATH//\'/\'\'}
 INIT_SQL+="SET secret_directory = '$secret_path_sql';"$'\n'

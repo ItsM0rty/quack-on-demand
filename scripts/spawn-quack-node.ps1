@@ -486,8 +486,10 @@ $encryptionKey = Secret-Or 'encryptionKey' ''
 $sb = [System.Text.StringBuilder]::new()
 # First, before any CREATE SECRET or ATTACH: $secretPath (see above) replaces the OS user's
 # ~/.duckdb/stored_secrets. Reading duckdb_secrets() then puts the secret manager in use, after which
-# DuckDB refuses to change secret_directory, allow_persistent_secrets or default_secret_storage from
-# any session. Under `.bail on`: the outer init turned bail off before `.read`ing this payload, and
+# DuckDB refuses to change secret_directory or allow_persistent_secrets from any session
+# (default_secret_storage stays changeable, which is harmless: a plain CREATE SECRET is temporary
+# and a persistent one can name its storage anyway). The real control is $secretPath itself, below
+# a read-only marker file, so CREATE PERSISTENT SECRET fails (see above). Under `.bail on`: the outer init turned bail off before `.read`ing this payload, and
 # if either statement failed the node must not start on the default secret directory. Mirrors
 # spawn-quack-node.sh.
 [void]$sb.AppendLine('.bail on')
