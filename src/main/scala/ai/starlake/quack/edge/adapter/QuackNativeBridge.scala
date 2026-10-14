@@ -21,7 +21,10 @@ object QuackNativeBridge:
     * the binary `QuackMessage` ready to POST to a Quack node's `/quack` endpoint.
     *
     * `heartbeatTimeoutSec` (Quack v3) is the connection lease the node grants: every request renews
-    * it, and once it lapses the node interrupts the running statement.
+    * it. The node checks the lease only when the connection's next message arrives; once lapsed,
+    * that message fails and the node interrupts what still runs on the connection and drops it. A
+    * lapse by itself interrupts nothing, so the lease does not bound work orphaned by a dead
+    * manager.
     */
   @native def serializeConnectionRequest(token: String, heartbeatTimeoutSec: Long): Array[Byte]
 

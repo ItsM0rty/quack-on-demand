@@ -517,9 +517,10 @@ final case class ManagerConfig(
       envVar = "QOD_QUACK_NODE_LEASE_SEC",
       description =
         "Lease (seconds, >= 1) the manager asks a node for on each native connection. The manager " +
-          "heartbeats at a third of it. A node checks the lease when the connection's next message " +
-          "arrives and fails that message once it has lapsed; a lapsed lease does not by itself " +
-          "interrupt a running statement."
+          "heartbeats at a third of it. The node checks the lease only when the connection's " +
+          "next message arrives; once lapsed, that message fails and the node interrupts what " +
+          "still runs on the connection and drops it. A lapse by itself interrupts nothing, so " +
+          "the lease does not bound work orphaned by a dead manager."
     )
     nodeLeaseSec: Int = 30,
     @field @ConfigField(
