@@ -412,6 +412,10 @@
     `json_execute_serialized_sql` (table function and pragma) is refused outright to the same
     callers: a serialized plan names its catalogs in JSON strings DuckDB decodes after the screen
     reads them. The data tables themselves and the other DuckLake functions are unchanged.
+    The screen knows the metadata catalog by its name: a caller who holds the catalog's Postgres
+    password and may ATTACH (a tenant user with the ACL off and lockdown off) can attach that
+    database again under another alias and read the keys there, so this guarantee also rests on
+    that password staying secret.
     String literals are read as DuckDB reads them: a literal continued on the next line
     (`'__duck'` newline `'lake_metadata_x'`, which DuckDB folds into one value) is judged folded,
     in every carrier, `query()` body and `SET` / `PRAGMA` form.
