@@ -24,7 +24,7 @@ import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.telemetry.{AuditActions, AuditEvent, EventJournal, StatementEvent}
 import ai.starlake.quack.route.{PoolSnapshot, Router, RoutingDecision, StatementClassifier}
 import ai.starlake.quack.spi.{ManagerEvent, ManagerEventSink}
-import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
+import ai.starlake.sql.{SqlCommentStripper, SqlTrivia, TooDeep}
 
 import ai.starlake.quack.observability.metrics.StatementInstruments
 import cats.effect.IO
@@ -448,6 +448,69 @@ final class FlightSqlRouter(
         * two listings are only coherent on one node; see `Router.softPinUsable`.
         */
       softPinOverCapacity: Boolean = false
+  ): IO[Either[RouterFailure, Routed[A]]] =
+    // Backstop behind the analysis steps' own TooDeep guards: the screens, gates and rewriters run
+    // synchronously here, before any IO, so a walk none of them guards that overflows is denied
+    // instead of escaping as a StackOverflowError, which would halt the manager.
+    TooDeep.orElse(tooDeepDenied(user, poolKey, sql, effectiveSet, recordExecution, patId, source))(
+      executeUnguarded(
+        connectionId,
+        user,
+        poolKey,
+        sql,
+        effectiveSet,
+        send,
+        source,
+        preferredNode,
+        recordExecution,
+        prepareDurationMs,
+        patId,
+        edge,
+        clientDataScans,
+        softPinOverCapacity
+      )
+    )
+
+  private def tooDeepDenied[A](
+      user: String,
+      poolKey: PoolKey,
+      sql: String,
+      effectiveSet: Option[EffectiveSet],
+      recordExecution: Boolean,
+      patId: Option[String],
+      source: String
+  ): IO[Either[RouterFailure, Routed[A]]] =
+    if recordExecution then
+      record(
+        user,
+        poolKey,
+        nodeId = "-",
+        sql,
+        durationMs = 0,
+        status = "denied",
+        error = Some(TooDeep.Reason),
+        kind = TooDeep.orElse(StatementKind.Other)(classifier.classify(sql)),
+        realm = if effectiveSet.exists(_.user.tenant.isEmpty) then "system" else "tenant",
+        patId = patId,
+        source = source
+      )
+    IO.pure(Left(RouterFailure.AccessDenied(s"access denied: ${TooDeep.Reason}")))
+
+  private def executeUnguarded[A](
+      connectionId: String,
+      user: String,
+      poolKey: PoolKey,
+      sql: String,
+      effectiveSet: Option[EffectiveSet],
+      send: FlightSqlRouter.NodeSend[A],
+      source: String,
+      preferredNode: Option[String],
+      recordExecution: Boolean,
+      prepareDurationMs: Option[Long],
+      patId: Option[String],
+      edge: String,
+      clientDataScans: Boolean,
+      softPinOverCapacity: Boolean
   ): IO[Either[RouterFailure, Routed[A]]] =
     val resolvedEdge = if edge.isEmpty then source else edge
     val s            = sessions.get(connectionId).getOrElse {

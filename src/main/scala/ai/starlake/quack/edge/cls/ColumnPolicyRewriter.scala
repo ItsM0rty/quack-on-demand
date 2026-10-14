@@ -6,7 +6,7 @@ import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import cats.effect.IO
 import cats.syntax.traverse._
 import ai.starlake.acl.parser.TableExtractor
-import ai.starlake.sql.ParserInput
+import ai.starlake.sql.{ParserInput, TooDeep}
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.statement.select.{ParenthesedSelect, PlainSelect, Select, SetOperationList}
 
@@ -85,37 +85,49 @@ final class ColumnPolicyRewriter(
       // Every parse below reads the lexer-canonical rendering, never the raw text: JSqlParser
       // tokenizes DuckDB's escape and dollar-quoted strings differently, and a table it cannot see
       // is a table no policy masks. A rendering refusal is input DuckDB rejects anyway.
-      ParserInput.render(sql) match
-        case Left(_)      => IO.pure(PassthroughParseFailed)
-        case Right(input) =>
-          rewriteCanonical(input.text, eff, ctx).map {
-            // The rewrite is printed from the parser input, which is not the caller's statement
-            // here (ParserInput.Rendered.exact): shipping it would run a different statement.
-            case Rewritten(_) if !input.exact => Denied(InexactRefusal)
-            case other                        => other
-          }
+      // A too-deep statement overflows the parse and resolver walks below: denied (TooDeep).
+      // Guarded twice because the walks run both eagerly (here) and inside the IO's map.
+      TooDeep.orElse(IO.pure(Denied(TooDeep.Reason))) {
+        ParserInput.render(sql) match
+          case Left(_)      => IO.pure(PassthroughParseFailed)
+          case Right(input) =>
+            rewriteCanonical(input.text, eff, ctx).map {
+              // The rewrite is printed from the parser input, which is not the caller's statement
+              // here (ParserInput.Rendered.exact): shipping it would run a different statement.
+              case Rewritten(_) if !input.exact => Denied(InexactRefusal)
+              case other                        => other
+            }
+      }
 
   private def rewriteCanonical(sql: String, eff: EffectiveSet, ctx: SchemaContext): IO[Outcome] =
     if readsOnlyCatalogFunctions(sql) then IO.pure(Passthrough)
     else
       buildSchema(sql, ctx).map { schema =>
-        PositionalReferences.resolve(sql, schema) match
-          case Left(reason) => Denied(reason)
-          case Right(named) =>
-            inner.rewrite(
-              sql = named,
-              schema = schema,
-              policies = eff.columnPolicies,
-              defaultCatalog = ctx.defaultDatabase,
-              defaultSchema = ctx.defaultSchema,
-              unresolvedMode = unresolvedMode
-            ) match
-              case RewriteOutcome.Rewritten(s)   => Rewritten(s)
-              case RewriteOutcome.Denied(reason) =>
-                if looksUnresolvedTable(reason) then DeniedUnresolvedTable else Denied(reason)
-              case RewriteOutcome.Passthrough => Passthrough
-              case RewriteOutcome.ParseFailed => PassthroughParseFailed
+        TooDeep.orElse(Denied(TooDeep.Reason))(rewriteResolved(sql, schema, eff, ctx))
       }
+
+  private def rewriteResolved(
+      sql: String,
+      schema: Map[String, List[String]],
+      eff: EffectiveSet,
+      ctx: SchemaContext
+  ): Outcome =
+    PositionalReferences.resolve(sql, schema) match
+      case Left(reason) => Denied(reason)
+      case Right(named) =>
+        inner.rewrite(
+          sql = named,
+          schema = schema,
+          policies = eff.columnPolicies,
+          defaultCatalog = ctx.defaultDatabase,
+          defaultSchema = ctx.defaultSchema,
+          unresolvedMode = unresolvedMode
+        ) match
+          case RewriteOutcome.Rewritten(s)   => Rewritten(s)
+          case RewriteOutcome.Denied(reason) =>
+            if looksUnresolvedTable(reason) then DeniedUnresolvedTable else Denied(reason)
+          case RewriteOutcome.Passthrough => Passthrough
+          case RewriteOutcome.ParseFailed => PassthroughParseFailed
 
   /** True for a single statement whose only FROM items are DuckDB's filterable catalog functions
     * (`duckdb_tables()`, `duckdb_views()`, `duckdb_schemas()`, `duckdb_columns()`) and which reads

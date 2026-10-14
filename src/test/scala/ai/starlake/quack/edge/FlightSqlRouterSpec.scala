@@ -4144,3 +4144,46 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .get
       .reason should include("reserved to superusers")
     lockedCaptured() shouldBe ""
+
+  // Audit F13: a StackOverflowError is fatal to cats-effect, so one too-deep statement that
+  // escapes a walk halts the whole manager. Run on a 1 MiB stack, a production worker's default.
+  private def onWorkerStack[A](body: => A): Either[Throwable, A] =
+    var out: Either[Throwable, A] = Left(new IllegalStateException("not run"))
+    val t                         = new Thread(
+      null,
+      () =>
+        out =
+          try Right(body)
+          catch case e: Throwable => Left(e), "deep-nesting",
+      1L << 20
+    )
+    t.start()
+    t.join()
+    out
+
+  // Under RoutingRefs.MaxSqlLength, so the placement walk parses it.
+  private val tooDeep = "SELECT " + List.fill(45000)("1").mkString("+")
+
+  "a too-deep statement" should "be forwarded, not crash the router, with the ACL off" in:
+    val (router, _, _) = setup()
+    onWorkerStack(router.execute("deep-1", "alice", poolKey, tooDeep).unsafeRunSync()) match
+      case Right(out) => out shouldBe a[Right[?, ?]]
+      case Left(e)    => fail(s"escaped ${e.getClass.getName}", e)
+
+  it should "be denied, not crash the router, when a pipeline step overflows" in:
+    val overflowing = new StatementValidator:
+      def validate(context: ValidationContext): ValidationResult = throw new StackOverflowError()
+    val (base, _, _) = setup()
+    val router       = new FlightSqlRouter(
+      base.supervisor,
+      base.sessions,
+      base.tracker,
+      base.adapter,
+      validator = overflowing,
+      stmtInstruments = si
+    )
+    onWorkerStack(router.execute("deep-2", "alice", poolKey, "SELECT 1").unsafeRunSync()) match
+      case Right(out) =>
+        out.swap.toOption.get shouldBe a[RouterFailure.AccessDenied]
+        router.history.snapshot(1).head.status shouldBe "denied"
+      case Left(e) => fail(s"escaped ${e.getClass.getName}", e)

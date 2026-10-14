@@ -2,7 +2,7 @@ package ai.starlake.acl.parser
 
 import java.util.Locale
 import ai.starlake.acl.model.Config
-import ai.starlake.sql.ParserInput
+import ai.starlake.sql.{ParserInput, TooDeep}
 import net.sf.jsqlparser.JSQLParserException
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.parser.feature.{Feature, FeatureConfiguration}
@@ -74,9 +74,17 @@ object SqlParser:
     *   ExtractionResult with per-statement results and aggregated tables
     */
   def extract(sql: String, config: Config): ExtractionResult =
-    if isClientBeginTransaction(sql) then
-      ExtractionResult.fromStatements(List(clientBeginTransaction(0, sql)))
-    else extractParsed(sql, config)
+    TooDeep.orElse(ExtractionResult.fromStatements(List(tooDeep(sql)))) {
+      if isClientBeginTransaction(sql) then
+        ExtractionResult.fromStatements(List(clientBeginTransaction(0, sql)))
+      else extractParsed(sql, config)
+    }
+
+  /** A statement nested too deeply for the walk (or JSqlParser's own printers) to follow: a parse
+    * error, which every consumer denies, instead of a fatal `StackOverflowError` ([[TooDeep]]).
+    */
+  private def tooDeep(sql: String): StatementResult =
+    StatementResult.ParseError(0, truncateSnippet(sql), TooDeep.Reason)
 
   /** `BEGIN TRANSACTION`, the statement a DuckDB 2.0 quack client sends when it first touches an
     * attached catalog (duckdb-quack `src/storage/quack_transaction.cpp`, `ForceStart`; its COMMIT
@@ -146,11 +154,13 @@ object SqlParser:
     */
   def extractSingle(sql: String, config: Config): StatementResult =
     try
-      if isClientBeginTransaction(sql) then clientBeginTransaction(0, sql)
-      else
-        ParserInput.render(sql) match
-          case Left(reason) => StatementResult.ParseError(0, truncateSnippet(sql), reason)
-          case Right(input) => analysed(CCJSqlParserUtil.parse(input.text), 0, config)
+      TooDeep.orElse(tooDeep(sql)) {
+        if isClientBeginTransaction(sql) then clientBeginTransaction(0, sql)
+        else
+          ParserInput.render(sql) match
+            case Left(reason) => StatementResult.ParseError(0, truncateSnippet(sql), reason)
+            case Right(input) => analysed(CCJSqlParserUtil.parse(input.text), 0, config)
+      }
     catch
       case e: JSQLParserException =>
         val snippet = truncateSnippet(sql)

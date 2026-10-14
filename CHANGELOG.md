@@ -51,6 +51,15 @@
   time through the deleted row count, or whole through an `error((SELECT ...))` message). That
   subquery is now checked like the `THEN UPDATE` / `THEN INSERT` forms, and an unrecognized MERGE
   action is refused. The earlier write-guard fix covered MERGE only in those two forms.
+- **Security: one deeply nested statement can no longer crash the manager.** A statement nested
+  deeply enough (`SELECT 1+1+...+1` with tens of thousands of terms, or hundreds of nested
+  subqueries) overflowed the recursive SQL analysis and escaped as a `StackOverflowError`, which
+  cats-effect treats as fatal: any authenticated user halted the whole manager, for every tenant.
+  This reached the default configuration (routing reads the statement's tables even with the ACL
+  off) as well as the ACL, OPA, lockdown, column-mask, row-policy write guard and filtered-metadata
+  steps. Every analysis step now catches the overflow and refuses the statement fail-closed ("nested
+  too deeply to analyse"); with the ACL off and no policy in play it is forwarded unanalysed, and the
+  node answers it.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
