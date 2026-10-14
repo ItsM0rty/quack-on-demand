@@ -20,6 +20,12 @@
   of stalling boot. Nodes, loaders and the demo seed attach as-is. The migration is one-way: back up catalog databases
   before upgrading, there is no downgrade. Until DuckDB v2.0.0 is released the toolchain is built
   from source with `scripts/dev/build-duckdb-prerelease.sh`.
+  Upgrade, HA (`replicaCount > 1`): there is no rolling upgrade across this release. A manager on
+  the previous version cannot reach a 2.0 node and a 2.0 manager cannot reach a 1.5.6 node, so
+  during a rolling `helm upgrade` every statement routed across versions fails, and a 2.0 replica
+  promoted to leader migrates catalogs that 1.5.6 nodes still serve. Back up the catalog databases,
+  scale the manager to one replica and stop writers, upgrade it, restart every node once no
+  previous-version replica is left, then scale back up.
   A DuckDB 2.0 client on the native front door gives up on a statement after its `http_timeout`
   (default 30 s); run `SET http_timeout = <seconds>` in the client session before a longer one
   (FlightSQL is unaffected). `VARIANT` columns reach FlightSQL clients as the Arrow
