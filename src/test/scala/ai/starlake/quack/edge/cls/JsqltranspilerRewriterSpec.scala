@@ -651,6 +651,92 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
     denied("SELECT c.c_email.x FROM customer c")
   }
 
+  // ---- a qualifier DuckDB binds past the innermost source that names it -------------------
+  //
+  // DuckDB binds `q.name` to the innermost binding `q` only when it has the column. Otherwise it
+  // reads column `q` and takes its field `name` (`SELECT c_addr.city FROM customer AS c_addr`),
+  // and failing that climbs to the enclosing selects, a correlated reference (2.0 CLI:
+  // `SELECT (SELECT x.c_email FROM (SELECT 1 AS a) x) FROM customer x` returns every real email).
+
+  private def deniedInBothModes(
+      sql: String,
+      tables: Map[String, List[String]],
+      policy: RoleColumnPolicy
+  ): Unit =
+    List(UnresolvedMode.Pass, UnresolvedMode.Deny).foreach { mode =>
+      // ParseFailed is denied by the router, fail closed.
+      withClue(s"[$mode] $sql") {
+        rw.rewrite(sql, tables, List(policy), Some("acme_tpch"), Some("tpch1"), mode) should
+          (be(a[RewriteOutcome.Denied]) or be(RewriteOutcome.ParseFailed))
+      }
+    }
+
+  "a qualifier shadowed by an inner source lacking the column" should "be denied" in
+    List(
+      "SELECT (SELECT x.c_email FROM (SELECT 1 AS a) x) AS leaked FROM customer x",
+      "SELECT (SELECT x.c_email FROM lineitem x) FROM customer x",
+      "WITH x AS (SELECT 1 AS a) SELECT (SELECT x.c_email FROM x) FROM customer x",
+      "SELECT (SELECT x.c_email FROM (VALUES (1)) x(a)) FROM customer x",
+      "SELECT c_id FROM customer x " +
+        "WHERE EXISTS (SELECT 1 FROM (SELECT 1 AS a) x WHERE x.c_email LIKE 'a%')",
+      "SELECT c_id FROM customer x ORDER BY (SELECT x.c_email FROM (SELECT 1 AS a) x)",
+      "SELECT (SELECT x.c_email.lower() FROM (SELECT 1 AS a) x) FROM customer x"
+    ).foreach(deniedInBothModes(_, withOrders, maskEmail))
+
+  it should "stay admitted when the inner source has the column" in {
+    outcome("SELECT (SELECT x.c_email FROM orders x) FROM customer x") shouldBe
+      RewriteOutcome.Passthrough
+  }
+
+  private val maskAddr =
+    maskEmail.copy(id = "cp-addr", columnName = "c_addr", transformSql = Some("NULL"))
+
+  // The catalog as a plain listing, and as DuckLake lists it (struct fields as rows of their own).
+  private val addrTables = List(
+    Map("customer" -> List("c_id", "c_name", "c_addr")),
+    Map("customer" -> List("c_id", "c_name", "c_addr", "city", "zip"))
+  )
+
+  "a qualifier naming a masked column" should "be denied as a field read of that column" in {
+    for
+      tables <- addrTables
+      policy <- List(maskAddr, maskAddr.copy(action = "deny", transformSql = None))
+      sql    <- List(
+        "SELECT c_addr.city FROM customer AS c_addr",
+        "SELECT c_addr.c_addr.city FROM customer AS c_addr",
+        "SELECT c_addr.city.upper() FROM customer AS c_addr",
+        "SELECT c_id FROM customer AS c_addr WHERE c_addr.city = 'Paris'",
+        "SELECT c_id FROM customer AS c_addr ORDER BY c_addr.city",
+        "SELECT c_addr.city FROM customer, (SELECT 1 AS a) c_addr",
+        "WITH c_addr AS (SELECT 1 AS a) SELECT c_addr.city FROM customer, c_addr"
+      )
+    do deniedInBothModes(sql, tables, policy)
+  }
+
+  // DuckDB binds `c_addr.c_id` to the table, but a DuckLake listing cannot tell a struct field from
+  // a column, so the collision is refused whatever the binding has.
+  it should "be refused even where DuckDB would bind it to the table" in {
+    deniedInBothModes("SELECT c_addr.c_id FROM customer AS c_addr", addrTables.head, maskAddr)
+    outcome("SELECT c.c_id FROM customer c") shouldBe RewriteOutcome.Passthrough
+  }
+
+  // The star expands to `c_addr.city`, `c_addr.zip` over a DuckLake listing: the same field read.
+  it should "be denied through an aliased star over a DuckLake listing" in
+    deniedInBothModes("SELECT * FROM customer AS c_addr", addrTables.last, maskAddr)
+
+  it should "leave a field read through a derived table, whose value is already masked, alone" in {
+    rw.rewrite(
+      "SELECT c_addr.city FROM (SELECT c_addr FROM customer) AS c_addr",
+      addrTables.head,
+      List(maskAddr),
+      Some("acme_tpch"),
+      Some("tpch1"),
+      UnresolvedMode.Pass
+    ) match
+      case RewriteOutcome.Rewritten(out) => out should include("NULL")
+      case other                         => fail(s"expected a masked rewrite, got $other")
+  }
+
   // `c.to_json()` is `to_json(c)`: DuckDB binds the receiver to the FROM binding `c`, the whole row
   // as a STRUCT, every column raw (2.0 CLI: `{"c_id":1,..,"c_email":"alice@x",..}`).
   "a method call on a masked table's binding (the whole row)" should "be denied" in

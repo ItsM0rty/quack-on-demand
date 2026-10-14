@@ -68,6 +68,17 @@
   OOM-killed. FlightSQL queries and schema probes, MCP and REST previews were all affected; the
   native front door was not. The result is now freed, and the statement fails with "a result column
   of type TYPE has no Arrow mapping and cannot be returned; cast it to VARCHAR".
+- **Security: a masked column can no longer be read raw by shadowing or aliasing its qualifier.**
+  DuckDB binds `q.name` to the innermost binding `q` only when it has the column; otherwise it reads
+  column `q` and takes its field `name`, and failing that climbs to the enclosing query. A holder
+  of a column mask or deny policy read the protected values raw both ways: a correlated shadow
+  (`SELECT (SELECT x.c_email FROM (SELECT 1 AS a) x) FROM customer x`, the inner `x` a derived
+  table, CTE, VALUES or base table lacking the column) and a struct field through an alias named
+  like the masked column (`SELECT c_addr.city FROM customer AS c_addr`, also three-part, method
+  call, WHERE and ORDER BY forms, and `SELECT *` over a DuckLake table with that alias). Both
+  forms, in every clause and both unresolved-table modes, are now refused. A qualifier that names
+  a covered column is refused even where DuckDB would bind it to the table (`SELECT c_addr.c_id
+  FROM customer AS c_addr`): alias the table differently.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM

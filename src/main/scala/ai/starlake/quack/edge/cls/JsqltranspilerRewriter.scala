@@ -786,9 +786,12 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
   * column decides, and the reference is covered only if a policy table is among that scope's
   * candidates; a source whose columns are unknown never ends the search (the name may bind there or
   * further out), so ambiguity stays covered. A derived table or CTE carries values already masked
-  * inside it, so a reference binding there is not a base read. A qualified reference resolves its
-  * qualifier the same way, innermost-first, falling back to every alias of the statement when no
-  * scope names it. The check can only add denials.
+  * inside it, so a reference binding there is not a base read. A qualified reference `q.name`
+  * resolves its qualifier the same way, innermost-first: a scope whose sources named `q` do not
+  * have the column passes it outward, as DuckDB's correlated lookup does, and when no scope names
+  * `q` it falls back to every alias of the statement. A qualifier that names a covered column is a
+  * field read of that column (DuckDB's fallback when the binding `q` lacks the column), whatever
+  * the binding has. The check can only add denials.
   */
 private[cls] object ResidualColumns:
   import scala.jdk.CollectionConverters._
@@ -1121,22 +1124,40 @@ private[cls] object ResidualColumns:
       (byName.exists(_.tableName == RoleColumnPolicy.Wildcard) ||
         unqualifiedCovered(name, scopes, byName))
 
+    /** Innermost-first binding of `q.name` over `named`, the sources named `q` in each scope that
+      * names it: a scope none of whose sources has the column passes the reference outward
+      * (DuckDB's correlated lookup), and one whose columns are unknown never ends the search.
+      */
+    private def qualifiedCovered(
+        name: String,
+        named: List[Scope],
+        byName: List[RoleColumnPolicy]
+    ): Boolean =
+      named match
+        case Nil            => false
+        case bound :: outer =>
+          if bound.exists(_.table.exists(isPolicyTable(_, byName))) then true
+          else if bound.exists(has(_, name).contains(true)) then false
+          else qualifiedCovered(name, outer, byName)
+
     def covered(col: Column, scopes: List[Scope]): Boolean =
       val name   = unquote(Option(col.getColumnName).getOrElse(""))
       val byName = policies.filter(_.columnName.equalsIgnoreCase(name))
       Option(col.getTable).flatMap(t => Option(t.getName)).map(unquote) match
         case Some(q) =>
-          scopes.iterator.map(_.filter(_.names.contains(lower(q)))).find(_.nonEmpty) match
-            case Some(bound) =>
-              byName.exists(_.tableName == RoleColumnPolicy.Wildcard) ||
-              bound.exists(_.table.exists(isPolicyTable(_, byName)))
-            case None =>
-              // Not named by any scope: any table the qualifier aliases anywhere, or itself. Or
-              // the qualifier is itself a column and `name` one of its fields (`c_email.x`,
-              // `c.c_email.x`): a read of that column.
-              val targets = aliases.collect { case (a, t) if a == lower(q) => t } :+ q
-              byName.exists(_.tableName == RoleColumnPolicy.Wildcard) ||
-              targets.exists(isPolicyTable(_, byName)) || nameCovered(q, scopes)
+          // The qualifier may itself be a column and `name` one of its fields (`c_email.x`,
+          // `c.c_email.x`, `c_addr.city FROM customer AS c_addr`): DuckDB reads it so whenever
+          // the binding `q` lacks the column, and a catalog may list a struct's fields as columns
+          // (DuckLake), so a qualifier naming a covered column is a read of it whatever the
+          // binding has.
+          byName.exists(_.tableName == RoleColumnPolicy.Wildcard) || nameCovered(q, scopes) || {
+            scopes.map(_.filter(_.names.contains(lower(q)))).filter(_.nonEmpty) match
+              case Nil =>
+                // Not named by any scope: any table the qualifier aliases anywhere, or itself.
+                val targets = aliases.collect { case (a, t) if a == lower(q) => t } :+ q
+                targets.exists(isPolicyTable(_, byName))
+              case named => qualifiedCovered(name, named, byName)
+          }
         case None => nameCovered(name, scopes)
 
   /** DuckDB's method call `x.f(args)` is `f(x, args)`; JSqlParser holds it as a function with the
