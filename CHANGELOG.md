@@ -252,6 +252,17 @@
   a manual stop left the manager and its nodes running and `run-jar.sh NUKE=1` wiped state under a
   live manager.
 
+- **Stopping a local manager stops only its own nodes.** BREAKING for anyone scripting
+  `scripts/kill-quack-nodes.sh` as a host-wide reset: `stop-jar.sh`, `stop-jar.ps1`, `qod stop` and
+  `kill-quack-nodes.sh` now stop only the nodes of the manager on their `QOD_ON_DEMAND_PORT`,
+  recognized by the marker `<rest-port>-<boot id>` the manager passes as the spawn script's second
+  argument, so another manager's nodes on the same host (an isolated test stack) are left alone. The
+  old host-wide reset is `kill-quack-nodes.sh --all`. Upgrading with orphan nodes left by an earlier
+  release: their wrappers carry the node token where the marker now goes, so neither the default
+  mode nor `--unmarked` matches them and `stop-jar.sh` / `qod stop` do not report them; use
+  `kill-quack-nodes.sh --all` (with no manager running). The spawn scripts take
+  `<port> [<manager-marker>]`.
+
 - **Typed Postgres and MySQL federated sources.** New source types `postgres` and `mysql` attach an
   external database from typed fields (host, port, database, user, password, plus `sslMode`, and
   `schema` for Postgres), with no SQL to write: REST `connection` on the federated-source create,
@@ -470,7 +481,8 @@
     reading (local and `qod fleet join`), or of a read-only Secret volume (mode 0400) on
     Kubernetes, replacing every `secretKeyRef` env var. Local nodes no longer inherit the manager's
     own credentials (`QOD_API_KEY`, the session JWT secret, passwords). BREAKING for custom node
-    images and launchers: the spawn script takes only the port, ignores secrets passed as env vars,
+    images and launchers: the spawn script takes `<port> [<manager-marker>]` (no token argument;
+    the token is a file in `QOD_SECRETS_DIR`), ignores secrets passed as env vars,
     and the node image entrypoint no longer reads `QOD_NODE_TOKEN`; restart every K8s node after
     upgrading. On Kubernetes the mounted files stay readable by a node user with unrestricted SQL
     (superuser, or ACL off without lockdown). For a database without its own metastore credentials

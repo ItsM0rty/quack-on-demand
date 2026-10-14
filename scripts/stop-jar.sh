@@ -6,8 +6,9 @@
 # processes by their spawn-quack-node.sh wrapper, whose argv carries the
 # manager's marker `<rest-port>-<boot id>` (LocalQuackBackend.managerMarker).
 # Nodes of another manager on this host (a different REST port) are never
-# touched, and nor are unmarked nodes from a manager older than the marker
-# (`kill-quack-nodes.sh --unmarked` stops those). Sends SIGTERM
+# touched, and nor are the orphans of a manager from an earlier release, whose
+# wrappers carry the node token where the marker now goes
+# (`kill-quack-nodes.sh --all` stops those, with no manager running). Sends SIGTERM
 # first for graceful shutdown; escalates to SIGKILL after FORCE_AFTER
 # seconds if anything is still listening.
 #

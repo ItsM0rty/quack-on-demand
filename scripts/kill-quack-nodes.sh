@@ -7,10 +7,10 @@
 # By default it only touches the nodes of the manager on QOD_ON_DEMAND_PORT (default 20900): each
 # node's wrapper argv and node directory carry that manager's marker `<rest-port>-<boot id>`, so the
 # nodes of another manager on this host (an isolated test stack) are left alone. `--unmarked` stops
-# only nodes with no marker: those of a manager older than the marker, which stop-jar.sh and
-# `qod stop` leave alone (it would also catch a `qod fleet join` node on this host, which carries no
-# marker either). `--all` sweeps every node on the host, whichever manager started it; it is the
-# old blunt reset and must be asked for explicitly.
+# only wrappers whose argv ends at the node port (a `qod fleet join` node on this host). `--all`
+# sweeps every node on the host, whichever manager started it; it is the old blunt reset, must be
+# asked for explicitly, and is the only mode that stops an earlier release's orphans (their wrapper
+# argv carries the node token where the marker now goes, so no other mode matches them).
 #
 # SIGTERM first so the script's `trap` tears down the duckdb child cleanly; SIGKILL after
 # FORCE_AFTER seconds for anything still alive.
