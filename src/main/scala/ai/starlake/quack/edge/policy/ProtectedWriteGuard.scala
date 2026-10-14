@@ -16,6 +16,7 @@ import ai.starlake.quack.edge.cls.{
 }
 import ai.starlake.quack.model.StatementKind
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
+import ai.starlake.sql.SqlCommentStripper
 import cats.effect.unsafe.implicits.global
 import net.sf.jsqlparser.parser.{CCJSqlParser, CCJSqlParserUtil}
 import net.sf.jsqlparser.parser.feature.{Feature, FeatureConfiguration}
@@ -32,12 +33,12 @@ enum GuardOutcome:
   case Deny(reason: String)
 
 /** Closes the CLS/RLS write-wrapping bypass (spec 2026-08-20-protected-write-guard). For a
-  * non-SELECT statement from a principal with enforced policies, denies when the read side exposes
-  * a protected table: any read of an RLS table, or a CLS table whose masked columns actually appear
-  * in the read. Any read it cannot isolate denies fail-closed. Never rewrites; only allows or
-  * denies. On EVERY statement kind, a plain SELECT included, it also denies a
-  * [[CatalogReachingCalls]] call (`query_table('t')`, `query('...')`): the rewriters cannot see a
-  * table named in a string, so that read would bypass them entirely.
+  * non-SELECT statement, or any batch of more than one statement, from a principal with enforced
+  * policies, denies when the read side exposes a protected table: any read of an RLS table, or a
+  * CLS table whose masked columns actually appear in the read. Any read it cannot isolate denies
+  * fail-closed. Never rewrites; only allows or denies. On EVERY statement kind, a plain SELECT
+  * included, it also denies a [[CatalogReachingCalls]] call (`query_table('t')`, `query('...')`):
+  * the rewriters cannot see a table named in a string, so that read would bypass them entirely.
   *
   * The guard owns its CLS detection oracle: it builds a `ColumnPolicyRewriter` internally in
   * `UnresolvedMode.Deny`, so a table whose columns the catalog cannot enumerate denies rather than
@@ -83,9 +84,19 @@ final class ProtectedWriteGuard(
         .orElse(DottedIdentifierScreen.find(sql))
         .orElse(CatalogReachingCalls.find(sql).map(CatalogReachingCalls.denyReason))
         .orElse(FileAccessScreen.find(sql)) match
-        case Some(reason)                         => Deny(s"access denied: $reason")
-        case None if kind == StatementKind.Select => Allow
+        case Some(reason) => Deny(s"access denied: $reason")
+        case None if kind == StatementKind.Select && !isBatch(sql) => Allow
         case None => checkWrite(sql, eff, ctx, colPolicies, rowPolicies, clientDataScans)
+
+  /** More than one statement, as the lexer separates them (a `;` inside a literal, a quoted name or
+    * a comment does not count, nor does a trailing one). `kind` describes only a batch's first
+    * statement, and the node runs all of them: `SELECT 1; INSERT INTO t SELECT c_email FROM
+    * customer` classifies Select, and the rewriters, whose parse keeps only the first statement,
+    * pass it through. So a batch is never waved through as a read: every statement is analysed like
+    * a write's, a read of a protected table in any of them included.
+    */
+  private def isBatch(sql: String): Boolean =
+    SqlCommentStripper.splitStatements(sql).lengthCompare(1) > 0
 
   private def checkWrite(
       sql: String,
@@ -121,10 +132,16 @@ final class ProtectedWriteGuard(
         PolicyCoverage.covers(c, s, tb, t.database, t.schema, t.table)
       }
 
+    // A plain read in a batch is denied with its own reason: the guard, not the rewriters, is
+    // what stops it (see isBatch), and "read into a write statement" would not describe it.
+    def denial(ast: Statement): String => String = ast match
+      case _: Select if pairs.lengthCompare(1) > 0 => batchDeny
+      case _                                       => deny
+
     // First statement that denies wins; Allow only when every statement is clean.
     val firstDeny = pairs.iterator
       .map { case (result, ast) =>
-        evaluateOne(result, ast, eff, ctx, rowKeys, colKeys, covers, clientDataScans)
+        evaluateOne(result, ast, eff, ctx, rowKeys, colKeys, covers, clientDataScans, denial(ast))
       }
       .collectFirst { case d: Deny => d }
     firstDeny.getOrElse(Allow)
@@ -137,7 +154,8 @@ final class ProtectedWriteGuard(
       rowKeys: List[(String, String, String)],
       colKeys: List[(String, String, String)],
       covers: (List[(String, String, String)], TableRef) => Boolean,
-      clientDataScans: Boolean
+      clientDataScans: Boolean,
+      deny: String => String
   ): GuardOutcome =
     result match
       case e: StatementResult.Extracted =>
@@ -146,7 +164,7 @@ final class ProtectedWriteGuard(
         val rowHit = reads.exists(t => covers(rowKeys, t))
         val colHit = reads.exists(t => covers(colKeys, t))
         if rowHit then GuardOutcome.Deny(deny(firstCovered(reads, rowKeys)))
-        else if colHit then preciseCls(ast, eff, ctx, firstCovered(reads, colKeys))
+        else if colHit then preciseCls(ast, eff, ctx, firstCovered(reads, colKeys), deny)
         else if TableExtractor
             .gatedUnsupported(e.accesses, e.unsupported, clientDataScans)
             .nonEmpty ||
@@ -163,7 +181,8 @@ final class ProtectedWriteGuard(
       ast: Statement,
       eff: EffectiveSet,
       ctx: SchemaContext,
-      protectedName: String
+      protectedName: String,
+      deny: String => String
   ): GuardOutcome =
     innerSelect(ast) match
       case Some(sel) =>
@@ -215,6 +234,9 @@ final class ProtectedWriteGuard(
 
   private def deny(table: String): String =
     s"access denied: $table is protected by a column/row policy and cannot be read into a write statement; query it directly instead"
+
+  private def batchDeny(table: String): String =
+    s"access denied: $table is protected by a column/row policy and cannot be read in a multi-statement batch; send that query on its own"
 
   private val IncompleteDeny =
     "access denied: statement could not be fully analysed and reads a protected schema; query the table directly instead"

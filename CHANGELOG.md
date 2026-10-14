@@ -101,6 +101,15 @@
   schema is advertised as absent and read from the result stream, which the ADBC driver accepts. A
   client that reads the schema before executing (an ODBC driver behind Power BI) gets none for
   these statements.
+- **Security: a batch led by a read can no longer launder a masked or filtered table.** A
+  statement is classified by its first statement only, so `SELECT 1; INSERT INTO scratch SELECT
+  c_email FROM customer` counted as a read: the protected-write guard let it through, the column
+  and row rewriters (which parse only the first statement) left it unchanged, and the node ran the
+  INSERT, copying the raw masked values or unfiltered rows into a table the holder of a column or
+  row policy could read back. A batch of more than one statement from such a principal now has
+  every statement analysed, whatever leads it: a write reading a protected table is refused as a
+  single one is, and so is a plain read of a protected table after the first statement ("cannot be
+  read in a multi-statement batch; send that query on its own"), which the rewriters never saw.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM

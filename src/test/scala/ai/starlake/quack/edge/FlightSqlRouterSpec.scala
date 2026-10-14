@@ -1528,6 +1528,43 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out.left.get shouldBe a[RouterFailure.AccessDenied]
     capturedSql() shouldBe ""
 
+  it should "deny a batch led by a read whose later write reads a protected table (audit F18)" in:
+    // The classifier reads the first statement only (Select), the rewriters' parse keeps only
+    // `SELECT 1`, and the node runs both statements: without the guard the masked or filtered
+    // rows land raw in scratch.
+    List(
+      "SELECT 1; INSERT INTO main.scratch SELECT c_email FROM main.customer",
+      "SELECT 1; CREATE TABLE main.leak AS SELECT * FROM main.customer"
+    ).foreach { sql =>
+      List(
+        effWithPolicies(List(maskCustomerEmail)),
+        effWithRowPolicies(List(rowPolicyCustomer))
+      ).foreach { eff =>
+        val (router, capturedSql, _) =
+          setupWithRewriter(protectedWriteGuard = guardKnowingCustomer)
+        val out = router.execute("pw-f18", "alice", poolKey, sql, Some(eff)).unsafeRunSync()
+        withClue(s"$sql ${eff.columnPolicies.size}/${eff.rowPolicies.size}") {
+          out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+          capturedSql() shouldBe ""
+        }
+      }
+    }
+
+  it should "still route a batch led by a read whose write reads nothing protected" in:
+    val (router, capturedSql, _) =
+      setupWithRewriter(protectedWriteGuard = guardKnowingCustomer)
+    val out = router
+      .execute(
+        "pw-f18-ok",
+        "alice",
+        poolKey,
+        "SELECT 1; INSERT INTO main.scratch SELECT c_id FROM main.customer",
+        effectiveSet = Some(effWithPolicies(List(maskCustomerEmail)))
+      )
+      .unsafeRunSync()
+    out shouldBe a[Right[?, ?]]
+    capturedSql() should include("INSERT INTO main.scratch SELECT c_id FROM main.customer")
+
   it should "deny a SELECT that reaches an RLS table through query_table / query end-to-end" in:
     // The row rewriter wraps base tables; a table named in a string is invisible to it, so
     // without the guard these reads reach the node unfiltered.

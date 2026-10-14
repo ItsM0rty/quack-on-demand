@@ -561,3 +561,83 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
       ctx
     ) shouldBe Allow
   }
+
+  // Audit F18: the classifier reads a batch's first statement only, so a batch led by a read
+  // classifies Select, and the node runs every statement of it.
+
+  private def classified(sql: String, e: EffectiveSet): GuardOutcome =
+    guardWithCls().check(sql, ai.starlake.quack.route.StatementClassifier.classify(sql), e, ctx)
+
+  private val maskAndRow =
+    List(eff(tenantUser, cols = List(maskEmail)), eff(tenantUser, rows = List(rowPolicy)))
+
+  "a batch led by a read" should "be denied when a later write reads a protected table" in
+    List(
+      "SELECT 1; INSERT INTO tpch1.scratch SELECT c_email FROM tpch1.customer",
+      "SELECT 1; CREATE TABLE tpch1.leak AS SELECT * FROM tpch1.customer",
+      "FROM tpch1.orders; INSERT INTO tpch1.scratch SELECT c_email FROM tpch1.customer",
+      "VALUES (1); INSERT INTO tpch1.scratch SELECT c_email FROM tpch1.customer",
+      "SHOW TABLES; INSERT INTO tpch1.scratch SELECT c_email FROM tpch1.customer",
+      "SELECT 1 /* ; */; INSERT INTO tpch1.scratch SELECT c_email FROM tpch1.customer"
+    ).foreach { sql =>
+      maskAndRow.foreach { e =>
+        withClue(s"$sql ${e.columnPolicies.size}/${e.rowPolicies.size}") {
+          ai.starlake.quack.route.StatementClassifier.classify(sql) shouldBe StatementKind.Select
+          classified(sql, e) shouldBe a[Deny]
+        }
+      }
+    }
+
+  it should "be denied when it deletes rows by a predicate on a protected table" in
+    maskAndRow.foreach { e =>
+      classified(
+        "SELECT 1; DELETE FROM tpch1.scratch WHERE id IN " +
+          "(SELECT c_id FROM tpch1.customer WHERE c_email LIKE 'a%')",
+        e
+      ) shouldBe a[Deny]
+    }
+
+  it should "be denied, with its own reason, when a later read reads a protected table" in
+    // The rewriters keep only the first statement, so the second read would reach the node raw.
+    maskAndRow.foreach { e =>
+      classified("SELECT 1; SELECT c_email FROM tpch1.customer", e) match
+        case Deny(reason) => reason should include("multi-statement batch")
+        case other        => fail(s"expected Deny, got $other")
+    }
+
+  it should "be denied when its first statement reads a protected table (audit F33)" in
+    // The rewriters would rewrite that first statement and print only it, dropping the rest.
+    List(
+      "SELECT c_email FROM tpch1.customer; SELECT 2",
+      "SELECT c_id FROM tpch1.customer; INSERT INTO tpch1.scratch VALUES (1)"
+    ).foreach { sql =>
+      maskAndRow.foreach { e =>
+        withClue(s"$sql ${e.columnPolicies.size}/${e.rowPolicies.size}") {
+          classified(sql, e) shouldBe a[Deny]
+        }
+      }
+    }
+
+  it should "still allow a batch that reads nothing protected" in {
+    classified(
+      "SELECT 1; INSERT INTO tpch1.scratch SELECT c_id FROM tpch1.customer",
+      eff(tenantUser, cols = List(maskEmail))
+    ) shouldBe Allow
+    maskAndRow.foreach { e =>
+      classified("SELECT 1; INSERT INTO tpch1.scratch VALUES (1)", e) shouldBe Allow
+      classified("SELECT 1; SELECT 2", e) shouldBe Allow
+    }
+  }
+
+  "a single SELECT carrying a semicolon" should "still be left to the rewriters" in
+    List(
+      "SELECT c_email FROM tpch1.customer;",
+      "SELECT c_email FROM tpch1.customer ;  -- trailing",
+      "SELECT c_email, ';' AS s FROM tpch1.customer",
+      "SELECT c_email AS \"a;b\" FROM tpch1.customer",
+      "SELECT c_email FROM tpch1.customer /* a; b */"
+    ).foreach { sql =>
+      maskAndRow.foreach { e =>
+        withClue(sql)(classified(sql, e) shouldBe Allow)
+      }
+    }
