@@ -3066,7 +3066,7 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
   it should "admit postgres_execute with the ACL off and lockdown off (owner ruling)" in:
     // The raw federation passthrough is blocked only for tenant-scoped principals when the ACL
     // validates (CatalogReachingCalls, unit-tested in AccessGateSpec / PostgresAclValidatorSpec)
-    // and for every caller under lockdown (below). The default validator here is allowAll.
+    // and for every non-superuser under lockdown (below). The default validator here is allowAll.
     val (base, _, _) = setup()
     val router       = new FlightSqlRouter(
       base.supervisor,

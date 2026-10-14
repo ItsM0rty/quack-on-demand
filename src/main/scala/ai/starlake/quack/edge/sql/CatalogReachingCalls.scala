@@ -21,7 +21,7 @@ package ai.starlake.quack.edge.sql
   * Owner ruling (2026-10-11): these are NOT refused for every caller. A superuser keeps the raw
   * passthrough (the standard way to send native SQL to a federated source), and with the ACL off
   * and lockdown off nothing is blocked. This gate is the "ACL validates" half; lockdown denies the
-  * same family for every caller through [[LockdownScreen]]. Three consumers call it:
+  * same family to every non-superuser through [[LockdownScreen]]. Three consumers call it:
   *
   *   - [[PostgresAclValidator]], when a tenant-scoped principal is screened: the `*.*.* ALL`
   *     wildcard covers "unsupported constructs", and admitting these under it would let a tenant

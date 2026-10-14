@@ -30,8 +30,8 @@ package ai.starlake.quack.edge.sql
   * the import would carry any of these settings past this screen. `postgres_query` /
   * `postgres_execute` and the other raw-SQL / arbitrary-connection calls are NOT refused here
   * (owner ruling 2026-10-11: superusers keep the federation passthrough); they are denied to
-  * tenant-scoped principals by [[CatalogReachingCalls]] when the ACL validates, and to every caller
-  * under [[LockdownScreen]].
+  * tenant-scoped principals by [[CatalogReachingCalls]] when the ACL validates, and to every
+  * non-superuser under [[LockdownScreen]].
   *
   * Settings read from DuckDB 2.0's own tokens, the carried statement of an EXPLAIN / PREPARE
   * wrapper included ([[StatementHead]]); `import_database` is found by [[FunctionCalls]] (any

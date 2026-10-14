@@ -9,8 +9,9 @@ import scala.collection.mutable.ListBuffer
 
 /** Statement screen for locked-down deployments (QOD_NODE_LOCKDOWN). Pure: the router consults it
   * only when the flag is on and the caller is not a superuser. Superuser detection is the caller's
-  * job; with ACL disabled there is no effective set, so every caller screens as non-superuser (fail
-  * closed; hosted deployments always run ACL on).
+  * job: both front doors bind the handshake's effective set whatever the ACL mode, so a superuser
+  * is recognized, and exempt, with the ACL off too; a call with no effective set bound screens as
+  * non-superuser (fail closed).
   *
   * Matching is token-based, deliberately not a full parse: the input is split on top-level
   * semicolons (quote- and comment-aware) and each statement is screened independently. Leading

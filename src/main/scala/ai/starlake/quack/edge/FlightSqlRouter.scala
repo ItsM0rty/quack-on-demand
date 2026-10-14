@@ -619,11 +619,16 @@ final class FlightSqlRouter(
             .map(_.id)
         TriggerScreen.mayManageTriggers(effectiveSet, poolTenantId)
       }
-    // Parser / credential settings, IMPORT DATABASE and the SQL-running calls (postgres_execute /
-    // postgres_query) are refused for every caller, superusers included, whatever the ACL mode and
-    // the lockdown flag: one session switching how the node parses desyncs the ACL for every
-    // session on it, one unredacting its HTTP logs exposes the node's credentials, and the SQL-
-    // running paths run text the edge never authorizes (NodeSettingScreen's scaladoc).
+    // Parser / credential settings, IMPORT DATABASE / import_database, shell_history() and string
+    // literals nested too deeply to screen are refused for every caller, superusers included,
+    // whatever the ACL mode and the lockdown flag: one session switching how the node parses
+    // desyncs the ACL for every session on it, one unredacting its HTTP logs exposes the node's
+    // credentials, and an import replays SQL the edge never reads (NodeSettingScreen's scaladoc).
+    // The SQL-running passthrough calls (postgres_execute / postgres_query, ...) are not refused
+    // here: CatalogReachingCalls denies them to tenant principals when the ACL validates (through
+    // AccessGate) and to policy holders (through the protected-write guard), LockdownScreen to
+    // non-superusers under lockdown, and CatalogWriteScreen to every caller when the target catalog
+    // is read-only or computed.
     val settingDenial                 = NodeSettingScreen.screen(sql)
     val preGateDenial: Option[String] =
       lockdownDenial
