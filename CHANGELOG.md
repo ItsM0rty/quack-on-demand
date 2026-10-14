@@ -750,9 +750,11 @@
   `forgot-password`, `reset-password`) now show the server's message.
 
 - **The boot banner shows the node lockdown state.** A new `NODE LOCKDOWN` line sits under
-  `SQL ACL`. Lockdown is off by default, and without it a tenant can ATTACH, INSTALL, read local
-  files and the node environment (catalog password, object-store keys, federation secrets), which
-  nothing on screen said. The line counts unlocked pools, so a per-pool `lockdown: off` under a
+  `SQL ACL`. Lockdown is off by default, and without it (and with the ACL off) a tenant can ATTACH,
+  LOAD and autoinstall extensions, and read local files, including the node's secret files on
+  Kubernetes, and the cloud SDK variables (`AWS_*`, `AZURE_*`, `GOOGLE_*`) a node inherits, which
+  nothing on screen said. The catalog password and the federation and object-store secrets are no
+  longer in the node environment (see the `QOD_SECRETS_DIR` entry above). The line counts unlocked pools, so a per-pool `lockdown: off` under a
   global `QOD_NODE_LOCKDOWN=true` shows up too.
 
 ## 0.9.11
