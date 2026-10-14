@@ -354,6 +354,29 @@ class QuackProtocolSpec extends AnyFunSpec with Matchers:
       finally allocator.close()
     }
 
+    // Audit F14: the schema export threw after the import, and nothing closed the imported reader,
+    // so every such statement leaked its native result for the life of the manager.
+    it("fails a column type with no Arrow mapping with a cast hint, releasing the result") {
+      val transport = FakeTransport(
+        Iterator(
+          QuackTestFixtures.serializeSampleConnectionResponse(connId),
+          QuackTestFixtures.serializeTypeColumnPrepareResponse()
+        )
+      )
+      val allocator = new RootAllocator()
+      try
+        val protocol = new QuackProtocol(transport, allocator)
+        val program  = for
+          conn   <- protocol.open(endpoint, token)
+          reader <- conn.execute("SELECT get_type(42)")
+        yield reader
+        val ex = intercept[QuackWireError.Permanent](program.unsafeRunSync())
+        ex.getMessage should include("type TYPE")
+        ex.getMessage should include("cast it to VARCHAR")
+        allocator.getAllocatedMemory shouldBe 0L
+      finally allocator.close()
+    }
+
   describe("Connection.close()"):
     it("issues exactly one DISCONNECT_MESSAGE and swallows transport failures") {
       val transport = FakeTransport(

@@ -384,6 +384,44 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
       finally allocator.close()
     }
 
+    it("closes the connection and frees the result when a column type has no Arrow mapping") {
+      val transport =
+        ScriptedTransport(_ => IO(QuackTestFixtures.serializeTypeColumnPrepareResponse()))
+      val allocator = new RootAllocator()
+      try
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
+        (1 to 50).foreach { _ =>
+          client.query(endpoint, token, "SELECT get_type(42)", None).unsafeRunSync() match
+            case QuackResponse.Failed(QuackError.Permanent(msg), _) => msg should include("VARCHAR")
+            case other => fail(s"expected Failed(Permanent), got $other")
+        }
+        transport.count(MessageType.DisconnectMessage) shouldBe 50
+        allocator.getAllocatedMemory shouldBe 0L
+      finally allocator.close()
+    }
+
+    it("rolls a stamped write back and frees the result when a column type has no Arrow mapping") {
+      val transport = ScriptedTransport {
+        case 1 =>
+          IO(
+            QuackTestFixtures.serializeSamplePrepareResponse(java.math.BigInteger.ONE, false, false)
+          )
+        case _ => IO(QuackTestFixtures.serializeTypeColumnPrepareResponse())
+      }
+      val allocator = new RootAllocator()
+      try
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
+        client
+          .queryStamped(endpoint, token, "BEGIN; CALL stamp()", "SELECT get_type(42)")
+          .unsafeRunSync() match
+          case QuackResponse.Failed(QuackError.Permanent(msg), _) => msg should include("VARCHAR")
+          case other => fail(s"expected Failed(Permanent), got $other")
+        transport.count(MessageType.PrepareRequest) shouldBe 2
+        transport.count(MessageType.DisconnectMessage) shouldBe 1
+        allocator.getAllocatedMemory shouldBe 0L
+      finally allocator.close()
+    }
+
     it("closes the connection when a cancel lands while PREPARE is in flight") {
       // PREPARE blocks uninterruptibly (like JdkHttpTransport), so the timeout's cancel is only
       // observed once it returns: the reader built from that response must be closed, not dropped.

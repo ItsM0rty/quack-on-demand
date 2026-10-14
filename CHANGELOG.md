@@ -60,6 +60,14 @@
   steps. Every analysis step now catches the overflow and refuses the statement fail-closed ("nested
   too deeply to analyse"); with the ACL off and no policy in play it is forwarded unanalysed, and the
   node answers it.
+- **Security: a result column with no Arrow mapping no longer leaks manager memory.** A statement
+  returning DuckDB's `TYPE` (`SELECT get_type(42)`, `make_type(...)`, `TRY_CAST(... AS TYPE)`, or
+  a list, struct or map holding one) failed when the manager built its Arrow reader, and the node's
+  imported result was never freed: every such statement leaked it for the life of the process, so
+  any pool user, even one with no table grants, could grow the shared manager until it was
+  OOM-killed. FlightSQL queries and schema probes, MCP and REST previews were all affected; the
+  native front door was not. The result is now freed, and the statement fails with "a result column
+  of type TYPE has no Arrow mapping and cannot be returned; cast it to VARCHAR".
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM

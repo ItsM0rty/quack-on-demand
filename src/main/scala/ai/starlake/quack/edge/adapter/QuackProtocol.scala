@@ -12,6 +12,7 @@ import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.*
+import scala.util.control.NonFatal
 
 /** Connection lifecycle errors surfaced by [[QuackProtocol]]. Mirrors the [[QuackError.Transient]]
   * / [[QuackError.Permanent]] split in `QuackHttpClient.scala` so Task 7's adapter can map between
@@ -274,13 +275,22 @@ final class Connection private[adapter] (
           val fetchSync: () => Array[Byte] =
             () => fetch(resultUuid, nextBatch.incrementAndGet()).unsafeRunSync()
           val closeSync: () => Unit = () => close().unsafeRunSync()
-          new ChainedQuackArrowReader(
-            allocator,
-            initial,
-            fetchSync,
-            closeSync,
-            needsMore
-          )
+          // The import is lazy: the schema is exported only when the reader is built, and that
+          // throws for a column type with no Arrow mapping. Until the reader exists nothing else
+          // owns `initial`, whose close is the only release of the native result.
+          try
+            new ChainedQuackArrowReader(
+              allocator,
+              initial,
+              fetchSync,
+              closeSync,
+              needsMore
+            )
+          catch
+            case NonFatal(e) =>
+              try initial.close()
+              catch case NonFatal(c) => e.addSuppressed(c)
+              throw unexportable(e).getOrElse(e)
         case Some(MessageType.ErrorResponse) =>
           val msg = QuackNativeBridge.extractErrorMessage(respBytes)
           throw QuackWireError.Permanent(msg)
@@ -291,6 +301,30 @@ final class Connection private[adapter] (
           )
     }
   }
+
+  /** DuckDB's own words when a result column's type has no Arrow mapping (`TYPE`, and any nested
+    * type holding one), raised when the imported stream's schema is exported.
+    */
+  private val UnsupportedArrowType = """Unsupported Arrow type ([^"\\]+)""".r
+
+  /** The error for a result the manager cannot export to Arrow, naming the type and the way out, or
+    * None when `e` is some other failure.
+    */
+  private def unexportable(e: Throwable): Option[QuackWireError] =
+    Iterator
+      .iterate(e)(_.getCause)
+      .takeWhile(_ != null)
+      .take(16) // a cause cycle must not spin
+      .flatMap(t => Option(t.getMessage))
+      .flatMap(m => UnsupportedArrowType.findFirstMatchIn(m))
+      .nextOption()
+      .map { m =>
+        val tpe = m.group(1).trim
+        QuackWireError.Permanent(
+          s"a result column of type $tpe has no Arrow mapping and cannot be returned; " +
+            "cast it to VARCHAR"
+        )
+      }
 
   /** Run `sql` on this connection and throw away the result. Used by the stamped-write bracket
     * (EPIC P1) for its BEGIN/CALL prelude and COMMIT epilogue, whose results are empty Success
