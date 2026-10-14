@@ -18,6 +18,7 @@ The chart is published as an OCI artifact on every release:
 helm install qod oci://ghcr.io/starlake-ai/charts/quack-on-demand \
   --version <release, e.g. 0.8.1> \
   --set postgres.host=<your-postgres-host> \
+  --set postgres.user=<a-non-superuser-role> \
   --set postgres.password=<your-postgres-password>
 ```
 
@@ -51,6 +52,7 @@ Point your `kubectl` context at the cluster (and make sure `postgres.host` resol
 helm install qod charts/quack-on-demand \
   --namespace qod --create-namespace \
   --set postgres.host=postgres.example.svc \
+  --set postgres.user=qod \
   --set postgres.existingSecret=qod-pg \
   --set admin.existingSecret=qod-admin
 ```
@@ -89,6 +91,9 @@ See [`values.yaml`](values.yaml) for the full list. The most-used:
 | `image.tag` | `""` (uses `Chart.AppVersion`) | |
 | `replicaCount` | `1` | Set to 2+ to enable HA mode (`QOD_HA_ENABLED`); requires `sessionJwtSecret` or `existingSessionJwtSecret` (the pre-existing Secret MUST carry the value under the key `sessionJwtSecret`). See [guides/RESILIENCE.md](../../../guides/RESILIENCE.md). |
 | `postgres.host` | `""` (REQUIRED) | Set to the cluster-reachable Postgres host. |
+| `postgres.user` | `""` (REQUIRED) | A dedicated non-superuser role with `CREATEDB` that owns the control-plane database. See [Tenant isolation](#tenant-isolation). |
+| `security.nodeLockdown` | `true` | `QOD_NODE_LOCKDOWN`. Keeps tenant users away from the node's mounted secrets. See [Tenant isolation](#tenant-isolation). |
+| `security.aclEnabled` | `false` | `QOD_ACL_ENABLED`: enforce per-table role grants. |
 | `postgres.existingSecret` | `""` | Recommended for prod. Inline `postgres.password` is dev-only. |
 | `admin.existingSecret` | `""` | Recommended for prod. Inline `admin.password` is dev-only. |
 | `apiKey.value` | `""` | Static `X-API-Key` for `/api/*`. Optional - UI login still works without it. |
@@ -166,6 +171,17 @@ Override only when you need to point at a private registry or a custom build:
 helm upgrade qod charts/quack-on-demand \
   --set quackNode.image=registry.example.com/quack-on-demand-node:<tag>
 ```
+
+## Tenant isolation
+
+Each node pod mounts its secrets read-only at `/var/run/qod-secrets` for its whole life: the DuckLake catalog's Postgres password, the encryption key of an encrypted database, the object-store keys and the federation SQL. A DuckLake database created without its own metastore credentials uses `postgres.user` / `postgres.password`, which are also the control plane's login. So whoever reads that file from a node can connect to the control-plane database (every tenant's password hashes, tokens and catalog passwords) and to every other tenant's catalog, including the per-file encryption keys; if `postgres.user` is a Postgres superuser, they also reach the database server itself (`COPY ... TO PROGRAM`, `pg_read_file`).
+
+Two chart defaults bound that exposure:
+
+- **`security.nodeLockdown: true`.** Non-superuser SQL cannot read local files (`read_text`, `read_csv`, `glob`...), ATTACH, INSTALL, LOAD or change protected settings, so a tenant user cannot read the mounted files. The manager's own default is off; the chart turns it on. A pool can opt out with `POST /api/pool/setLockdown`; its tenant users can then read the files, unless the SQL ACL (`security.aclEnabled: true`) is on, which also refuses file reads to non-superusers. With both off, every tenant user can read the credential.
+- **`postgres.user` has no default.** Use a dedicated role that is not a Postgres superuser, for example `CREATE ROLE qod LOGIN CREATEDB PASSWORD '...'; CREATE DATABASE qod OWNER qod;`.
+
+QoD superusers are never screened and can always read the files. Isolating each node to its own catalog needs one Postgres role per catalog database, which is not implemented yet.
 
 ## Manager ↔ Quack node TLS
 

@@ -205,6 +205,25 @@
   fleet server could make the next node spawn `rm -rf` an arbitrary path and block every later
   spawn. The PowerShell twin gets the same hardening.
 
+- **Security (Helm chart): node lockdown is on by default, and `postgres.user` has no default.**
+  With the chart's former defaults (SQL ACL off, lockdown off, `postgres.user: postgres`), any
+  tenant user could `read_text` the node's mounted `/var/run/qod-secrets/pgPassword`. For a database
+  created without its own metastore credentials that is the control plane's Postgres superuser
+  password, which opens the control-plane database (every tenant's password hashes, tokens and
+  catalog passwords), every other tenant's catalog (including per-file encryption keys) and the
+  server itself (`COPY ... TO PROGRAM`). New `security.nodeLockdown` (default `true`, renders
+  `QOD_NODE_LOCKDOWN`) and `security.aclEnabled` (default `false`, renders `QOD_ACL_ENABLED`)
+  values; `helm install` prints a warning when both are off. Lockdown refuses ATTACH, INSTALL, LOAD,
+  protected settings and local file reads to non-superusers; a pool can still opt out with
+  `POST /api/pool/setLockdown`, and its tenant users can then read the file again unless the ACL is
+  on. Superusers are never screened. BREAKING for chart users: `postgres.user` must now be set; use
+  a dedicated non-superuser role with `CREATEDB` that owns the control-plane database (`CREATE ROLE
+  qod LOGIN CREATEDB PASSWORD '...'; CREATE DATABASE qod OWNER qod;`), and tenant statements that
+  relied on ATTACH, INSTALL, LOAD or local file reads are refused until their pool opts out. This
+  does not bound what the credential reaches once read (a superuser, or a pool that opts out, still
+  gets the shared login); one Postgres role per catalog database is designed but not implemented.
+  The manager's own defaults (`qod start`, `run-jar.sh`, Docker) are unchanged.
+
 - **Fixed: `qod serve --demo`, and `qod start` / `qod serve` with macOS `/usr/bin/java` or on
   Windows, refused to boot ("native Quack client cannot run on this host").** The launcher never
   told the manager where its libduckdb was: the demo did not provision libduckdb at all, SIP strips
@@ -444,7 +463,10 @@
     images and launchers: the spawn script takes only the port, ignores secrets passed as env vars,
     and the node image entrypoint no longer reads `QOD_NODE_TOKEN`; restart every K8s node after
     upgrading. On Kubernetes the mounted files stay readable by a node user with unrestricted SQL
-    (superuser, or ACL off without lockdown).
+    (superuser, or ACL off without lockdown). For a database without its own metastore credentials
+    that file holds the control plane's own Postgres login, which opens the control-plane database
+    and every tenant's catalog (and the server itself when it is a Postgres superuser); the Helm
+    chart now turns lockdown on by default (see the chart entry above).
   - The DuckLake catalog's Postgres password no longer rides an ATTACH string, where
     `SELECT path FROM duckdb_databases()` (and connection errors) showed it to any SQL user of the
     node, who could then reach the catalog and its encryption keys under a name of their own. Nodes

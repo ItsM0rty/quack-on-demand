@@ -172,7 +172,16 @@ networkPolicy:
 postgres:
   host: ""                 # REQUIRED - e.g. "rds.example.com" or "postgres.svc"
   port: 5432
-  user: postgres
+  # REQUIRED, no default. Every DuckLake catalog created without its own
+  # credentials inherits this login, and each node holds it (as a file of its
+  # secrets volume) to attach its catalog. A node user who obtains it reaches
+  # the control-plane database and every other tenant's catalog; when it is a
+  # Postgres superuser it also reaches the server itself (COPY ... TO PROGRAM,
+  # pg_read_file). Use a dedicated non-superuser role that owns the control-
+  # plane database and can create the catalog databases, e.g.:
+  #   CREATE ROLE qod LOGIN CREATEDB PASSWORD '...';
+  #   CREATE DATABASE qod OWNER qod;
+  user: ""
   # Control-plane database name. Holds the qodstate_* tables. Per-tenant
   # DuckLake catalog databases (`${tenant}_${tenantDb}`, e.g. `tpch_tpch1`)
   # live next to it on the same Postgres server.
@@ -185,6 +194,21 @@ postgres:
   password: ""             # DEV ONLY: inline plaintext, rendered into a Secret by the chart
   existingSecret: ""       # PROD: reference an externally-managed Secret containing the key below
   existingSecretKey: pgPassword
+
+# --- Tenant SQL screening -----------------------------------------------------
+# Node lockdown (QOD_NODE_LOCKDOWN) is ON in this chart, unlike the manager's
+# own first-run default. It stops non-superusers from running ATTACH, INSTALL
+# and LOAD, changing protected settings and reading local files. Without it (and with
+# the SQL ACL off) any tenant user can read the node's mounted secrets
+# (/var/run/qod-secrets: the catalog Postgres password, object-store keys,
+# federation SQL) with read_text(). Pools can still opt out one by one
+# (POST /api/pool/setLockdown). Turning it off chart-wide is only safe when
+# every tenant user is trusted with the postgres.user credential.
+security:
+  nodeLockdown: true
+  # SQL ACL (QOD_ACL_ENABLED): enforce role grants per table. Off by default;
+  # turning it on also refuses file-reading functions to non-superusers.
+  aclEnabled: false
 
 # --- Quack node image --------------------------------------------------------
 # Image used for the Quack node pods the manager spawns. This is the DuckDB

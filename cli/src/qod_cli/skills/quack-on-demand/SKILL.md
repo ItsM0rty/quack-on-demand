@@ -91,7 +91,9 @@ Not sure which command you want?
 
 On Kubernetes, the Helm chart is published as an OCI artifact per release:
 `helm install qod oci://ghcr.io/starlake-ai/charts/quack-on-demand --version <release>`
-(external Postgres required; see https://docs.starlake.ai/qod). Locally,
+(external Postgres required, and `postgres.user` must be set to a dedicated
+non-superuser role; the chart turns node lockdown on, so tenant users cannot
+read the node's mounted catalog password; see https://docs.starlake.ai/qod). Locally,
 `qod start` supervises the released uber-jar, downloaded and cached on first
 use (Java 21+ required; the `duckdb` CLI and node spawn scripts are
 provisioned automatically):
