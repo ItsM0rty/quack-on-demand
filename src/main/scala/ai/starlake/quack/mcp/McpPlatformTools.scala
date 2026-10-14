@@ -338,7 +338,7 @@ final class McpPlatformTools(
       required = List("database", "alias", "name"),
       props = "database" -> strProp("Database (tenant-db) name."),
       "alias"        -> strProp("Source alias."),
-      "name"         -> strProp("Secret name (referenced as {{name}} in setup SQL)."),
+      "name"         -> strProp("Secret name (referenced as {{secret.NAME}} in setup SQL)."),
       "value"        -> strProp("Secret value to store."),
       "external_ref" -> strProp("External resolver reference."),
       tenantProp
