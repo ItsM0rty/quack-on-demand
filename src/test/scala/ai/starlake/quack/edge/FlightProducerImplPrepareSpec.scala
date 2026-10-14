@@ -647,3 +647,109 @@ class FlightProducerImplPrepareSpec extends AnyFlatSpec with Matchers:
     listener.onErrorRef.get() shouldBe null
     // The query actually reached a node.
     sent.exists(_._2.contains("SELECT a FROM t")) shouldBe true
+  // ---- audit F17: a schema probe never runs a statement the Execute runs again ----
+  //
+  // The node runs every statement of the text it is sent. Probing `SELECT 1; INSERT ...` (or any
+  // side-effecting single statement such as `CALL postgres_execute(...)`) for its schema ran the
+  // write at Prepare / GetFlightInfo / GetSchema time, with no history row or audit, and the
+  // Execute then wrote again. Such text is now never sent until the Execute, and its schema is
+  // advertised as absent, which FlightSQL clients read as "take it from the stream".
+
+  private val unprobed = List(
+    "SELECT 1; INSERT INTO orders VALUES (1)",
+    "SET VARIABLE v = 1; INSERT INTO orders VALUES (1)",
+    "CALL postgres_execute('pg', 'INSERT INTO t VALUES (1)')"
+  )
+
+  private def statementQuery(sql: String) =
+    FlightSql.CommandStatementQuery.newBuilder().setQuery(sql).build()
+
+  private def descriptorOf(sql: String) =
+    FlightDescriptor.command(ProtoAny.pack(statementQuery(sql)).toByteArray)
+
+  "a statement that may write" should "run exactly once through Prepare and Execute" in:
+    unprobed.foreach { sql =>
+      withClue(sql) {
+        val (producer, sent, router, peer) = setupProducer()
+        val prep                           = runPrepare(producer, peer, sql)
+        prep.onErrorRef.get() shouldBe null
+        sent shouldBe empty
+        decodePrepareResult(prep.onNextValue.get()).getDatasetSchema.isEmpty shouldBe true
+        val command = prepareQueryHandle(producer, peer, sql)
+        sent shouldBe empty
+        val info = producer.getFlightInfoPreparedStatement(
+          command,
+          fakeCallContext(peer),
+          FlightDescriptor.command(command.toByteArray)
+        )
+        info.getSchemaOptional.isPresent shouldBe false
+        producer
+          .getSchemaPreparedStatement(command, fakeCallContext(peer), null)
+          .getSchema
+          .getFields
+          .isEmpty shouldBe true
+        sent shouldBe empty
+        val historyBefore = router.history.size
+        val listener      = new RecordingStreamListener
+        producer.getStreamPreparedStatement(command, fakeCallContext(peer), listener)
+        listener.awaitTerminal()
+        listener.onErrorRef.get() shouldBe null
+        sent.size shouldBe 1
+        sent.head._2 should include(sql)
+        router.history.size - historyBefore shouldBe 1
+      }
+    }
+
+  it should "run exactly once through GetFlightInfo and DoGet" in:
+    unprobed.foreach { sql =>
+      withClue(sql) {
+        val (producer, sent, _, peer) = setupProducer()
+        val info                      =
+          producer.getFlightInfoStatement(statementQuery(sql), fakeCallContext(peer), descriptorOf(sql))
+        sent shouldBe empty
+        info.getSchemaOptional.isPresent shouldBe false
+        val listener = new RecordingStreamListener
+        producer.getStreamStatement(
+          FlightSql.TicketStatementQuery
+            .newBuilder()
+            .setStatementHandle(ByteString.copyFromUtf8(sql))
+            .build(),
+          fakeCallContext(peer),
+          listener
+        )
+        listener.awaitTerminal()
+        listener.onErrorRef.get() shouldBe null
+        sent.size shouldBe 1
+      }
+    }
+
+  it should "not run at all on a lone GetSchema" in:
+    unprobed.foreach { sql =>
+      withClue(sql) {
+        val (producer, sent, _, peer) = setupProducer()
+        producer
+          .getSchemaStatement(statementQuery(sql), fakeCallContext(peer), descriptorOf(sql))
+          .getSchema
+          .getFields
+          .isEmpty shouldBe true
+        sent shouldBe empty
+      }
+    }
+
+  it should "run exactly once when prepared then executed as an update" in:
+    val (producer, sent, _, peer) = setupProducer()
+    val sql                       = "USE memory.main; INSERT INTO orders VALUES (6)"
+    val handle = decodePrepareResult(runPrepare(producer, peer, sql).onNextValue.get())
+      .getPreparedStatementHandle
+    sent shouldBe empty
+    val ack = new RecordingPutListener
+    producer
+      .acceptPutPreparedStatementUpdate(
+        FlightSql.CommandPreparedStatementUpdate.newBuilder().setPreparedStatementHandle(handle).build(),
+        fakeCallContext(peer),
+        null,
+        ack
+      )
+      .run()
+    ack.onErrorRef.get() shouldBe null
+    sent.size shouldBe 1

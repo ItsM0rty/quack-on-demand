@@ -50,16 +50,59 @@ class PrepareStrategySpec extends AnyFlatSpec with Matchers:
     PrepareStrategy.choose("PRAGMA database_list", StatementKind.Other) shouldBe
       PrepareStrategy.FullExecute
 
-  it should "fall back to full execute when the statement contains a non-trailing semicolon" in:
+  it should "leave a multi-statement batch unprobed (the node would run all of it)" in:
     val multi = "SELECT 1; SELECT 2"
-    PrepareStrategy.choose(multi, StatementKind.Select) shouldBe PrepareStrategy.FullExecute
+    PrepareStrategy.choose(multi, StatementKind.Select) shouldBe PrepareStrategy.Unprobed
 
   it should "tolerate a trailing semicolon on an otherwise wrappable SELECT" in:
     PrepareStrategy.choose("SELECT 1;", StatementKind.Select) shouldBe
       PrepareStrategy.ProbeWrap("SELECT * FROM (SELECT 1) AS _qod_probe LIMIT 0")
 
-  it should "fall back to full execute for the conservative Other bucket" in:
-    PrepareStrategy.choose("VACUUM", StatementKind.Other) shouldBe PrepareStrategy.FullExecute
+  it should "leave the Other bucket unprobed, a lone PRAGMA aside" in:
+    PrepareStrategy.choose("VACUUM", StatementKind.Other) shouldBe PrepareStrategy.Unprobed
+
+  // ---- audit F17: a probe must never run what the Execute runs again ----
+  //
+  // The node runs every statement of the text it is sent, so probing a batch or a side-effecting
+  // statement for its schema ran the write at Prepare / GetFlightInfo / GetSchema time, unrecorded,
+  // and the Execute then ran it again.
+
+  it should "never probe a batch whose tail writes, whatever leads it" in
+    List(
+      "SELECT 1; INSERT INTO orders VALUES (1)"              -> StatementKind.Select,
+      "FROM orders LIMIT 0; INSERT INTO orders VALUES (1)"   -> StatementKind.Select,
+      "VALUES (1); INSERT INTO orders VALUES (1)"            -> StatementKind.Select,
+      "SHOW TABLES; INSERT INTO orders VALUES (1)"           -> StatementKind.Select,
+      "EXPLAIN SELECT 1; INSERT INTO orders VALUES (1)"      -> StatementKind.Select,
+      "SET VARIABLE v = 1; INSERT INTO orders VALUES (1)"    -> StatementKind.Other,
+      "USE memory.main; INSERT INTO orders VALUES (1)"       -> StatementKind.Other,
+      "SET TimeZone = 'UTC'; INSERT INTO orders VALUES (1)"  -> StatementKind.Other,
+      "PRAGMA version; INSERT INTO orders VALUES (1)"        -> StatementKind.Other,
+      "CALL pragma_version(); INSERT INTO orders VALUES (1)" -> StatementKind.Other,
+      "SELECT 1 /* ; */; UPDATE counter SET n = n + 1"       -> StatementKind.Select
+    ).foreach { (sql, kind) =>
+      withClue(sql)(PrepareStrategy.choose(sql, kind) shouldBe PrepareStrategy.Unprobed)
+    }
+
+  it should "never probe a single statement that may write" in
+    List(
+      "CALL postgres_execute('pg', 'INSERT INTO t VALUES (1)')",
+      "CALL mysql_execute('my', 'DELETE FROM t')",
+      "IMPORT DATABASE '/tmp/x'",
+      "SET VARIABLE v = (SELECT nextval('s'))",
+      "USE memory.main"
+    ).foreach { sql =>
+      withClue(sql)(
+        PrepareStrategy.choose(sql, StatementKind.Other) shouldBe PrepareStrategy.Unprobed
+      )
+    }
+
+  it should "still probe a lone PRAGMA and a semicolon inside a literal" in {
+    PrepareStrategy.choose("PRAGMA table_info('orders')", StatementKind.Other) shouldBe
+      PrepareStrategy.FullExecute
+    PrepareStrategy.choose("SELECT ';' AS s", StatementKind.Select) shouldBe
+      PrepareStrategy.ProbeWrap("SELECT * FROM (SELECT ';' AS s) AS _qod_probe LIMIT 0")
+  }
 
   it should "ignore leading whitespace and comments when classifying SHOW-style verbs" in:
     PrepareStrategy.choose("  -- a comment\n  SHOW TABLES", StatementKind.Select) shouldBe

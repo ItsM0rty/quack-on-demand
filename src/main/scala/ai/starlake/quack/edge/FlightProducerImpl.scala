@@ -58,7 +58,9 @@ final class FlightProducerImpl(
     *
     * `preferredNode` soft-pins Execute to the node that served Prepare (warm DuckDB caches);
     * `prepareDurationMs` rides into the Execute's [[StatementRecord]] for the UI. Both None for
-    * SkipExecute. `datasetSchema` answers getSchemaPreparedStatement without a second probe.
+    * SkipExecute. `datasetSchema` answers getSchemaPreparedStatement without a second probe; None
+    * when the statement was left unprobed ([[PrepareStrategy.Unprobed]]): its schema is advertised
+    * as absent and the Execute stream carries it.
     */
   private final case class PreparedExec(
       sql: String,
@@ -68,7 +70,7 @@ final class FlightProducerImpl(
       poolKey: ai.starlake.quack.model.PoolKey,
       preferredNode: Option[String],
       prepareDurationMs: Option[Long],
-      datasetSchema: Schema
+      datasetSchema: Option[Schema]
   )
 
   /** Live per-call plan resolved for a prepared Execute/Update: the captured statement identity
@@ -82,7 +84,7 @@ final class FlightProducerImpl(
       effectiveSet: Option[ai.starlake.quack.ondemand.rbac.EffectiveSet],
       preferredNode: Option[String],
       prepareDurationMs: Option[Long],
-      datasetSchema: Schema
+      datasetSchema: Option[Schema]
   )
 
   /** Zero-field schema: the "dispatch through executeUpdate" marker, and the `parameter_schema`
@@ -368,6 +370,10 @@ final class FlightProducerImpl(
                 .toRuntimeException()
             )
 
+  /** How a schema request may obtain `sql`'s result schema ([[PrepareStrategy]]). Pure. */
+  private def strategyOf(sql: String): PrepareStrategy =
+    PrepareStrategy.choose(sql, router.classifier.classify(sql))
+
   override def createPreparedStatement(
       request: FlightSql.ActionCreatePreparedStatementRequest,
       context: FlightProducer.CallContext,
@@ -378,89 +384,70 @@ final class FlightProducerImpl(
 
     ConnectionContext.entry(peer) match
       case Some(ConnectionContext.Entry(poolKey, connId, user, eff, _)) =>
-        val kind     = router.classifier.classify(sql)
-        val strategy = PrepareStrategy.choose(sql, kind)
-
-        val probeSqlOpt: Option[String] = strategy match
-          case PrepareStrategy.SkipExecute      => None
-          case PrepareStrategy.ProbeWrap(probe) => Some(probe)
-          case PrepareStrategy.FullExecute      => Some(sql)
-
-        probeSqlOpt match
-          case None =>
-            // SkipExecute: no node call; advertise countSchema (see its doc for the ADBC why),
-            // except a claimed SQL admin mutation, which always delivers (status, detail) -
-            // advertise adminStatusSchema instead (see its doc for the incident this fixes).
-            // Not executed here either way - only the schema advertised at Prepare differs.
-            val (skipSchema, skipSchemaBytes) =
-              if ai.starlake.quack.edge.admin.AdminSqlParser.claims(sql) then
-                (adminStatusSchema, adminStatusSchemaBytes)
-              else (countSchema, countSchemaBytes)
-            val handle = java.util.UUID.randomUUID().toString
-            preparedStatements.put(
-              handle,
-              PreparedExec(
-                sql,
-                ownerPeer = peer,
-                connId,
-                user,
-                poolKey,
-                preferredNode = None,
-                prepareDurationMs = None,
-                datasetSchema = skipSchema
-              )
+        // Registers the handle and answers the Prepare with the advertised schema (None: absent).
+        def prepared(schema: Option[Schema], node: Option[String], durationMs: Option[Long]) =
+          val handle = java.util.UUID.randomUUID().toString
+          preparedStatements.put(
+            handle,
+            PreparedExec(
+              sql,
+              ownerPeer = peer,
+              connId,
+              user,
+              poolKey,
+              preferredNode = node,
+              prepareDurationMs = durationMs,
+              datasetSchema = schema
             )
-            val resp = FlightSql.ActionCreatePreparedStatementResult
-              .newBuilder()
-              .setPreparedStatementHandle(ByteString.copyFromUtf8(handle))
-              .setDatasetSchema(skipSchemaBytes)
-              // The ODBC driver throws on an ABSENT parameter_schema, so advertise
-              // zero parameters explicitly via the empty schema.
-              .setParameterSchema(emptySchemaBytes)
-              .build()
-            listener.onNext(new Result(ProtoAny.pack(resp).toByteArray))
-            listener.onCompleted()
+          )
+          val resp = FlightSql.ActionCreatePreparedStatementResult
+            .newBuilder()
+            .setPreparedStatementHandle(ByteString.copyFromUtf8(handle))
+            .setDatasetSchema(schema.map(serializeSchema).getOrElse(ByteString.EMPTY))
+            // The ODBC driver throws on an ABSENT parameter_schema, so advertise
+            // zero parameters explicitly via the empty schema.
+            .setParameterSchema(emptySchemaBytes)
+            .build()
+          listener.onNext(new Result(ProtoAny.pack(resp).toByteArray))
+          listener.onCompleted()
 
-          case Some(probeSql) =>
-            // recordExecution = false: the operator-visible history row is the matching
-            // Execute, which carries the probe's duration via prepareDurationMs.
-            scala.util.Try(
-              router
-                .execute(connId, user, poolKey, probeSql, eff, recordExecution = false)
-                .unsafeRunSync()
-            ) match
-              case scala.util.Success(Right(result)) =>
-                val handle                = java.util.UUID.randomUUID().toString
-                val (schema, schemaBytes) =
-                  try
-                    val s = result.rows.getVectorSchemaRoot.getSchema
-                    (s, serializeSchema(s))
-                  finally result.close()
-                preparedStatements.put(
-                  handle,
-                  PreparedExec(
-                    sql,
-                    ownerPeer = peer,
-                    connId,
-                    user,
-                    poolKey,
-                    preferredNode = Some(result.nodeId),
-                    prepareDurationMs = Some(result.durationMs),
-                    datasetSchema = schema
-                  )
-                )
-                val resp = FlightSql.ActionCreatePreparedStatementResult
-                  .newBuilder()
-                  .setPreparedStatementHandle(ByteString.copyFromUtf8(handle))
-                  .setDatasetSchema(schemaBytes)
-                  .setParameterSchema(emptySchemaBytes)
-                  .build()
-                listener.onNext(new Result(ProtoAny.pack(resp).toByteArray))
-                listener.onCompleted()
-              case scala.util.Success(Left(f)) =>
-                listener.onError(toFlightException(f))
-              case scala.util.Failure(t) =>
-                listener.onError(internalError("createPreparedStatement", t))
+        // recordExecution = false: the operator-visible history row is the matching Execute,
+        // which carries the probe's duration via prepareDurationMs.
+        def probeThenPrepare(probeSql: String): Unit =
+          scala.util.Try(
+            router
+              .execute(connId, user, poolKey, probeSql, eff, recordExecution = false)
+              .unsafeRunSync()
+          ) match
+            case scala.util.Success(Right(result)) =>
+              val schema =
+                try result.rows.getVectorSchemaRoot.getSchema
+                finally result.close()
+              prepared(Some(schema), Some(result.nodeId), Some(result.durationMs))
+            case scala.util.Success(Left(f)) =>
+              listener.onError(toFlightException(f))
+            case scala.util.Failure(t) =>
+              listener.onError(internalError("createPreparedStatement", t))
+
+        strategyOf(sql) match
+          case PrepareStrategy.SkipExecute =>
+            // No node call; advertise countSchema (see its doc for the ADBC why), except a claimed
+            // SQL admin mutation, which always delivers (status, detail) - advertise
+            // adminStatusSchema instead (see its doc for the incident this fixes). Not executed
+            // here either way - only the schema advertised at Prepare differs.
+            val skipSchema =
+              if ai.starlake.quack.edge.admin.AdminSqlParser.claims(sql) then adminStatusSchema
+              else countSchema
+            prepared(Some(skipSchema), None, None)
+
+          case PrepareStrategy.Unprobed =>
+            // No node call: running the text to read its schema would run its effects, and the
+            // Execute runs them again (audit F17). The schema is advertised as absent, which
+            // FlightSQL clients read as "take it from the stream".
+            prepared(None, None, None)
+
+          case PrepareStrategy.ProbeWrap(probe) => probeThenPrepare(probe)
+          case PrepareStrategy.FullExecute      => probeThenPrepare(sql)
       case _ =>
         listener.onError(noContext(peer))
 
@@ -483,7 +470,7 @@ final class FlightProducerImpl(
   ): SchemaResult =
     val handle = command.getPreparedStatementHandle.toStringUtf8
     preparedStatements.get(handle) match
-      case Some(p) => new SchemaResult(p.datasetSchema)
+      case Some(p) => new SchemaResult(p.datasetSchema.getOrElse(emptySchema))
       case None    =>
         throw CallStatus.INVALID_ARGUMENT
           .withDescription(s"no such prepared statement: $handle")
@@ -505,8 +492,16 @@ final class FlightProducerImpl(
         val endpoint = new FlightEndpoint(ticket)
         // The ODBC driver reads the result schema from FlightInfo.schema (not the
         // GetSchema RPC): a null here breaks Power BI, and the cached Prepare-time
-        // schema matches the DoGet stream so ADBC's mismatch guard stays happy.
-        new FlightInfo(p.datasetSchema, descriptor, Collections.singletonList(endpoint), -1L, -1L)
+        // schema matches the DoGet stream so ADBC's mismatch guard stays happy. An unprobed
+        // statement has no schema to give: absent (null) lets ADBC and JDBC take the stream's,
+        // where a zero-field schema would fail ADBC's guard.
+        new FlightInfo(
+          p.datasetSchema.orNull,
+          descriptor,
+          Collections.singletonList(endpoint),
+          -1L,
+          -1L
+        )
 
   override def getStreamPreparedStatement(
       command: FlightSql.CommandPreparedStatementQuery,
@@ -535,7 +530,7 @@ final class FlightProducerImpl(
               // p.datasetSchema is exactly what Prepare advertised (cached, not recomputed): the
               // SkipExecute branch of createPreparedStatement sets it to countSchema (or
               // adminStatusSchema for a claimed admin mutation), same rule as the literal path.
-              val advertisedWasCount = p.datasetSchema == countSchema
+              val advertisedWasCount = p.datasetSchema.contains(countSchema)
               try streamArrow(result.rows, listener, advertisedWasCount)
               catch
                 case t: Throwable =>
@@ -1377,9 +1372,12 @@ final class FlightProducerImpl(
     // here. DML/DDL probes None -> advertise countSchema; an empty schema would trip
     // ADBC's FlightInfo.schema == DoGet stream guard. A claimed SQL admin mutation is DDL
     // too (probes None the same way) but actually delivers (status, detail), not Count - see
-    // adminStatusSchema's doc for the incident this mirrors on the prepared path.
-    val schema = probeStatementSchema(peer, command.getQuery).getOrElse(
-      if ai.starlake.quack.edge.admin.AdminSqlParser.claims(command.getQuery) then adminStatusSchema
+    // adminStatusSchema's doc for the incident this mirrors on the prepared path. An unprobed
+    // statement advertises no schema (null): the DoGet stream carries it.
+    val sql    = command.getQuery
+    val schema = probeStatementSchema(peer, sql).getOrElse(
+      if strategyOf(sql) == PrepareStrategy.Unprobed then null
+      else if ai.starlake.quack.edge.admin.AdminSqlParser.claims(sql) then adminStatusSchema
       else countSchema
     )
     new FlightInfo(
@@ -1391,8 +1389,9 @@ final class FlightProducerImpl(
     )
 
   /** Probe the result schema for a literal statement (same PrepareStrategy split as
-    * createPreparedStatement): Some for queries, None for DML/DDL. recordExecution = false keeps
-    * the probe out of history and load metrics. Throws a Flight exception on auth / router failure.
+    * createPreparedStatement): Some for queries, None for DML/DDL and for an unprobed statement,
+    * which never reaches a node. recordExecution = false keeps the probe out of history and load
+    * metrics. Throws a Flight exception on auth / router failure.
     */
   private def probeStatementSchema(
       peer: String,
@@ -1400,12 +1399,10 @@ final class FlightProducerImpl(
   ): Option[Schema] =
     ConnectionContext.entry(peer) match
       case Some(ConnectionContext.Entry(poolKey, connId, user, eff, _)) =>
-        val kind                        = router.classifier.classify(sql)
-        val strategy                    = PrepareStrategy.choose(sql, kind)
-        val probeSqlOpt: Option[String] = strategy match
-          case PrepareStrategy.SkipExecute      => None
-          case PrepareStrategy.ProbeWrap(probe) => Some(probe)
-          case PrepareStrategy.FullExecute      => Some(sql)
+        val probeSqlOpt: Option[String] = strategyOf(sql) match
+          case PrepareStrategy.SkipExecute | PrepareStrategy.Unprobed => None
+          case PrepareStrategy.ProbeWrap(probe)                       => Some(probe)
+          case PrepareStrategy.FullExecute                            => Some(sql)
         probeSqlOpt.map { probeSql =>
           scala.util.Try(
             router
@@ -1424,7 +1421,8 @@ final class FlightProducerImpl(
         throw noContext(peer)
 
   /** Dedicated GetSchema RPC for CommandStatementQuery: same probed schema, empty for DML/DDL (the
-    * documented contract for this RPC).
+    * documented contract for this RPC) and for an unprobed statement, whose schema only its
+    * execution can tell.
     */
   override def getSchemaStatement(
       command: FlightSql.CommandStatementQuery,
@@ -1466,9 +1464,8 @@ final class FlightProducerImpl(
             // countSchema exactly when PrepareStrategy chose SkipExecute and no admin dialect
             // claimed the statement) WITHOUT re-running a probe: SkipExecute means nothing was
             // executed there either way, so recomputing the pure classification is free and safe.
-            val kind               = router.classifier.classify(sql)
             val advertisedWasCount =
-              PrepareStrategy.choose(sql, kind) == PrepareStrategy.SkipExecute
+              strategyOf(sql) == PrepareStrategy.SkipExecute
                 && !ai.starlake.quack.edge.admin.AdminSqlParser.claims(sql)
             try streamArrow(result.rows, listener, advertisedWasCount)
             catch

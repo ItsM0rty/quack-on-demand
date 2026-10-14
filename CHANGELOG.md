@@ -90,6 +90,17 @@
   the statement"), any other COMMIT failure with INTERNAL, as DoGet already did. A COMMIT failure
   on a stream nobody reads to the end is now logged at ERROR. Statement history and the write audit
   still record such a statement as `ok`.
+- **Fixed: a FlightSQL batch led by a read no longer runs twice.** To answer a Prepare,
+  GetFlightInfo or GetSchema with a result schema, the edge ran the statement on a node; for a
+  batch (`SELECT 1; INSERT INTO orders VALUES (1)`, `SET VARIABLE v = 1; INSERT ...`, any lead
+  but a write) and for a single `USE`, `SET`, `CALL` and other non-query statements it ran the
+  whole text, so the write committed at prepare time with no history row or audit, and the Execute
+  ran it again: every such row was written twice (one ADBC `cursor.execute` or `qod sql "..."` is a
+  Prepare plus an Execute), and a lone GetSchema wrote with no trace at all. A batch, and every
+  non-query statement but a lone `PRAGMA`, now reaches a node only when executed, once; its result
+  schema is advertised as absent and read from the result stream, which the ADBC driver accepts. A
+  client that reads the schema before executing (an ODBC driver behind Power BI) gets none for
+  these statements.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
