@@ -624,7 +624,9 @@
     works), and so are `file_search_path` (`SET file_search_path = '/etc'; SELECT * FROM x.csv`
     read /etc/x.csv), `home_directory`, `allow_asterisks_in_http_paths`, `ca_cert_file` and the
     server certificate verification settings, all GLOBAL on DuckDB 2.0. tpch's `dbgen` (creates
-    and fills tables in any catalog at any scale) is reserved to superusers too.
+    and fills tables in any catalog at any scale) is reserved to superusers too. Known gap: only
+    lockdown turns off `autoinstall_known_extensions`, so off lockdown a function call or a bare
+    `LOAD` of a known extension still installs it.
   - `shell_history()` is refused to every caller, superusers included: a node's init SQL reaches
     its DuckDB CLI through stdin, so the history held the object-store secret keys, the catalog
     password and the node token, readable by any tenant user with `*.*.* ALL`, and by everyone

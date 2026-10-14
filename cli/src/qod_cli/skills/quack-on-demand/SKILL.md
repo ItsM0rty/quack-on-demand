@@ -2003,7 +2003,13 @@ opt-in except pod security:
   a tenant user cannot `INSTALL` / `FORCE INSTALL` / `UPDATE EXTENSIONS` or `LOAD` an
   extension from a path or URL ("installing an extension ... is reserved to
   superusers"); install extensions at node start and `LOAD httpfs` by its bare name
-  (`LOAD 'httpfs'`, quoted, is refused). Nor can a tenant user set
+  (`LOAD 'httpfs'`, quoted, is refused). **This does not cover autoinstall
+  outside lockdown**: only node lockdown sets `autoinstall_known_extensions =
+  false`, so with lockdown off (the default) calling a function of a known
+  DuckDB extension the node lacks (`CALL dsdgen(...)`, `CALL start_ui_server()`,
+  or a bare `LOAD ui`) still makes DuckDB download and load that extension
+  wherever the node has network egress. Turn node lockdown on (below) when
+  tenant users must not pull in extensions at all. Nor can a tenant user set
   `file_search_path`, `home_directory`, `allow_asterisks_in_http_paths`, `ca_cert_file`
   or the server certificate verification settings, and `shell_history()` is refused to
   every caller, superusers included (the node CLI's history holds its init SQL).
