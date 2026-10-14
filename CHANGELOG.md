@@ -292,7 +292,8 @@
   source (Iceberg included). Fixed with it: a secret value containing `{{` no longer fails the
   tenant-db's whole federation setup (the placeholder check now runs before substitution). A `sql`
   source's setupSql may not mention the reserved secret prefixes `qod_pg_`, `qod_mysql_`,
-  `qod_ice_`. MySQL is implemented and unit tested but not verified live (the DuckDB 2.0 toolchain
+  `qod_ice_` (judged on the text with `{{alias}}` expanded: it prevents an accidental collision
+  with a typed source's secret, not a name spliced in through a `{{secret.NAME}}` value). MySQL is implemented and unit tested but not verified live (the DuckDB 2.0 toolchain
   has no mysql extension), including whether `READ_ONLY` alone refuses writes through it.
 
 - **Security: nodes and the manager no longer load the OS user's persistent DuckDB secrets.**

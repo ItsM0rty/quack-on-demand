@@ -20,7 +20,10 @@ object FederatedSourceRules:
   /** Secret-name prefixes QoD's own rendered blocks create and drop on a node: `qod_pg_` and
     * `qod_mysql_` (Postgres / MySQL, dropped right after their ATTACH), `qod_ice_` (Iceberg). A
     * `sql` source naming one could be replaced or dropped by a typed sibling's block, so its
-    * setupSql may not mention them.
+    * setupSql may not mention them. The check judges the setupSql text with `{{alias}}` expanded
+    * and prevents accidental collisions only: a `{{secret.NAME}}` value is spliced in verbatim at
+    * spawn and never scanned, so a name spelled deliberately through a secret value passes. Not a
+    * boundary: the same author can already DETACH or edit a sibling.
     */
   val ReservedSecretPrefixes: List[String] = List("qod_pg_", "qod_mysql_", "qod_ice_")
 
@@ -36,8 +39,8 @@ object FederatedSourceRules:
     val config = source.config.filter(_.trim.nonEmpty)
     val typed  = t match
       case FederatedSourceType.Sql =>
-        // Judged on the text the builder will render: `{{alias}}` expands first, so
-        // `qod_{{alias}}` under alias `pg_x` is `qod_pg_x`.
+        // Judged on the setupSql text with `{{alias}}` expanded, so `qod_{{alias}}` under alias
+        // `pg_x` is `qod_pg_x`. Secret values are not spliced in here (see ReservedSecretPrefixes).
         val lower = source.setupSql.replace("{{alias}}", source.alias).toLowerCase(Locale.ROOT)
         ReservedSecretPrefixes.filter(lower.contains).map { p =>
           s"setupSql mentions '$p', a secret-name prefix reserved for QoD's typed sources"
