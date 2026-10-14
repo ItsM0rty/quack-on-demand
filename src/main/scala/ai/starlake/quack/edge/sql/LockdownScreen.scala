@@ -228,6 +228,12 @@ object LockdownScreen:
   // ignored - a legit remote COPY with options is not over-denied.
   private val CopyPathLiteral = "(?<![a-zA-Z0-9_])(?:from|to)\\s*'([^']*)'".r
 
+  // EXPORT DATABASE's target: the first literal after DATABASE (`EXPORT DATABASE '<dir>'`, or
+  // `EXPORT DATABASE <db> TO '<dir>'`); its options come after it.
+  private val ExportPathLiteral = "(?<![a-zA-Z0-9_])database\\b[^']*?'([^']*)'".r
+
+  private val ExportLocalRefusal = "EXPORT DATABASE to a local path is disabled on this deployment"
+
   // The file extensions DuckDB 2.0's replacement scans recognize, used to spot a path-shaped name
   // that carries a separator: read_csv's .csv / .tsv, the json extension's .json / .jsonl /
   // .ndjson / .geojson / .geojsonl, parquet's .parquet, the core read_duckdb's .db / .ddb /
@@ -385,12 +391,32 @@ object LockdownScreen:
                 .toOption
                 .flatMap(r => copyLocalPath(StatementHead.normalize(r.text), deniedBuckets))
             )
+        // EXPORT DATABASE writes schema.sql, load.sql and one file per table to its target, as
+        // COPY ... TO writes one (audit F23); judged the same way, as written and as DuckDB reads
+        // it. A target neither reading finds is refused: nothing proves it remote.
+        val exportHit =
+          if !first.contains("export") then None
+          else
+            val verdicts = List(
+              exportVerdict(lower, deniedBuckets),
+              ParserInput
+                .render(stmt)
+                .toOption
+                .flatMap(r => exportVerdict(StatementHead.normalize(r.text), deniedBuckets))
+            ).flatten
+            if verdicts.isEmpty then Some(ExportLocalRefusal)
+            else
+              verdicts.collectFirst {
+                case LitVerdict.Bucket(b) => bucketMessage(b)
+                case LitVerdict.Local     => ExportLocalRefusal
+              }
         // Settings statements still get the function scan: a denied function inside a
         // SET value must not slip through. A file in table position (`FROM '/etc/x.parquet'`),
         // which carries no read-function call, is judged on the whole batch afterwards
         // (fileInTablePosition).
         settingHit
           .orElse(copyHit)
+          .orElse(exportHit)
           .orElse(deniedFunctionIn(stmt, deniedBuckets))
 
   /** Splits the input on top-level semicolons: a semicolon inside any of DuckDB's quoting forms
@@ -626,6 +652,12 @@ object LockdownScreen:
           case LitVerdict.Local     => Some("COPY over local paths is disabled on this deployment")
       }
       .nextOption()
+
+  /** EXPORT DATABASE's target literal judged like a COPY path, or None when there is none. */
+  private def exportVerdict(lower: String, deniedBuckets: Set[String]): Option[LitVerdict] =
+    ExportPathLiteral
+      .findFirstMatchIn(lower)
+      .map(m => literalVerdict("'" + m.group(1) + "'", deniedBuckets))
 
   /** The string literals of `stmt` in a conservative table position, each with the values it stands
     * for (its own body, and the value DuckDB folds it into across a newline): right after FROM,

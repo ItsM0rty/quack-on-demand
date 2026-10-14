@@ -1097,3 +1097,27 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     ).foreach(sql => withClue(sql)(denied(sql) shouldBe true))
     denied("SELECT histogram(o_total) FROM orders") shouldBe false
   }
+
+  // Audit F23: EXPORT DATABASE writes schema.sql, load.sql and one file per table to its target
+  // directory, like COPY ... TO, but no rule judged it: a local directory on a local-dataPath pool
+  // and the denied DuckLake bucket were both writable under lockdown with the ACL off.
+  "EXPORT DATABASE" should "be judged by its target like COPY ... TO" in {
+    List(
+      "EXPORT DATABASE '/tmp/dump'",
+      "EXPORT DATABASE '/tmp/dump' (FORMAT CSV, DELIMITER '|')",
+      "export database lake TO '/tmp/dump'",
+      "EXPORT DATABASE \"lake\" TO '/tmp/dump' (FORMAT PARQUET)",
+      "EXPORT DATABASE e'/tmp/dump'",
+      "EXPORT DATABASE $$/tmp/dump$$",
+      "EXPORT /* c */ DATABASE/*x*/'/tmp/dump'",
+      "EXPLAIN ANALYZE EXPORT DATABASE '/tmp/dump'",
+      "SELECT 1; EXPORT DATABASE '/tmp/dump'"
+    ).foreach(sql => withClue(sql)(denied(sql) shouldBe true))
+    List(
+      "EXPORT DATABASE 's3://lakebucket/dump'",
+      "EXPORT DATABASE lake TO 's3://lakebucket/dump' (FORMAT PARQUET)",
+      "EXPORT DATABASE $$s3://lakebucket/dump$$"
+    ).foreach(sql => withClue(sql)(deniedB(sql) shouldBe true))
+    deniedB("EXPORT DATABASE 's3://staging/dump' (FORMAT CSV, DELIMITER '|')") shouldBe false
+    deniedB("EXPORT DATABASE lake TO 's3://staging/dump'") shouldBe false
+  }

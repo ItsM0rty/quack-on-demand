@@ -1658,6 +1658,23 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "refuse EXPORT DATABASE to a local path under lockdown with the ACL off (audit F23)" in:
+    // No policy, allow-all validator: lockdown is the only screen standing, as in the default
+    // posture with lockdown turned on. COPY ... TO the same directory was refused; EXPORT was not.
+    List(
+      "EXPORT DATABASE '/tmp/dump' (FORMAT CSV)",
+      "EXPLAIN ANALYZE EXPORT DATABASE '/tmp/dump'"
+    ).foreach { sql =>
+      val (router, capturedSql, _) = setupWithRewriter(lockdownFor = _ => true)
+      val out = router
+        .execute("ld-f23", "alice", poolKey, sql, Some(effWithPolicies(Nil)))
+        .unsafeRunSync()
+      withClue(sql) {
+        out.left.toOption.get shouldBe a[RouterFailure.AccessDenied]
+        capturedSql() shouldBe ""
+      }
+    }
+
   it should "deny a SELECT that reaches an RLS table through query_table / query end-to-end" in:
     // The row rewriter wraps base tables; a table named in a string is invisible to it, so
     // without the guard these reads reach the node unfiltered.

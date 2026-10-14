@@ -140,6 +140,12 @@
   refused when a table their policy covers is read anywhere the filter cannot reach ("pivot a
   subquery instead: PIVOT (SELECT * FROM t) ..."), and an EXPLAIN of a statement reading such a
   table is refused. A pivoted subquery is filtered as before.
+- **Security: node lockdown judges EXPORT DATABASE like COPY ... TO.** EXPORT DATABASE writes
+  `schema.sql`, `load.sql` and one file per table to its target directory, but no lockdown rule
+  looked at it: with the ACL off, a tenant user on a locked-down pool could write to the node's
+  local disk (on a pool with a local data path) or into the denied DuckLake data bucket, both of
+  which `COPY ... TO` is refused. Its target is now judged as a COPY path is: a local path or a
+  denied bucket is refused, another object-store URL is admitted.
 
 - **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
   CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
