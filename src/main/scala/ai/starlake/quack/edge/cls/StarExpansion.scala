@@ -2,7 +2,7 @@ package ai.starlake.quack.edge.cls
 
 import ai.starlake.acl.parser.AstChildren
 import ai.starlake.quack.ondemand.state.RoleColumnPolicy
-import net.sf.jsqlparser.expression.{Alias, Expression}
+import net.sf.jsqlparser.expression.{Alias, ColumnsTransformer, Expression}
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.schema.{Column, Table}
 import net.sf.jsqlparser.statement.select.{
@@ -30,11 +30,11 @@ import scala.util.Try
   *
   * Only shapes whose column list is exact are expanded: `t.*` naming one base table of the FROM
   * clause, or `*` over a FROM clause of exactly one base table, the table's columns known and the
-  * name not a CTE of the statement. A star carrying a modifier (or an alias, which is how
-  * JSqlParser reads `* REPLACE (..) EXCLUDE (..)`) that cannot be expanded is refused when the
-  * select reads a table a column policy names; elsewhere it is left to the resolver, which masks
-  * nothing there. The pattern forms (`* LIKE`, COLUMNS(..)) are not modifiers: the residual check
-  * refuses them.
+  * name not a CTE of the statement, and only modifiers whose result is exact: a column-list EXCLUDE
+  * / EXCEPT and REPLACE. A star carrying any other modifier (RENAME, APPLY, a pattern EXCLUDE), an
+  * alias, or one that cannot be expanded is refused when the select reads a table a column policy
+  * names; elsewhere it is left to the resolver, which masks nothing there. The pattern forms (`*
+  * LIKE`, COLUMNS(..)) are not modifiers: the residual check refuses them.
   */
 private[cls] object StarExpansion:
 
@@ -50,6 +50,12 @@ private[cls] object StarExpansion:
     "a star with EXCLUDE / REPLACE cannot be expanded over this FROM clause under column " +
       "policies; name the columns instead"
 
+  private def transformers(star: AllColumns): List[ColumnsTransformer] =
+    Option(star.getTransformers).map(_.asScala.toList).getOrElse(Nil)
+
+  /** A star with no modifier (EXCLUDE, REPLACE, RENAME, ..): exactly the columns it stands for. */
+  private[cls] def unmodified(star: AllColumns): Boolean = transformers(star).isEmpty
+
   // JSqlParser splits a quoted column name on its dots when the expansion is parsed again
   // (`c."price.usd"` came out as `"price"."usd"`, another column), so it cannot be printed.
   private val DottedColumnRefusal =
@@ -62,7 +68,7 @@ private[cls] object StarExpansion:
       schema: Map[String, List[String]],
       policies: List[RoleColumnPolicy]
   ): Either[String, String] =
-    Try(CCJSqlParserUtil.parse(sql)).toOption match
+    Try(ai.starlake.sql.JSqlStatements.parseFirst(sql)).toOption match
       case Some(sel: Select) =>
         val selects = plainSelects(sel)
         val ctes    = cteNames(sel)
@@ -136,8 +142,7 @@ private[cls] object StarExpansion:
     val expanded: List[Either[String, Option[List[SelectItem[?]]]]] = items.map { si =>
       si.getExpression match
         case star: AllColumns =>
-          val modified = Option(star.getExceptColumns).exists(!_.isEmpty) ||
-            Option(star.getReplaceExpressions).exists(!_.isEmpty) || si.getAlias != null
+          val modified              = !unmodified(star) || si.getAlias != null
           val target: Option[Table] = star match
             case atc: AllTableColumns =>
               val q = Option(atc.getTable)
@@ -182,9 +187,23 @@ private[cls] object StarExpansion:
   ): Either[String, List[SelectItem[?]]] =
     val bindingName = Option(t.getAlias).map(_.getName).getOrElse(t.getName)
     val known       = cols.map(lower).toSet
-    val excepts     = Option(star.getExceptColumns).map(_.asScala.toList).getOrElse(Nil)
-    val replaces    = Option(star.getReplaceExpressions).map(_.asScala.toList).getOrElse(Nil)
-    val excluded    = excepts.map { c =>
+    import ColumnsTransformer.ColumnsTransformerType as Kind
+    val ts = transformers(star)
+    // Only a column-list EXCLUDE / EXCEPT and REPLACE have an exact expansion; RENAME, APPLY and a
+    // pattern exclusion are refused rather than approximated.
+    val expandable = ts.forall { t =>
+      t.getType match
+        case Kind.EXCEPT | Kind.EXCLUDE => t.getExceptPattern == null && t.getExceptColumns != null
+        case Kind.REPLACE               => t.getReplaceItems != null
+        case _                          => false
+    }
+    val excepts = ts
+      .filter(t => t.getType == Kind.EXCEPT || t.getType == Kind.EXCLUDE)
+      .flatMap(t => Option(t.getExceptColumns).map(_.asScala.toList).getOrElse(Nil))
+    val replaces = ts
+      .filter(_.getType == Kind.REPLACE)
+      .flatMap(t => Option(t.getReplaceItems).map(_.asScala.toList).getOrElse(Nil))
+    val excluded = excepts.map { c =>
       val qualifierOk = Option(c.getTable)
         .flatMap(q => Option(q.getName))
         .forall(q => lower(unquote(q)) == lower(unquote(bindingName)))
@@ -199,7 +218,7 @@ private[cls] object StarExpansion:
     }
     val drop = excluded.flatten.toSet
     val kept = cols.filterNot(c => drop.contains(lower(c)))
-    if excluded.contains(None) || replaced.contains(None) then Left(Refusal)
+    if !expandable || excluded.contains(None) || replaced.contains(None) then Left(Refusal)
     else if kept.exists(_.contains('.')) then Left(DottedColumnRefusal)
     else
       val subs = replaced.flatten.toMap

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **jsqlparser 5.4.162 and jsqltranspiler 1.16.** The SQL parser behind the ACL, column and row
+  policies, the metadata filter and the write screens moves from 5.4.15, which changed under them:
+  - A batch is now split where DuckDB splits it (at each `;` its lexer treats as a separator) and
+    every statement is parsed on its own. The parser stopped returning a batch's first statement
+    and stopped skipping a statement it cannot parse inside a batch, which would have denied any
+    batch holding one (`USE mem.main; SELECT ...`) and let a `SHOW TABLES` after such a statement
+    through the metadata filter unfiltered. Column and row policies still rewrite only a batch's
+    first statement; the protected-write guard analyses every statement before them, as before.
+  - `TABLE t` is read as a statement wherever it appears (`x = ANY (TABLE t)`, `IN (TABLE t)`,
+    `EXISTS (TABLE t)`, `SELECT (TABLE t)`, `FROM (TABLE t)`). The ACL checks it as a read of `t`,
+    and it is refused under a column policy (always in expression position, when `t` has one in
+    table position) and under a row policy on `t`. Before, the ACL refused the statement form and
+    the column policy rewrite missed `= ANY (TABLE t)`, which read every column of `t` unmasked.
+  - Star modifiers are expanded from the parser's new transformer list: a column-list EXCLUDE /
+    EXCEPT and REPLACE as before; RENAME, APPLY and a pattern EXCLUDE are refused under a column
+    policy.
+  - The write screen judges a statement that fails to parse on its original text too, not only on
+    the parser's rendering of it.
+  - jsqltranspiler 1.16 resolves `TRIM(x)` and a select-list `LIKE` again (1.14 and 1.15 threw on
+    their absent optional parts, which denied them under column policies).
+
 - **DuckDB 2.0.** Engine, nodes and JDBC move to DuckDB v2.0.0 (`org.duckdb:duckdb_jdbc:2.0.0.0`
   from Maven Central) and Quack protocol v3, with duckdb-quack at `f96420ed`, the commit the v2.0.0
   quack extension ships. All six libquackwire natives (linux-x86_64, linux-aarch64, osx-x86_64,

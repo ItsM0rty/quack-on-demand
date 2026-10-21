@@ -114,7 +114,7 @@ object SqlParser:
         )
       case Right(input) =>
         try
-          val stmts: Statements = CCJSqlParserUtil.parseStatements(
+          val stmts: Statements = ai.starlake.sql.JSqlStatements.parseBatch(
             input.text,
             (parser: net.sf.jsqlparser.parser.CCJSqlParser) => {
               val featureConfig = new FeatureConfiguration()
@@ -159,7 +159,8 @@ object SqlParser:
         else
           ParserInput.render(sql) match
             case Left(reason) => StatementResult.ParseError(0, truncateSnippet(sql), reason)
-            case Right(input) => analysed(CCJSqlParserUtil.parse(input.text), 0, config)
+            case Right(input) =>
+              analysed(ai.starlake.sql.JSqlStatements.parseFirst(input.text), 0, config)
       }
     catch
       case e: JSQLParserException =>

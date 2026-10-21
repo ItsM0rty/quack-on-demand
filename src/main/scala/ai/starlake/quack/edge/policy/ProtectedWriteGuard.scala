@@ -243,7 +243,7 @@ final class ProtectedWriteGuard(
   private def parseAsts(sql: String): Option[List[Statement]] =
     ai.starlake.sql.ParserInput.renderWithoutTimeTravel(sql).toOption.flatMap { input =>
       try
-        val stmts = CCJSqlParserUtil.parseStatements(input.text, configure)
+        val stmts = ai.starlake.sql.JSqlStatements.parseBatch(input.text, configure)
         Option(stmts.getStatements).map(_.asScala.toList)
       catch case _: Throwable => None
     }
