@@ -166,6 +166,9 @@ if(WIN32)
     ${DUCKDB_SERIALIZER_DIR}/binary_deserializer.cpp
     ${DUCKDB_SERIALIZER_DIR}/memory_stream.cpp
     ${DUCKDB_SERIALIZER_DIR}/serializer.cpp
+    # SerializationData's special members are out of line in 2.0 and not
+    # exported by duckdb.dll; the file is only their `= default` definitions.
+    ${DUCKDB_SERIALIZER_DIR}/serialization_data.cpp
     # A couple of leaf symbols the serializer references
     # (StorageCompatibility, ValueOperations::NotDistinctFrom) live in
     # heavy translation units (storage_compatibility.cpp, which reaches the

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <random>
 #include <string>
 
 // Pulls in duckdb-quack's message-layer types. Since protocol v3,
@@ -107,6 +108,27 @@ void throw_runtime(JNIEnv* env, const char* what) {
   if (cls != nullptr) {
     env->ThrowNew(cls, what);
   }
+}
+
+// A random version-4 UUID as DuckDB's UUIDv4::GenerateRandomUUID lays it
+// out (big-endian bytes, upper word first), for the query id a v3 PREPARE
+// carries. Generated here because duckdb.dll does not export
+// UUID::GenerateRandomUUID, so the Windows native could not link it.
+duckdb::hugeint_t random_query_uuid() {
+  thread_local std::mt19937_64 engine{[] {
+    std::random_device rd;
+    std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
+    return std::mt19937_64(seq);
+  }()};
+  uint64_t upper = engine();
+  uint64_t lower = engine();
+  // version 4: byte 6 is 0100xxxx; variant: byte 8 is 10xxxxxx
+  upper = (upper & ~(uint64_t(0xF0) << 8)) | (uint64_t(0x40) << 8);
+  lower = (lower & ~(uint64_t(0xC0) << 56)) | (uint64_t(0x80) << 56);
+  duckdb::hugeint_t result;
+  result.upper = static_cast<int64_t>(upper);
+  result.lower = lower;
+  return result;
 }
 
 // Pulls a 128-bit magnitude out of a Java BigInteger via the standard
@@ -213,7 +235,7 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_serializePrepareRequ
     auto sql = jstring_to_std(env, sql_j);
     // v3: the client names the query; FETCH and CANCEL refer to it, and the
     // PREPARE_RESPONSE echoes it back (extractResultUuid).
-    duckdb::PrepareRequestMessage msg(connection_id, sql, duckdb::UUID::GenerateRandomUUID());
+    duckdb::PrepareRequestMessage msg(connection_id, sql, random_query_uuid());
     duckdb::MemoryStream stream;
     msg.ToMemoryStream(stream);
     return to_jbyte_array(env, stream);
@@ -845,11 +867,11 @@ std::unique_ptr<duckdb::DataChunk> make_one_row_one_col_int_chunk() {
   types.push_back(duckdb::LogicalType::INTEGER);
   auto chunk = std::make_unique<duckdb::DataChunk>();
   chunk->Initialize(duckdb::Allocator::DefaultAllocator(), types);
-  // 2.0 vectors carry their own size: set it before writing, since the
-  // deprecated SetCardinality leaves them empty and the chunk would
-  // serialize zero data bytes.
-  chunk->SetChildCardinality(1);
-  chunk->SetValue(0, 0, duckdb::Value::INTEGER(42));
+  // 2.0 vectors carry their own size: Vector::Append sizes the column (the
+  // deprecated SetCardinality leaves it empty and the chunk would serialize
+  // zero data bytes). Not SetChildCardinality: duckdb.dll does not export it.
+  chunk->data[0].Append(duckdb::Value::INTEGER(42));
+  chunk->SetCardinalityUnsafe(1);
   return chunk;
 }
 
