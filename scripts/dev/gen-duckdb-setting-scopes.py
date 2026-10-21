@@ -201,6 +201,35 @@ def extension_source(name, repo):
     return d, tag
 
 
+def class_constant(src, expr):
+    """`Class::NAME` declared in `src` as `NAME = "..."` inside `class Class` (or struct)."""
+    m = re.fullmatch(r"(\w+)::(\w+)", expr.strip())
+    if not m:
+        return None
+    cls = re.search(rf"\b(?:class|struct)\s+{m.group(1)}\b[^;{{]*\{{", src)
+    if not cls:
+        return None
+    val = re.search(rf'\b{m.group(2)}\s*=\s*"((?:[^"\\]|\\.)*)"', src[cls.end():])
+    return val.group(1) if val else None
+
+
+def option_object(src, f, opt, arg):
+    """(scope argument, debug) of the `ExtensionOption <var>(...)` the two-argument
+    `AddExtensionOption(name, std::move(<var>))` registers: the constructor takes
+    (description, type, set_function, default_value, default_scope, is_debug, is_deprecated)."""
+    var = re.fullmatch(r"(?:std::move\(\s*)?(\w+)\s*\)?", arg.strip())
+    ctor = var and re.search(rf"\bExtensionOption\s+{var.group(1)}\s*\(", src)
+    if not ctor:
+        die(f"{f}: {opt}: cannot find the ExtensionOption {arg!r} it registers")
+    cargs = call_args(src, ctor.end() - 1)
+    if len(cargs) < 5:
+        die(f"{f}: {opt}: ExtensionOption {var.group(1)} sets no default scope")
+    # A bare SET of an option that refuses the session scope lands in the global one.
+    no_session = re.search(rf"\b{var.group(1)}\.supports_session\s*=\s*false\b", src)
+    scope_arg = "SetScope::GLOBAL" if no_session else cargs[4]
+    return scope_arg, len(cargs) > 5 and cargs[5] == "true"
+
+
 def extension_options(name, root):
     consts = constants_of(root)
     opts = {}
@@ -212,14 +241,17 @@ def extension_options(name, root):
             args = call_args(src, m.end() - 1)
             if args and re.match(r"(const\s+)?(Identifier|string|std::string)\b", args[0]):
                 continue  # a declaration, not a call
-            opt = string_value(args[0], consts)
+            opt = string_value(args[0], consts) or class_constant(src, args[0])
             if opt is None:
                 die(f"{f}: cannot read the option name {args[0]!r}")
-            scope_arg = args[5] if len(args) > 5 else "SetScope::SESSION"
+            if len(args) == 2:
+                scope_arg, debug = option_object(src, f, opt, args[1])
+            else:
+                scope_arg = args[5] if len(args) > 5 else "SetScope::SESSION"
+                debug = len(args) > 6 and args[6] == "true"
             sm = re.fullmatch(r"SetScope::(\w+)", scope_arg)
             if not sm:
                 die(f"{f}: {opt}: cannot read the scope {scope_arg!r}")
-            debug = len(args) > 6 and args[6] == "true"
             scope = "GlobalDefault" if sm.group(1) == "GLOBAL" else "LocalDefault"
             prev = opts.get(opt.lower())
             if prev and prev[0] != scope:

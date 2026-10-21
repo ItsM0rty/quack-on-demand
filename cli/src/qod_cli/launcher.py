@@ -396,11 +396,28 @@ def _duckdb_dir(kind: str, cache_dir: Path | None) -> Path:
     return duckdb_cache_root(cache_dir) / duckdb_version() / kind
 
 
+def _extract_tar_gz(archive: Path, dest: Path) -> None:
+    """Unpack a DuckDB 2.x release asset (a flat .tar.gz) into `dest`, refusing
+    members that would land outside it."""
+    import tarfile
+
+    with tarfile.open(archive, "r:gz") as t:
+        if hasattr(tarfile, "data_filter"):
+            t.extractall(dest, filter="data")
+        else:
+            root = dest.resolve()
+            for m in t.getmembers():
+                target = (dest / m.name).resolve()
+                if not (m.isfile() or m.isdir()) or not target.is_relative_to(root):
+                    raise RuntimeError(f"unexpected member {m.name!r} in {archive.name}")
+            t.extractall(dest)
+
+
 def duckdb_cli_url(os_name: str, arch: str) -> str:
     plat = _DUCKDB_PLAT[(os_name, arch.lower())]
     return (
         f"https://github.com/duckdb/duckdb/releases/download/"
-        f"v{duckdb_version()}/duckdb_cli-{plat}.zip"
+        f"v{duckdb_version()}/duckdb-cli-{plat}.tar.gz"
     )
 
 
@@ -412,7 +429,6 @@ def ensure_duckdb_cli(
     """bin dir holding the pinned `duckdb` CLI under `cache_dir`, downloading
     it from the DuckDB GitHub release on first use."""
     import platform
-    import zipfile
 
     bin_dir = _duckdb_dir("bin", cache_dir)
     duckdb = bin_dir / ("duckdb.exe" if os_name == "win32" else "duckdb")
@@ -421,15 +437,14 @@ def ensure_duckdb_cli(
 
     arch = arch if arch is not None else platform.machine()
     bin_dir.mkdir(parents=True, exist_ok=True)
-    archive = bin_dir / "duckdb_cli.zip"
+    archive = bin_dir / "duckdb-cli.tar.gz"
     try:
         _download(duckdb_cli_url(os_name, arch), archive, f"duckdb {duckdb_version()} CLI")
-        with zipfile.ZipFile(archive) as z:
-            z.extractall(bin_dir)
+        _extract_tar_gz(archive, bin_dir)
     finally:
         archive.unlink(missing_ok=True)
     if not duckdb.is_file():
-        raise RuntimeError(f"no duckdb binary found after extracting the CLI zip in {bin_dir}")
+        raise RuntimeError(f"no duckdb binary found after extracting the CLI archive in {bin_dir}")
     duckdb.chmod(0o755)
     return bin_dir
 
@@ -438,7 +453,7 @@ def libduckdb_url(os_name: str, arch: str) -> str:
     plat = _DUCKDB_PLAT[(os_name, arch.lower())]
     return (
         f"https://github.com/duckdb/duckdb/releases/download/"
-        f"v{duckdb_version()}/libduckdb-{plat}.zip"
+        f"v{duckdb_version()}/duckdb-shared-libs-{plat}.tar.gz"
     )
 
 
@@ -450,7 +465,6 @@ def ensure_libduckdb(
     """lib dir holding the pinned libduckdb shared library (required by the
     JNI native client: libquackwire links against this exact ABI)."""
     import platform
-    import zipfile
 
     lib_dir = _duckdb_dir("lib", cache_dir)
     lib_names = {"darwin": "libduckdb.dylib", "linux": "libduckdb.so", "win32": "duckdb.dll"}
@@ -460,15 +474,14 @@ def ensure_libduckdb(
 
     arch = arch if arch is not None else platform.machine()
     lib_dir.mkdir(parents=True, exist_ok=True)
-    archive = lib_dir / "libduckdb.zip"
+    archive = lib_dir / "duckdb-shared-libs.tar.gz"
     try:
         _download(libduckdb_url(os_name, arch), archive, f"libduckdb {duckdb_version()}")
-        with zipfile.ZipFile(archive) as z:
-            z.extractall(lib_dir)
+        _extract_tar_gz(archive, lib_dir)
     finally:
         archive.unlink(missing_ok=True)
     if not lib.is_file():
-        raise RuntimeError(f"no {lib.name} found after extracting the libduckdb zip in {lib_dir}")
+        raise RuntimeError(f"no {lib.name} found after extracting the libduckdb archive in {lib_dir}")
     return lib_dir
 
 

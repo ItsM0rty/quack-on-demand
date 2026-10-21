@@ -14,22 +14,14 @@ name: quackwire native build
 #   - duckdb-quack : the native/quackwire/thirdparty/duckdb-quack submodule
 #                    commit (its short sha is the middle segment of
 #                    build.sbt's libquackwireVersion)
-#   - libduckdb    : the official release zips of project/Versions.scala's
+#   - libduckdb    : the official release archives of project/Versions.scala's
 #                    `val duckdb` (X.Y.Z.W -> tag vX.Y.Z) on every platform:
-#                    libduckdb-{linux-amd64,linux-arm64,osx-universal,
-#                    windows-amd64}.zip, plus the internal headers from the
-#                    duckdb repo at the same tag. Homebrew is NOT used (its
-#                    bottle lags releases).
-#
-# DuckDB 2.0 pre-release (until v2.0.0 ships): there are no v2.0.0 release
-# zips or tag yet, so every build leg fails at "Install libduckdb" with a 404.
-# That is deliberate: this workflow must not produce natives against any other
-# DuckDB than the pin. Until then only osx-aarch64 is rebuilt, on a developer
-# host against the locally built engine (.duckdb/2.0.0), and the other four
-# vendored binaries are stale 1.5.6 builds the manager refuses at boot. The
-# 2.0 legs of this file (zip names, header staging, the Windows shim in
-# native/quackwire/src/win_duckdb_compat.cpp) are UNVERIFIED until the
-# release zips exist.
+#                    duckdb-shared-libs-{linux-amd64,linux-arm64,osx-universal,
+#                    windows-amd64}.tar.gz (DuckDB 2.x names; 1.x shipped
+#                    libduckdb-*.zip), plus the whole src/include tree of the
+#                    duckdb repo at the same tag (duckdb.hpp and the internal
+#                    headers; the archives carry only the C headers).
+#                    Homebrew is NOT used (its bottle lags releases).
 #
 # Runner labels (verified 2026-06-01):
 #   - ubuntu-22.04        : standard linux/x86_64, free on public repos
@@ -111,22 +103,22 @@ jobs:
             platform: linux-x86_64
             libname: libquackwire.so
             os: linux
-            duckdb_zip: libduckdb-linux-amd64.zip
+            duckdb_archive: duckdb-shared-libs-linux-amd64.tar.gz
           - runner: ubuntu-22.04-arm
             platform: linux-aarch64
             libname: libquackwire.so
             os: linux
-            duckdb_zip: libduckdb-linux-arm64.zip
+            duckdb_archive: duckdb-shared-libs-linux-arm64.tar.gz
           - runner: macos-15-intel
             platform: osx-x86_64
             libname: libquackwire.dylib
             os: macos
-            duckdb_zip: libduckdb-osx-universal.zip
+            duckdb_archive: duckdb-shared-libs-osx-universal.tar.gz
           - runner: macos-14
             platform: osx-aarch64
             libname: libquackwire.dylib
             os: macos
-            duckdb_zip: libduckdb-osx-universal.zip
+            duckdb_archive: duckdb-shared-libs-osx-universal.tar.gz
     steps:
       - name: Checkout (with duckdb-quack submodule)
         uses: actions/checkout@v7
@@ -149,59 +141,56 @@ jobs:
       - name: Install libduckdb v${{ env.DUCKDB_VERSION }} (macOS)
         if: matrix.os == 'macos'
         env:
-          DUCKDB_ZIP: ${{ matrix.duckdb_zip }}
+          DUCKDB_ARCHIVE: ${{ matrix.duckdb_archive }}
         run: |
           set -euo pipefail
           home="$RUNNER_TEMP/duckdb-home"
           mkdir -p "$home/include" "$home/lib"
           tmp=$(mktemp -d)
-          curl -fsSL -o "$tmp/$DUCKDB_ZIP" \
-            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/$DUCKDB_ZIP" \
-            || { echo "::error::no DuckDB v$DUCKDB_VERSION release zip $DUCKDB_ZIP (not released yet?)"; exit 1; }
-          unzip -o "$tmp/$DUCKDB_ZIP" -d "$tmp/extracted"
-          cp "$tmp/extracted/duckdb.h"   "$home/include/duckdb.h"
-          cp "$tmp/extracted/duckdb.hpp" "$home/include/duckdb.hpp"
+          mkdir -p "$tmp/extracted"
+          curl -fsSL -o "$tmp/$DUCKDB_ARCHIVE" \
+            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/$DUCKDB_ARCHIVE" \
+            || { echo "::error::no DuckDB v$DUCKDB_VERSION release archive $DUCKDB_ARCHIVE (not released yet?)"; exit 1; }
+          tar -xzf "$tmp/$DUCKDB_ARCHIVE" -C "$tmp/extracted"
           cp "$tmp/extracted/libduckdb.dylib" "$home/lib/libduckdb.dylib"
-          # Nested INTERNAL headers (duckdb/common/serializer/*.hpp etc.),
-          # same reason as the Linux step below.
+          # Headers: the whole src/include tree at the same tag (duckdb.hpp
+          # and the internal headers), same reason as the Linux step below.
           git clone --depth 1 --branch "v$DUCKDB_VERSION" https://github.com/duckdb/duckdb "$tmp/duckdb-src"
-          cp -r "$tmp/duckdb-src/src/include/duckdb" "$home/include/"
+          cp -r "$tmp/duckdb-src/src/include/." "$home/include/"
           echo "DUCKDB_HOME=$home" >> "$GITHUB_ENV"
           ls -l "$home/lib/libduckdb.dylib" "$home/include/duckdb.hpp"
           ls "$home/include/duckdb/common/serializer/binary_serializer.hpp"
 
-      # Linux: download the official libduckdb release zip and stage into
+      # Linux: download the official libduckdb release archive and stage into
       # /usr/local. The CMake `find_path / find_library` hints in
       # native/quackwire/CMakeLists.txt cover /usr/local/{include,lib}.
-      # Asset names, verified on the v1.5.6 release page (re-check on the
+      # Asset names, verified on the v2.0.0 release page (re-check on the
       # pinned release: gh api repos/duckdb/duckdb/releases/tags/v<pin>
       # .assets[].name):
-      #   libduckdb-linux-amd64.zip   (x86_64)
-      #   libduckdb-linux-arm64.zip   (aarch64)
+      #   duckdb-shared-libs-linux-amd64.tar.gz   (x86_64)
+      #   duckdb-shared-libs-linux-arm64.tar.gz   (aarch64)
       - name: Install libduckdb v${{ env.DUCKDB_VERSION }} (Linux)
         if: matrix.os == 'linux'
         env:
-          DUCKDB_ZIP: ${{ matrix.duckdb_zip }}
+          DUCKDB_ARCHIVE: ${{ matrix.duckdb_archive }}
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends unzip ca-certificates curl cmake build-essential git
+          sudo apt-get install -y --no-install-recommends ca-certificates curl cmake build-essential git
           tmp=$(mktemp -d)
-          # 1. Binary + amalgamated public headers from the official release.
-          curl -fsSL -o "$tmp/$DUCKDB_ZIP" \
-            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/$DUCKDB_ZIP" \
-            || { echo "::error::no DuckDB v$DUCKDB_VERSION release zip $DUCKDB_ZIP (not released yet?)"; exit 1; }
-          unzip -o "$tmp/$DUCKDB_ZIP" -d "$tmp/extracted"
-          sudo install -m 0644 "$tmp/extracted/duckdb.h"   /usr/local/include/duckdb.h
-          sudo install -m 0644 "$tmp/extracted/duckdb.hpp" /usr/local/include/duckdb.hpp
+          mkdir -p "$tmp/extracted"
+          # 1. The shared library from the official release.
+          curl -fsSL -o "$tmp/$DUCKDB_ARCHIVE" \
+            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/$DUCKDB_ARCHIVE" \
+            || { echo "::error::no DuckDB v$DUCKDB_VERSION release archive $DUCKDB_ARCHIVE (not released yet?)"; exit 1; }
+          tar -xzf "$tmp/$DUCKDB_ARCHIVE" -C "$tmp/extracted"
           sudo install -m 0755 "$tmp/extracted/libduckdb.so" /usr/local/lib/libduckdb.so
-          # 2. Nested INTERNAL headers (duckdb/common/serializer/*.hpp etc.).
-          # The release zip ships only the amalgamated duckdb.{h,hpp}; the
-          # duckdb-quack message layer pulls `duckdb/common/serializer/
-          # binary_serializer.hpp` directly; we grab them from a shallow
-          # clone at the same tag.
+          # 2. Headers: the whole src/include tree at the same tag. The release
+          # archive ships only the C headers; libquackwire includes duckdb.hpp
+          # and the duckdb-quack message layer pulls internal headers such as
+          # `duckdb/common/serializer/binary_serializer.hpp`.
           git clone --depth 1 --branch "v$DUCKDB_VERSION" https://github.com/duckdb/duckdb "$tmp/duckdb-src"
-          sudo cp -r "$tmp/duckdb-src/src/include/duckdb" /usr/local/include/
+          sudo cp -r "$tmp/duckdb-src/src/include/." /usr/local/include/
           sudo ldconfig
           ls -l /usr/local/lib/libduckdb.so /usr/local/include/duckdb.hpp
           ls /usr/local/include/duckdb/common/serializer/binary_serializer.hpp
@@ -277,11 +266,11 @@ jobs:
           java-version: '21'
 
       # Assemble DUCKDB_HOME the way CMakeLists.txt expects: duckdb.lib + the
-      # FULL duckdb/ include tree. The release zip ships only the amalgamated
-      # duckdb.{h,hpp}; the duckdb-quack message layer also pulls internal
-      # headers (duckdb/common/serializer/binary_serializer.hpp), grabbed from a
-      # shallow clone at the same pinned tag. Runs in git-bash for parity with
-      # the Linux step.
+      # FULL include tree. The release archive ships only the C headers; the
+      # duckdb.hpp and the internal headers the duckdb-quack message layer pulls
+      # (duckdb/common/serializer/binary_serializer.hpp) come from a shallow
+      # clone at the same pinned tag. Runs in git-bash for parity with the
+      # Linux step.
       - name: Install libduckdb v${{ env.DUCKDB_VERSION }} (Windows)
         shell: bash
         run: |
@@ -289,16 +278,15 @@ jobs:
           home="$RUNNER_TEMP/duckdb-home"
           mkdir -p "$home/include" "$home/lib"
           tmp="$(mktemp -d)"
-          curl -fsSL -o "$tmp/libduckdb.zip" \
-            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/libduckdb-windows-amd64.zip" \
-            || { echo "::error::no DuckDB v$DUCKDB_VERSION release zip libduckdb-windows-amd64.zip (not released yet?)"; exit 1; }
-          unzip -o "$tmp/libduckdb.zip" -d "$tmp/dl"
-          cp "$tmp/dl/duckdb.h"   "$home/include/duckdb.h"
-          cp "$tmp/dl/duckdb.hpp" "$home/include/duckdb.hpp"
+          mkdir -p "$tmp/dl"
+          curl -fsSL -o "$tmp/libduckdb.tar.gz" \
+            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/duckdb-shared-libs-windows-amd64.tar.gz" \
+            || { echo "::error::no DuckDB v$DUCKDB_VERSION release archive duckdb-shared-libs-windows-amd64.tar.gz (not released yet?)"; exit 1; }
+          tar -xzf "$tmp/libduckdb.tar.gz" -C "$tmp/dl"
           cp "$tmp/dl/duckdb.lib" "$home/lib/duckdb.lib"
           cp "$tmp/dl/duckdb.dll" "$home/lib/duckdb.dll"
           git clone --depth 1 --branch "v$DUCKDB_VERSION" https://github.com/duckdb/duckdb "$tmp/duckdb-src"
-          cp -r "$tmp/duckdb-src/src/include/duckdb" "$home/include/"
+          cp -r "$tmp/duckdb-src/src/include/." "$home/include/"
           ls "$home/lib/duckdb.lib" "$home/include/duckdb.hpp"
           ls "$home/include/duckdb/common/serializer/binary_serializer.hpp"
           echo "DUCKDB_HOME=$home" >> "$GITHUB_ENV"

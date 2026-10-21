@@ -2,24 +2,27 @@
 
 ## Unreleased
 
-- **DuckDB 2.0.** Engine, nodes and JDBC move to DuckDB 2.0 and Quack protocol v3. libquackwire
-  follows on osx-aarch64 only for now (rebuilt against the locally built 2.0 pre-release engine);
-  the linux-x86_64, linux-aarch64, osx-x86_64 and windows-x86_64 natives remain DuckDB 1.5.6 /
-  Quack v1 builds until the v2.0.0 release zips exist, and the manager refuses to boot on them (see
-  the build marker below).
+- **DuckDB 2.0.** Engine, nodes and JDBC move to DuckDB v2.0.0 (`org.duckdb:duckdb_jdbc:2.0.0.0`
+  from Maven Central) and Quack protocol v3, with duckdb-quack at `f96420ed`, the commit the v2.0.0
+  quack extension ships. libquackwire is rebuilt against the release on osx-aarch64; the
+  linux-x86_64, linux-aarch64, osx-x86_64 and windows-x86_64 natives are refreshed from the
+  `quackwire.yml` run of the release commit, and until then the manager refuses to boot on them
+  (see the build marker below). DuckDB 2.x renamed its release assets: `run-jar.sh`,
+  `run-jar.ps1`, the qod CLI and the images download `duckdb-cli-<platform>.tar.gz` and
+  `duckdb-shared-libs-<platform>.tar.gz` (1.x shipped `.zip`s), so they need `tar` instead of
+  `unzip`.
   BREAKING: the manager and every node upgrade together (restart every node). The native front
   door requires DuckDB 2.0 clients; a 1.x client gets "requires a DuckDB 2.0 client". It also
   admits a 2.0 client's `BEGIN TRANSACTION` and its INSERT data path (`scan_data_from_quack_client`,
   scoped to the client's own connection). DuckLake catalogs older than the latest version are
-  migrated once by the manager's DuckLake initializer, under its advisory lock. A catalog already at
-  the latest development version is migrated again only when the DuckLake build changes (recorded
-  in a `qod_meta.ducklake_migration` table in the catalog's database), and a current catalog
-  attaches with no DDL, so a boot no longer re-runs the migration DDL (ACCESS EXCLUSIVE in Postgres)
+  migrated once by the manager's DuckLake initializer, under its advisory lock, to DuckLake 1.1
+  (a catalog a 2.0 pre-release created at `1.1-dev1` included). Each migration is recorded in a
+  `qod_meta.ducklake_migration` table in the catalog's database, and a current catalog attaches
+  with no DDL, so a boot no longer re-runs the migration DDL (ACCESS EXCLUSIVE in Postgres)
   on every catalog. The initializer waits at most 5 s for a catalog table lock: when a long-running
   read holds one, it logs a WARN naming the database and retries on the next reconcile pass instead
   of stalling boot. Nodes, loaders and the demo seed attach as-is. The migration is one-way: back up catalog databases
-  before upgrading, there is no downgrade. Until DuckDB v2.0.0 is released the toolchain is built
-  from source with `scripts/dev/build-duckdb-prerelease.sh`.
+  before upgrading, there is no downgrade.
   Upgrade, HA (`replicaCount > 1`): there is no rolling upgrade across this release. A manager on
   the previous version cannot reach a 2.0 node and a 2.0 manager cannot reach a 1.5.6 node, so
   during a rolling `helm upgrade` every statement routed across versions fails, and a 2.0 replica
@@ -359,6 +362,15 @@
   under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).
   Node connections are released on error and on cancel. New `QOD_DUCKDB_EXTENSION_DIR` points the
   manager's DuckDB at a local extension directory and turns on unsigned extensions.
+
+- **Fixed: the manager leaked 40 bytes per node response.** Every decoded PREPARE and FETCH
+  response left its Arrow stream struct allocated in the native client (about 4 GB a day at 1000
+  statements per second, plus two per healthy node every health-check interval). The struct is
+  freed once Arrow has taken its contents.
+
+- **Fixed: a DuckDB pre-release passed for the release.** `run-jar.sh` and `run-jar.ps1` accepted
+  any cached CLI whose version merely contained the pin (`v2.0.0-alpha46057` for `2.0.0`); they
+  now require the exact version and reinstall otherwise.
 
 - **The native client is the only manager-to-node client.** BREAKING: the embedded fallback client
   (an in-process DuckDB running `quack_query` over JDBC, behind a JVM-wide mutex) is gone, since

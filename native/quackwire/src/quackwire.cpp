@@ -802,6 +802,22 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_extractArrowStream(
   }
 }
 
+// Frees the struct extractArrowStream allocated. The Arrow Java importer moves its contents into
+// a struct of its own and marks this one released, so only the 40-byte shell is left; a stream
+// the import never took still owns its chunks and is released here first.
+extern "C" JNIEXPORT void JNICALL
+Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_freeStreamShell(
+    JNIEnv*, jobject, jlong ptr) {
+  auto* stream = reinterpret_cast<ArrowArrayStream*>(ptr);
+  if (stream == nullptr) {
+    return;
+  }
+  if (stream->release != nullptr) {
+    stream->release(stream);
+  }
+  delete stream;
+}
+
 // =====================================================================
 // Test-only JNI fixture helpers (Task 5.3)
 // =====================================================================

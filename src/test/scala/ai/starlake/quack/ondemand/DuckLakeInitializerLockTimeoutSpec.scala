@@ -141,6 +141,43 @@ class DuckLakeInitializerLockTimeoutSpec extends AnyFlatSpec with Matchers with 
     count(c, "SELECT count(*) FROM ducklake_data_file")
     c
 
+  /** A catalog as a DuckDB 1.5.x install left it: DuckLake 1.0, one table, no migration stamp. */
+  private def createV10Catalog(db: String, meta: Map[String, String]): Unit =
+    val duck = DriverManager.getConnection(
+      "jdbc:duckdb:",
+      DuckDbExtensionSource.fromEnv.connectionProperties
+    )
+    try
+      val ext = DuckDbExtensionSource.fromEnv
+      Try {
+        exec(duck, ext.loadSql("ducklake"))
+        exec(duck, ext.loadSql("postgres_scanner"))
+      } match
+        case Failure(t) if extensionUnavailable(t) =>
+          cancel(s"DuckDB extensions unavailable (${t.getMessage}); skipping")
+        case Failure(t) => throw t
+        case Success(_) => ()
+      exec(duck, "SET ducklake_default_version = '1.0'")
+      exec(duck, CatalogPgSecret.createSql(CatalogPgSecret.Name, pg.password))
+      exec(
+        duck,
+        DuckLakeInitializer.attachSql(
+          CatalogPgSecret.connstr(pg.host, pg.port.toString, db, pg.user),
+          "old",
+          meta("dataPath"),
+          encrypted = false,
+          migrate = false
+        )
+      )
+      exec(duck, "CREATE TABLE old.t AS SELECT range AS i FROM range(5)")
+      exec(duck, "DETACH old")
+    finally duck.close()
+    val c = connect(db)
+    try
+      DuckLakeInitializer.readCatalogState(c).version shouldBe
+        DuckLakeInitializer.MetadataRead.Value("1.0")
+    finally c.close()
+
   "initBlocking" should "create a catalog and stamp the engine build that created it" in {
     val db   = freshDb()
     val meta = metastoreFor(db)
@@ -174,11 +211,8 @@ class DuckLakeInitializerLockTimeoutSpec extends AnyFlatSpec with Matchers with 
   it should "give up on a needed migration behind an open read with a retry-later error" in {
     val db   = freshDb()
     val meta = metastoreFor(db)
-    init(meta)
-    // Another engine build migrated this dev catalog last: the next boot must migrate.
-    val c = connect(db)
-    try exec(c, "UPDATE qod_meta.ducklake_migration SET engine_build = 'duckdb=old ducklake=old'")
-    finally c.close()
+    // A catalog older than the pinned DuckLake: the next boot must migrate.
+    createV10Catalog(db, meta)
 
     val reader             = openReader(db)
     given ExecutionContext = ExecutionContext.global
@@ -197,53 +231,24 @@ class DuckLakeInitializerLockTimeoutSpec extends AnyFlatSpec with Matchers with 
         e.getMessage should include("retried")
       case other => fail(s"expected CatalogLockTimeoutException, got $other")
     elapsedMs should be < 60000L
-    stamp(db) shouldBe Some("duckdb=old ducklake=old")
+    stamp(db) shouldBe None
 
     // The read ended: the retry migrates and stamps the current build.
     resetDdlLog(db)
     init(meta)
     alterCount(db) should be > 0
-    stamp(db).getOrElse(fail("no stamp recorded")) should not be "duckdb=old ducklake=old"
+    stamp(db) shouldBe defined
+    val after = connect(db)
+    try
+      DuckLakeInitializer.readCatalogState(after).version shouldBe
+        DuckLakeInitializer.MetadataRead.Value(DuckLakeInitializer.LatestDuckLakeVersion)
+    finally after.close()
   }
 
   it should "migrate a 1.0 catalog once, then attach it as-is" in {
     val db   = freshDb()
     val meta = metastoreFor(db)
-    // A catalog as a DuckDB 1.5.x install left it.
-    val duck = DriverManager.getConnection(
-      "jdbc:duckdb:",
-      DuckDbExtensionSource.fromEnv.connectionProperties
-    )
-    try
-      val ext = DuckDbExtensionSource.fromEnv
-      Try {
-        exec(duck, ext.loadSql("ducklake"))
-        exec(duck, ext.loadSql("postgres_scanner"))
-      } match
-        case Failure(t) if extensionUnavailable(t) =>
-          cancel(s"DuckDB extensions unavailable (${t.getMessage}); skipping")
-        case Failure(t) => throw t
-        case Success(_) => ()
-      exec(duck, "SET ducklake_default_version = '1.0'")
-      exec(duck, CatalogPgSecret.createSql(CatalogPgSecret.Name, pg.password))
-      exec(
-        duck,
-        DuckLakeInitializer.attachSql(
-          CatalogPgSecret.connstr(pg.host, pg.port.toString, db, pg.user),
-          "old",
-          meta("dataPath"),
-          encrypted = false,
-          migrate = false
-        )
-      )
-      exec(duck, "CREATE TABLE old.t AS SELECT range AS i FROM range(5)")
-      exec(duck, "DETACH old")
-    finally duck.close()
-    val before = connect(db)
-    try
-      DuckLakeInitializer.readCatalogState(before).version shouldBe
-        DuckLakeInitializer.MetadataRead.Value("1.0")
-    finally before.close()
+    createV10Catalog(db, meta)
 
     resetDdlLog(db)
     init(meta)

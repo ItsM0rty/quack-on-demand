@@ -437,23 +437,32 @@ def test_demo_refuses_when_latest_release_predates_the_demo(runner, monkeypatch)
 def test_duckdb_cli_url_platform_mapping(monkeypatch):
     monkeypatch.delenv("DUCKDB_VERSION", raising=False)
     base = f"https://github.com/duckdb/duckdb/releases/download/v{launcher.DUCKDB_CLI_VERSION}"
-    assert launcher.duckdb_cli_url("darwin", "arm64") == f"{base}/duckdb_cli-osx-universal.zip"
-    assert launcher.duckdb_cli_url("linux", "x86_64") == f"{base}/duckdb_cli-linux-amd64.zip"
-    assert launcher.duckdb_cli_url("linux", "aarch64") == f"{base}/duckdb_cli-linux-arm64.zip"
-    assert launcher.duckdb_cli_url("win32", "AMD64") == f"{base}/duckdb_cli-windows-amd64.zip"
+    assert launcher.duckdb_cli_url("darwin", "arm64") == f"{base}/duckdb-cli-osx-universal.tar.gz"
+    assert launcher.duckdb_cli_url("linux", "x86_64") == f"{base}/duckdb-cli-linux-amd64.tar.gz"
+    assert launcher.duckdb_cli_url("linux", "aarch64") == f"{base}/duckdb-cli-linux-arm64.tar.gz"
+    assert launcher.duckdb_cli_url("win32", "AMD64") == f"{base}/duckdb-cli-windows-amd64.tar.gz"
     # Windows on ARM (e.g. Parallels on Apple Silicon): platform.machine() is
     # "ARM64"; duckdb ships native windows-arm64 assets.
-    assert launcher.duckdb_cli_url("win32", "ARM64") == f"{base}/duckdb_cli-windows-arm64.zip"
+    assert launcher.duckdb_cli_url("win32", "ARM64") == f"{base}/duckdb-cli-windows-arm64.tar.gz"
 
 
-def _duckdb_zip():
+def _tar_gz(name, content):
+    """A DuckDB 2.x release asset: a flat .tar.gz holding one file."""
     import io
-    import zipfile
+    import tarfile
 
+    data = content.encode()
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("duckdb", "#!/bin/sh\n")
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.mode = 0o755
+        t.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
+def _duckdb_cli_archive():
+    return _tar_gz("duckdb", "#!/bin/sh\n")
 
 
 @pytest.mark.skipif(
@@ -463,7 +472,7 @@ def _duckdb_zip():
 @respx.mock
 def test_ensure_duckdb_cli_downloads_and_extracts(tmp_path):
     respx.get(launcher.duckdb_cli_url("linux", "x86_64")).mock(
-        return_value=httpx.Response(200, content=_duckdb_zip())
+        return_value=httpx.Response(200, content=_duckdb_cli_archive())
     )
     bin_dir = launcher.ensure_duckdb_cli(cache_dir=tmp_path, os_name="linux", arch="x86_64")
     duckdb = pathlib.Path(bin_dir) / "duckdb"
@@ -496,7 +505,7 @@ def test_ensure_duckdb_cli_does_not_reuse_another_versions_cache(tmp_path):
     # the old engine (Quack v1) against a manager speaking v3.
     _plant_legacy_and_other_version(tmp_path)
     route = respx.get(launcher.duckdb_cli_url("linux", "x86_64")).mock(
-        return_value=httpx.Response(200, content=_duckdb_zip())
+        return_value=httpx.Response(200, content=_duckdb_cli_archive())
     )
     bin_dir = launcher.ensure_duckdb_cli(cache_dir=tmp_path, os_name="linux", arch="x86_64")
     assert route.called
@@ -511,7 +520,7 @@ def test_ensure_duckdb_cli_honours_a_duckdb_version_override_over_the_cached_pin
     _duckdb_cache.plant(tmp_path, os_name="linux")
     monkeypatch.setenv("DUCKDB_VERSION", "2.0.1")
     route = respx.get(launcher.duckdb_cli_url("linux", "x86_64")).mock(
-        return_value=httpx.Response(200, content=_duckdb_zip())
+        return_value=httpx.Response(200, content=_duckdb_cli_archive())
     )
     bin_dir = launcher.ensure_duckdb_cli(cache_dir=tmp_path, os_name="linux", arch="x86_64")
     assert route.called and "v2.0.1/" in str(route.calls.last.request.url)
@@ -715,25 +724,19 @@ def test_demo_rejects_non_release_version_with_hint(runner, monkeypatch):
 def test_libduckdb_url_platform_mapping(monkeypatch):
     monkeypatch.delenv("DUCKDB_VERSION", raising=False)
     base = f"https://github.com/duckdb/duckdb/releases/download/v{launcher.DUCKDB_CLI_VERSION}"
-    assert launcher.libduckdb_url("darwin", "arm64") == f"{base}/libduckdb-osx-universal.zip"
-    assert launcher.libduckdb_url("linux", "x86_64") == f"{base}/libduckdb-linux-amd64.zip"
-    assert launcher.libduckdb_url("win32", "ARM64") == f"{base}/libduckdb-windows-arm64.zip"
+    assert launcher.libduckdb_url("darwin", "arm64") == f"{base}/duckdb-shared-libs-osx-universal.tar.gz"
+    assert launcher.libduckdb_url("linux", "x86_64") == f"{base}/duckdb-shared-libs-linux-amd64.tar.gz"
+    assert launcher.libduckdb_url("win32", "ARM64") == f"{base}/duckdb-shared-libs-windows-arm64.tar.gz"
 
 
-def _libduckdb_zip(name):
-    import io
-    import zipfile
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr(name, "not really a dylib")
-    return buf.getvalue()
+def _libduckdb_archive(name):
+    return _tar_gz(name, "not really a dylib")
 
 
 @respx.mock
 def test_ensure_libduckdb_downloads_and_extracts(tmp_path):
     respx.get(launcher.libduckdb_url("linux", "x86_64")).mock(
-        return_value=httpx.Response(200, content=_libduckdb_zip("libduckdb.so"))
+        return_value=httpx.Response(200, content=_libduckdb_archive("libduckdb.so"))
     )
     lib_dir = launcher.ensure_libduckdb(cache_dir=tmp_path, os_name="linux", arch="x86_64")
     assert (pathlib.Path(lib_dir) / "libduckdb.so").is_file()
@@ -751,7 +754,7 @@ def test_ensure_libduckdb_does_not_reuse_another_versions_cache(tmp_path):
     # A 1.5.x libduckdb lacks symbols the 2.0 libquackwire binds at load: reusing it refuses boot.
     _plant_legacy_and_other_version(tmp_path)
     route = respx.get(launcher.libduckdb_url("linux", "x86_64")).mock(
-        return_value=httpx.Response(200, content=_libduckdb_zip("libduckdb.so"))
+        return_value=httpx.Response(200, content=_libduckdb_archive("libduckdb.so"))
     )
     lib_dir = launcher.ensure_libduckdb(cache_dir=tmp_path, os_name="linux", arch="x86_64")
     assert route.called
@@ -904,8 +907,8 @@ def test_jar_cache_dir_env_overrides_cache(tmp_path, monkeypatch):
 
 def test_duckdb_version_env_overrides_pin(monkeypatch):
     monkeypatch.setenv("DUCKDB_VERSION", "1.6.0")
-    assert "v1.6.0/duckdb_cli-" in launcher.duckdb_cli_url("linux", "x86_64")
-    assert "v1.6.0/libduckdb-" in launcher.libduckdb_url("linux", "x86_64")
+    assert "v1.6.0/duckdb-cli-" in launcher.duckdb_cli_url("linux", "x86_64")
+    assert "v1.6.0/duckdb-shared-libs-" in launcher.libduckdb_url("linux", "x86_64")
 
 
 def test_duckdb_cache_dir_env_uses_run_jar_layout(tmp_path, monkeypatch):

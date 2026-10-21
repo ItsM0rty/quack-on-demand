@@ -87,32 +87,34 @@ RUN <<EOF
 set -eu
 apt-get update
 apt-get install -y --no-install-recommends \
-  bash tini curl ca-certificates unzip postgresql-client openssl
+  bash tini curl ca-certificates postgresql-client openssl
 
 case "${TARGETARCH:-amd64}" in
   amd64) DUCKDB_ARCH=linux-amd64 ;;
   arm64) DUCKDB_ARCH=linux-arm64 ;;
   *)     echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;;
 esac
-curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-${DUCKDB_ARCH}.zip" \
-  -o /tmp/duckdb-cli.zip
-unzip -d /usr/local/bin /tmp/duckdb-cli.zip
+# DuckDB 2.x release assets are flat .tar.gz archives (duckdb-cli-*, duckdb-shared-libs-*).
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-cli-${DUCKDB_ARCH}.tar.gz" \
+  -o /tmp/duckdb-cli.tar.gz
+tar -xzf /tmp/duckdb-cli.tar.gz -C /usr/local/bin duckdb
 chmod +x /usr/local/bin/duckdb
-rm /tmp/duckdb-cli.zip
+rm /tmp/duckdb-cli.tar.gz
 
 # libduckdb.so is required at runtime by libquackwire (the JNI shim that is
 # the manager's only client to its nodes), which links the pinned libduckdb
 # dynamically (DuckDB::LibraryVersion / ArrowConverter / etc.). The duckdb
 # CLI above is self-contained and does not provide a system-installed
 # libduckdb.so.
-curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-${DUCKDB_ARCH}.zip" \
-  -o /tmp/libduckdb.zip
-unzip -d /tmp/libduckdb /tmp/libduckdb.zip
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-${DUCKDB_ARCH}.tar.gz" \
+  -o /tmp/libduckdb.tar.gz
+mkdir -p /tmp/libduckdb
+tar -xzf /tmp/libduckdb.tar.gz -C /tmp/libduckdb
 install -m 0755 /tmp/libduckdb/libduckdb.so /usr/local/lib/libduckdb.so
 ldconfig
-rm -rf /tmp/libduckdb.zip /tmp/libduckdb
+rm -rf /tmp/libduckdb.tar.gz /tmp/libduckdb
 
-apt-get purge -y --auto-remove curl unzip
+apt-get purge -y --auto-remove curl
 rm -rf /var/lib/apt/lists/*
 EOF
 

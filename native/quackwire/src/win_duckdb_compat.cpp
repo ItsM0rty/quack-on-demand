@@ -3,12 +3,13 @@
 // ============================================================================
 //  !! VERSION-PINNED FILE - REVISIT ON EVERY DUCKDB / duckdb-quack BUMP !!
 //
-//  Pinned to: DuckDB 2.0 (engine b15358c371, build.sbt libquackwireVersion
-//             "2.0.0-974927a394b1-*"), re-derived 2026-10-13 from that
-//             engine's src/common/storage_compatibility.cpp. UNVERIFIED on
-//             Windows: no v2.0.0 release zip (duckdb.dll / duckdb.lib) exists
-//             yet, so this file has not been compiled or linked. Re-check it
-//             against the v2.0.0 sources when the release zips ship.
+//  Pinned to: DuckDB v2.0.0 (build.sbt libquackwireVersion
+//             "2.0.0-f96420ed46ae-*"), re-derived 2026-10-13 from the
+//             pre-release engine b15358c371 and re-checked 2026-10-21 against
+//             the v2.0.0 tag: storage_compatibility.{hpp,cpp} and
+//             storage_info.hpp are unchanged, and so are the serializer
+//             sources of duckdb-quack's duckdb submodule (8d68e6f9d8) against
+//             v2.0.0. Compiled and linked only by quackwire.yml's Windows leg.
 //
 //  DuckDB 2.0 renamed SerializationCompatibility to StorageCompatibility
 //  (src/include/duckdb/common/storage_compatibility.hpp, its own translation

@@ -25,7 +25,7 @@ RUN <<EOF
 set -eu
 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates curl unzip bash postgresql-client tini python3 python3-venv
+  ca-certificates curl bash postgresql-client tini python3 python3-venv
 rm -rf /var/lib/apt/lists/*
 EOF
 
@@ -37,10 +37,10 @@ case "${TARGETARCH:-$(dpkg --print-architecture)}" in
   *) echo "unsupported architecture" >&2; exit 1 ;;
 esac
 curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
-  "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-${ARCH}.zip" -o /tmp/duckdb.zip
-unzip /tmp/duckdb.zip -d /usr/local/bin
+  "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-cli-${ARCH}.tar.gz" -o /tmp/duckdb.tar.gz
+tar -xzf /tmp/duckdb.tar.gz -C /usr/local/bin duckdb
 chmod +x /usr/local/bin/duckdb
-rm /tmp/duckdb.zip
+rm /tmp/duckdb.tar.gz
 duckdb -c 'SELECT version()'
 EOF
 

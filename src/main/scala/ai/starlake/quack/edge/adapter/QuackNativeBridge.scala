@@ -103,6 +103,12 @@ object QuackNativeBridge:
     */
   @native def extractArrowStream(bytes: Array[Byte]): Long
 
+  /** Frees the heap struct [[extractArrowStream]] returned, once the Arrow Java importer has moved
+    * its contents into a struct it owns (the import marks this one released). A stream the import
+    * never took is released first, so its chunks are freed with it. Call exactly once per pointer.
+    */
+  @native def freeStreamShell(ptr: Long): Unit
+
   /** Parses `bytes` as a `FETCH_RESPONSE` and returns the number of `DataChunkWrapper` entries it
     * carries. The driver uses `0` as the end-of-FETCH-loop signal, matching the upstream
     * Quack-extension scan code (`duckdb-quack/src/quack_scan.cpp:331`, which guards the loop with

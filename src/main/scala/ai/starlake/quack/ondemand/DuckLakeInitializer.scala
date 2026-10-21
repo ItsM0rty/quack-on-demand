@@ -389,7 +389,7 @@ object DuckLakeInitializer extends LazyLogging:
     * the in-process DuckDB and asserts it: a pin bump that moves the version fails that spec
     * instead of silently skipping migrations.
     */
-  val LatestDuckLakeVersion: String = "1.1-dev1"
+  val LatestDuckLakeVersion: String = "1.1"
 
   /** Postgres `lock_timeout`, in ms, on the initializer's catalog connection only (never on a
     * node's). Bounds how long one migration DDL statement waits behind an open read of the table it

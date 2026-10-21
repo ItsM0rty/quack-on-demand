@@ -31,9 +31,7 @@ object Versions {
   val blobstore      = "0.10.1"
   val starlakeJdbc   = "0.7"
   val duckdb         = "2.0.0.0" // before bumping: docs/duckdb-pin-bump-checklist.md
-  // DuckDB 2.0 pre-release: built by scripts/dev/build-duckdb-prerelease.sh into ~/.m2. Release
-  // day: set to `duckdb` (Central) and drop the mavenLocal resolver in build.sbt.
-  val duckdbJdbc     = "2.0.0.0-pre-b15358c"
+  val duckdbJdbc     = duckdb
   val micrometer     = "1.13.6"
   val liquibase      = "4.29.2"
   val caffeine       = "3.1.8"

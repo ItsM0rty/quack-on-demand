@@ -12,9 +12,9 @@ import scala.util.{Failure, Success, Try}
   *
   * Pins two facts [[DuckLakeInitializer.migrationPlan]] stands on: the engine's latest catalog
   * version is [[DuckLakeInitializer.LatestDuckLakeVersion]] (a pin bump that moves it fails here),
-  * and on a current catalog an attach without `AUTOMATIC_MIGRATION` runs no migration DDL while a
-  * flagged one re-runs it. The Postgres side (the lock_timeout, the stamp, the retry) is
-  * `DuckLakeInitializerLockTimeoutSpec`.
+  * and on a current catalog an attach runs no migration DDL, with or without `AUTOMATIC_MIGRATION`,
+  * since the pinned version is a release. The Postgres side (the lock_timeout, the stamp, the
+  * retry) is `DuckLakeInitializerLockTimeoutSpec`.
   */
 class DuckLakeInitializerMigrationSpec extends AnyFlatSpec with Matchers:
 
@@ -130,20 +130,18 @@ class DuckLakeInitializerMigrationSpec extends AnyFlatSpec with Matchers:
     }
   }
 
-  /** The reason the flag must not ride every boot: on the pinned DuckLake a flagged attach of a
-    * catalog already at the latest dev version re-runs the dev migration. If a pin bump stops
-    * re-running it, this fails as a reminder that the stamp is no longer needed, not as a defect.
+  /** The pinned DuckLake is a release: a flagged attach of a catalog already at its version runs no
+    * migration DDL, so [[DuckLakeInitializer.migrationPlan]] needs the engine-build stamp only for
+    * a dev version (which DuckLake re-migrates on every flagged attach). If a pin bump moves back
+    * to a dev version, this fails as a reminder that the stamp matters again.
     */
-  "a flagged attach of a current dev catalog" should "re-run the migration DDL on the pinned DuckLake" in {
+  "a flagged attach of a current released catalog" should "run no migration DDL on the pinned DuckLake" in {
+    DuckLakeInitializer.LatestDuckLakeVersion should not include "-dev"
     val (meta, data) = lake()
     withDuckDb(conn => attach(conn, meta, data, migrate = false))
     withDuckDb { conn =>
       exec(conn, "CALL enable_logging('QueryLog')")
       attach(conn, meta, data, migrate = true)
-      val (alters, creates, updates) = migrationDdl(conn)
-      withClue("ALTER TABLE ... ADD COLUMN IF NOT EXISTS statements: ") {
-        alters should be > 0
-      }
-      (creates + updates) should be > 0
+      migrationDdl(conn) shouldBe (0, 0, 0)
     }
   }

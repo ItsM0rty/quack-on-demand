@@ -126,8 +126,9 @@ function Install-DuckDb {
 
   $duckExe = Join-Path $binDir 'duckdb.exe'
   if (Test-Path $duckExe) {
-    $ver = & $duckExe -version 2>$null | Select-Object -First 1
-    if ($ver -match "v$([regex]::Escape($version))") {
+    # Exact match: a pre-release reports v2.0.0-alpha<N> and must not pass for v2.0.0.
+    $ver = & $duckExe -version 2>$null | Where-Object { $_ -match '^v' } | Select-Object -First 1
+    if ($ver -match "^v$([regex]::Escape($version))(\s|$)") {
       Write-Host "duckdb: cached v$version -> $duckExe"
       # Expose to the loaders + JNI client explicitly.
       $env:DUCKDB_BIN = $duckExe
@@ -141,13 +142,16 @@ function Install-DuckDb {
   $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ("qod-duckdb-" + [System.Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   try {
-    Write-Host "  fetching CLI from $base/duckdb_cli-windows-amd64.zip"
-    Invoke-WebRequest -Uri "$base/duckdb_cli-windows-amd64.zip" -OutFile "$tmp\cli.zip"
-    Expand-Archive -Path "$tmp\cli.zip" -DestinationPath $binDir -Force
+    # DuckDB 2.x release assets are flat .tar.gz archives; tar.exe ships with Windows 10 1803+.
+    Write-Host "  fetching CLI from $base/duckdb-cli-windows-amd64.tar.gz"
+    Invoke-WebRequest -Uri "$base/duckdb-cli-windows-amd64.tar.gz" -OutFile "$tmp\cli.tar.gz"
+    tar -xzf "$tmp\cli.tar.gz" -C $binDir
+    if ($LASTEXITCODE -ne 0) { throw "failed to unpack $base/duckdb-cli-windows-amd64.tar.gz" }
 
-    Write-Host "  fetching libduckdb from $base/libduckdb-windows-amd64.zip"
-    Invoke-WebRequest -Uri "$base/libduckdb-windows-amd64.zip" -OutFile "$tmp\lib.zip"
-    Expand-Archive -Path "$tmp\lib.zip" -DestinationPath $libDir -Force
+    Write-Host "  fetching libduckdb from $base/duckdb-shared-libs-windows-amd64.tar.gz"
+    Invoke-WebRequest -Uri "$base/duckdb-shared-libs-windows-amd64.tar.gz" -OutFile "$tmp\lib.tar.gz"
+    tar -xzf "$tmp\lib.tar.gz" -C $libDir
+    if ($LASTEXITCODE -ne 0) { throw "failed to unpack $base/duckdb-shared-libs-windows-amd64.tar.gz" }
     # duckdb.dll must sit next to the CLI too so `duckdb.exe` starts standalone.
     $srcDll = Join-Path $libDir 'duckdb.dll'
     if (Test-Path $srcDll) { Copy-Item $srcDll (Join-Path $binDir 'duckdb.dll') -Force }
