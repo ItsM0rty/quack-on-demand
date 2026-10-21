@@ -54,19 +54,26 @@ cd /src/ui && npm ci
 cd /src && sbt -no-colors assembly
 cp distrib/quack-on-demand-assembly-*.jar /quack-on-demand.jar
 
-# Strip non-Linux DuckDB JNI natives from the assembly jar (saves ~190MB).
-# The jar bundles libduckdb_java.so_{osx_universal,linux_amd64,linux_arm64,
-# windows_amd64} so it can run anywhere; only the matching Linux one is
-# ever loaded inside the runtime container.
+# Strip the DuckDB JNI natives this image never loads from the assembly jar
+# (saves ~170MB): the jar bundles one per platform so it can run anywhere
+# (2.0.0.0: libduckdb_java.so_{linux_amd64,linux_arm64,macos_arm64,
+# windows_amd64}; the set and its names change between DuckDB releases, so
+# they are listed from the jar rather than named here), and only the
+# matching Linux one is loaded inside the runtime container.
 apt-get update
-apt-get install -y --no-install-recommends zip
-zip -dq /quack-on-demand.jar \
-  libduckdb_java.so_osx_universal \
-  libduckdb_java.so_windows_amd64
+apt-get install -y --no-install-recommends zip unzip
 case "${TARGETARCH:-amd64}" in
-  amd64) zip -dq /quack-on-demand.jar libduckdb_java.so_linux_arm64 ;;
-  arm64) zip -dq /quack-on-demand.jar libduckdb_java.so_linux_amd64 ;;
+  amd64) keep=libduckdb_java.so_linux_amd64 ;;
+  arm64) keep=libduckdb_java.so_linux_arm64 ;;
+  *)     echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;;
 esac
+unzip -Z1 /quack-on-demand.jar | grep -qx "$keep" \
+  || { echo "the DuckDB JDBC in the jar has no $keep" >&2; exit 1; }
+drop="$(unzip -Z1 /quack-on-demand.jar | grep '^libduckdb_java\.so_' | grep -vx "$keep" || true)"
+if [ -n "$drop" ]; then
+  # shellcheck disable=SC2086  # one entry name per word
+  zip -dq /quack-on-demand.jar $drop
+fi
 rm -rf /var/lib/apt/lists/*
 EOF
 
