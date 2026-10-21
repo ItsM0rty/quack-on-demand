@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
+
+- **Fixed: the metadata filter reads a system-catalog subquery inside parentheses.** A predicate
+  such as `WHERE (x OR EXISTS (SELECT ... FROM information_schema.tables))` was denied ("a position
+  this filter cannot rewrite"): jsqlparser 5 reads `(expr)` as a parenthesized expression list,
+  which the filter's walk did not descend. It now filters the subquery like an unparenthesized one.
+  Nothing leaked before: the filter's reference count denied the statement.
+
+- **Fixed: the demo's federated source attaches on a default `run-jar.sh` launch.** The `acme_pg`
+  source of `globex_tpcds` reads its connection from the manager's `QOD_PG_*` variables, which
+  `run-jar.sh` and `run-jar.ps1` defaulted for their own Postgres probe without exporting, so a
+  launch that did not set them logged "federation blob resolution failed" and the globex nodes
+  booted without `acme_pg`. Both launchers now export host, port, user and password, defaults
+  included; nodes still never inherit them. The demo source connects as the control-plane login:
+  keep node lockdown on (`QOD_NODE_LOCKDOWN=true`) wherever the demo is reachable by others.
 
 - **jsqlparser 5.4.162 and jsqltranspiler 1.16.** The SQL parser behind the ACL, column and row
   policies, the metadata filter and the write screens moves from 5.4.15, which changed under them:
