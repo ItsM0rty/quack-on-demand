@@ -607,6 +607,10 @@ pg_user="${QOD_PG_USER:-postgres}"
 pg_pass="${QOD_PG_PASSWORD:-azizam}"
 pg_admin_db="${QOD_PG_ADMIN_DB:-postgres}"
 pg_dbname="${QOD_PG_DBNAME:-qod}"
+# The demo's federated source (acme_pg in bootstrap-demo.yaml) resolves its connection from the
+# manager's env:QOD_PG_* secrets, so hand the manager the values probed here, defaults included.
+# Nodes never inherit them: LocalQuackBackend strips credential-named variables at spawn.
+export QOD_PG_HOST="$pg_host" QOD_PG_PORT="$pg_port" QOD_PG_USER="$pg_user" QOD_PG_PASSWORD="$pg_pass"
 
 pg_reachable=0
 if command -v psql >/dev/null 2>&1; then

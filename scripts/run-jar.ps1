@@ -372,6 +372,13 @@ $pgUser    = Get-EnvOr 'QOD_PG_USER' 'postgres'
 $pgPass    = Get-EnvOr 'QOD_PG_PASSWORD' 'azizam'
 $pgAdminDb = Get-EnvOr 'QOD_PG_ADMIN_DB' 'postgres'
 $pgDbName  = Get-EnvOr 'QOD_PG_DBNAME' 'qod'
+# The demo's federated source (acme_pg in bootstrap-demo.yaml) resolves its connection from the
+# manager's env:QOD_PG_* secrets, so hand the manager the values probed here, defaults included.
+# Nodes never inherit them: LocalQuackBackend strips credential-named variables at spawn.
+$env:QOD_PG_HOST     = $pgHost
+$env:QOD_PG_PORT     = $pgPort
+$env:QOD_PG_USER     = $pgUser
+$env:QOD_PG_PASSWORD = $pgPass
 $pgReachable = $false
 
 # Run a psql -tAc query; returns trimmed stdout ('' on any failure). Uses a
