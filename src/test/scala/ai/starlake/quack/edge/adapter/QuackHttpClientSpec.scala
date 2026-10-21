@@ -7,24 +7,21 @@ import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.net.URI
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.duration.*
+import scala.jdk.CollectionConverters.*
 
-/** Covers Task 7's `query(...)` flag-branching in [[QuackHttpClient]].
+/** Covers [[QuackHttpClient]], whose only path is the native wire client.
   *
   * Why this spec is shaped the way it is:
   *
-  *   - We do NOT touch `sys.env` at test time. `nativeClient` is a constructor flag now (sourced
-  *     from the HOCON `quack-on-demand.nativeClient` key in production), so tests pass it directly.
-  *     Mutating env mid-test would race with parallel suites and leak across runs.
-  *   - The native path's [[QuackProtocol]] is injected via the `protocolFactory` constructor
-  *     parameter (Task 7's "Option A" injection seam). A [[FakeTransport]] queue-fed with canned
-  *     wire bytes from [[QuackTestFixtures]] drives the protocol's state machine end-to-end without
-  *     any real network I/O.
-  *   - Embedded-path tests intentionally do not exercise the real embedded-DuckDB code, which
-  *     already has its own coverage in [[QuackHttpAdapterSpec]] (via `FakeClient`) and is gated by
-  *     an `INSTALL quack` from the network at class init. We assert routing via a subclass that
-  *     intercepts `query` and counts which branch `nativeClient` selects.
+  *   - The [[QuackProtocol]] is injected via the `protocolFactory` constructor parameter. A
+  *     [[FakeTransport]] queue-fed with canned wire bytes from [[QuackTestFixtures]] drives the
+  *     protocol's state machine end-to-end without any real network I/O.
+  *   - There is no embedded fallback any more (DuckDB 2.0's JDBC dropped the Arrow export it
+  *     needed), so the constructor takes no client-mode flag and every call goes to the protocol.
   */
 class QuackHttpClientSpec extends AnyFunSpec with Matchers:
 
@@ -53,64 +50,69 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
       throw err
     }
 
-  /** Builds a `QuackHttpClient` pinned to the native path with an injected protocol factory.
+  /** Answers by message type and records every request type in arrival order. `onPrepare` gets the
+    * 1-based index of the PREPARE so a test can make one of them fail or block. CONNECT, DISCONNECT
+    * and HEARTBEAT always succeed.
     */
-  private def nativeClient(
+  private final class ScriptedTransport(
+      onPrepare: Int => IO[Array[Byte]],
+      onConnect: IO[Array[Byte]] = IO(QuackTestFixtures.serializeSampleConnectionResponse(connId))
+  ) extends QuackTransport:
+    val types: ConcurrentLinkedQueue[Int]                  = ConcurrentLinkedQueue[Int]()
+    private val prepares                                   = AtomicInteger(0)
+    def post(uri: URI, body: Array[Byte]): IO[Array[Byte]] = IO.defer {
+      val t = QuackNativeBridge.parseMessageType(body)
+      types.add(t)
+      if t == MessageType.PrepareRequest.wireOrdinal then onPrepare(prepares.incrementAndGet())
+      else if t == MessageType.ConnectionRequest.wireOrdinal then onConnect
+      else IO(QuackTestFixtures.serializeSampleConnectionResponse(connId))
+    }
+    def seen: List[Int]       = types.asScala.toList
+    def count(m: MessageType) = seen.count(_ == m.wireOrdinal)
+
+  /** Polls `cond` until it holds or `within` elapses; true iff it held. */
+  private def eventually(within: FiniteDuration)(cond: => Boolean): Boolean =
+    val deadline = System.nanoTime() + within.toNanos
+    var ok       = cond
+    while !ok && System.nanoTime() < deadline do
+      Thread.sleep(25)
+      ok = cond
+    ok
+
+  private val prepareOk: Array[Byte] =
+    QuackTestFixtures.serializeSamplePrepareResponse(java.math.BigInteger.TWO, false, true)
+
+  /** Builds a `QuackHttpClient` with an injected protocol factory. */
+  private def clientWith(
       allocator: RootAllocator,
       factory: BufferAllocator => QuackProtocol
   ): QuackHttpClient =
-    new QuackHttpClient(
-      allocator,
-      nativeClient = true,
-      nodeDisableSsl = true,
-      protocolFactory = Some(factory)
-    )
-
-  /** Subclass that records which internal branch `query` took. The embedded path's `queryEmbedded`
-    * would actually hit DuckDB; we short-circuit by overriding `query` and asserting which branch
-    * the flag selected. Mirrors the FakeClient pattern in [[QuackHttpAdapterSpec]].
-    */
-  private final class RoutingProbeClient(allocator: RootAllocator, native: Boolean)
-      extends QuackHttpClient(
-        allocator,
-        nativeClient = native,
-        nodeDisableSsl = true,
-        protocolFactory = None
-      ):
-    val embeddedCalls: AtomicInteger = AtomicInteger(0)
-    val nativeCalls: AtomicInteger   = AtomicInteger(0)
-    // We intercept the public `query` to count which branch the router
-    // chose. We do NOT call super because the embedded path requires a
-    // real Quack node on the wire and the native path requires a real
-    // libquackwire transport -- both out of scope for a routing test.
-    override def query(
-        endpoint: String,
-        token: String,
-        sql: String,
-        session: Option[String]
-    ): IO[QuackResponse] = IO {
-      if native then nativeCalls.incrementAndGet() else embeddedCalls.incrementAndGet()
-      QuackResponse.Ok(null, 0L, () => ())
-    }
+    new QuackHttpClient(allocator, protocolFactory = Some(factory))
 
   describe("query routing"):
-    it("routes to the embedded path when nativeClient=false") {
+    it("routes every query through the protocol factory: there is no other client") {
+      val transport = FakeTransport(
+        Iterator(
+          QuackTestFixtures.serializeSampleConnectionResponse(connId),
+          prepareOk,
+          QuackTestFixtures.serializeSampleConnectionResponse("disconnect-ack")
+        )
+      )
       val allocator = new RootAllocator()
       try
-        val client = new RoutingProbeClient(allocator, native = false)
-        client.query(endpoint, token, "SELECT 1", None).unsafeRunSync()
-        client.embeddedCalls.get() shouldBe 1
-        client.nativeCalls.get() shouldBe 0
-      finally allocator.close()
-    }
-
-    it("routes to the native path when nativeClient=true") {
-      val allocator = new RootAllocator()
-      try
-        val client = new RoutingProbeClient(allocator, native = true)
-        client.query(endpoint, token, "SELECT 1", None).unsafeRunSync()
-        client.embeddedCalls.get() shouldBe 0
-        client.nativeCalls.get() shouldBe 1
+        val built  = AtomicInteger(0)
+        val client = new QuackHttpClient(
+          allocator,
+          protocolFactory = Some { alloc =>
+            built.incrementAndGet()
+            new QuackProtocol(transport, alloc)
+          }
+        )
+        val resp = client.query(endpoint, token, "SELECT 1", None).unsafeRunSync()
+        resp shouldBe a[QuackResponse.Ok]
+        resp.asInstanceOf[QuackResponse.Ok].close()
+        built.get() shouldBe 1
+        transport.postCount.get() should be >= 2
       finally allocator.close()
     }
 
@@ -133,7 +135,7 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
       )
       val allocator = new RootAllocator()
       try
-        val client = nativeClient(allocator, _ => new QuackProtocol(transport, allocator))
+        val client = clientWith(allocator, _ => new QuackProtocol(transport, allocator))
         val resp   = client.query(endpoint, token, "SELECT 42", None).unsafeRunSync()
         resp match
           case QuackResponse.Ok(reader, _, close) =>
@@ -165,7 +167,7 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
       val transport = FailingTransport(QuackWireError.Permanent("bad token"))
       val allocator = new RootAllocator()
       try
-        val client = nativeClient(allocator, _ => new QuackProtocol(transport, allocator))
+        val client = clientWith(allocator, _ => new QuackProtocol(transport, allocator))
         val resp   = client.query(endpoint, token, "SELECT 1", None).unsafeRunSync()
         resp match
           case QuackResponse.Failed(QuackError.Permanent(msg), _) =>
@@ -178,7 +180,7 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
       val transport = FailingTransport(QuackWireError.Transient("HTTP 503"))
       val allocator = new RootAllocator()
       try
-        val client = nativeClient(allocator, _ => new QuackProtocol(transport, allocator))
+        val client = clientWith(allocator, _ => new QuackProtocol(transport, allocator))
         val resp   = client.query(endpoint, token, "SELECT 1", None).unsafeRunSync()
         resp match
           case QuackResponse.Failed(QuackError.Transient(msg), _) =>
@@ -209,7 +211,7 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
       )
       val allocator = new RootAllocator()
       try
-        val client = nativeClient(allocator, _ => new QuackProtocol(transport, allocator))
+        val client = clientWith(allocator, _ => new QuackProtocol(transport, allocator))
         val resp   = client.query(endpoint, token, "SELECT 1", None).unsafeRunSync()
         resp match
           case QuackResponse.Ok(reader, _, close) =>
@@ -258,7 +260,7 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
             QuackTestFixtures.serializeSampleConnectionResponse(connId)
           )
         )
-        val client = nativeClient(allocator, alloc => new QuackProtocol(transport, alloc))
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
         val resp   = client
           .queryStamped(
             endpoint,
@@ -294,7 +296,7 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
             QuackTestFixtures.serializeSampleConnectionResponse(connId)
           )
         )
-        val client = nativeClient(allocator, alloc => new QuackProtocol(transport, alloc))
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
         val ok     = client
           .queryStamped(endpoint, token, "BEGIN; CALL stamp()", "INSERT INTO t VALUES (1)")
           .unsafeRunSync()
@@ -324,7 +326,7 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
             QuackTestFixtures.serializeSampleConnectionResponse(connId)
           )
         )
-        val client = nativeClient(allocator, alloc => new QuackProtocol(transport, alloc))
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
         val ok     = client
           .queryStamped(endpoint, token, "BEGIN; CALL stamp()", "INSERT INTO t VALUES (1)")
           .unsafeRunSync()
@@ -351,7 +353,7 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
             QuackTestFixtures.serializeSampleConnectionResponse("conn-fallback")
           )
         )
-        val client = nativeClient(allocator, alloc => new QuackProtocol(transport, alloc))
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
         val resp   = client
           .queryStamped(endpoint, token, "BEGIN; CALL stamp()", "INSERT INTO t VALUES (1)")
           .unsafeRunSync()
@@ -363,19 +365,137 @@ class QuackHttpClientSpec extends AnyFunSpec with Matchers:
       finally allocator.close()
     }
 
-    it("routes to the plain query path when nativeClient is false (embedded shares sessions)") {
+  describe("native connection release"):
+    it("closes the connection when PREPARE answers ERROR_RESPONSE, and stops its heartbeats") {
+      val transport = ScriptedTransport(_ =>
+        IO(QuackTestFixtures.serializeSampleErrorResponse("Catalog Error: no such table"))
+      )
       val allocator = new RootAllocator()
       try
-        var plainCalled = 0
-        val client = new QuackHttpClient(allocator, nativeClient = false, nodeDisableSsl = true):
-          override def query(
-              endpoint: String,
-              token: String,
-              sql: String,
-              session: Option[String]
-          ) =
-            IO { plainCalled += 1; QuackResponse.Failed(QuackError.Permanent("stub"), 0L) }
-        client.queryStamped(endpoint, token, "BEGIN; CALL stamp()", "INSERT 1").unsafeRunSync()
-        plainCalled shouldBe 1
+        // Lease 3 s: a beat every second, so a leaked heartbeat shows within the wait below.
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc, 3))
+        val resp   = client.query(endpoint, token, "SELECT * FROM missing", None).unsafeRunSync()
+        resp match
+          case QuackResponse.Failed(QuackError.Permanent(msg), _) => msg should include("no such")
+          case other => fail(s"expected Failed(Permanent), got $other")
+        transport.count(MessageType.DisconnectMessage) shouldBe 1
+        Thread.sleep(1500)
+        transport.count(MessageType.HeartbeatRequest) shouldBe 0
+      finally allocator.close()
+    }
+
+    it("closes the connection and frees the result when a column type has no Arrow mapping") {
+      val transport =
+        ScriptedTransport(_ => IO(QuackTestFixtures.serializeTypeColumnPrepareResponse()))
+      val allocator = new RootAllocator()
+      try
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
+        (1 to 50).foreach { _ =>
+          client.query(endpoint, token, "SELECT get_type(42)", None).unsafeRunSync() match
+            case QuackResponse.Failed(QuackError.Permanent(msg), _) => msg should include("VARCHAR")
+            case other => fail(s"expected Failed(Permanent), got $other")
+        }
+        transport.count(MessageType.DisconnectMessage) shouldBe 50
+        allocator.getAllocatedMemory shouldBe 0L
+      finally allocator.close()
+    }
+
+    it("rolls a stamped write back and frees the result when a column type has no Arrow mapping") {
+      val transport = ScriptedTransport {
+        case 1 =>
+          IO(
+            QuackTestFixtures.serializeSamplePrepareResponse(java.math.BigInteger.ONE, false, false)
+          )
+        case _ => IO(QuackTestFixtures.serializeTypeColumnPrepareResponse())
+      }
+      val allocator = new RootAllocator()
+      try
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
+        client
+          .queryStamped(endpoint, token, "BEGIN; CALL stamp()", "SELECT get_type(42)")
+          .unsafeRunSync() match
+          case QuackResponse.Failed(QuackError.Permanent(msg), _) => msg should include("VARCHAR")
+          case other => fail(s"expected Failed(Permanent), got $other")
+        transport.count(MessageType.PrepareRequest) shouldBe 2
+        transport.count(MessageType.DisconnectMessage) shouldBe 1
+        allocator.getAllocatedMemory shouldBe 0L
+      finally allocator.close()
+    }
+
+    it("closes the connection when a cancel lands while PREPARE is in flight") {
+      // PREPARE blocks uninterruptibly (like JdkHttpTransport), so the timeout's cancel is only
+      // observed once it returns: the reader built from that response must be closed, not dropped.
+      val transport = ScriptedTransport(_ => IO.blocking { Thread.sleep(800); prepareOk })
+      val allocator = new RootAllocator()
+      try
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc, 3))
+        val got    = client.query(endpoint, token, "SELECT 42", None).timeout(100.millis).attempt
+        got.unsafeRunSync().left.toOption.get shouldBe a[java.util.concurrent.TimeoutException]
+        eventually(5.seconds)(transport.count(MessageType.DisconnectMessage) == 1) shouldBe true
+        val afterClose = transport.count(MessageType.HeartbeatRequest)
+        Thread.sleep(1500)
+        transport.count(MessageType.HeartbeatRequest) shouldBe afterClose
+      finally allocator.close() // throws if the dropped reader leaked Arrow buffers
+    }
+
+    it("skips PREPARE and closes the connection when a cancel lands during CONNECT") {
+      val transport = ScriptedTransport(
+        _ => IO(prepareOk),
+        onConnect = IO.blocking {
+          Thread.sleep(800)
+          QuackTestFixtures.serializeSampleConnectionResponse(connId)
+        }
+      )
+      val allocator = new RootAllocator()
+      try
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
+        val got    = client.query(endpoint, token, "DELETE FROM t", None).timeout(100.millis)
+        got.attempt
+          .unsafeRunSync()
+          .left
+          .toOption
+          .get shouldBe a[java.util.concurrent.TimeoutException]
+        eventually(5.seconds)(transport.count(MessageType.DisconnectMessage) == 1) shouldBe true
+        // A timed-out caller's statement is never sent.
+        transport.count(MessageType.PrepareRequest) shouldBe 0
+      finally allocator.close()
+    }
+
+    it("rolls a cancelled stamped write back through DISCONNECT, never COMMIT") {
+      val transport = ScriptedTransport {
+        case 1 =>
+          IO(QuackTestFixtures.serializeSamplePrepareResponse(BigInt(1).bigInteger, false, false))
+        case _ => IO.blocking { Thread.sleep(800); prepareOk }
+      }
+      val allocator = new RootAllocator()
+      try
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
+        val got    = client
+          .queryStamped(endpoint, token, "BEGIN; CALL stamp()", "INSERT INTO t VALUES (1)")
+          .timeout(100.millis)
+          .attempt
+          .unsafeRunSync()
+        got.left.toOption.get shouldBe a[java.util.concurrent.TimeoutException]
+        eventually(5.seconds)(transport.count(MessageType.DisconnectMessage) == 1) shouldBe true
+        // prelude + sql only: a cancelled caller was told the write failed, so no COMMIT.
+        transport.count(MessageType.PrepareRequest) shouldBe 2
+      finally allocator.close()
+    }
+
+    it("closes the stamped connection when the prelude PREPARE fails, then retries plain") {
+      val transport = ScriptedTransport {
+        case 1 => IO(QuackTestFixtures.serializeSampleErrorResponse("no stamp function"))
+        case _ => IO(QuackTestFixtures.serializeSampleErrorResponse("constraint violated"))
+      }
+      val allocator = new RootAllocator()
+      try
+        val client = clientWith(allocator, alloc => new QuackProtocol(transport, alloc))
+        val resp   = client
+          .queryStamped(endpoint, token, "BEGIN; CALL stamp()", "INSERT INTO t VALUES (1)")
+          .unsafeRunSync()
+        resp shouldBe a[QuackResponse.Failed]
+        // Two connections (stamped bracket, plain fallback), both released.
+        transport.count(MessageType.ConnectionRequest) shouldBe 2
+        transport.count(MessageType.DisconnectMessage) shouldBe 2
       finally allocator.close()
     }

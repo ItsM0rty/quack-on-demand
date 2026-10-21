@@ -36,8 +36,9 @@ def join(
     cache = launcher.default_cache_dir()
     spawn_sh, _ = launcher.materialize_spawn_scripts(cache / "scripts")
     exe = duckdb_bin or (launcher.ensure_duckdb_cli(cache) / "duckdb")
-    # A caller-supplied binary (the worker image's) is asked for its version.
-    version = probe_duckdb_version(exe) if duckdb_bin else launcher.duckdb_version()
+    # Report what the binary that runs the node says, cached or caller-supplied (the worker
+    # image's), not the pin: the fleet listing is how an operator spots a stale engine.
+    version = probe_duckdb_version(exe)
     adv = advertise_host or default_advertise_host()
     # The default state dir keeps its pre-rename name ("agent") so an upgraded server still
     # finds, and reaps, a node orphaned by the previous version's pidfile.

@@ -16,13 +16,16 @@ import scala.jdk.CollectionConverters._
   * orphan-discovery pass can reconstruct [[ai.starlake.quack.model.RunningNode]] after a manager
   * restart.
   *
-  * Four Secrets accompany each pod:
+  * Four Secrets accompany each pod, all delivered as FILES of one read-only projected volume
+  * (`qod-node-secrets`, mode 0400, mounted at [[KubernetesQuackBackend.SecretsMountPath]] and named
+  * by `QOD_SECRETS_DIR`), never as env vars: a node user with SQL can read its own process
+  * environment back.
   *   - per-pool `qod-fedsql-${tenant}-${tenantDb}-${pool}` holds the resolved federation SQL when
   *     `spec.extraSetupSql` is non-empty; all pods of the pool share it.
   *   - per-pool `qod-nodeenv-${tenant}-${tenantDb}-${pool}` holds the sensitive metastore values
-  *     ([[KubernetesQuackBackend.NodeEnvSecretKeys]]: `pgPassword`, `encryptionKey`) the node needs
-  *     as env vars; all pods of the pool share it, since they all attach the same tenant-db with
-  *     the same credentials.
+  *     ([[KubernetesQuackBackend.NodeEnvSecretKeys]]: `pgPassword`, `encryptionKey`) plus the
+  *     manager's own object-store credentials ([[NodeSecretFiles.CloudCredKeys]]); all pods of the
+  *     pool share it, since they all attach the same tenant-db with the same credentials.
   *   - per-pod `qod-token-${nodeId}` holds the bearer token the manager uses to call this specific
   *     pod's `/quack` endpoint. The token survives manager restart -- [[discoverExisting]] reads it
   *     back from the Secret to repopulate the in-memory cache, so adopted pods stop 401-ing after a
@@ -31,9 +34,10 @@ import scala.jdk.CollectionConverters._
   *     (authored by `ObjectStoreSecret.sql`, [[ai.starlake.quack.model.NodeSpec.objectStoreSql]])
   *     when non-empty; only that one node's pod references it.
   *
-  * UPGRADE NOTE: as of this change, `pgPassword` and `encryptionKey` reach a node through the
-  * per-pool node-env Secret, not the pod's plain env. Pods created by an earlier manager still
-  * carry the old shape and are NOT healed in place: restart every node after upgrading.
+  * UPGRADE NOTE: pods created by an earlier manager still carry the old shape (`secretKeyRef` env
+  * vars, or plain env before that) and are NOT healed in place: restart every node after upgrading.
+  * The node image's entrypoint no longer passes a token argument, so old pod specs need the
+  * matching old image.
   */
 final class KubernetesQuackBackend(
     client: KubernetesClient,
@@ -92,39 +96,26 @@ final class KubernetesQuackBackend(
     // would resurrect a key `effectiveMetastoreFor` deliberately removed (e.g. the
     // bootstrap tenant-db's DuckLake directory reappearing as `dataPath` on a
     // pathless duckdb-file node, which then fails ATTACH with "Is a directory").
-    // Sensitive metastore values never become plain EnvVars: a pod spec is readable by anyone with
-    // `kubectl get pod -o yaml`, and `pgPassword` alone is enough to read
-    // `ducklake_data_file.encryption_key` and decrypt every file of an encrypted DuckLake. They go
-    // through the per-pool node-env Secret instead (ensureNodeEnvSecret, called from start()).
-    // Both this strip and that Secret's contents are derived from nodeEnvSecretValues, so the pod
-    // can never reference a Secret key the Secret does not hold.
-    val secreted = nodeEnvSecretValues(spec)
-    val merged   = spec.metastore -- secreted.keySet
+    // Sensitive values never become EnvVars at all, neither plain (a pod spec is readable by anyone
+    // with `kubectl get pod -o yaml`) nor `secretKeyRef` (a node user with SQL reads its own
+    // process environment back through getenv() or /proc/self/environ). Every
+    // NodeSecretFiles.Keys value (pgPassword, encryptionKey, federation SQL, object-store SQL, the
+    // token, the forwarded QOD_S3_* / QOD_AZURE_* credentials) reaches the spawn script as a file of
+    // the read-only `qod-node-secrets` projected volume instead (secretsVolume below), whose
+    // Secrets start() creates before the pod.
+    val merged = spec.metastore.filterNot { case (k, _) => NodeSecretFiles.isKey(k) }
     merged.foreach { case (k, v) =>
       val e = new EnvVar()
       e.setName(k)
       e.setValue(v)
       envs.add(e)
     }
-    secreted.keys.foreach { k =>
-      val e      = new EnvVar()
-      val source = new EnvVarSource()
-      val ref    = new SecretKeySelector()
-      ref.setName(nodeEnvSecretNameFor(spec.poolKey))
-      ref.setKey(k)
-      source.setSecretKeyRef(ref)
-      e.setName(k)
-      e.setValueFrom(source)
-      envs.add(e)
-    }
-    // Mirror the env-inheritance LocalQuackBackend gets for free (via
-    // ProcessBuilder): forward object-store credentials present on the
-    // manager process so spawn-quack-node.sh can build CREATE SECRET for
-    // s3:// / az:// / gs:// data paths. `spec.metastore` wins if it already
-    // carries an explicit value for one of these keys.
-    KubernetesQuackBackend.cloudCredEnvVars.foreach { name =>
-      // The full metastore, not `merged`: a sensitive key that also named a cloud-cred var must
-      // still suppress the forward rather than be shadowed by the manager's own env.
+    // Mirror the env-inheritance LocalQuackBackend gets for free (via ProcessBuilder): forward the
+    // non-secret object-store settings present on the manager process so spawn-quack-node.sh can
+    // build CREATE SECRET for s3:// / az:// / gs:// data paths (the credentials themselves ride
+    // the node-env Secret, see nodeEnvSecretValues). `spec.metastore` wins if it already carries
+    // an explicit value for one of these keys.
+    KubernetesQuackBackend.cloudCredEnvVars.filterNot(NodeSecretFiles.isKey).foreach { name =>
       if !spec.metastore.contains(name) then
         readEnv(name).foreach { v =>
           val e = new EnvVar()
@@ -140,10 +131,9 @@ final class KubernetesQuackBackend(
     kindEnv.setValue(spec.kindWire)
     envs.add(kindEnv)
     // Tenant-db initSql: spawn-quack-node.sh emits it after the proxy
-    // settings and before `INSTALL quack; LOAD quack;`. Inlined like `kind`
-    // (not Secret-backed): it carries engine defaults (SET memory_limit,
-    // temp_directory, extension INSTALLs), not credentials - those belong
-    // in the federation blob, which stays Secret-backed below.
+    // settings and before `INSTALL quack; LOAD quack;`. Inlined like `kind`:
+    // it carries engine defaults (SET memory_limit, temp_directory, extension
+    // INSTALLs), not credentials - those belong in the federation blob.
     if spec.dbInitSql.nonEmpty then
       val dbInitEnv = new EnvVar()
       dbInitEnv.setName("dbInitSql")
@@ -158,55 +148,10 @@ final class KubernetesQuackBackend(
       lockdownEnv.setName("lockdownSql")
       lockdownEnv.setValue(spec.lockdownSql)
       envs.add(lockdownEnv)
-    // Federation: when the pool has any extraSetupSql, point the pod's
-    // `extraSetupSql` env var at the per-pool Secret instead of inlining
-    // the value. Same env var name as LocalQuackBackend's
-    // env.put("extraSetupSql", ...) so spawn-quack-node.sh reads it
-    // identically. Putting it in a Secret keeps the (potentially long,
-    // potentially credential-bearing) SQL out of `kubectl describe pod`
-    // output and out of the pod object's etcd record. The Secret itself
-    // is created in start() by ensureFederationSecret.
-    if spec.extraSetupSql.nonEmpty then
-      val fedEnv = new EnvVar()
-      fedEnv.setName("extraSetupSql")
-      val source = new EnvVarSource()
-      val ref    = new SecretKeySelector()
-      ref.setName(secretNameFor(spec.poolKey))
-      ref.setKey(KubernetesQuackBackend.FederationSecretKey)
-      source.setSecretKeyRef(ref)
-      fedEnv.setValueFrom(source)
-      envs.add(fedEnv)
-    // Per-database object-store secret (ObjectStoreSecret.sql): scoped CREATE
-    // SECRET for this node's own bucket/credentials. Materialised from the
-    // per-pod Secret instead of inlined so `kubectl describe pod` doesn't
-    // expose the credential-bearing SQL. ensureObjectStoreSecret() must have
-    // created the Secret BEFORE pod create, same ordering requirement as the
-    // token Secret below.
-    if spec.objectStoreSql.nonEmpty then
-      val storeEnv = new EnvVar()
-      storeEnv.setName("objectStoreSql")
-      val storeSource = new EnvVarSource()
-      val storeRef    = new SecretKeySelector()
-      storeRef.setName(objectStoreSecretNameFor(spec.nodeId))
-      storeRef.setKey(KubernetesQuackBackend.ObjectStoreSecretKey)
-      storeSource.setSecretKeyRef(storeRef)
-      storeEnv.setValueFrom(storeSource)
-      envs.add(storeEnv)
-    // Token is materialised from the per-pod Secret instead of inlined, so
-    // (a) kubectl describe pod doesn't expose the bearer string and
-    // (b) the value is recoverable after a manager restart via
-    // discoverExisting. ensureTokenSecret() must have created the Secret
-    // BEFORE pod create or kubelet will reject the pod with
-    // CreateContainerConfigError.
-    val tokenEnv = new EnvVar()
-    tokenEnv.setName("QOD_NODE_TOKEN")
-    val tokenSource = new EnvVarSource()
-    val tokenRef    = new SecretKeySelector()
-    tokenRef.setName(tokenSecretNameFor(spec.nodeId))
-    tokenRef.setKey(KubernetesQuackBackend.TokenSecretKey)
-    tokenSource.setSecretKeyRef(tokenRef)
-    tokenEnv.setValueFrom(tokenSource)
-    envs.add(tokenEnv)
+    val secretsDirEnv = new EnvVar()
+    secretsDirEnv.setName(NodeSecretFiles.DirEnv)
+    secretsDirEnv.setValue(KubernetesQuackBackend.SecretsMountPath)
+    envs.add(secretsDirEnv)
     val portEnv = new EnvVar()
     portEnv.setName("QOD_NODE_PORT")
     portEnv.setValue(quackPort.toString)
@@ -277,7 +222,9 @@ final class KubernetesQuackBackend(
     // level, no privilege escalation + all capabilities dropped + read-only rootfs on the quack
     // container. A pod template's own securityContext fields win field-by-field -- only the
     // fields the template left null are filled in with the default, so an operator's
-    // stricter/looser override on a specific field survives untouched.
+    // stricter/looser override on a specific field survives untouched. The non-root uid with every
+    // capability dropped is also what keeps spawn-quack-node.sh's 0500 secret directory read-only
+    // (root with CAP_DAC_OVERRIDE could write it; its marker file still holds, and the script WARNs).
     podSpec.setSecurityContext(mergedPodSecurityContext(Option(podSpec.getSecurityContext)))
     quack.setSecurityContext(mergedContainerSecurityContext(Option(quack.getSecurityContext)))
 
@@ -286,6 +233,7 @@ final class KubernetesQuackBackend(
     // template already declares a volume/mount of the same name/path.
     ensureEmptyDirVolumes(podSpec)
     ensureEmptyDirMounts(quack)
+    ensureSecretsVolume(podSpec, quack, secretsVolume(spec))
 
     // Identity metadata overlay (always ours).
     val meta = Option(pod.getMetadata).getOrElse(new ObjectMeta())
@@ -319,6 +267,81 @@ final class KubernetesQuackBackend(
       caps.setDrop(java.util.List.of("ALL"))
       sc.setCapabilities(caps)
     sc
+
+  /** The read-only projected volume carrying every [[NodeSecretFiles.Keys]] value the node needs,
+    * one file per key named after it: the per-pod token Secret, the per-pool node-env Secret
+    * ([[nodeEnvSecretValues]]), the per-pool federation Secret and the per-pod object-store Secret,
+    * each only when start() creates it. Mode 0400; `fsGroup` is always set
+    * ([[mergedPodSecurityContext]] defaults it to `k8s.runAsUser` when the template sets none), so
+    * kubelet makes them 0440 root:fsGroup, readable by the node's uid through that supplementary
+    * group.
+    */
+  private def secretsVolume(spec: NodeSpec): Volume =
+    def projection(secretName: String, items: Seq[(String, String)]): VolumeProjection =
+      val sp = new SecretProjection()
+      sp.setName(secretName)
+      sp.setOptional(false)
+      sp.setItems(items.map { case (key, path) =>
+        val ktp = new KeyToPath()
+        ktp.setKey(key)
+        ktp.setPath(path)
+        ktp
+      }.asJava)
+      val vp = new VolumeProjection()
+      vp.setSecret(sp)
+      vp
+    val nodeEnvItems = nodeEnvSecretValues(spec).keys.toSeq
+      .flatMap(k => NodeSecretFiles.canonical(k).map(c => (c, k)))
+      .groupBy(_._1)
+      .map { case (c, ks) => (ks.find(_._2 == c).getOrElse(ks.head)._2, c) }
+      .toSeq
+      .sortBy(_._2)
+    val sources =
+      Seq(projection(tokenSecretNameFor(spec.nodeId), Seq(TokenSecretKeyPath))) ++
+        Option.when(nodeEnvItems.nonEmpty)(
+          projection(nodeEnvSecretNameFor(spec.poolKey), nodeEnvItems)
+        ) ++
+        Option.when(spec.extraSetupSql.nonEmpty)(
+          projection(
+            secretNameFor(spec.poolKey),
+            Seq(KubernetesQuackBackend.FederationSecretKey -> "extraSetupSql")
+          )
+        ) ++
+        Option.when(spec.objectStoreSql.nonEmpty)(
+          projection(
+            objectStoreSecretNameFor(spec.nodeId),
+            Seq(KubernetesQuackBackend.ObjectStoreSecretKey -> "objectStoreSql")
+          )
+        )
+    val projected = new ProjectedVolumeSource()
+    projected.setDefaultMode(Integer.valueOf(KubernetesQuackBackend.SecretsFileMode))
+    projected.setSources(sources.asJava)
+    val v = new Volume()
+    v.setName(KubernetesQuackBackend.SecretsVolumeName)
+    v.setProjected(projected)
+    v
+
+  private val TokenSecretKeyPath: (String, String) =
+    KubernetesQuackBackend.TokenSecretKey -> NodeSecretFiles.TokenKey
+
+  /** Install [[secretsVolume]] on the pod and mount it read-only on the quack container, replacing
+    * any template volume / mount of the same name or path: the manager owns this one.
+    */
+  private def ensureSecretsVolume(podSpec: PodSpec, quack: Container, volume: Volume): Unit =
+    val volumes = Option(podSpec.getVolumes).map(_.asScala.toList).getOrElse(Nil)
+    podSpec.setVolumes(
+      (volumes.filterNot(_.getName == volume.getName) :+ volume).asJava
+    )
+    val mounts = Option(quack.getVolumeMounts).map(_.asScala.toList).getOrElse(Nil)
+    val vm     = new VolumeMount()
+    vm.setName(volume.getName)
+    vm.setMountPath(KubernetesQuackBackend.SecretsMountPath)
+    vm.setReadOnly(true)
+    quack.setVolumeMounts(
+      (mounts.filterNot(m =>
+        m.getName == volume.getName || m.getMountPath == KubernetesQuackBackend.SecretsMountPath
+      ) :+ vm).asJava
+    )
 
   /** Add the `tmp` / `duckdb-tmp` emptyDir volumes to the pod spec, skipping any name the template
     * already declares.
@@ -392,6 +415,9 @@ final class KubernetesQuackBackend(
     svc
 
   def start(spec: NodeSpec): IO[RunningNode] =
+    QuackBackend.screenBootSql(spec) *> startScreened(spec)
+
+  private def startScreened(spec: NodeSpec): IO[RunningNode] =
     // Which resources THIS call created, so partial-start cleanup never tears down a
     // Terminating incumbent's resources after a 409'd create.
     val created = java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
@@ -660,11 +686,19 @@ final class KubernetesQuackBackend(
     // Case-insensitive, like `HandlerResolvers.redactPassword` and
     // `PoolSupervisor.mergeSecretKeys`: a metastore key spelled `PgPassword` is redacted from every
     // API response by those two, so it must not be the one spelling that lands in a pod spec as a
-    // plain EnvVar. The key keeps its original spelling in the Secret and in the secretKeyRef, so
-    // the two still agree by construction.
-    spec.metastore.view
-      .filterKeys(k => KubernetesQuackBackend.NodeEnvSecretKeys.exists(_.equalsIgnoreCase(k)))
+    // plain EnvVar. The key keeps its original spelling in the Secret; the volume maps it to the
+    // canonical file name the script reads.
+    val fromMetastore = spec.metastore.view
+      .filterKeys(k =>
+        KubernetesQuackBackend.NodeEnvSecretKeys.exists(_.equalsIgnoreCase(k)) ||
+          NodeSecretFiles.CloudCredKeys.exists(_.equalsIgnoreCase(k))
+      )
       .toMap
+    // The manager's own object-store credentials, forwarded as env before: now Secret-backed.
+    val fromManager = NodeSecretFiles.CloudCredKeys
+      .filterNot(k => fromMetastore.keys.exists(_.equalsIgnoreCase(k)))
+      .flatMap(k => readEnv(k).filter(_.nonEmpty).map(k -> _))
+    fromMetastore ++ fromManager
 
   /** K8s Secret name for a pool's sensitive node env values. Per-pool, not per-pod: every pod of a
     * pool attaches the same tenant-db with the same credentials. Same RFC-1123 hyphenization as
@@ -926,7 +960,17 @@ final class KubernetesQuackBackend(
       .flatMap(ps => Option(ps.getContainers))
       .exists(_.asScala.exists { c =>
         Option(c.getEnv).exists(_.asScala.exists(_.getName == "objectStoreSql"))
-      })
+      }) || projectedSecretNames(p).exists(_.startsWith("qod-store-"))
+
+  /** Names of the Secrets the pod's projected volumes draw from (the `qod-node-secrets` shape). */
+  private def projectedSecretNames(p: Pod): List[String] =
+    Option(p.getSpec)
+      .flatMap(ps => Option(ps.getVolumes))
+      .map(_.asScala.toList)
+      .getOrElse(Nil)
+      .flatMap(v => Option(v.getProjected).flatMap(pr => Option(pr.getSources)))
+      .flatMap(_.asScala.toList)
+      .flatMap(src => Option(src.getSecret).map(_.getName))
 
   /** The node-env Secret this pod's containers reference, if any. Read off the pod's own
     * `secretKeyRef`s rather than rebuilt from labels, so it reports what the running pod actually
@@ -941,6 +985,7 @@ final class KubernetesQuackBackend(
       .flatMap(c => Option(c.getEnv).map(_.asScala.toList).getOrElse(Nil))
       .flatMap(e => Option(e.getValueFrom).flatMap(vf => Option(vf.getSecretKeyRef)))
       .map(_.getName)
+      .concat(projectedSecretNames(p))
       .find(_.startsWith("qod-nodeenv-"))
 
   def cleanup(): IO[Unit] = IO.unit
@@ -966,6 +1011,15 @@ object KubernetesQuackBackend:
     * `scripts/spawn-quack-node.sh` reads), mirroring [[FederationSecretKey]] / [[TokenSecretKey]].
     */
   val ObjectStoreSecretKey: String = "objectStoreSql"
+
+  /** Name of the projected Secret volume carrying the node's sensitive values as files. */
+  val SecretsVolumeName: String = "qod-node-secrets"
+
+  /** Where that volume is mounted; the pod's `QOD_SECRETS_DIR`. */
+  val SecretsMountPath: String = "/var/run/qod-secrets"
+
+  /** File mode of the projected files: 0400 (owner read-only), as a decimal Integer for the API. */
+  val SecretsFileMode: Int = Integer.parseInt("400", 8)
 
   /** Metastore keys delivered through the per-pool node-env Secret rather than a plain pod EnvVar.
     * Delegates to the model so the strip in [[KubernetesQuackBackend.buildPod]] and the contents of

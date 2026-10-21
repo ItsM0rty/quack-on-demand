@@ -27,6 +27,9 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
     denied("RESET enable_external_access") shouldBe true
     denied("PRAGMA temp_directory = '/tmp/x'") shouldBe true
     denied("SET allowed_directories = ['/']") shouldBe true
+    // iceberg: lets a scan guess the metadata version by listing the table's directory
+    denied("SET unsafe_enable_version_guessing = true") shouldBe true
+    denied("RESET unsafe_enable_version_guessing") shouldBe true
     denied("SET schema = 'tpch1'") shouldBe false
     denied("PRAGMA table_info('t')") shouldBe false
   }
@@ -473,4 +476,666 @@ class LockdownScreenSpec extends AnyFlatSpec with Matchers:
         offenders shouldBe empty
       }
     finally src.close()
+  }
+
+  "DuckDB 2.0 statements" should "deny CONNECT / DISCONNECT and extension repository DDL" in {
+    denied("CONNECT 'quack:evil.example:9494' (TOKEN 'x')") shouldBe true
+    denied("  /* c */ connect 'quack:h:1'") shouldBe true
+    denied("DISCONNECT") shouldBe true
+    denied("CREATE EXTENSION REPOSITORY r WITH PREFIX 'https://x/'") shouldBe true
+    denied("create  extension\nrepository r with prefix 'https://x/'") shouldBe true
+    denied("DROP EXTENSION REPOSITORY r") shouldBe true
+    denied("CREATE OR REPLACE EXTENSION REPOSITORY r WITH PREFIX 'https://x/'") shouldBe true
+    denied("create or  replace\nextension repository r with prefix 'https://x/'") shouldBe true
+    denied("DROP EXTENSION REPOSITORY IF EXISTS r") shouldBe true
+    denied("CONNECT LOCAL") shouldBe true
+    denied("SELECT 1; CONNECT 'quack:h:1'") shouldBe true
+    denied("CREATE TABLE connections(a INT)") shouldBe false
+    denied("SELECT * FROM connect_log") shouldBe false
+  }
+
+  it should "protect allow_extension_repositories" in {
+    denied("SET allow_extension_repositories = 'allowed'") shouldBe true
+    denied("RESET allow_extension_repositories") shouldBe true
+  }
+
+  // Settings protected for DuckDB 2.0: extension sources and trust, parser dialects and grammars,
+  // secret storage, local file paths, outbound connections and the node's own quack auth.
+  private val Protected20 = List(
+    "allowed_configs"                      -> "['memory_limit']",
+    "extension_directories"                -> "['/tmp/ext']",
+    "extension_repository_directory"       -> "'/tmp/repos'",
+    "custom_extension_repository"          -> "'https://x/'",
+    "autoinstall_extension_repository"     -> "'https://x/'",
+    "allow_extensions_metadata_mismatch"   -> "true",
+    "active_grammar_extensions"            -> "['g']",
+    "allow_parser_override_extension"      -> "'DEFAULT'",
+    "current_dialect"                      -> "'spark'",
+    "dialect_compatibility_mode"           -> "'spark'",
+    "allow_persistent_secrets"             -> "true",
+    "default_secret_storage"               -> "'local_file'",
+    "allow_unredacted_secrets"             -> "true",
+    "redact_http_logs"                     -> "false",
+    "enable_logging"                       -> "true",
+    "logging_level"                        -> "'DEBUG'",
+    "logging_mode"                         -> "'ENABLE_ALL'",
+    "logging_storage"                      -> "'stdout'",
+    "enabled_log_types"                    -> "'HTTP'",
+    "disabled_log_types"                   -> "'QueryLog'",
+    "pg_debug_show_queries"                -> "true",
+    "home_directory"                       -> "'/tmp'",
+    "file_search_path"                     -> "'/etc'",
+    "log_query_path"                       -> "'/tmp/q.log'",
+    "profile_output"                       -> "'/tmp/p.json'",
+    "profiling_output"                     -> "'/tmp/p.json'",
+    "ca_cert_file"                         -> "'/tmp/ca.pem'",
+    "enable_server_cert_verification"      -> "false",
+    "enable_curl_server_cert_verification" -> "false",
+    "http_proxy"                           -> "'evil:3128'",
+    "s3_url_scheme_aliases"                -> "['oss']",
+    "pg_staleness_query"                   -> "'SELECT 1 ${SCHEMA}'",
+    "pg_pool_health_check_query"           -> "'SELECT 1'",
+    "quack_authentication_function"        -> "'f'",
+    "quack_authorization_function"         -> "'f'"
+  )
+
+  it should "protect the DuckDB 2.0 extension, parser, secret, file, network and log settings" in
+    Protected20.foreach { case (name, value) =>
+      val upper = name.toUpperCase(java.util.Locale.ROOT)
+      withClue(name) {
+        denied(s"SET $name = $value") shouldBe true
+        denied(s"set $upper = $value") shouldBe true
+        denied(s"SET GLOBAL $name = $value") shouldBe true
+        denied(s"SET \"$name\" = $value") shouldBe true
+        denied(s"RESET $name") shouldBe true
+        denied(s"PRAGMA $name = $value") shouldBe true
+        denied(s"SELECT 1; SET $name = $value") shouldBe true
+        // a quoted name glued to the keyword, and EXPLAIN ANALYZE, both apply on 2.0
+        denied(s"SET\"$name\"=$value") shouldBe true
+        denied(s"SET`$name`=$value") shouldBe true
+        denied(s"SET GLOBAL\"$name\"=$value") shouldBe true
+        denied(s"PRAGMA\"$name\"=$value") shouldBe true
+        denied(s"RESET\"$name\"") shouldBe true
+        denied(s"EXPLAIN ANALYZE SET\"$name\"=$value") shouldBe true
+        // reading a protected setting stays admitted
+        denied(s"SELECT current_setting('$name')") shouldBe false
+      }
+    }
+
+  it should "keep the settings that only share a prefix with a protected one admitted" in {
+    // (http_proxy_username / _password are node-wide on 2.0, global-only: protected themselves.)
+    denied("SET http_retries = 3") shouldBe false
+    denied("SET http_keep_alive = false") shouldBe false
+    denied("SET http_timeout = 300") shouldBe false
+  }
+
+  "protected settings" should "be denied with a quoted name glued to the keyword" in {
+    // Each applies on the 2.0 CLI: the tokenizer needs no whitespace before a quoted name.
+    denied("SET\"memory_limit\"='1GB'") shouldBe true
+    denied("SET`memory_limit`='1GB'") shouldBe true
+    denied("SET GLOBAL\"memory_limit\"='1GB'") shouldBe true
+    denied("SET SESSION`extension_directories`=['/tmp']") shouldBe true
+    denied("PRAGMA\"memory_limit\"='1GB'") shouldBe true
+    denied("RESET\"enable_external_access\"") shouldBe true
+    denied("SET/**/\"temp_directory\"='/tmp/x'") shouldBe true
+  }
+
+  it should "be denied behind EXPLAIN ANALYZE, which executes the statement it carries" in {
+    // Verified on the 2.0 CLI: each of these applies the setting.
+    denied("EXPLAIN ANALYZE SET memory_limit = '1GB'") shouldBe true
+    denied("EXPLAIN (ANALYZE) SET memory_limit = '1GB'") shouldBe true
+    denied("EXPLAIN(ANALYZE)SET\"memory_limit\"='1GB'") shouldBe true
+    denied("EXPLAIN ANALYZE PRAGMA memory_limit = '1GB'") shouldBe true
+    denied("EXPLAIN ANALYZE RESET memory_limit") shouldBe true
+    denied("EXPLAIN ANALYZE (FORMAT json) SET threads = 64") shouldBe true
+  }
+
+  "statements behind EXPLAIN ANALYZE" should "meet the same first-token rules" in {
+    // Verified on the 2.0 CLI: EXPLAIN ANALYZE COPY ... TO writes the file and EXPLAIN ANALYZE
+    // LOAD attempts the load. ATTACH / INSTALL / CONNECT behind EXPLAIN are syntax errors on 2.0
+    // and are denied anyway.
+    denied("EXPLAIN ANALYZE COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+    denied("EXPLAIN ANALYZE LOAD spatial") shouldBe true
+    denied("EXPLAIN (ANALYZE) LOAD spatial") shouldBe true
+    denied("EXPLAIN ANALYZE ATTACH 'x.db' AS y") shouldBe true
+    denied("EXPLAIN ANALYZE COPY (SELECT 1) TO 's3://staging/x.csv'") shouldBe false
+    denied("EXPLAIN ANALYZE SELECT * FROM t") shouldBe false
+    denied("EXPLAIN UPDATE t SET threads = 1") shouldBe false
+  }
+
+  "a prepared statement" should "meet the first-token rules on the statement it prepares" in {
+    // Verified on 2.0: PREPARE p AS COPY (SELECT 1) TO '<local>'; EXECUTE p writes the file; only
+    // SELECT / INSERT / UPDATE / DELETE / COPY are preparable, so COPY ... TO is the write carrier.
+    denied("PREPARE p AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+    denied("PREPARE \"p\"AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+    denied("EXPLAIN PREPARE p AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+    denied("PREPARE p AS COPY (SELECT 1) TO 's3://staging/x.csv'") shouldBe false
+    denied("PREPARE p AS SELECT * FROM t") shouldBe false
+  }
+
+  "the node-escaping functions" should "be denied: raw SQL, arbitrary connection, node env" in {
+    // postgres_scan / postgres_scan_pushdown connect to any caller-chosen DSN (an ATTACH bypass);
+    // postgres_query / postgres_execute run raw SQL on it; getenv reads the node's env. Verified on
+    // the 2.0 CLI; mysql_* / sqlite_* classified by name. No "over local paths" wording (no path).
+    denied(
+      "SELECT * FROM postgres_scan('host=h dbname=qod user=postgres', 'public', 't')"
+    ) shouldBe true
+    denied("SELECT * FROM postgres_scan_pushdown('host=h', 'public', 't')") shouldBe true
+    denied("SELECT * FROM postgres_query('c', 'SELECT 1')") shouldBe true
+    denied("CALL postgres_execute('c', 'DROP TABLE t')") shouldBe true
+    denied("SELECT * FROM mysql_query('c', 'SELECT 1')") shouldBe true
+    denied("SELECT * FROM sqlite_query('s', 'SELECT 1')") shouldBe true
+    denied("SELECT * FROM sqlite_scan('/x.db', 't')") shouldBe true
+    denied("SELECT * FROM quack_query('quack:h:9494', 'SELECT 1', token := 't')") shouldBe true
+    denied("SELECT * FROM quack_query_by_name('c', 'SELECT 1')") shouldBe true
+    denied("CALL postgres_configure_pool(health_check_query := 'SELECT 1')") shouldBe true
+    denied("SELECT getenv('pgPassword')") shouldBe true
+    // *_external_resource invokes a table function named at run time; refuse the invokers.
+    denied("SELECT * FROM destroy_external_resource('read' || '_text', '/x')") shouldBe true
+    denied("SELECT * FROM create_external_resource('t', {}, 'r')") shouldBe true
+    denied("SELECT * FROM register_external_resource('t', 'n', 'h')") shouldBe true
+    denied("SELECT * FROM register_external_resource_type('n', 'k')") shouldBe true
+    denied("SELECT * FROM deregister_external_resource('n')") shouldBe true
+    LockdownScreen.screen("SELECT * FROM postgres_query('c', 'x')", Set.empty) match
+      case Some(m) => m should not include "over local paths"
+      case None    => fail("expected a refusal")
+  }
+
+  "every 2.0 file-reading table function" should "deny a local path and admit a remote one" in {
+    // read_single_*_file are new in 2.0; the rest predate it. Each takes a caller-named file first.
+    for fn <- List(
+        "read_single_csv_file",
+        "read_single_json_file",
+        "read_single_parquet_file",
+        "read_duckdb",
+        "read_json_objects",
+        "read_ndjson_objects",
+        "read_postgres_binary",
+        "sniff_csv",
+        "parquet_metadata",
+        "parquet_schema",
+        "ducklake_scan"
+      )
+    do
+      withClue(fn) {
+        denied(s"SELECT * FROM $fn('/proc/self/environ')") shouldBe true
+        denied(s"SELECT * FROM `$fn`('./x.csv')") shouldBe true
+        denied(s"SELECT * FROM $fn('s3://staging/x.csv')") shouldBe false
+        deniedB(s"SELECT * FROM $fn('s3://lakebucket/x.csv')") shouldBe true
+      }
+  }
+
+  it should "not grant the remote exemption to an argument built from string operations" in {
+    // Pre-existing smuggle: the arg must lex as exactly ONE string-literal token. An expression
+    // that merely starts with a remote-looking literal reads a local file on 2.0, so it is denied.
+    denied("SELECT * FROM read_text('s3://x'[1:0] || '/proc/self/environ')") shouldBe true
+    denied("SELECT * FROM read_csv('s3://x' || '/etc/passwd')") shouldBe true
+    denied("SELECT * FROM read_text('s3://staging/ok.csv')") shouldBe false
+    denied("SELECT * FROM read_text('s3://staging/it''s.csv')") shouldBe false
+  }
+
+  it should "parse a path LIST from the lexer, not a raw ] scan, and require terminated literals" in {
+    // A ] inside the first literal must not cut the list, and an unterminated element (trailing
+    // doubled quote) must not pass as a lone remote literal hiding a local path after it.
+    denied("SELECT * FROM read_text(['http://h/f.txt?x='']', '/proc/self/environ'])") shouldBe true
+    denied("SELECT * FROM read_text(['s3://a'']', '/etc/passwd'])") shouldBe true
+    denied("SELECT * FROM read_csv(['s3://staging/a.csv', '/etc/passwd'])") shouldBe true
+    denied("SELECT * FROM read_parquet(['s3://staging/a.parquet'])") shouldBe false
+    denied("SELECT * FROM read_csv(['s3://staging/a.csv', 's3://staging/b.csv'])") shouldBe false
+    deniedB("SELECT * FROM read_parquet(['s3://lakebucket/a.parquet'])") shouldBe true
+  }
+
+  it should "deny sql_auto_complete, which lists a local directory like glob" in {
+    // Verified on 2.0: sql_auto_complete('SELECT * FROM ''/etc/pas') suggests local file names.
+    denied("SELECT * FROM sql_auto_complete('SELECT * FROM ''/etc/pas')") shouldBe true
+    denied("CALL sql_auto_complete('x')") shouldBe true
+    denied("SELECT * FROM `sql_auto_complete`('x')") shouldBe true
+  }
+
+  it should "deny the write-side and third-argument-path functions (no path exemption)" in {
+    // enable_profiling writes a profile file; ducklake_add_data_files registers a local Parquet
+    // file named in its third argument, so a remote-looking first argument must not exempt it.
+    denied("CALL enable_profiling(save_location := '/tmp/p.json')") shouldBe true
+    denied("SELECT * FROM ducklake_add_data_files('c', 't', '/tmp/x.parquet')") shouldBe true
+    denied(
+      "SELECT * FROM ducklake_add_data_files('c', 't', 's3://staging/x.parquet')"
+    ) shouldBe true
+  }
+
+  "the postgres control functions" should "be denied (ATTACH and pool-config bypasses)" in {
+    // postgres_attach is the function form of the denied ATTACH statement; postgres_configure_pool
+    // carries health_check_query, the lever of the protected setting pg_pool_health_check_query.
+    denied("SELECT * FROM postgres_attach('dbname=x host=h', source := 'pg')") shouldBe true
+    denied("CALL postgres_configure_pool(health_check_query := 'SELECT 1')") shouldBe true
+    denied("SELECT `postgres_attach`('dbname=x')") shouldBe true
+    LockdownScreen.screen(
+      "CALL postgres_configure_pool(health_check_query := 'x')",
+      Set.empty
+    ) match
+      case Some(m) => m should not include "over local paths"
+      case None    => fail("expected a refusal")
+  }
+
+  "enable_logging" should "be denied in every call form, since file storage writes local files" in {
+    // Verified on the 2.0 CLI: both forms write duckdb_log_entries.csv under the path, and the
+    // entries carry query text and write_log() payloads.
+    denied("CALL enable_logging(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("SELECT * FROM enable_logging(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("CALL enable_logging(storage='file', storage_config={'path': '/tmp/l'})") shouldBe true
+    denied("CALL ENABLE_LOGGING(storage_path='/tmp/logs', storage='file')") shouldBe true
+    denied("CALL main.enable_logging(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("CALL \"enable_logging\"(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("CALL `enable_logging`(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("CALL enable_logging/* c */(storage='file', storage_path='/tmp/logs')") shouldBe true
+    denied("SELECT 1; CALL enable_logging(storage='file', storage_path='/tmp/logs')") shouldBe true
+    // fail closed even for a remote path: the path is a named argument, never the first one
+    denied("CALL enable_logging(storage='file', storage_path='s3://bucket/logs')") shouldBe true
+    denied("CALL enable_logging()") shouldBe true
+    // a call spelled inside a literal counts, like every denied function (query() runs one)
+    denied("SELECT * FROM query('CALL enable_logging(storage_path=''/tmp/l'')')") shouldBe true
+    // a column named like it is not a call
+    denied("SELECT enable_logging FROM t") shouldBe false
+    denied("CALL disable_logging()") shouldBe false
+  }
+
+  "the statement splitter" should "not lose a statement behind a dollar-quoted or E-string literal" in {
+    // DuckDB reads `$x$'$x$` as a dollar-quoted string holding one quote, and `E'\''` as an
+    // escape string holding one quote. A splitter that knew only '...' opened a single-quoted
+    // run at that inner quote and merged the ATTACH into the leading `select` fragment.
+    denied("SELECT $x$'$x$; ATTACH 'x.db' AS y") shouldBe true
+    denied("SELECT E'\\''; ATTACH 'x.db' AS y") shouldBe true
+  }
+
+  it should "not split on a semicolon inside a dollar-quoted string" in {
+    denied("SELECT $$a; ATTACH 'x' AS y$$") shouldBe false
+    LockdownScreen.splitStatements("SELECT $$a; b$$; SELECT 2") shouldBe
+      List("SELECT $$a; b$$", " SELECT 2")
+  }
+
+  it should "read dollar-quote tags case-sensitively, lexing before folding case" in {
+    // DuckDB 2.0 compares dollar tags case-sensitively: $A$ is not closed by $a$, so the literal
+    // runs to the second $A$ and the read_text call after it runs (verified on the 2.0 CLI).
+    // Folding case before lexing closed the literal at $a$ and read the call as a block comment.
+    denied("SELECT $A$x$a$ /* $A$, * FROM read_text('/etc/hosts') -- */") shouldBe true
+    // matching tags: the call sits in a comment for DuckDB too
+    denied("SELECT $a$x$a$ /* $a$, * FROM read_text('/etc/hosts') -- */") shouldBe false
+  }
+
+  it should "split after an identifier ending in a dollar-tag shape, as DuckDB does" in {
+    // DuckDB 2.0: `x$a$` is ONE identifier (identifiers continue through `$`), so the `;` after it
+    // is a statement boundary and no dollar-quoted string opens there.
+    LockdownScreen
+      .splitStatements("SELECT 1 AS x$a$; ATTACH 'x' AS q; SELECT 2 AS y$a$")
+      .length shouldBe 3
+    denied("SELECT 1 AS x$a$; ATTACH 'x' AS q; SELECT 2 AS y$a$") shouldBe true
+  }
+
+  it should "lex the batch the way DuckDB 2.0 does: non-ASCII tags, backticks, the unicode pre-pass" in {
+    // Each batch attaches `y` on the DuckDB 2.0 CLI.
+    denied("SELECT $\u20AC$ ' $\u20AC$; ATTACH 'x.db' AS y") shouldBe true
+    denied("SELECT 1 AS `a/*`; ATTACH 'x.db' AS y; SELECT 1 AS `*/`") shouldBe true
+    denied(
+      "SELECT 1 /* ' */ AS a\u00A0$q$; ATTACH 'x.db' AS y; SELECT 1 AS b\u00A0$q$ /* ' */"
+    ) shouldBe true
+  }
+
+  // ---- function calls read from DuckDB 2.0's tokens, not a name regex ----
+  //
+  // DuckDB 2.0 accepts backtick-quoted identifiers, function names included: on the 2.0 CLI
+  // `SELECT * FROM `read_text`('/etc/hosts')` returns the file. A call is an identifier token
+  // (bare, double-quoted or backtick-quoted, possibly qualified) followed, past any trivia, by an
+  // opening parenthesis token; a regex accepting only a bare or double-quoted name admitted it.
+
+  "denied functions" should "be found under every DuckDB 2.0 identifier quoting" in {
+    denied("SELECT * FROM `read_text`('/etc/hosts')") shouldBe true
+    denied("SELECT * FROM `READ_TEXT`('/etc/hosts')") shouldBe true
+    denied("SELECT * FROM \"read_text\"('/etc/hosts')") shouldBe true
+    denied("SELECT * FROM `system`.`main`.`read_text`('/etc/hosts')") shouldBe true
+    denied("SELECT * FROM system.\"main\".`read_text` /* c */ ('/etc/hosts')") shouldBe true
+    denied("SELECT `getenv`('HOME')") shouldBe true
+    denied("SELECT * FROM `glob`('s3://b/*')") shouldBe true
+  }
+
+  it should "not treat a backtick-quoted identifier with no parenthesis as a call" in {
+    denied("SELECT `read_text` FROM t") shouldBe false
+    denied("SELECT `read_text`, \"getenv\" FROM t") shouldBe false
+  }
+
+  it should "keep the remote-literal exemption for the backtick form" in {
+    denied("SELECT * FROM `read_csv`('s3://bucket/x.csv')") shouldBe false
+    denied("SELECT * FROM `read_csv`('/etc/x.csv')") shouldBe true
+    deniedB("SELECT * FROM `read_csv`('s3://lakebucket/x.csv')") shouldBe true
+  }
+
+  it should "judge every occurrence, whatever its quoting" in {
+    denied("SELECT * FROM read_csv('s3://b/x.csv'), `read_csv`('/etc/x.csv')") shouldBe true
+  }
+
+  it should "find a backtick-quoted call inside a string literal a query() call runs" in {
+    // query() runs its argument as SQL; each of these reads /etc/hosts on the 2.0 CLI.
+    denied("SELECT * FROM query('SELECT * FROM `read_text`(''/etc/hosts'')')") shouldBe true
+    denied("SELECT * FROM query($$SELECT * FROM `read_text`('/etc/hosts')$$)") shouldBe true
+    // an escape string's \x72 is `r`
+    denied("SELECT * FROM query(e'SELECT * FROM \\x72ead_text(''/etc/hosts'')')") shouldBe true
+  }
+
+  "bare-path FROM" should "deny a quoted-identifier replacement scan of a local path" in {
+    // DuckDB 2.0 replacement-scans a quoted identifier as it does a literal: both forms read the
+    // file on the 2.0 CLI. A qualified name is joined with dots before the scan.
+    denied("SELECT * FROM `/etc/x.parquet`") shouldBe true
+    denied("SELECT * FROM \"/etc/x.parquet\"") shouldBe true
+    denied("SELECT * FROM \"/etc/x\".\"parquet\"") shouldBe true
+    denied("SELECT * FROM t JOIN `/etc/x.csv` ON true") shouldBe true
+    denied("SELECT * FROM `orders`") shouldBe false
+    denied("SELECT * FROM \"main\".\"orders\"") shouldBe false
+    denied("SELECT * FROM `s3://b/x.parquet`") shouldBe false
+    deniedB("SELECT * FROM `s3://lakebucket/x.parquet`") shouldBe true
+  }
+
+  "denied functions" should "fail closed past the string-literal nesting the scan follows" in {
+    // Each literal body is scanned as SQL (query() runs one), a bounded number of levels deep.
+    def nested(levels: Int): String =
+      "SELECT " + (1 to levels).foldLeft("x")((body, k) => "$t" + k + "$" + body + "$t" + k + "$")
+    denied(nested(3)) shouldBe false
+    denied(nested(FunctionCalls.MaxDepth)) shouldBe false
+    denied(nested(FunctionCalls.MaxDepth + 1)) shouldBe true
+  }
+
+  // ---- a literal body is read from the ORIGINAL characters, then pre-passed again ----
+  //
+  // DuckDB's unicode-space pre-pass keeps a unicode space it believes sits inside a literal, so
+  // the literal's VALUE holds that character. When query() runs the value, DuckDB's parser runs
+  // the pre-pass again over it, and the character, now outside any literal, becomes a space. Each
+  // statement below reads /etc/hosts (or the environment) on the 2.0 CLI. A body decoded from the
+  // engine view instead carried the view's stand-in, an identifier character, which welded
+  // `FROM<NBSP>read_text` into one word and hid the call.
+
+  "denied functions" should "be found behind a unicode space kept inside a literal query() runs" in {
+    denied("SELECT count(*) FROM query('SELECT * FROM\u00A0read_text(''/etc/hosts'')')") shouldBe
+      true
+    denied("SELECT count(*) FROM query('SELECT * FROM\u3000read_text(''/etc/hosts'')')") shouldBe
+      true
+    denied("SELECT count(*) FROM query('SELECT * FROM read_text\uFEFF(''/etc/hosts'')')") shouldBe
+      true
+    denied("SELECT count(*) FROM query($$SELECT * FROM\u00A0read_text('/etc/hosts')$$)") shouldBe
+      true
+    denied("SELECT * FROM query('SELECT\u00A0getenv(''HOME'')')") shouldBe true
+    denied("SELECT * FROM query(e'SELECT * FROM\u00A0read_text(''/etc/hosts'')')") shouldBe true
+  }
+
+  it should "still admit a kept unicode space in an ordinary literal" in {
+    denied("SELECT 'a\u00A0b', 'read_text\u00A0x' FROM t") shouldBe false
+  }
+
+  // ---- a path-shaped quoted identifier is judged wherever it sits ----
+  //
+  // DuckDB 2.0 replacement-scans a table name it cannot resolve, so a quoted identifier naming a
+  // file reads it in every table position, not only after FROM or JOIN: each statement below
+  // reads the file on the 2.0 CLI. A path-shaped quoted identifier is not a shape ordinary SQL
+  // takes, so every one is judged.
+
+  "quoted identifiers" should "be judged as paths in every table position" in {
+    denied("SELECT * FROM (\"/abs/t.csv\")") shouldBe true
+    denied("SELECT * FROM (`/abs/t.csv`) x") shouldBe true
+    denied("SUMMARIZE \"/abs/t.csv\"") shouldBe true
+    denied("DESCRIBE `/abs/t.csv`") shouldBe true
+    denied("PIVOT \"/abs/t.csv\" ON a USING sum(b)") shouldBe true
+    denied("SELECT * FROM t, \"/abs/t.csv\"") shouldBe true
+    denied("SELECT * FROM t, `data/t.csv` x") shouldBe true
+  }
+
+  it should "admit ordinary and remote quoted identifiers anywhere" in {
+    denied("SELECT \"orders\".\"id\" AS \"Order Id\" FROM \"main\".\"orders\"") shouldBe false
+    denied("SELECT 1 AS \"a/b\", `x/csv` FROM t, \"main\".\"orders\"") shouldBe false
+    // A quoted name holding a dot is refused wherever it sits (DottedIdentifierScreen).
+    denied("SELECT `x.csv` FROM t") shouldBe true
+    denied("SUMMARIZE `s3://b/x.parquet`") shouldBe false
+    deniedB("SUMMARIZE `s3://lakebucket/x.parquet`") shouldBe true
+  }
+
+  // ---- every file extension DuckDB 2.0's replacement scans recognize ----
+  //
+  // read_csv's scan takes .csv and .tsv, the json extension's .json, .jsonl, .ndjson, .geojson and
+  // .geojsonl, parquet's .parquet (each also behind .gz or .zst), and the core read_duckdb's .db,
+  // .ddb and .duckdb; an extension autoloaded by file suffix adds .xlsx, .avro, .shp, .gpkg and
+  // .fgb. A relative path with a separator is path-shaped only through its extension.
+
+  "bare-path FROM" should "recognize every extension DuckDB 2.0 replacement-scans" in {
+    denied("SELECT * FROM 'd/t.tsv'") shouldBe true
+    denied("SELECT * FROM 'd/t.jsonl'") shouldBe true
+    denied("SELECT * FROM 'd/t.tsv.gz'") shouldBe true
+    denied("SELECT * FROM 'd/t.csv.zst'") shouldBe true
+    denied("SELECT * FROM 'd/t.geojson'") shouldBe true
+    denied("SELECT * FROM 'd/t.duckdb'") shouldBe true
+    denied("SELECT * FROM 'd/t.db'") shouldBe true
+    denied("SELECT * FROM 'd/t.xlsx'") shouldBe true
+    denied("SELECT * FROM 'd/t.csv?v=1'") shouldBe true
+    // judged from the parse, a literal in a table position is a file whatever its shape: only a
+    // remote URL is exempt
+    denied("SELECT * FROM 'a/b'") shouldBe true
+  }
+
+  // ---- run-time-SQL table functions (2026-10-11 ruling: these gaps ship fixed with 2.0) ------
+
+  "query / query_table / json_execute_serialized_sql" should "be denied under lockdown" in {
+    // A computed argument runs SQL no lexical screen sees: a concatenation spells a denied reader.
+    denied("SELECT * FROM query('SELECT * FROM read' || '_text(''/etc/hosts'')')") shouldBe true
+    denied("SELECT * FROM query('SELECT 1')") shouldBe true
+    denied("SELECT * FROM query_table('/abs/t.csv')") shouldBe true
+    denied("SELECT * FROM query_table(['orders'])") shouldBe true
+    denied("SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))") shouldBe
+      true
+  }
+
+  "a COPY path" should "be judged as DuckDB reads it: continued and escaped literals folded" in {
+    deniedB("COPY t TO 's3://lakebu'\n'cket/x.csv'") shouldBe true
+    deniedB("COPY t FROM 's3://lakebu'\n'cket/x.csv'") shouldBe true
+    denied("COPY t TO e'/tmp/x.csv'") shouldBe true
+    denied("COPY t TO $$/tmp/x.csv$$") shouldBe true
+    deniedB("COPY t TO 's3://staging/x.csv'") shouldBe false
+    deniedB("COPY t TO 's3://stag'\n'ing/x.csv'") shouldBe false
+  }
+
+  "duckdb_table_sample" should "be denied under lockdown (it reads the table its string names)" in {
+    denied("SELECT * FROM duckdb_table_sample('memory.main.t')") shouldBe true
+    LockdownScreen.judged("duckdb_table_sample") shouldBe true
+  }
+
+  // ---- replacement scans below the top level --------------------------------------------------
+
+  "replacement scans" should "be judged at every depth and after a join or a comma" in {
+    denied("SELECT * FROM (FROM '/data/s.parquet')") shouldBe true
+    denied("SELECT * FROM (SELECT * FROM '/data/s.parquet') x") shouldBe true
+    denied("SELECT * FROM t JOIN '/data/s.csv' x ON true") shouldBe true
+    denied("SELECT * FROM t LEFT JOIN (FROM '/data/s.csv') x ON true") shouldBe true
+    denied("FROM range(1), '/data/s.parquet'") shouldBe true
+    denied("SELECT * FROM t JOIN u USING (id), '/data/s.parquet'") shouldBe true
+    denied("WITH c AS (SELECT * FROM '/data/s.csv') SELECT * FROM c") shouldBe true
+    denied("SELECT * FROM t WHERE x IN (SELECT a FROM e'/data/s.csv')") shouldBe true
+    denied("SELECT * FROM t WHERE x IN (SELECT a FROM $$/data/s.csv$$)") shouldBe true
+    denied("SELECT ARRAY(SELECT a FROM '/data/s.csv')") shouldBe true
+    denied("SELECT * FROM trim((FROM '/data/s.csv'))") shouldBe true
+    // DuckDB folds a newline-separated literal into the first: judged as the folded name
+    denied("SELECT * FROM 'x'\n'/../data/s.csv'") shouldBe true
+    denied("SELECT * FROM t, /* c */ '/data/s.csv'") shouldBe true
+  }
+
+  it should "admit literals that are not in a table position" in {
+    denied("SELECT * FROM (FROM 's3://b/x.parquet')") shouldBe false
+    denied("SELECT extract(year FROM '2020-01-01'::DATE)") shouldBe false
+    denied("SELECT substring('/a/b.csv' FROM 2)") shouldBe false
+    denied("SELECT trim(both FROM '/a/b.csv'), overlay('/a.csv' PLACING 'x' FROM 1)") shouldBe false
+    denied("SELECT 'a', '/a/b.csv' FROM t") shouldBe false
+    denied("SELECT * FROM t WHERE c IN ('/a/b.csv', '/c/d.csv')") shouldBe false
+    denied("SELECT * FROM t WHERE c = '/a/b.csv' ORDER BY 1") shouldBe false
+    denied("INSERT INTO t VALUES ('/a/b.csv'), ('/c/d.csv')") shouldBe false
+    denied("SELECT * FROM t x, u y WHERE x.p = '/a/b.csv'") shouldBe false
+  }
+
+  // ---- extension readers autoloadable on a node ------------------------------------------------
+
+  "avro and iceberg readers" should "be denied over local paths and admitted on remote ones" in {
+    denied("SELECT * FROM read_avro('/data/x.avro')") shouldBe true
+    denied("SELECT * FROM avro_metadata('/data/x.avro')") shouldBe true
+    denied("SELECT * FROM iceberg_scan('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_metadata('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_snapshots('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_column_stats('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM iceberg_load_table_response('/data/warehouse/t')") shouldBe true
+    denied("SELECT * FROM read_avro('s3://b/x.avro')") shouldBe false
+    denied("SELECT * FROM iceberg_scan('s3://b/warehouse/t')") shouldBe false
+  }
+
+  "iceberg table maintenance and quack server control" should "be denied" in {
+    denied("SELECT * FROM iceberg_rollback_to_snapshot('cat.s.t', 1)") shouldBe true
+    denied("CALL set_iceberg_table_properties('cat.s.t', {'k': 'v'})") shouldBe true
+    denied("CALL iceberg_to_ducklake('ice', 'lake')") shouldBe true
+    denied("CALL quack_serve('quack:localhost:9999')") shouldBe true
+    denied("CALL quack_stop('quack:localhost:21900')") shouldBe true
+  }
+
+  // ---- table positions outside FROM / JOIN / comma ---------------------------------------------
+  //
+  // Each statement below read a scratch CSV on the DuckDB 2.0 CLI through the literal.
+
+  "replacement scans" should "be judged in every table position DuckDB 2.0 accepts" in {
+    denied("SUMMARIZE '/data/s.csv'") shouldBe true
+    denied("DESCRIBE '/data/s.csv'") shouldBe true
+    denied("DESCRIBE TABLE '/data/s.csv'") shouldBe true
+    denied("DESC '/data/s.csv'") shouldBe true
+    denied("SHOW TABLE '/data/s.csv'") shouldBe true
+    denied("TABLE '/data/s.csv'") shouldBe true
+    denied("PIVOT '/data/s.csv' ON a USING sum(b)") shouldBe true
+    denied("SELECT * FROM (PIVOT '/data/s.csv' ON a USING sum(b))") shouldBe true
+    denied("PIVOT_WIDER '/data/s.csv' ON a USING sum(b)") shouldBe true
+    denied("PIVOT_LONGER '/data/s.csv' ON a INTO NAME k VALUE v") shouldBe true
+    denied("UNPIVOT '/data/s.csv' ON a INTO NAME k VALUE v") shouldBe true
+    denied(
+      "MERGE INTO t USING '/data/s.csv' AS s ON t.a = s.a " +
+        "WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)"
+    ) shouldBe true
+    denied(
+      "MERGE INTO t USING ('/data/s.csv') AS s ON t.a = s.a " +
+        "WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)"
+    ) shouldBe true
+    denied("DELETE FROM t USING '/data/s.csv' s WHERE t.a = s.a") shouldBe true
+    denied("DELETE FROM t USING u, '/data/s.csv' s WHERE t.a = s.a") shouldBe true
+    denied("INSERT INTO t TABLE '/data/s.csv'") shouldBe true
+    denied("CREATE TABLE t2 AS TABLE '/data/s.csv'") shouldBe true
+    denied("SELECT * FROM (TABLE '/data/s.csv')") shouldBe true
+    denied("SELECT * FROM (SUMMARIZE '/data/s.csv')") shouldBe true
+    denied("WITH c AS (TABLE '/data/s.csv') SELECT * FROM c") shouldBe true
+    denied("EXPLAIN TABLE '/data/s.csv'") shouldBe true
+    denied("SUMMARIZE e'/data/s.csv'") shouldBe true
+  }
+
+  it should "keep admitting those statements over tables and remote literals" in {
+    denied("SUMMARIZE t") shouldBe false
+    denied("DESCRIBE t") shouldBe false
+    denied("TABLE t") shouldBe false
+    denied("PIVOT t ON a USING sum(b)") shouldBe false
+    denied("SELECT * FROM t PIVOT (sum(b) FOR a IN ('/a/b.csv', 'x'))") shouldBe false
+    denied("MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN UPDATE SET p = '/a/b.csv'") shouldBe
+      false
+    denied("DELETE FROM t USING u WHERE t.p = '/a/b.csv'") shouldBe false
+    denied("SELECT * FROM t JOIN u USING (id) WHERE p = '/a/b.csv'") shouldBe false
+    denied("SUMMARIZE 's3://b/x.parquet'") shouldBe false
+    denied("MERGE INTO t USING 's3://b/x.csv' s ON t.a = s.a WHEN MATCHED THEN DELETE") shouldBe
+      false
+    denied("SELECT * FROM t ORDER BY a DESC, 2") shouldBe false
+  }
+
+  "a dollar quote after a Unicode space" should "not hide a denied call later on the line" in {
+    // DuckDB opens the dollar quote after the space character, so the `--` sits inside the string
+    // and the call after it runs: the screen must see that call.
+    denied("SELECT\u00a0$$--$$, * FROM read_csv('/tmp/x.csv')") shouldBe true
+    denied("SELECT\u3000$$--$$, * FROM read_csv('/tmp/x.csv')") shouldBe true
+    deniedB("SELECT\u200b$$--$$, * FROM read_parquet('s3://lakebucket/x.parquet')") shouldBe true
+  }
+
+  "a dollar sign after a soft hyphen" should "continue the identifier, as DuckDB 1.5.6 does" in {
+    // DuckDB names the column `AS<U+00AD>$$` and reads the rest of the line as a comment: the call
+    // never runs (run through the 1.5.6 CLI against a missing file, which it did not open).
+    denied("SELECT 1 AS\u00ad$$ -- $$, * FROM read_csv('/tmp/x.csv')") shouldBe false
+    denied("SELECT 1 AS\u00a0$$ -- $$, * FROM read_csv('/tmp/x.csv')") shouldBe true
+  }
+
+  // The FROM-list tracking ended the list at a keyword used as a name, so a file after the next
+  // comma went unjudged (each read the CSV on the 2.0 CLI). The file decision now follows the
+  // tenant screen's two tiers: the parse when the statement parses, a conservative lexical scan
+  // when it does not; the remote exemption and the bucket deny-set are unchanged.
+  "a file in table position" should "be judged from the parse, a keyword alias hiding nothing" in {
+    List(
+      "SELECT * FROM range(1) AS values, '/etc/x.csv'",
+      "SELECT * FROM range(1) AS set, '/etc/x.csv'",
+      "SELECT * FROM range(1) set, '/etc/x.csv'",
+      "SELECT * FROM range(1) AS values, ('/etc/x.csv')",
+      "SELECT * FROM (SELECT 1 AS \"order\") r JOIN (SELECT 1 AS \"order\") s " +
+        "ON r.order = s.order, '/etc/x.csv'",
+      // a relative path and a quoted glob read the working directory
+      "SELECT * FROM 'x.csv'",
+      "SELECT * FROM \"*\".csv",
+      "SELECT * FROM \"data_*\".parquet"
+    ).foreach(sql => withClue(sql)(denied(sql) shouldBe true))
+    List(
+      "SELECT * FROM range(1) AS values, 's3://staging/x.csv'",
+      "SELECT * FROM \"s3://staging/x.parquet\"",
+      "SELECT * FROM orders WHERE o_comment IS DISTINCT FROM '/etc/x.csv'",
+      "SELECT * FROM orders ORDER BY o_id, '/etc/x.csv'"
+    ).foreach(sql => withClue(sql)(denied(sql) shouldBe false))
+    deniedB("SELECT * FROM range(1) AS values, 's3://lakebucket/x.csv'") shouldBe true
+    deniedB("SELECT * FROM \"s3://lakebucket/x.parquet\"") shouldBe true
+  }
+
+  // 2.0 table macros whose body reads `query_table(source)`: `histogram('/etc/x.csv', b)` returned
+  // the CSV's values on the 2.0 CLI. Refused in table position; the aggregate stays admitted.
+  "a query_table-reading table macro" should "be denied in table position" in {
+    List(
+      "SELECT * FROM histogram('/etc/x.csv', b)",
+      "SELECT * FROM histogram_values('s3://staging/x.parquet', a)",
+      "SELECT * FROM histogram('/etc/x.csv', b) set, t"
+    ).foreach(sql => withClue(sql)(denied(sql) shouldBe true))
+    denied("SELECT histogram(o_total) FROM orders") shouldBe false
+  }
+
+  // Audit F23: EXPORT DATABASE writes schema.sql, load.sql and one file per table to its target
+  // directory, like COPY ... TO, but no rule judged it: a local directory on a local-dataPath pool
+  // and the denied DuckLake bucket were both writable under lockdown with the ACL off.
+  "EXPORT DATABASE" should "be judged by its target like COPY ... TO" in {
+    List(
+      "EXPORT DATABASE '/tmp/dump'",
+      "EXPORT DATABASE '/tmp/dump' (FORMAT CSV, DELIMITER '|')",
+      "export database lake TO '/tmp/dump'",
+      "EXPORT DATABASE \"lake\" TO '/tmp/dump' (FORMAT PARQUET)",
+      "EXPORT DATABASE e'/tmp/dump'",
+      "EXPORT DATABASE $$/tmp/dump$$",
+      "EXPORT /* c */ DATABASE/*x*/'/tmp/dump'",
+      "EXPLAIN ANALYZE EXPORT DATABASE '/tmp/dump'",
+      "SELECT 1; EXPORT DATABASE '/tmp/dump'"
+    ).foreach(sql => withClue(sql)(denied(sql) shouldBe true))
+    List(
+      "EXPORT DATABASE 's3://lakebucket/dump'",
+      "EXPORT DATABASE lake TO 's3://lakebucket/dump' (FORMAT PARQUET)",
+      "EXPORT DATABASE $$s3://lakebucket/dump$$"
+    ).foreach(sql => withClue(sql)(deniedB(sql) shouldBe true))
+    deniedB("EXPORT DATABASE 's3://staging/dump' (FORMAT CSV, DELIMITER '|')") shouldBe false
+    deniedB("EXPORT DATABASE lake TO 's3://staging/dump'") shouldBe false
+  }
+
+  // Audit F24: DuckDB 2.0's PREPARE takes a string as its name too (`PREPARE 'p' AS ...`, a
+  // dollar-quoted or E-string name), so the prepare skip has to pass any one-token name, or every
+  // screen judges the wrapper word `prepare` and a prepared COPY ... TO is admitted.
+  "a PREPARE named by a string" should "have its prepared COPY judged" in {
+    val names = List("'p'", "$$p$$", "$t$p$t$", "E'p'", "e'p'")
+    names.foreach { n =>
+      withClue(n) {
+        denied(
+          s"PREPARE $n AS COPY (SELECT * FROM lineitem) TO '/tmp/leak.csv'; EXECUTE p"
+        ) shouldBe
+          true
+        deniedB(s"PREPARE $n AS COPY (SELECT 1) TO 's3://lakebucket/x.parquet'") shouldBe true
+        deniedB(s"PREPARE $n AS COPY (SELECT 1) TO 's3://staging/x.parquet'") shouldBe false
+        denied(s"EXPLAIN PREPARE $n AS COPY (SELECT 1) TO '/tmp/x.csv'") shouldBe true
+      }
+    }
   }

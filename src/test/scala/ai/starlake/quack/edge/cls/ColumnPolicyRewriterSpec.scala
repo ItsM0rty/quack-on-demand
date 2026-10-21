@@ -27,7 +27,11 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     )
   private def rw: ColumnPolicyRewriter = new ColumnPolicyRewriter(defaultCat, enabled = true)
   private val ctx                      =
-    SchemaContext(defaultDatabase = Some("acme_tpch"), defaultSchema = Some("tpch1"))
+    SchemaContext(
+      defaultDatabase = Some("acme_tpch"),
+      defaultSchema = Some("tpch1"),
+      attachedCatalogs = Set.empty
+    )
 
   "rewrite" should "passthrough when the feature is disabled" in {
     val policies = List(
@@ -76,6 +80,18 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
 
   private val maskEmail =
     RoleColumnPolicy("cp-1", "r-1", "*", "tpch1", "customer", "c_email", "mask", Some("'***'"))
+
+  it should "deny a rewrite it cannot print as the caller's statement, saying why" in {
+    // `//` reaches JSqlParser as `/`: a rewrite printed from that would divide differently
+    rw.rewrite(
+      "SELECT c_email, c_id // 2 FROM customer",
+      StatementKind.Select,
+      eff(tenantUser, List(maskEmail)),
+      ctx
+    ).unsafeRunSync() match
+      case Denied(reason) => reason should include("//")
+      case other          => fail(s"expected Denied, got $other")
+  }
 
   // ---- statements that read no physical table (issue #114, second report) -----------------
   //
@@ -821,51 +837,12 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     out shouldBe Passthrough
   }
 
-  // -------- KNOWN GAP (ignored below): unaliased aggregate produces broken SQL at the node --------
-  //
-  // Live repro (against a real DuckDB node, not reproducible at this unit level): with a mask
-  // policy on customer.c_phone,
-  //
-  //   SELECT c_mktsegment, min(c_phone) FROM tpch1.customer GROUP BY 1
-  //
-  // fails at the node. jsqltranspiler's star-expansion / result-set-metadata machinery names the
-  // unaliased aggregate projection slot "min" (DuckDB's own synthesized column name), and the
-  // Prepare-time LIMIT-0 probe wrapper built around the rewritten SQL then breaks because DuckDB
-  // rejects that shape. The aliased form
-  //
-  //   SELECT c_mktsegment, min(c_phone) AS phone FROM tpch1.customer GROUP BY 1
-  //
-  // works fine end-to-end. Exact node-side error (captured from the live repro): DuckDB's binder
-  // rejects the wrapped/probed SELECT with a reference to the synthetic "min" column name colliding
-  // with the aggregate-function keyword once the probe wrapper re-projects it.
-  //
-  // Unit-level finding (this test, no live DuckDB involved): JsqltranspilerRewriter never
-  // synthesizes an alias for an unaliased projection expression. Walking
-  // ColumnPolicyRewriter -> JsqltranspilerRewriter -> the vendored JSQLColumResolver
-  // (getResolvedStatementText) confirms new SelectItems are only ever constructed for `*` / `t.*`
-  // expansion, and even then the ORIGINAL (possibly-null) alias is carried through unchanged; the
-  // PolicyVisitor's mask substitution (JsqltranspilerRewriter.scala PolicyVisitor.visit) replaces
-  // the Column expression in place and never touches SelectItem.alias either. So the unaliased
-  // aggregate keeps flowing through the rewriter with NO alias while the aliased form keeps its
-  // alias - the rewriter faithfully preserves the caller's aliasing choice rather than ever adding
-  // one. The breakage is therefore real but only manifests once the wrapped SQL reaches the engine
-  // (Prepare-time LIMIT-0 probe / DuckDB binder), which this unit test cannot exercise.
-  //
-  // This test pins the current (broken-downstream) rewritten SQL verbatim as a characterization:
-  // the unaliased form's masked aggregate still carries no alias. Any future change that makes the
-  // rewriter auto-alias bare aggregate/function projections (the likely fix) will change this
-  // output and this test will need updating alongside the fix - that's the point of un-ignoring it
-  // when the fix lands.
-  //
-  // NOTE on the enabled-first protocol: unlike TEST 1 and TEST 2 (which fail today and will pass
-  // once fixed), this test currently PASSES when enabled - it documents/characterizes today's
-  // rewriter output rather than asserting a unit-level failure, because the actual defect only
-  // manifests once the rewritten SQL reaches the live DuckDB node (see the live repro above, which
-  // is NOT reproducible without a running node). It is ignored anyway so it reads consistently
-  // alongside TEST 1/2 as a pinned KNOWN GAP, and so a future rewriter change that starts
-  // auto-aliasing bare aggregates doesn't silently drift this characterization without a human
-  // reviewing whether the live breakage is now fixed.
-  ignore should "leave an unaliased aggregate projection unaliased after masking (KNOWN GAP, breaks at the node)" in {
+  // An unaliased aggregate over a masked column (`min(c_phone)`) stays unaliased: DuckDB names the
+  // slot itself. It used to fail at the node through the FlightSQL prepare probe
+  // `SELECT * FROM (<query>) AS _qod_probe LIMIT 0`: the resolver expanded the probe's star under
+  // its own name for the slot (`_qod_probe.min`), which DuckDB does not bind. The probe's star is
+  // now kept as written (JsqltranspilerRewriterSpec runs both shapes on DuckDB).
+  it should "leave an unaliased aggregate projection unaliased after masking" in {
     val catWithPhone = new ColumnCatalog.MapCatalog(
       Map(("acme_tpch", "tpch1", "customer") -> List("c_mktsegment", "c_phone"))
     )
@@ -890,13 +867,25 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       )
       .unsafeRunSync()
 
+    val probedOut = r
+      .rewrite(
+        "SELECT * FROM (SELECT c_mktsegment, min(c_phone) FROM tpch1.customer GROUP BY 1) " +
+          "AS _qod_probe LIMIT 0",
+        StatementKind.Select,
+        eff(tenantUser, List(maskPhone)),
+        ctx
+      )
+      .unsafeRunSync()
+
     unaliasedOut match
       case Rewritten(sql) =>
-        // Verbatim characterization of the current (broken-downstream) shape: the masked
-        // aggregate is rewritten in place but the projection slot is STILL not given an
-        // explicit alias, unlike the working aliased form asserted below.
         sql shouldBe "SELECT c_mktsegment, min('***') FROM tpch1.customer GROUP BY 1"
-        sql should not include " AS "
+      case other => fail(s"expected Rewritten, got $other")
+
+    probedOut match
+      case Rewritten(sql) =>
+        sql shouldBe "SELECT * FROM (SELECT c_mktsegment, min('***') FROM tpch1.customer " +
+          "GROUP BY 1) AS _qod_probe LIMIT 0"
       case other => fail(s"expected Rewritten, got $other")
 
     aliasedOut match
@@ -939,4 +928,219 @@ class ColumnPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync() match
       case Denied(_) => succeed
       case other     => fail(s"expected Denied, got $other")
+  }
+
+  it should "deny a TABLE statement passed to ARRAY() or ANY, which reads every column raw" in
+    List(
+      "SELECT ARRAY(TABLE customer)",
+      "SELECT unnest(ARRAY(TABLE tpch1.customer))",
+      "SELECT 1 WHERE 'a@x' = ANY (TABLE customer)"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
+  it should "deny the star expansion and whole-row forms that read a masked column raw" in
+    List(
+      "SELECT COLUMNS('c_e.*') FROM customer",
+      "SELECT * LIKE 'c_e%' FROM customer",
+      "SELECT concat(*COLUMNS(*)) FROM customer",
+      "SELECT c_id FROM customer ORDER BY COLUMNS('c_e.*')",
+      "SELECT c FROM customer c",
+      "SELECT to_json(customer) FROM customer"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
+  it should "expand a star modifier into a masked column list" in {
+    rw.rewrite(
+      "SELECT * EXCLUDE (c_ssn) FROM customer c",
+      StatementKind.Select,
+      eff(tenantUser, List(maskEmail)),
+      ctx
+    ).unsafeRunSync() shouldBe Rewritten(
+      "SELECT c.c_id, '***' AS c_email, c.c_phone FROM customer c"
+    )
+  }
+
+  it should "mask a method call on a masked column and deny a field read of one" in {
+    val effSet = eff(tenantUser, List(maskEmail))
+    rw.rewrite("SELECT c_email.lower() FROM customer", StatementKind.Select, effSet, ctx)
+      .unsafeRunSync() shouldBe Rewritten("SELECT lower('***') FROM customer")
+    rw.rewrite(
+      "SELECT c_id FROM customer c WHERE c.c_email.contains('alice')",
+      StatementKind.Select,
+      effSet,
+      ctx
+    ).unsafeRunSync() shouldBe Rewritten(
+      "SELECT c_id FROM customer c WHERE contains('***', 'alice')"
+    )
+    rw.rewrite("SELECT c_email.x FROM customer", StatementKind.Select, effSet, ctx)
+      .unsafeRunSync() shouldBe a[Denied]
+  }
+
+  it should "deny a method call on a masked table's binding, which reads the whole row" in
+    List(
+      "SELECT c.to_json() FROM customer c",
+      "SELECT customer.to_json() FROM customer",
+      "SELECT tpch1.customer.to_json() FROM customer",
+      "SELECT c.list() FROM customer c",
+      "SELECT c.struct_extract('c_email') FROM customer c",
+      "SELECT c_id FROM customer c WHERE c.to_json()::VARCHAR LIKE '%alice%'",
+      "SELECT list_transform([1], x -> c.to_json()) FROM customer c"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
+  it should "deny an alias column list on a masked table, which renames the column raw" in
+    List(
+      "SELECT e FROM customer AS c(a, b, e)",
+      "SELECT e FROM customer c(a, b, e)",
+      "SELECT c.e FROM customer AS c(a, b, e)",
+      "SELECT a FROM customer AS c(a, b, e) WHERE e LIKE 'a%'",
+      "SELECT c_id FROM customer c(c_id, n, zz) NATURAL JOIN (SELECT 'alice@x' AS zz) g"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
+  it should "deny an alias column list on a parenthesized FROM item holding a masked table" in
+    List(
+      "SELECT e FROM (customer) AS c(a, b, e)",
+      "SELECT e FROM ((customer)) AS c(a, b, e)",
+      "SELECT e FROM (customer c) AS d(a, b, e)",
+      "SELECT x.e FROM (customer AS c) x(a, b, e)",
+      "SELECT e FROM (customer JOIN orders USING (c_id)) AS j(a, b, e)"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() shouldBe a[Denied]
+      }
+    }
+
+  it should "admit an alias column list on a table without a column policy" in {
+    val orders = new ColumnPolicyRewriter(
+      new ColumnCatalog.MapCatalog(
+        Map(
+          ("acme_tpch", "tpch1", "customer") -> List("c_id", "c_email"),
+          ("acme_tpch", "tpch1", "orders")   -> List("o_id", "c_id")
+        )
+      )
+    )
+    orders
+      .rewrite(
+        "SELECT a FROM orders AS o(a, b)",
+        StatementKind.Select,
+        eff(tenantUser, List(maskEmail)),
+        ctx
+      )
+      .unsafeRunSync() shouldBe Passthrough
+  }
+
+  it should "keep the mask under a column list on a derived table or CTE" in
+    List(
+      "SELECT e FROM (SELECT c_email FROM customer) AS d(e)",
+      "WITH d(e) AS (SELECT c_email FROM customer) SELECT e FROM d"
+    ).foreach { sql =>
+      withClue(sql) {
+        rw.rewrite(sql, StatementKind.Select, eff(tenantUser, List(maskEmail)), ctx)
+          .unsafeRunSync() match
+          case Rewritten(out) =>
+            out should include("'***'")
+            out should not include "SELECT c_email"
+          case Denied(_) | PassthroughParseFailed => succeed
+          case other => fail(s"expected the mask or a denial, got $other")
+      }
+    }
+
+  it should "mask the dbt self-named CTE, whose body reads the real table" in {
+    // DuckDB binds the body's `customer` to the real table, the main query's to the CTE.
+    rw.rewrite(
+      "WITH customer AS (SELECT * FROM customer) SELECT c_email FROM customer",
+      StatementKind.Select,
+      eff(tenantUser, List(maskEmail)),
+      ctx
+    ).unsafeRunSync() match
+      case Rewritten(out) =>
+        out should include("'***'")
+        out should not include "SELECT c_email"
+      case other => fail(s"expected Rewritten, got $other")
+    // a three-part name still reaches the catalog as (catalog, schema, table)
+    rw.rewrite(
+      "SELECT c_email FROM acme_tpch.tpch1.customer",
+      StatementKind.Select,
+      eff(tenantUser, List(maskEmail)),
+      ctx
+    ).unsafeRunSync() shouldBe Rewritten("SELECT '***' AS c_email FROM acme_tpch.tpch1.customer")
+  }
+
+  it should "deny a NATURAL join that compares a masked column against a guess list" in {
+    rw.rewrite(
+      "SELECT g.c_phone, c_id FROM (SELECT '555-' || lpad(unnest(range(10000))::VARCHAR, 4, '0') " +
+        "AS c_phone) g NATURAL JOIN customer",
+      StatementKind.Select,
+      eff(tenantUser, List(maskPhone)),
+      ctx
+    ).unsafeRunSync() shouldBe a[Denied]
+  }
+
+  // DuckDB 2.0 reads a backtick pair as an identifier quote, and the ACL (getUnquotedName) strips
+  // it: every match below used to strip only double quotes, so a backtick-quoted table or column
+  // met no mask while the gate authorized the read (F07).
+  private val backtickTwins = List(
+    "SELECT c_id, c_email FROM `customer`" -> "SELECT c_id, c_email FROM \"customer\"",
+    "SELECT c_id, c_email FROM `tpch1`.`customer`" -> "SELECT c_id, c_email FROM \"tpch1\".\"customer\"",
+    "SELECT * FROM `customer`"                -> "SELECT * FROM \"customer\"",
+    "SELECT `c_email` FROM customer"          -> "SELECT \"c_email\" FROM customer",
+    "SELECT c.`c_email` FROM customer c"      -> "SELECT c.\"c_email\" FROM customer c",
+    "SELECT `c`.c_email FROM customer AS `c`" -> "SELECT \"c\".c_email FROM customer AS \"c\"",
+    "SELECT upper(`c_email`) FROM customer"   -> "SELECT upper(\"c_email\") FROM customer",
+    "SELECT `c_email` || '' FROM customer"    -> "SELECT \"c_email\" || '' FROM customer",
+    "SELECT CAST(`c_email` AS VARCHAR) FROM customer" -> "SELECT CAST(\"c_email\" AS VARCHAR) FROM customer",
+    "SELECT c_id FROM customer WHERE `c_email` LIKE '%a%'" -> "SELECT c_id FROM customer WHERE \"c_email\" LIKE '%a%'",
+    "SELECT c_id FROM customer ORDER BY `c_email`" -> "SELECT c_id FROM customer ORDER BY \"c_email\"",
+    "SELECT `c` FROM customer c"          -> "SELECT \"c\" FROM customer c",
+    "SELECT to_json(`c`) FROM customer c" -> "SELECT to_json(\"c\") FROM customer c",
+    "SELECT (SELECT `c_email` FROM `customer` LIMIT 1)" -> "SELECT (SELECT \"c_email\" FROM \"customer\" LIMIT 1)",
+    "SELECT x FROM (SELECT `c_email` AS x FROM `customer`) s" -> "SELECT x FROM (SELECT \"c_email\" AS x FROM \"customer\") s"
+  )
+
+  it should "treat a backtick-quoted table or column exactly like its double-quoted twin" in
+    List(UnresolvedMode.Pass, UnresolvedMode.Deny).foreach { mode =>
+      val r = new ColumnPolicyRewriter(defaultCat, unresolvedMode = mode, enabled = true)
+      List(maskEmail, maskEmail.copy(action = RoleColumnPolicy.ActionDeny, transformSql = None))
+        .foreach { p =>
+          backtickTwins.foreach { (backtick, twin) =>
+            withClue(s"$mode ${p.action}: $backtick") {
+              val run = (sql: String) =>
+                r.rewrite(sql, StatementKind.Select, eff(tenantUser, List(p)), ctx).unsafeRunSync()
+              val out = run(backtick)
+              out shouldBe run(twin)
+              out should not be Passthrough
+              out should not be PassthroughParseFailed
+            }
+          }
+        }
+    }
+
+  it should "mask a backtick-quoted table and column, in a projection and in an expression" in {
+    val effSet           = eff(tenantUser, List(maskEmail))
+    def run(sql: String) = rw.rewrite(sql, StatementKind.Select, effSet, ctx).unsafeRunSync()
+    run("SELECT c_id, c_email FROM `customer`") shouldBe
+      Rewritten("SELECT c_id, '***' AS c_email FROM \"customer\"")
+    run("SELECT `c_email` FROM customer") shouldBe
+      Rewritten("SELECT '***' AS \"c_email\" FROM customer")
+    run("SELECT upper(`c_email`) FROM customer") shouldBe
+      Rewritten("SELECT upper('***') FROM customer")
+    run("SELECT c_id FROM customer WHERE `c_email` LIKE '%a%'") should not be Passthrough
   }

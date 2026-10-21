@@ -65,7 +65,13 @@ object OpaDryRun:
           val catalog = TenantDb.catalogAlias(meta, key.tenantDb)
           val schema  = meta.get("schemaName").filter(_.nonEmpty).getOrElse("main")
           val cfg     = Config.forDuckDB(Some(catalog), Some(schema), Set(catalog))
-          AccessGate.evaluate(sql, cfg, catalog, filteredMetadata = false) match
+          AccessGate.evaluate(
+            sql,
+            cfg,
+            catalog,
+            filteredMetadata = false,
+            clientDataScans = false
+          ) match
             case GateOutcome.Refuse(msg, _, _)  => Left("refused_before_opa" -> msg)
             case GateOutcome.NothingGated(_, _) =>
               Left("nothing_to_authorize" -> "the statement touches no table OPA would decide on")

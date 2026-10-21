@@ -42,10 +42,17 @@ final case class ManifestFederatedSource(
     description: Option[String] = None,
     disabled: Boolean = false,
     secrets: List[ManifestFederatedSecret] = Nil,
-    // "sql" (default) or "iceberg_rest". Defaulted so a pre-Iceberg manifest decodes unchanged.
+    // "sql" (default), "iceberg_rest", "postgres" or "mysql". Defaulted so a pre-Iceberg manifest
+    // decodes unchanged.
     sourceType: String = "sql",
-    // Typed config as raw JSON for iceberg_rest sources. Mirrors FederatedSource.config, which is
-    // text because `model` is a leaf package. Exported verbatim rather than redacted.
+    // Typed config as raw JSON for typed sources (IcebergRestConfig, or RdbmsConfig for postgres /
+    // mysql). Mirrors FederatedSource.config, which is text because `model` is a leaf package.
+    // Exported verbatim rather than redacted. For postgres / mysql the one credential is
+    // `password`, which `RdbmsConfig.validate` requires to be a `{{secret.NAME}}` placeholder on
+    // EVERY write path (REST, MCP, and this manifest's import, all through
+    // `FederatedSourceRules.errors`), so a stored row can only hold the placeholder and the
+    // password VALUE travels only as a (redacted) secret below; host, database and user are
+    // exported in the clear.
     //
     // What that is guaranteed to be safe for, exactly: `IcebergRestConfig.validate` runs
     // `placeholderErrors` over `IcebergRestConfig.CredentialFields`, which is `clientSecret`,

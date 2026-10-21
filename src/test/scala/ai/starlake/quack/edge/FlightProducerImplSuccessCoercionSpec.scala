@@ -75,11 +75,7 @@ class FlightProducerImplSuccessCoercionSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     sup.createPool(poolKey, RoleDistribution(0, 0, 1)).unsafeRunSync()
 
-    val client = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         queryResponse(sql)
     val adapter  = new QuackHttpAdapter(client, tracker)
@@ -511,3 +507,175 @@ class FlightProducerImplSuccessCoercionSpec extends AnyFlatSpec with Matchers:
     listener.awaitTerminal()
     listener.onErrorRef.get() shouldBe null
     listener.countValue shouldBe 3L
+
+  // ---- edge-level: DoPut (executeUpdate) commits before it acknowledges ----
+  //
+  // Audit F16: a stamped write's deferred COMMIT fires on exhaustion (failure propagates) or from
+  // close() (best-effort, swallowed). The DoPut tail read only the Count row, closed the result and
+  // then acknowledged, so a COMMIT that failed (a DuckLake write-write conflict, a node gone, a
+  // lapsed lease) was swallowed and the client got its row count for a rolled-back write.
+
+  /** Mirrors [[ai.starlake.quack.edge.adapter.StampedCommitArrowReader]]: `commit` runs once, on
+    * exhaustion (a throw propagates) or else from close() (a throw is swallowed).
+    */
+  private final class CommitOnExhaustionReader(
+      allocator: org.apache.arrow.memory.BufferAllocator,
+      underlying: org.apache.arrow.vector.ipc.ArrowReader,
+      commit: () => Unit
+  ) extends org.apache.arrow.vector.ipc.ArrowReader(allocator):
+    private val attempted = new java.util.concurrent.atomic.AtomicBoolean(false)
+    @volatile var committedOnExhaustion: Boolean = false
+    override def loadNextBatch(): Boolean        =
+      val more = underlying.loadNextBatch()
+      if !more && attempted.compareAndSet(false, true) then
+        commit()
+        committedOnExhaustion = true
+      more
+    override def getVectorSchemaRoot(): VectorSchemaRoot = underlying.getVectorSchemaRoot
+    override def getDictionaryVectors()
+        : java.util.Map[java.lang.Long, org.apache.arrow.vector.dictionary.Dictionary] =
+      underlying.getDictionaryVectors
+    override def bytesRead(): Long                     = underlying.bytesRead()
+    override def close(closeReadSource: Boolean): Unit =
+      if attempted.compareAndSet(false, true) then
+        try commit()
+        catch case _: Throwable => ()
+      underlying.close(closeReadSource)
+    override protected def readSchema(): org.apache.arrow.vector.types.pojo.Schema =
+      underlying.getVectorSchemaRoot.getSchema
+    override protected def closeReadSource(): Unit = ()
+
+  private final class RecordingPutListener
+      extends org.apache.arrow.flight.FlightProducer.StreamListener[
+        org.apache.arrow.flight.PutResult
+      ]:
+    @volatile var acked: Option[Long]                      = None
+    @volatile var completed: Boolean                       = false
+    val onErrorRef                                         = new AtomicReference[Throwable](null)
+    def onNext(r: org.apache.arrow.flight.PutResult): Unit =
+      val buf   = r.getApplicationMetadata
+      val bytes = new Array[Byte](buf.readableBytes().toInt)
+      buf.getBytes(buf.readerIndex(), bytes)
+      acked = Some(FlightSql.DoPutUpdateResult.parseFrom(bytes).getRecordCount)
+    def onError(t: Throwable): Unit = onErrorRef.set(t)
+    def onCompleted(): Unit         = completed = true
+
+  private val conflictMsg = "Invalid Input Error: Failed to commit: Failed to commit DuckLake " +
+    "transaction.\nTransaction conflict: catalog was modified by a concurrent transaction"
+
+  private def stampedCount(count: Long, commit: () => Unit): CommitOnExhaustionReader =
+    new CommitOnExhaustionReader(
+      TestArrow.sharedAllocator,
+      TestArrow.readerFor(s"SELECT CAST($count AS BIGINT) AS \"Count\""),
+      commit
+    )
+
+  private def putStatement(producer: FlightProducerImpl, peer: String, sql: String) =
+    val ack = new RecordingPutListener
+    producer
+      .acceptPutStatement(
+        FlightSql.CommandStatementUpdate.newBuilder().setQuery(sql).build(),
+        fakeContext(peer),
+        null,
+        ack
+      )
+      .run()
+    ack
+
+  private def statusOf(t: Throwable): FlightStatusCode =
+    t.asInstanceOf[FlightRuntimeException].status().code()
+
+  "acceptPutStatement" should "fail the update, not acknowledge it, when the COMMIT conflicts" in:
+    val (producer, peer) = setupProducer { _ =>
+      IO.pure(
+        QuackResponse.Ok(
+          stampedCount(42L, () => throw QuackWireError.Permanent(conflictMsg)),
+          5L,
+          () => ()
+        )
+      )
+    }
+    val ack = putStatement(producer, peer, "INSERT INTO orders SELECT * FROM staging")
+    ack.acked shouldBe None
+    ack.completed shouldBe false
+    statusOf(ack.onErrorRef.get()) shouldBe FlightStatusCode.UNAVAILABLE
+
+  it should "fail closed to INTERNAL when the COMMIT fails for another reason" in:
+    val (producer, peer) = setupProducer { _ =>
+      IO.pure(
+        QuackResponse.Ok(
+          stampedCount(1L, () => throw QuackWireError.Permanent("node connection lost")),
+          5L,
+          () => ()
+        )
+      )
+    }
+    val ack = putStatement(producer, peer, "DELETE FROM orders WHERE id = 7")
+    ack.acked shouldBe None
+    statusOf(ack.onErrorRef.get()) shouldBe FlightStatusCode.INTERNAL
+
+  it should "fail the update when the result is empty and the COMMIT conflicts" in:
+    val (producer, peer) = setupProducer { _ =>
+      IO.pure(
+        QuackResponse.Ok(
+          new ThrowingArrowReader(TestArrow.sharedAllocator, QuackWireError.Permanent(conflictMsg)),
+          5L,
+          () => ()
+        )
+      )
+    }
+    val ack = putStatement(producer, peer, "INSERT INTO orders VALUES (1)")
+    ack.acked shouldBe None
+    statusOf(ack.onErrorRef.get()) shouldBe FlightStatusCode.UNAVAILABLE
+
+  it should "commit on the drain, then acknowledge the count" in:
+    val reader           = new AtomicReference[CommitOnExhaustionReader](null)
+    val (producer, peer) = setupProducer { _ =>
+      val r = stampedCount(3L, () => ())
+      reader.set(r)
+      IO.pure(QuackResponse.Ok(r, 5L, () => ()))
+    }
+    val ack = putStatement(producer, peer, "UPDATE orders SET o_total = 0")
+    ack.onErrorRef.get() shouldBe null
+    ack.acked shouldBe Some(3L)
+    ack.completed shouldBe true
+    reader.get().committedOnExhaustion shouldBe true
+
+  "acceptPutPreparedStatementUpdate" should "fail the update, not acknowledge it, when the COMMIT conflicts" in:
+    val (producer, peer) = setupProducer { _ =>
+      IO.pure(
+        QuackResponse.Ok(
+          stampedCount(42L, () => throw QuackWireError.Permanent(conflictMsg)),
+          5L,
+          () => ()
+        )
+      )
+    }
+    val prepListener = new RecordingResultListener
+    producer.createPreparedStatement(
+      FlightSql.ActionCreatePreparedStatementRequest
+        .newBuilder()
+        .setQuery("INSERT INTO orders SELECT * FROM staging")
+        .build(),
+      fakeContext(peer),
+      prepListener
+    )
+    val handle = com.google.protobuf.Any
+      .parseFrom(prepListener.ref.get().getBody)
+      .unpack(classOf[FlightSql.ActionCreatePreparedStatementResult])
+      .getPreparedStatementHandle
+    val ack = new RecordingPutListener
+    producer
+      .acceptPutPreparedStatementUpdate(
+        FlightSql.CommandPreparedStatementUpdate
+          .newBuilder()
+          .setPreparedStatementHandle(handle)
+          .build(),
+        fakeContext(peer),
+        null,
+        ack
+      )
+      .run()
+    ack.acked shouldBe None
+    ack.completed shouldBe false
+    statusOf(ack.onErrorRef.get()) shouldBe FlightStatusCode.UNAVAILABLE

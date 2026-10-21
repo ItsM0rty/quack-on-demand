@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 #
-# Stop the quack-on-demand manager and all child Quack nodes.
+# Stop the quack-on-demand manager and its child Quack nodes.
 #
-# Locates the manager by its REST port (default 20900) and child quack
-# processes by their spawn-quack-node.sh parent script. Sends SIGTERM
+# Locates the manager by its REST port (default 20900) and ITS child quack
+# processes by their spawn-quack-node.sh wrapper, whose argv carries the
+# manager's marker `<rest-port>-<boot id>` (LocalQuackBackend.managerMarker).
+# Nodes of another manager on this host (a different REST port) are never
+# touched, and nor are the orphans of a manager from an earlier release, whose
+# wrappers carry the node token where the marker now goes
+# (`kill-quack-nodes.sh --all` stops those, with no manager running). Sends SIGTERM
 # first for graceful shutdown; escalates to SIGKILL after FORCE_AFTER
 # seconds if anything is still listening.
 #
@@ -28,10 +33,20 @@ FORCE_AFTER="${FORCE_AFTER:-10}"
 # trap which terminates the duckdb child.
 mgr_pid=$(lsof -nP -iTCP:"$MGR_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
 edge_pid=$(lsof -nP -iTCP:"$EDGE_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
-spawn_pids=$(pgrep -f spawn-quack-node 2>/dev/null || true)
+# This manager's wrappers (`spawn-quack-node.sh <node-port> <rest-port>-<boot id>`) and nodes
+# (`.../duckdb -init <tmp>/quack-node.<rest-port>-<boot id>.XXXXXX/init`).
+SPAWN_RE="spawn-quack-node\.sh [0-9]+ ${MGR_PORT}-[0-9a-f]+"
+DUCK_RE="duckdb .*-init .*quack-node\.${MGR_PORT}-[0-9a-f]+\."
+spawn_pids=$(pgrep -f "$SPAWN_RE" 2>/dev/null || true)
+# pgrep exits 1 when nothing matches, which pipefail + set -e would turn into a silent abort here.
+unmarked=$( (pgrep -f 'spawn-quack-node\.sh [0-9]+$' 2>/dev/null || true) | wc -l | tr -d ' ')
+if [[ "$unmarked" != "0" ]]; then
+  echo "note: leaving $unmarked unmarked spawn-quack-node.sh process(es) alone (an older manager's;" \
+    "kill-quack-nodes.sh --unmarked stops them)."
+fi
 
 if [[ -z "$mgr_pid" && -z "$edge_pid" && -z "$spawn_pids" ]]; then
-  echo "nothing running on ports $MGR_PORT / $EDGE_PORT and no spawn-quack-node processes."
+  echo "nothing running on ports $MGR_PORT / $EDGE_PORT and no spawn-quack-node processes of that manager."
   exit 0
 fi
 
@@ -53,7 +68,7 @@ done
 for ((i=0; i<FORCE_AFTER; i++)); do
   sleep 1
   if ! lsof -nP -iTCP:"$MGR_PORT","$EDGE_PORT" -sTCP:LISTEN -t 2>/dev/null > /dev/null \
-     && ! pgrep -f spawn-quack-node > /dev/null 2>&1; then
+     && ! pgrep -f "$SPAWN_RE" > /dev/null 2>&1; then
     echo "stopped cleanly after ${i}s."
     exit 0
   fi
@@ -67,8 +82,10 @@ for pid in $all_pids; do
 done
 
 # Re-discover (PIDs may have died but spawned new replacements unlikely)
-remaining_spawn=$(pgrep -f spawn-quack-node 2>/dev/null || true)
-remaining_duck=$(pgrep -f '^duckdb' 2>/dev/null || true)
+remaining_spawn=$(pgrep -f "$SPAWN_RE" 2>/dev/null || true)
+# Nodes run as `<abs path>/duckdb -init <tmp>/quack-node.<marker>.XXX/init`; match that argv with
+# this manager's marker, not a bare `^duckdb` (which the absolute path never matches).
+remaining_duck=$(pgrep -f "$DUCK_RE" 2>/dev/null || true)
 for pid in $remaining_spawn $remaining_duck; do
   kill -9 "$pid" 2>/dev/null || true
 done

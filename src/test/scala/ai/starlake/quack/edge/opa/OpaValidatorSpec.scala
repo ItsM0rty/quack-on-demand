@@ -119,6 +119,23 @@ class OpaValidatorSpec extends AnyFlatSpec with Matchers:
     ) shouldBe a[Denied]
     calls.toString shouldBe ""
 
+  it should "deny a node-escaping call (postgres_query / getenv) before asking OPA" in:
+    for sql <- List(
+        "SELECT * FROM postgres_query('c', 'SELECT 1')",
+        "SELECT * FROM sqlite_query('s', 'SELECT 1')",
+        "SELECT * FROM quack_query('quack:h:9494', 'SELECT 1', token := 't')",
+        "SELECT * FROM destroy_external_resource('read_text', '/x')",
+        "SELECT getenv('pgPassword')",
+        "SET pg_pool_health_check_query = 'SELECT 1'",
+        "CALL postgres_configure_pool(health_check_query := 'SELECT 1')"
+      )
+    do
+      val calls = StringBuilder()
+      validator(Right((200, """{"result":{"allow":true}}""")), calls).validate(
+        ctx(sql, Some(eff(true)))
+      ) shouldBe a[Denied]
+      withClue(sql)(calls.toString shouldBe "")
+
   it should "deny an unknown tenant without calling OPA" in:
     val calls = StringBuilder()
     val other = ctx("SELECT * FROM orders", Some(eff(true)))
@@ -141,3 +158,29 @@ class OpaValidatorSpec extends AnyFlatSpec with Matchers:
     // A read inside the ceiling still goes to OPA.
     v.validate(ctx("SELECT * FROM orders", Some(ro))) shouldBe Allowed
     calls.toString should include("/v1/data/qod/authz/statement")
+
+  it should "deny a quoted name holding a dot without asking OPA" in:
+    // OPA would be asked about schema a, table b, while DuckDB reads main."a.b".
+    val calls = StringBuilder()
+    validator(Right((200, """{"result":{"allow":true}}""")), calls)
+      .validate(ctx("SELECT * FROM \"a.b\"", Some(eff(true)))) match
+      case Denied(reason, _, _) => reason should include("quoted identifier containing a dot")
+      case other                => fail(s"expected Denied, got $other")
+    calls.toString shouldBe ""
+    // A superuser never reaches OPA or the screen.
+    validator(Right((200, """{"result":{"allow":true}}""")), calls)
+      .validate(ctx("SELECT * FROM \"a.b\"", Some(eff(false)))) shouldBe Allowed
+
+  it should "deny a backtick pair without asking OPA while the backtick screen is active" in:
+    assume(BacktickScreen.active, "backtick screen is inert on this DuckDB pin")
+    val calls = StringBuilder()
+    val b     = "`"
+    val sql = s"SELECT 1 $b 2; SET search_path='tpch.other'; SELECT * FROM orders WHERE 3 $b 4 = 7"
+    validator(Right((200, """{"result":{"allow":true}}""")), calls)
+      .validate(ctx(sql, Some(eff(true)))) match
+      case Denied(reason, _, _) => reason should include("backtick")
+      case other                => fail(s"expected Denied, got $other")
+    calls.toString shouldBe ""
+    // A superuser never reaches OPA or the screen.
+    validator(Right((200, """{"result":{"allow":true}}""")), calls)
+      .validate(ctx(sql, Some(eff(false)))) shouldBe Allowed

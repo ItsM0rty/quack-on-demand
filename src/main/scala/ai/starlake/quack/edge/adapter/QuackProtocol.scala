@@ -1,6 +1,6 @@
 package ai.starlake.quack.edge.adapter
 
-import cats.effect.IO
+import cats.effect.{FiberIO, IO}
 import cats.effect.unsafe.IORuntime
 import com.typesafe.scalalogging.LazyLogging
 import org.apache.arrow.memory.BufferAllocator
@@ -11,6 +11,8 @@ import org.apache.arrow.vector.ipc.ArrowReader
 import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import scala.concurrent.duration.*
+import scala.util.control.NonFatal
 
 /** Connection lifecycle errors surfaced by [[QuackProtocol]]. Mirrors the [[QuackError.Transient]]
   * / [[QuackError.Permanent]] split in `QuackHttpClient.scala` so Task 7's adapter can map between
@@ -78,12 +80,18 @@ trait QuackTransport:
   */
 final class QuackProtocol(
     transport: QuackTransport,
-    allocator: BufferAllocator
+    allocator: BufferAllocator,
+    nodeLeaseSec: Int = QuackProtocol.DefaultNodeLeaseSec
 ) extends LazyLogging:
+  require(nodeLeaseSec >= 1, s"nodeLeaseSec must be >= 1, got $nodeLeaseSec")
 
   /** Opens a Quack connection: POST `CONNECTION_REQUEST(token)`, expect
     * `CONNECTION_RESPONSE(connId)`. Surfaces `ERROR_RESPONSE` as [[QuackWireError.Permanent]], any
     * other unexpected message type as [[QuackWireError.Permanent]].
+    *
+    * The returned [[Connection]] already runs its heartbeat fiber, so it holds a node session and a
+    * fiber until [[Connection.close]]: acquire it under a mask and release it on every outcome
+    * (error and cancel included), as `QuackHttpClient` does.
     *
     * `endpoint` is the upstream Quack endpoint string in the `quack:host:port` form that
     * `ai.starlake.quack.ondemand.runtime.LocalQuackBackend` produces. Translated to
@@ -102,25 +110,50 @@ final class QuackProtocol(
       guard()
       // Inside the IO too: a malformed endpoint fails the IO rather than throwing at call time.
       val url     = QuackProtocol.endpointToHttp(endpoint)
-      val reqBody = QuackNativeBridge.serializeConnectionRequest(token)
-      transport.post(url, reqBody).map { respBytes =>
-        val wireOrdinal = QuackNativeBridge.parseMessageType(respBytes)
-        MessageType.fromWireOrdinal(wireOrdinal) match
-          case Some(MessageType.ConnectionResponse) =>
-            val connId = QuackNativeBridge.extractConnectionId(respBytes)
-            new Connection(transport, url, connId, allocator)
-          case Some(MessageType.ErrorResponse) =>
-            val msg = QuackNativeBridge.extractErrorMessage(respBytes)
-            throw QuackWireError.Permanent(msg)
-          case other =>
-            val label = other.map(_.toString).getOrElse(wireOrdinal.toString)
-            throw QuackWireError.Permanent(
-              s"unexpected response type after CONNECTION_REQUEST: $label"
-            )
+      val reqBody = QuackNativeBridge.serializeConnectionRequest(token, nodeLeaseSec.toLong)
+      // Uncancelable from the POST on: once the node may have granted the connection, a cancel
+      // must not drop it before its heartbeat fiber is registered where close() reaches it. The
+      // JDK transport's send is IO.blocking (uninterruptible) anyway, so this masks nothing a
+      // cancel could have cut short.
+      IO.uncancelable { _ =>
+        transport
+          .post(url, reqBody)
+          .map { respBytes =>
+            val wireOrdinal = QuackNativeBridge.parseMessageType(respBytes)
+            MessageType.fromWireOrdinal(wireOrdinal) match
+              case Some(MessageType.ConnectionResponse) =>
+                val connId = QuackNativeBridge.extractConnectionId(respBytes)
+                new Connection(transport, url, connId, allocator)
+              case Some(MessageType.ErrorResponse) =>
+                val msg = QuackNativeBridge.extractErrorMessage(respBytes)
+                throw QuackWireError.Permanent(msg)
+              case other =>
+                val label = other.map(_.toString).getOrElse(wireOrdinal.toString)
+                throw QuackWireError.Permanent(
+                  s"unexpected response type after CONNECTION_REQUEST: $label"
+                )
+          }
+          .flatTap { conn =>
+            conn
+              .startHeartbeats(QuackProtocol.heartbeatEvery(nodeLeaseSec))
+              .handleErrorWith(t => conn.close() *> IO.raiseError(t))
+          }
       }
     }
 
 object QuackProtocol:
+
+  /** Default node lease (Quack v3 `heartbeat_timeout_seconds`), config `nodeLeaseSec`. */
+  val DefaultNodeLeaseSec: Int = 30
+
+  /** A third of the lease, at least one second. The node checks the lease when a message arrives
+    * and counts whole elapsed seconds, so a beat renews in time while the gap since the previous
+    * message stays under the lease: from 3 s up, one lost beat is tolerated (two periods stay under
+    * the lease, three do not). The 1 s floor leaves less below 3 s: at 2 s no beat may be lost, and
+    * at 1 s the period equals the lease, so a gap of one period already lapses it unless other
+    * traffic renews it first.
+    */
+  def heartbeatEvery(leaseSec: Int): FiniteDuration = math.max(1, leaseSec / 3).seconds
 
   /** "quack:host:port" -> "http://host:port/quack". The leading `quack:` scheme is what
     * `LocalQuackBackend` and `KubernetesQuackBackend` publish; we never see a `quack://` two-slash
@@ -174,6 +207,43 @@ final class Connection private[adapter] (
     allocator: BufferAllocator
 ) extends LazyLogging:
 
+  @volatile private var heartbeat: Option[FiberIO[Nothing]] = None
+  private val closing: AtomicBoolean                        = AtomicBoolean(false)
+
+  /** Renews the node lease until [[close]]. A failed beat is ignored: a dead node already fails the
+    * in-flight request, and the next beat retries. The bytes are built inside the beat's IO, so a
+    * native failure fails (and logs) that beat instead of the open that already holds a session.
+    *
+    * `.start` and the registration run under one mask: a cancel between them would leave a fiber
+    * that [[close]] cannot reach.
+    */
+  private[adapter] def startHeartbeats(every: FiniteDuration): IO[Unit] =
+    val beat = IO
+      .defer {
+        // No new beat once close() began, so none is SENT after the DISCONNECT.
+        if closing.get() then IO.unit
+        else transport.post(url, QuackNativeBridge.serializeHeartbeat(connectionId)).void
+      }
+      .handleError(e =>
+        logger.debug(s"HEARTBEAT for $connectionId failed (ignored): ${e.getMessage}")
+      )
+    IO.uncancelable(_ =>
+      (IO.sleep(every) *> beat).foreverM.start.flatMap(f => IO { heartbeat = Some(f) })
+    )
+
+  /** Stops the heartbeats without waiting for them. `fiber.cancel` would wait for an in-flight
+    * beat, whose JDK send is uninterruptible and has no timeout, so a hung node would hang close()
+    * and the DISCONNECT behind it. Instead the cancel runs on its own fiber and the `closing` flag
+    * keeps any beat from starting from here on. A beat already in flight may still reach the node
+    * after the DISCONNECT; the node then finds no such connection and answers "Invalid connection
+    * id" before touching any lease (quack_server.cpp DispatchMessage), so it neither renews nor
+    * resurrects the session, and the error is swallowed by the beat's own handler.
+    */
+  private def stopHeartbeats: IO[Unit] = IO.defer {
+    closing.set(true)
+    heartbeat.fold(IO.unit)(_.cancel.start.void)
+  }
+
   /** Posts a PREPARE_REQUEST for `sql` and returns a streaming [[ArrowReader]] that chains the
     * initial PREPARE_RESPONSE batches with subsequent FETCH_RESPONSE batches until the server
     * signals end-of-stream (empty `results` vector on a FETCH_RESPONSE -- see upstream
@@ -185,7 +255,8 @@ final class Connection private[adapter] (
     * pattern for bridging IO into a synchronous caller, mirroring what http4s does for its IO ←→
     * blocking-API edges.
     */
-  def execute(sql: String)(using runtime: IORuntime): IO[ArrowReader] =
+  def execute(sql: String)(using runtime: IORuntime): IO[ArrowReader] = IO.defer {
+    // Inside the IO: a native throw must fail the IO, so the caller's error path closes us.
     val prepBody = QuackNativeBridge.serializePrepareRequest(connectionId, sql)
     transport.post(url, prepBody).map { respBytes =>
       val wireOrdinal = QuackNativeBridge.parseMessageType(respBytes)
@@ -199,15 +270,27 @@ final class Connection private[adapter] (
           // Materialising the IO with the caller-supplied runtime
           // keeps the reader implementation free of cats-effect
           // imports and free of any global-runtime assumption.
-          val fetchSync: () => Array[Byte] = () => fetch(resultUuid).unsafeRunSync()
-          val closeSync: () => Unit        = () => close().unsafeRunSync()
-          new ChainedQuackArrowReader(
-            allocator,
-            initial,
-            fetchSync,
-            closeSync,
-            needsMore
-          )
+          // Quack v3 FETCHes name their batch: 1, 2, ... in order, one per call.
+          val nextBatch                    = java.util.concurrent.atomic.AtomicLong(0L)
+          val fetchSync: () => Array[Byte] =
+            () => fetch(resultUuid, nextBatch.incrementAndGet()).unsafeRunSync()
+          val closeSync: () => Unit = () => close().unsafeRunSync()
+          // The import is lazy: the schema is exported only when the reader is built, and that
+          // throws for a column type with no Arrow mapping. Until the reader exists nothing else
+          // owns `initial`, whose close is the only release of the native result.
+          try
+            new ChainedQuackArrowReader(
+              allocator,
+              initial,
+              fetchSync,
+              closeSync,
+              needsMore
+            )
+          catch
+            case NonFatal(e) =>
+              try initial.close()
+              catch case NonFatal(c) => e.addSuppressed(c)
+              throw unexportable(e).getOrElse(e)
         case Some(MessageType.ErrorResponse) =>
           val msg = QuackNativeBridge.extractErrorMessage(respBytes)
           throw QuackWireError.Permanent(msg)
@@ -217,6 +300,31 @@ final class Connection private[adapter] (
             s"unexpected response type after PREPARE_REQUEST: $label"
           )
     }
+  }
+
+  /** DuckDB's own words when a result column's type has no Arrow mapping (`TYPE`, and any nested
+    * type holding one), raised when the imported stream's schema is exported.
+    */
+  private val UnsupportedArrowType = """Unsupported Arrow type ([^"\\]+)""".r
+
+  /** The error for a result the manager cannot export to Arrow, naming the type and the way out, or
+    * None when `e` is some other failure.
+    */
+  private def unexportable(e: Throwable): Option[QuackWireError] =
+    Iterator
+      .iterate(e)(_.getCause)
+      .takeWhile(_ != null)
+      .take(16) // a cause cycle must not spin
+      .flatMap(t => Option(t.getMessage))
+      .flatMap(m => UnsupportedArrowType.findFirstMatchIn(m))
+      .nextOption()
+      .map { m =>
+        val tpe = m.group(1).trim
+        QuackWireError.Permanent(
+          s"a result column of type $tpe has no Arrow mapping and cannot be returned; " +
+            "cast it to VARCHAR"
+        )
+      }
 
   /** Run `sql` on this connection and throw away the result. Used by the stamped-write bracket
     * (EPIC P1) for its BEGIN/CALL prelude and COMMIT epilogue, whose results are empty Success
@@ -231,11 +339,13 @@ final class Connection private[adapter] (
       finally reader.close(false)
     }
 
-  /** Best-effort DISCONNECT_MESSAGE. A half-dead node must not crash the caller's `IO`, so we
-    * swallow any transport exception. The server-side `connectionId` will be cleaned up by the
-    * node's own connection reaper anyway.
+  /** Stops the heartbeats (without waiting for an in-flight one), then sends a best-effort
+    * DISCONNECT_MESSAGE. A half-dead node must not crash the caller's `IO`, so we swallow any
+    * transport exception. Do not count on the node to reap a connection that is never closed: it
+    * checks a lease only when a message for that connection arrives, so an abandoned connection
+    * keeps its node session until DISCONNECT or node shutdown.
     */
-  def close(): IO[Unit] = transport
+  def close(): IO[Unit] = stopHeartbeats *> transport
     .post(url, QuackNativeBridge.serializeDisconnect(connectionId))
     .void
     .handleError { e =>
@@ -246,8 +356,11 @@ final class Connection private[adapter] (
   /** Internal hook used by [[ChainedQuackArrowReader]] to fire the next FETCH_REQUEST.
     * Public-package-private because the reader is in the same package.
     */
-  private[adapter] def fetch(resultUuid: java.math.BigInteger): IO[Array[Byte]] =
-    transport.post(url, QuackNativeBridge.serializeFetchRequest(connectionId, resultUuid))
+  private[adapter] def fetch(resultUuid: java.math.BigInteger, batchIndex: Long): IO[Array[Byte]] =
+    transport.post(
+      url,
+      QuackNativeBridge.serializeFetchRequest(connectionId, resultUuid, batchIndex)
+    )
 
 /** Lazy chained [[ArrowReader]] that pulls batches from the initial PREPARE_RESPONSE reader, then
   * issues FETCH_REQUEST/FETCH_RESPONSE round-trips until the server signals end-of-stream (empty

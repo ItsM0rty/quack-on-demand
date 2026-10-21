@@ -7,10 +7,26 @@ import scala.util.Using
 object QuackNativeBridge:
   @native def smokeAnswer(): Int
 
+  /** The build marker compiled into the binary (`quackwire-build-info:protocol=..;duckdb=..;
+    * duckdb_source=..;quack=..`): the Quack protocol generation, the DuckDB version and source id
+    * it was built against and the duckdb-quack commit. Parsed by [[NativeBuildInfo]]. A native that
+    * predates the marker lacks this export, so calling it raises `UnsatisfiedLinkError`.
+    */
+  @native def buildInfo(): String
+
+  /** The libduckdb loaded into this process, as `duckdb=<version>;duckdb_source=<source id>`. */
+  @native def linkedDuckDb(): String
+
   /** Serializes a `CONNECTION_REQUEST` message with the supplied auth token. The returned bytes are
     * the binary `QuackMessage` ready to POST to a Quack node's `/quack` endpoint.
+    *
+    * `heartbeatTimeoutSec` (Quack v3) is the connection lease the node grants: every request renews
+    * it. The node checks the lease only when the connection's next message arrives; once lapsed,
+    * that message fails and the node interrupts what still runs on the connection and drops it. A
+    * lapse by itself interrupts nothing, so the lease does not bound work orphaned by a dead
+    * manager.
     */
-  @native def serializeConnectionRequest(token: String): Array[Byte]
+  @native def serializeConnectionRequest(token: String, heartbeatTimeoutSec: Long): Array[Byte]
 
   /** Serializes a `PREPARE_REQUEST` message binding `sql` to an existing connection identified by
     * `connectionId`.
@@ -23,11 +39,18 @@ object QuackNativeBridge:
     * `resultUuid` is the 128-bit identifier threaded through from the `PREPARE_RESPONSE`; pass it
     * as a `java.math.BigInteger` so the JNI layer can unpack it into the native
     * `hugeint_t {upper:int64, lower:uint64}` pair without sign-mangling on the boundary.
+    *
+    * `batchIndex` (Quack v3) is the 1-based index of the batch asked for, counted after the batches
+    * the PREPARE_RESPONSE carried inline; the request also acks every batch before it.
     */
   @native def serializeFetchRequest(
       connectionId: String,
-      resultUuid: java.math.BigInteger
+      resultUuid: java.math.BigInteger,
+      batchIndex: Long
   ): Array[Byte]
+
+  /** Serializes a `HEARTBEAT_REQUEST` that renews the connection's lease (Quack v3). */
+  @native def serializeHeartbeat(connectionId: String): Array[Byte]
 
   /** Serializes a `DISCONNECT_MESSAGE` that releases server-side state for the supplied connection.
     */
@@ -80,6 +103,12 @@ object QuackNativeBridge:
     */
   @native def extractArrowStream(bytes: Array[Byte]): Long
 
+  /** Frees the heap struct [[extractArrowStream]] returned, once the Arrow Java importer has moved
+    * its contents into a struct it owns (the import marks this one released). A stream the import
+    * never took is released first, so its chunks are freed with it. Call exactly once per pointer.
+    */
+  @native def freeStreamShell(ptr: Long): Unit
+
   /** Parses `bytes` as a `FETCH_RESPONSE` and returns the number of `DataChunkWrapper` entries it
     * carries. The driver uses `0` as the end-of-FETCH-loop signal, matching the upstream
     * Quack-extension scan code (`duckdb-quack/src/quack_scan.cpp:331`, which guards the loop with
@@ -116,21 +145,21 @@ object QuackNativeBridge:
   // Referencing the module object forces its <clinit> (and therefore the
   // `loaded` init above, and the underlying System.load) to run right here,
   // instead of lazily at the first native call. Used by
-  // QuackNativeSupport.effectiveNativeClient to probe loadability at boot.
+  // QuackNativeSupport.requireLoaded, which QuackNativeSupport.bootCheck runs at boot.
   private[adapter] def forceInit(): Unit =
     val _ = QuackNativeBridge
     ()
 
-/** Classpath probe for the bundled libquackwire native. Deliberately separate from
-  * [[QuackNativeBridge]]: touching that object triggers the JNI load at init, which is exactly what
-  * must NOT happen on a platform with no bundled binary (Windows on ARM64 - quackwire.dll is built
-  * x86_64-only). Main consults [[effectiveNativeClient]] before constructing the client so such
-  * platforms degrade to the embedded HTTP path instead of crashing.
+/** Classpath probe and load gate for the bundled libquackwire native, the manager's only client to
+  * its nodes. Deliberately separate from [[QuackNativeBridge]]: touching that object triggers the
+  * JNI load at init, which must not happen on a platform with no bundled binary (one NativeLoader
+  * does not know, or a jar assembled without that platform's binary).
   *
-  * On a platform WITH a bundled binary, presence alone does not mean the native actually loads
-  * (e.g. Windows missing the MSVC runtime, or the ABI-pinned duckdb.dll not resolvable on PATH).
-  * [[effectiveNativeClient]] also attempts the real load once here, at boot, so a broken native
-  * degrades a single time with a warning instead of poisoning every query with a failed <clinit>.
+  * Main runs [[bootCheck]] early in boot, so a platform with no bundled binary, or one whose
+  * bundled native cannot load (an old glibc, a missing MSVC runtime, libduckdb not found) or was
+  * built for another DuckDB or Quack protocol than this jar pins (a stale native, see
+  * [[NativeBuildInfo]]), refuses to boot with an actionable message instead of failing every query.
+  * There is no fallback client.
   */
 object QuackNativeSupport extends com.typesafe.scalalogging.LazyLogging:
 
@@ -147,42 +176,63 @@ object QuackNativeSupport extends com.typesafe.scalalogging.LazyLogging:
   def availableForThisPlatform: Boolean =
     scala.util.Try(NativeLoader.platformDir()).toOption.exists(available(_))
 
-  /** The native-client setting Main should actually use: the configured value, forced to `false`
-    * (with a warning) when no native is bundled for this platform, or when a bundled native fails
-    * to actually load. `tryLoad` is injectable for tests; in production it triggers the real JNI
-    * load via [[QuackNativeBridge.forceInit]] exactly once, here at boot -- never lazily at the
-    * first query.
+  /** The boot gate: Right when the native client can run here, else a message naming the platform,
+    * the `libquackwire/binaries/<platform>` binary the jar should have bundled and the
+    * `DUCKDB_CACHE_DIR` hint. Main turns a Left into a boot failure.
+    *
+    * `load` runs only when a native is bundled (touching the bridge on a platform without one only
+    * adds a link error to the report); in production it is [[requireLoaded]], so the one real JNI
+    * load happens here, at boot. Every parameter is injectable for tests.
     */
-  def effectiveNativeClient(
-      configured: Boolean,
-      nativeBundled: Boolean = availableForThisPlatform,
-      tryLoad: () => Unit = () => requireLoaded()
-  ): Boolean =
-    if configured && !nativeBundled then
-      logger.warn(
-        "nativeClient=true but no libquackwire native is bundled for this platform " +
-          "(e.g. Windows on ARM64, where quackwire.dll is x86_64-only); " +
-          "falling back to the embedded HTTP client."
-      )
-      false
-    else if configured && nativeBundled then
-      // UnsatisfiedLinkError (and the ExceptionInInitializerError that wraps it when the
-      // failure surfaces via object init) is a java.lang.Error, not an Exception -- NonFatal
-      // (and therefore scala.util.Try) does not catch it. Catch Throwable explicitly.
-      try
-        tryLoad()
-        true
-      catch
-        case t: Throwable =>
-          val cause = if t.getCause != null then t.getCause else t
-          logger.warn(
-            "nativeClient=true and quackwire is bundled for this platform, but loading it " +
-              s"failed: ${cause.getMessage}. Falling back to the embedded HTTP client. On Windows " +
-              "this is commonly a missing Microsoft Visual C++ runtime or the ABI-pinned " +
-              "duckdb.dll not being resolvable on PATH."
-          )
-          false
-    else configured
+  def bootCheck(
+      bundled: Boolean = availableForThisPlatform,
+      load: () => Unit = () => requireLoaded(),
+      osName: String = sys.props.getOrElse("os.name", "unknown"),
+      osArch: String = sys.props.getOrElse("os.arch", "unknown"),
+      preloaded: => Option[Path] = LibDuckDbPreload.lastLoaded
+  ): Either[String, Unit] =
+    val platform =
+      s"os.name=$osName, os.arch=$osArch (libquackwire/binaries/${expectedBinary(osName, osArch)})"
+    val cause: Option[String] =
+      if !bundled then Some("no libquackwire native is bundled in this jar for the platform")
+      else
+        // A failed load can surface as a java.lang.Error (UnsatisfiedLinkError, or the
+        // ExceptionInInitializerError wrapping it), which NonFatal does not cover.
+        try
+          load()
+          None
+        catch
+          case t: Throwable =>
+            val root = initCause(t)
+            Some(Option(root.getMessage).getOrElse(root.toString))
+    cause match
+      case None         => Right(())
+      case Some(reason) =>
+        // libduckdb found and loaded means provisioning worked, and a stale native is not a
+        // provisioning problem either: in both cases the cache hint would only mislead.
+        val cacheHint =
+          if reason.contains("DUCKDB_CACHE_DIR") || reason.contains(StaleNativeException.Marker) ||
+            (bundled && preloaded.isDefined)
+          then ""
+          else
+            " When the binary is present but cannot find libduckdb: " +
+              LibDuckDbPreload.provisionHint(LibDuckDbPreload.bundledAbi.getOrElse("<abi>"))
+        val because = reason.stripSuffix(".")
+        Left(
+          s"The native Quack client (libquackwire) cannot run on this host: $because. " +
+            s"Platform: $platform. The manager has no fallback client to reach its nodes, so it " +
+            "refuses to boot. Use a jar built with the libquackwire binary for this platform." +
+            cacheHint
+        )
+
+  /** `<platform>/<library file>` under `libquackwire/binaries/`, derived from `os.name` / `os.arch`
+    * the way [[NativeLoader]] resolves it. A platform it does not know is reported as
+    * `<os.name>-<os.arch>`, since no build exists to name.
+    */
+  private def expectedBinary(osName: String, osArch: String): String =
+    scala.util.Try(NativeLoader.platformDir(osName, osArch)).toOption match
+      case Some(dir) => s"$dir/${NativeLoader.libraryFile(dir)}"
+      case None      => s"$osName-$osArch (no libquackwire build exists for it)"
 
   /** Attempts `load` and returns None when it succeeds, else a NON-fatal exception carrying the
     * original cause. A failed [[QuackNativeBridge]] init surfaces as `ExceptionInInitializerError`
@@ -190,27 +240,80 @@ object QuackNativeSupport extends com.typesafe.scalalogging.LazyLogging:
     * cats-effect treats as fatal: thrown inside an IO they kill the runtime and leave any
     * `unsafeRunSync` caller waiting forever. Unwrapping to the `UnsatisfiedLinkError` underneath
     * keeps the message actionable.
+    *
+    * A load that fails on a missing symbol found libduckdb but not a symbol the native imports: the
+    * two are different DuckDB builds, reported as a [[StaleNativeException]] rather than as a
+    * provisioning problem.
     */
   private[adapter] def probe(
       load: () => Unit,
-      preloadMiss: => Option[String] = LibDuckDbPreload.lastMiss
+      preloadMiss: => Option[String] = LibDuckDbPreload.lastMiss,
+      preloaded: => Option[Path] = LibDuckDbPreload.lastLoaded
   ): Option[IllegalStateException] =
     try
       load()
       None
     catch
       case t: Throwable =>
-        val root = initCause(t)
-        val hint = preloadMiss.getOrElse(
-          "It links the pinned libduckdb dynamically: provision .duckdb/<abi>/lib " +
-            "(scripts/run-jar.sh does) or point DUCKDB_CACHE_DIR at a cache holding it."
-        )
-        Some(
-          new IllegalStateException(
-            s"libquackwire native failed to load: ${root.getMessage}. $hint",
-            root
+        val root   = initCause(t)
+        val detail = Option(root.getMessage).getOrElse(root.toString)
+        if NativeBuildInfo.isMissingSymbol(detail) then
+          Some(
+            StaleNativeException(
+              s"libquackwire native failed to load: $detail. libduckdb was found, but it lacks " +
+                "a symbol the native imports, so the two were built from different DuckDB " +
+                "releases: most likely the bundled native was built against another DuckDB than " +
+                s"this jar pins (${NativeBuildInfo.stampText}), or a libduckdb other than the " +
+                "pinned one is first on the loader path. " + NativeBuildInfo.RefreshHint,
+              root
+            )
           )
-        )
+        else
+          val abi  = LibDuckDbPreload.bundledAbi.getOrElse("<abi>")
+          val hint = preloadMiss.getOrElse(
+            preloaded match
+              case Some(lib) =>
+                s"libduckdb was preloaded from $lib, so it was provisioned: either that file is " +
+                  s"not DuckDB $abi, or the bundled libquackwire does not match it or this host."
+              case None =>
+                s"It links the pinned libduckdb dynamically. ${LibDuckDbPreload.provisionHint(abi)}"
+          )
+          Some(
+            new IllegalStateException(s"libquackwire native failed to load: $detail. $hint", root)
+          )
+
+  /** Calls the native's build-info exports and returns why the loaded native must not run, None
+    * when its build marker matches `/native/VERSION` and the loaded libduckdb. A missing export
+    * (`UnsatisfiedLinkError`) is a native that predates the marker, hence stale.
+    */
+  private[adapter] def verifyBuild(
+      buildInfo: () => String = () => QuackNativeBridge.buildInfo(),
+      linkedDuckDb: () => String = () => QuackNativeBridge.linkedDuckDb(),
+      stamp: Option[String] = LibDuckDbPreload.bundledStamp
+  ): Option[IllegalStateException] =
+    try NativeBuildInfo.mismatch(buildInfo(), linkedDuckDb(), stamp).map(StaleNativeException(_))
+    catch
+      case t: Throwable =>
+        val root = initCause(t)
+        root match
+          case e: UnsatisfiedLinkError =>
+            Some(
+              StaleNativeException(
+                "the bundled libquackwire native has no build-info export " +
+                  s"(${Option(e.getMessage).getOrElse("UnsatisfiedLinkError")}), so it predates " +
+                  "build markers: a stale native (a DuckDB 1.5.x / Quack v1 build) that cannot " +
+                  s"run with the pinned ${NativeBuildInfo.stampText}. " + NativeBuildInfo.RefreshHint,
+                e
+              )
+            )
+          case other =>
+            Some(
+              StaleNativeException(
+                s"could not read the libquackwire build marker: ${other.getMessage}. " +
+                  NativeBuildInfo.RefreshHint,
+                other
+              )
+            )
 
   @scala.annotation.tailrec
   private def initCause(t: Throwable): Throwable = t match
@@ -218,23 +321,144 @@ object QuackNativeSupport extends com.typesafe.scalalogging.LazyLogging:
       initCause(t.getCause)
     case _ => t
 
-  /** The JNI load, attempted once per JVM and shared by [[effectiveNativeClient]] and
-    * [[requireLoaded]].
+  /** The JNI load and build check, attempted once per JVM and shared by every [[requireLoaded]]
+    * caller.
     */
   private lazy val loadFailure: Option[IllegalStateException] =
-    probe(() => QuackNativeBridge.forceInit())
+    probe(() => QuackNativeBridge.forceInit()).orElse(verifyBuild())
 
-  /** Throws a non-fatal `IllegalStateException` naming the root cause when the native cannot load.
-    * Entry points call it inside their IO before the first native call, so a broken native fails
-    * the statement instead of hanging the caller.
+  /** Throws a non-fatal `IllegalStateException` naming the root cause when the native cannot load
+    * or is stale. Entry points call it inside their IO before the first native call, so a broken
+    * native fails the statement instead of hanging the caller.
     */
   def requireLoaded(): Unit =
-    loadFailure.foreach(e => throw new IllegalStateException(e.getMessage, e.getCause))
+    loadFailure.foreach {
+      case e: StaleNativeException => throw StaleNativeException(e.getMessage, e.getCause)
+      case e                       => throw new IllegalStateException(e.getMessage, e.getCause)
+    }
+
+/** The bundled libquackwire native was built for another DuckDB or Quack protocol than this jar
+  * pins (or than the libduckdb it loaded). Not a provisioning problem: the fix is a native refresh.
+  */
+final class StaleNativeException private (message: String, cause: Throwable)
+    extends IllegalStateException(s"${StaleNativeException.Marker}: $message", cause)
+
+object StaleNativeException:
+  /** Leads every message, so [[QuackNativeSupport.bootCheck]] can tell this cause apart. */
+  val Marker = "stale libquackwire native"
+
+  /** `message` may already carry the [[Marker]] (a rethrow); it is not repeated. */
+  def apply(message: String, cause: Throwable = null): StaleNativeException =
+    new StaleNativeException(message.stripPrefix(s"$Marker: "), cause)
+
+/** The build marker compiled into libquackwire (`kQuackwireBuildInfo` in quackwire.cpp, defined by
+  * native/quackwire/CMakeLists.txt) and the checks [[QuackNativeSupport]] runs on it. A vendored
+  * binary is only as trustworthy as this marker: `/native/VERSION` is stamped for the whole set, so
+  * a binary left over from an earlier DuckDB passes every check that reads the stamp alone.
+  * scripts/release/quackwire-build-info.sh reads the same marker from the file at release time.
+  */
+private[adapter] object NativeBuildInfo:
+
+  /** The Quack protocol generation the manager's node client speaks. */
+  val ProtocolVersion: Long = 3L
+
+  val Prefix = "quackwire-build-info:"
+
+  val RefreshHint: String =
+    "Use a jar whose libquackwire/binaries/ were rebuilt against the pinned DuckDB " +
+      "(scripts/release/refresh-quackwire-binaries.sh, or QOD_VERSION=BUILD ./scripts/run-jar.sh " +
+      "for the host platform)."
+
+  /** `<duckdb>-<quack sha12>-<rev>`, e.g. `2.0.0-974927a394b1-1`. */
+  private val Stamp = "(\\d+\\.\\d+\\.\\d+)-([0-9a-f]+)-.*".r
+
+  /** `v2.0.0-alpha46057` and `v2.0.0` both name release 2.0.0. */
+  private val Release = "v?(\\d+\\.\\d+\\.\\d+).*".r
+
+  def stampText: String =
+    LibDuckDbPreload.bundledStamp.fold("no /native/VERSION stamp")(s => s"libquackwire $s")
+
+  /** The `key=value;...` fields of a build marker (or of [[QuackNativeBridge.linkedDuckDb]]). */
+  def fields(raw: String): Map[String, String] =
+    raw.trim
+      .stripPrefix(Prefix)
+      .split(';')
+      .toList
+      .flatMap { kv =>
+        kv.split("=", 2) match
+          case Array(k, v) if k.nonEmpty => Some(k -> v)
+          case _                         => None
+      }
+      .toMap
+
+  /** Why a native with build marker `built`, running against libduckdb `linked` (both as the native
+    * reports them), must not run under the `/native/VERSION` `stamp`; None when everything agrees.
+    */
+  def mismatch(built: String, linked: String, stamp: Option[String]): Option[String] =
+    val b = fields(built)
+    val l = fields(linked)
+    (
+      get(b, "protocol"),
+      get(b, "duckdb"),
+      get(b, "duckdb_source"),
+      get(b, "quack"),
+      stamp.map(_.trim)
+    ) match
+      case (
+            Some(protocol),
+            Some(duckdb),
+            Some(source),
+            Some(quack),
+            Some(pin @ Stamp(abi, quack12))
+          ) =>
+        val release = duckdb match
+          case Release(r) => r
+          case other      => other
+        if protocol != ProtocolVersion.toString then
+          Some(
+            s"the bundled native speaks Quack protocol $protocol, the manager needs " +
+              s"$ProtocolVersion. $RefreshHint"
+          )
+        else if release != abi || !quack.startsWith(quack12) then
+          Some(
+            s"the bundled native was built against DuckDB $duckdb with duckdb-quack " +
+              s"${quack.take(12)}, but this jar pins libquackwire $pin (DuckDB $abi, " +
+              s"duckdb-quack $quack12). $RefreshHint"
+          )
+        else if !get(l, "duckdb").contains(duckdb) || !get(l, "duckdb_source").contains(source)
+        then
+          Some(
+            s"the bundled native was built against DuckDB $duckdb ($source) but the process " +
+              s"loaded libduckdb ${get(l, "duckdb").getOrElse("?")} " +
+              s"(${get(l, "duckdb_source").getOrElse("?")}); their C++ ABIs differ. Put the " +
+              s"pinned libduckdb $abi first on the loader path (.duckdb/$abi/lib or " +
+              "DUCKDB_CACHE_DIR), or rebuild the native against the loaded one."
+          )
+        else None
+      case (_, _, _, _, None) =>
+        Some("no /native/VERSION stamp is bundled next to the native; the jar is malformed.")
+      case (_, _, _, _, Some(s)) if !Stamp.matches(s) =>
+        Some(s"/native/VERSION ($s) is not a <duckdb>-<quack sha>-<rev> stamp.")
+      case _ =>
+        Some(s"the bundled native's build marker is incomplete ($built). $RefreshHint")
+
+  private def get(fields: Map[String, String], key: String): Option[String] =
+    fields.get(key).filter(_.nonEmpty)
+
+  /** True for a dynamic-loader message about a symbol the image imports and no loaded library
+    * exports: dyld (macOS), glibc (Linux, under `-z now` at load), Windows `ERROR_PROC_NOT_FOUND`.
+    */
+  def isMissingSymbol(message: String): Boolean =
+    message.contains("Symbol not found") || message.contains("undefined symbol") ||
+      message.contains("specified procedure could not be found")
 
 private object NativeLoader:
-  def platformDir(): String =
-    val os    = sys.props("os.name").toLowerCase(Locale.ROOT)
-    val arch  = sys.props("os.arch").toLowerCase(Locale.ROOT)
+  def platformDir(
+      osName: String = sys.props("os.name"),
+      osArch: String = sys.props("os.arch")
+  ): String =
+    val os    = osName.toLowerCase(Locale.ROOT)
+    val arch  = osArch.toLowerCase(Locale.ROOT)
     val osTag =
       if os.contains("mac") then "osx"
       else if os.contains("linux") then "linux"
@@ -246,9 +470,17 @@ private object NativeLoader:
       case other               => sys.error(s"unsupported arch for libquackwire: $other")
     s"$osTag-$archTag"
 
+  /** The library file name the binaries for `platformDir` carry (`System.mapLibraryName` for that
+    * OS rather than the running one).
+    */
+  def libraryFile(platformDir: String): String =
+    if platformDir.startsWith("windows") then "quackwire.dll"
+    else if platformDir.startsWith("osx") then "libquackwire.dylib"
+    else "libquackwire.so"
+
   def loadFromResources(resourcePath: String): Unit =
-    // Resolved before the preload: a platform with no bundled native (Windows on ARM64) has
-    // nothing to preload libduckdb for.
+    // Resolved before the preload: a platform with no bundled native has nothing to preload
+    // libduckdb for.
     val resource = Option(getClass.getResourceAsStream(resourcePath))
       .getOrElse(sys.error(s"libquackwire resource not found: $resourcePath"))
     // libquackwire links libduckdb dynamically. Loading the pinned one first lets the dynamic
@@ -265,21 +497,24 @@ private object NativeLoader:
     tmp.toFile.deleteOnExit()
     System.load(tmp.toAbsolutePath.toString)
 
-/** Loads the pinned libduckdb into the process before libquackwire, from the `.duckdb/<abi>/lib`
+/** Loads the pinned libduckdb into the process before libquackwire, from the `<root>/<abi>/lib`
   * cache the launchers provision.
   *
   * libquackwire depends on `@rpath/libduckdb.dylib` (`libduckdb.so`, `duckdb.dll`), and the only
   * rpath baked into a vendored binary is the build machine's cache directory, which exists nowhere
-  * else. `run-jar.sh` and `qod start` / `qod serve` cover that by putting the cache on the loader
-  * path, but a JVM started through a bash script on macOS never sees `DYLD_LIBRARY_PATH` (System
-  * Integrity Protection strips `DYLD_*` when a protected binary such as `/bin/bash` runs), which is
-  * exactly how `sbt test` forks. An image already loaded under the same install name (macOS),
-  * soname (Linux) or module name (Windows) satisfies the dependency, so a preload makes the baked
-  * rpath irrelevant.
+  * else. The loader path cannot be relied on to cover that: System Integrity Protection strips
+  * `DYLD_*` whenever a protected binary runs, so a JVM that is itself `/usr/bin/java`, or is
+  * started through `/bin/bash` (exactly how `sbt test` forks), never sees `DYLD_LIBRARY_PATH`, and
+  * Windows has no loader variable at all. So every launcher hands this preload an absolute location
+  * instead: the qod CLI (`qod start`, `qod serve`, the demo) exports `DUCKDB_CACHE_DIR` at its
+  * versioned `<user cache>/qod/duckdb`, `run-jar.sh` provisions `<repo>/.duckdb/<abi>`, and
+  * build.sbt points forked tests at the main checkout's. An image already loaded under the same
+  * install name (macOS), soname (Linux) or module name (Windows) satisfies the dependency, so a
+  * preload makes the baked rpath irrelevant.
   *
   * Best effort by design: finding nothing, or failing to load what it found, leaves resolution to
-  * the loader path exactly as before, and [[QuackNativeSupport.effectiveNativeClient]] still
-  * decides whether the native client is usable.
+  * the loader path exactly as before, and [[QuackNativeSupport.bootCheck]] still decides whether
+  * the manager can boot.
   */
 private[adapter] object LibDuckDbPreload extends com.typesafe.scalalogging.LazyLogging:
 
@@ -294,14 +529,17 @@ private[adapter] object LibDuckDbPreload extends com.typesafe.scalalogging.LazyL
       case DuckDbVersion(v) => Some(v)
       case _                => None
 
-  def bundledAbi: Option[String] =
-    Option(getClass.getResourceAsStream(VersionResource)).flatMap { in =>
-      scala.util.Using.resource(in)(s => abiVersion(new String(s.readAllBytes(), "UTF-8")))
+  /** The whole `/native/VERSION` stamp, trimmed. */
+  def bundledStamp: Option[String] =
+    Option(getClass.getResourceAsStream(VersionResource)).map { in =>
+      scala.util.Using.resource(in)(s => new String(s.readAllBytes(), "UTF-8").trim)
     }
 
+  def bundledAbi: Option[String] = bundledStamp.flatMap(abiVersion)
+
   /** Where the launchers put libduckdb, in the order they are tried: `$DUCKDB_CACHE_DIR/<abi>/lib`
-    * (run-jar.sh's and the qod launcher's air-gap layout), then `<cwd>/.duckdb/<abi>/lib` (run-jar
-    * .sh's default, and a repo-root `sbt test`).
+    * (the qod CLI's cache, which it always exports, and run-jar.sh's air-gap layout), then
+    * `<cwd>/.duckdb/<abi>/lib` (run-jar.sh's default, and a repo-root `sbt test`).
     */
   def candidates(abi: String, env: Map[String, String], cwd: Path): List[Path] =
     val lib = System.mapLibraryName("duckdb")
@@ -310,17 +548,28 @@ private[adapter] object LibDuckDbPreload extends com.typesafe.scalalogging.LazyL
 
   /** The [[notFoundMessage]] of the last [[preload]] that found no candidate, None after one that
     * did. Only logged at DEBUG there: a miss is the normal case wherever libduckdb comes from the
-    * loader path (the Docker image, `qod start`, Windows PATH), so the paths are named only when
-    * the libquackwire load really fails ([[QuackNativeSupport.probe]]).
+    * loader path (the Docker image installs it in `/usr/local/lib`), so the paths are named only
+    * when the libquackwire load really fails ([[QuackNativeSupport.probe]]).
     */
   @volatile private[adapter] var lastMiss: Option[String] = None
+
+  /** The libduckdb the last [[preload]] loaded, None when it loaded nothing. Lets a later
+    * libquackwire failure say that provisioning worked rather than blame it.
+    */
+  @volatile private[adapter] var lastLoaded: Option[Path] = None
+
+  /** How each launcher provisions libduckdb `abi`, for the preload miss and the boot refusal. */
+  def provisionHint(abi: String): String =
+    s"The qod CLI (qod start, qod serve, the demo) provisions <user cache>/qod/duckdb/$abi/lib and " +
+      s"exports DUCKDB_CACHE_DIR at it unless DUCKDB_VERSION names another release; otherwise " +
+      s"set DUCKDB_CACHE_DIR to a directory holding $abi/lib/${System.mapLibraryName("duckdb")}, " +
+      s"or provision .duckdb/$abi/ (scripts/run-jar.sh populates it)."
 
   /** What [[preload]] records when an ABI is known but no candidate holds libduckdb. */
   def notFoundMessage(abi: String, tried: List[Path]): String =
     s"no libduckdb $abi to preload; tried ${tried.mkString(", ")}. libquackwire falls back to " +
-      s"the dynamic loader path, which fails unless a launcher put the cache on it. Provision " +
-      s".duckdb/$abi/ (scripts/run-jar.sh populates it) or set DUCKDB_CACHE_DIR to a cache " +
-      "holding it."
+      s"the dynamic loader path, which only finds a libduckdb an image installed. " +
+      provisionHint(abi)
 
   /** Loads the first existing candidate and returns it; None when there was nothing to load or the
     * load failed. Never throws: an `UnsatisfiedLinkError` is a `java.lang.Error`, hence Throwable.
@@ -338,7 +587,7 @@ private[adapter] object LibDuckDbPreload extends com.typesafe.scalalogging.LazyL
       lastMiss.foreach(m => logger.debug(m))
       hit
     }
-    found.flatMap { lib =>
+    val loaded = found.flatMap { lib =>
       try
         load(lib.toAbsolutePath.toString)
         logger.debug(s"preloaded libduckdb from $lib")
@@ -351,3 +600,5 @@ private[adapter] object LibDuckDbPreload extends com.typesafe.scalalogging.LazyL
           )
           None
     }
+    lastLoaded = loaded
+    loaded

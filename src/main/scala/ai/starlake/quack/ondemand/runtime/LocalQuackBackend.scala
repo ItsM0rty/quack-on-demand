@@ -3,38 +3,80 @@ package ai.starlake.quack.ondemand.runtime
 import java.util.Locale
 import ai.starlake.quack.model.{NodeSpec, PoolKey, RunningNode}
 import cats.effect.IO
+import com.typesafe.scalalogging.LazyLogging
 
 import java.lang.{ProcessBuilder => JProcessBuilder}
 import java.security.SecureRandom
 import java.time.Instant
 import java.util.Base64
 import scala.collection.concurrent.TrieMap
+import scala.jdk.CollectionConverters.*
 
 final class LocalQuackBackend(
     min: Int,
     max: Int,
     commandFor: (NodeSpec, Int, String) => List[String] =
       LocalQuackBackend.defaultCommand(LocalQuackBackend.DefaultSpawnScript)
-) extends QuackBackend:
+) extends QuackBackend
+    with LazyLogging:
 
   private val ports     = new PortAllocator(min, max)
   private val processes = TrieMap.empty[String, Process]
   private val tokens    = TrieMap.empty[String, String]
   private val nodePorts = TrieMap.empty[String, Int]
-  // PIDs of nodes recovered via `adopt()` - we don't have a Process
+  // Processes of nodes recovered via `adopt()` - we don't have a Process
   // handle for those (parent JVM didn't fork them), but we can still
-  // SIGTERM via ProcessHandle on stop().
-  private val adoptedPids = TrieMap.empty[String, Long]
+  // SIGTERM them on stop(). Only identity-verified handles (NodeProcess), so
+  // a signal never reaches a process that merely reuses the row's pid.
+  private val adoptedProcs = TrieMap.empty[String, ProcessHandle]
+  // Ports of node processes still running that this backend does not hold (left by an earlier
+  // manager), each leased until that process exits: a new node must never be started onto a port a
+  // leftover may still be listening on. Keyed by port; the value is the process holding the lease.
+  private val reserved = TrieMap.empty[Int, ProcessHandle]
+  // The OS reported no start instant for a node: logged once, see start().
+  private val startInstantMissingLogged = new java.util.concurrent.atomic.AtomicBoolean(false)
 
-  def start(spec: NodeSpec): IO[RunningNode] = IO.blocking {
+  // A manager killed together with a node it was spawning can leave a secrets directory behind.
+  NodeSecretFiles.sweepStale()
+
+  def start(spec: NodeSpec): IO[RunningNode] =
+    QuackBackend.screenBootSql(spec) *> startScreened(spec)
+
+  private def startScreened(spec: NodeSpec): IO[RunningNode] = IO.blocking {
+    // One process per node id. A start under an id this backend still holds (reconcile replacing
+    // a node it judged dead) stops the held process first: overwriting the handle instead would
+    // leave that process running untracked, holding its port past every stop path, and leak the
+    // port lease too.
+    if processes.contains(spec.nodeId) || adoptedProcs.contains(spec.nodeId) ||
+      nodePorts.contains(spec.nodeId)
+    then
+      held(spec.nodeId).filter(_.isAlive).foreach { h =>
+        logger.warn(s"start of ${spec.nodeId}: stopping its still-running process ${h.pid()} first")
+      }
+      release(spec.nodeId)
     val port  = ports.lease().getOrElse(throw new RuntimeException(s"no free port in [$min, $max]"))
     val token = LocalQuackBackend.randomToken()
     val cmd   = commandFor(spec, port, token)
     val pb    = new JProcessBuilder(cmd*).inheritIO()
-    // Propagate metastore as environment variables to the spawned Quack node.
-    // Defaults from application.conf apply first; per-pool entries from
-    // CreatePoolRequest.metastore override them.
+    // Propagate the non-sensitive metastore as environment variables to the spawned Quack node.
     val env = pb.environment()
+    // Nothing secret may sit in the node's environment (or argv): a node user reads both back
+    // through getenv() / /proc/<pid>/environ. The sensitive values (NodeSecretFiles.Keys: metastore
+    // pgPassword / encryptionKey, federation and object-store SQL, the node token, the manager's
+    // own QOD_S3_* / QOD_AZURE_* credentials) go to a private directory the script reads and
+    // deletes; the manager's other credentials it inherited (QOD_API_KEY, the session JWT secret,
+    // passwords...) are dropped outright.
+    val inherited = env.asScala.toMap
+    val secrets   = NodeSecretFiles.collect(
+      spec.metastore,
+      spec.extraSetupSql,
+      spec.objectStoreSql,
+      token,
+      inherited
+    )
+    inherited.keys.foreach { k =>
+      if NodeSecretFiles.isKey(k) || NodeSecretFiles.isInheritedSecret(k) then env.remove(k)
+    }
     // When running from an installed app-image (QOD_APP_HOME set), prepend the bundled duckdb bin
     // so spawn-quack-node.sh's `command -v duckdb` resolves it. Additive: no-op in dev/source runs.
     LocalQuackBackend.duckdbPathPrefix(sys.env.get("QOD_APP_HOME")).foreach { prefix =>
@@ -52,9 +94,8 @@ final class LocalQuackBackend(
     // would resurrect a key `effectiveMetastoreFor` deliberately removed (e.g. the
     // bootstrap tenant-db's DuckLake directory reappearing as `dataPath` on a
     // pathless duckdb-file node, which then fails ATTACH with "Is a directory").
-    spec.metastore.foreach { case (k, v) => env.put(k, v) }
+    spec.metastore.foreach { case (k, v) => if !NodeSecretFiles.isKey(k) then env.put(k, v) }
     env.put("kind", spec.kindWire)
-    if spec.extraSetupSql.nonEmpty then env.put("extraSetupSql", spec.extraSetupSql)
     // Tenant-db initSql: spawn-quack-node.sh emits it after the proxy settings
     // and before `INSTALL quack; LOAD quack;`, unlike extraSetupSql which runs
     // after the catalog ATTACH.
@@ -63,13 +104,38 @@ final class LocalQuackBackend(
     // after extraSetupSql, right before quack_serve, so the value
     // restrictions are in effect before the node serves any tenant statement.
     if spec.lockdownSql.nonEmpty then env.put("lockdownSql", spec.lockdownSql)
-    // Per-database object-store secret (ObjectStoreSecret.sql). spawn-quack-node.sh runs it
-    // alongside the global STORAGE_SQL block, before the DuckLake catalog ATTACH.
-    if spec.objectStoreSql.nonEmpty then env.put("objectStoreSql", spec.objectStoreSql)
-    val proc = pb.start()
+    val secretsDir =
+      try NodeSecretFiles.writePrivateDir(secrets)
+      catch
+        case e: Throwable =>
+          ports.release(port)
+          throw e
+    env.put(NodeSecretFiles.DirEnv, secretsDir.toString)
+    env.put(NodeSecretFiles.EphemeralEnv, "1")
+    val proc =
+      try pb.start()
+      catch
+        case e: Throwable =>
+          NodeSecretFiles.deleteQuietly(secretsDir)
+          ports.release(port)
+          throw e
+    // The script deletes the directory as soon as it has read it; this covers a script that dies
+    // first (bad kind, missing duckdb, a kill before it got that far).
+    proc.onExit().thenRun(() => NodeSecretFiles.deleteQuietly(secretsDir))
     processes.put(spec.nodeId, proc)
     tokens.put(spec.nodeId, token)
     nodePorts.put(spec.nodeId, port)
+    val startInstant = proc.toHandle.info().startInstant()
+    if !startInstant.isPresent && proc.isAlive && startInstantMissingLogged.compareAndSet(
+        false,
+        true
+      )
+    then
+      logger.error(
+        "The OS reports no start time for spawned node processes, so a node's process cannot be " +
+          "verified (NodeProcess): reconcile will read every local node as dead and replace it on " +
+          "each pass. Run the manager where ProcessHandle.info().startInstant() is available."
+      )
 
     RunningNode(
       nodeId = spec.nodeId,
@@ -80,37 +146,47 @@ final class LocalQuackBackend(
       token = token,
       pid = Some(proc.pid()),
       podName = None,
-      startedAt = Instant.now(),
+      // The OS's own start instant when it reports one: NodeProcess matches the row against it, and
+      // on Linux the JVM derives it from a boot time read once, so a wall-clock step after the
+      // manager started cannot make this node's own row fail its identity check.
+      startedAt = startInstant.orElse(Instant.now()),
       maxConcurrent = spec.maxConcurrent
     )
   }
 
-  def stop(key: PoolKey, nodeId: String): IO[Unit] = IO.blocking {
-    processes.remove(nodeId) match
-      case Some(p) =>
-        LocalQuackBackend.terminate(p.pid(), force = false)
-        if !p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) then
-          LocalQuackBackend.terminate(p.pid(), force = true)
-      case None =>
-        // Adopted (from `reconcile`): no Process handle, but we kept the
-        // pid. Fall back to pid-based teardown so the whole node tree still
-        // dies (SIGTERM on Unix, `taskkill /T` on Windows).
-        adoptedPids.remove(nodeId).foreach { pid =>
-          LocalQuackBackend.terminate(pid, force = false)
-          val handle = Option(java.lang.ProcessHandle.of(pid))
-            .flatMap(o => if o.isPresent then Some(o.get()) else None)
-          val exited = handle match
-            case Some(h) =>
-              try
-                h.onExit().get(5, java.util.concurrent.TimeUnit.SECONDS)
-                true
-              catch case _: Throwable => false
-            case None => true // already gone
-          if !exited then LocalQuackBackend.terminate(pid, force = true)
-        }
+  def stop(key: PoolKey, nodeId: String): IO[Unit] = IO.blocking(release(nodeId))
+
+  /** Terminate the node's process tree and drop every entry held for its id. An adopt entry is
+    * dropped even when a Process handle exists (reconcile adopts the nodes this backend started
+    * too), so `cleanup()` never signals a process that is already gone.
+    */
+  private def release(nodeId: String): Unit =
+    val adopted = adoptedProcs.remove(nodeId)
+    processes.remove(nodeId).map(_.toHandle).orElse(adopted).foreach { h =>
+      LocalQuackBackend.stopTree(h, LocalQuackBackend.ShutdownGracePerProcessSec)
+    }
     tokens.remove(nodeId)
     nodePorts.remove(nodeId).foreach(ports.release)
-    ()
+
+  /** The process this backend holds under `nodeId`: the one it forked, else the adopted one. */
+  private def held(nodeId: String): Option[ProcessHandle] =
+    processes.get(nodeId).map(_.toHandle).orElse(adoptedProcs.get(nodeId))
+
+  /** A node's process from an earlier manager generation that this backend never adopted (it was
+    * not listening when reconcile first saw it) is not reached by `release`, so a replacement would
+    * orphan it. Stop it here, but only when its identity is verified ([[NodeProcess]]).
+    */
+  override def stopStray(node: RunningNode): IO[Unit] = IO.blocking {
+    NodeProcess
+      .of(node)
+      .filterNot(h => held(node.nodeId).exists(_.pid() == h.pid()))
+      .foreach { h =>
+        logger.warn(
+          s"${node.nodeId}: stopping process ${h.pid()} an earlier manager left running, " +
+            "before replacing it"
+        )
+        LocalQuackBackend.stopTree(h, LocalQuackBackend.ShutdownGracePerProcessSec)
+      }
   }
 
   def isAlive(nodeId: String): Boolean =
@@ -119,15 +195,50 @@ final class LocalQuackBackend(
   /** Register a node that survived a manager restart: claim its port, record its token, and attach
     * a ProcessHandle so a future `stop()` actually kills the right OS process. We can't recover the
     * original `java.lang.Process` (the child wasn't a JVM-spawned subprocess anymore) - `processes`
-    * keeps a `Process` map, so we only stash what we have. `stop()` falls back to
-    * `ProcessHandle.of(pid)` when the entry is adopt-only.
+    * keeps a `Process` map, so we only stash what we have. `stop()` falls back to the adopted
+    * handle when the entry is adopt-only. A pid whose process does not match the row's `startedAt`
+    * is not the node's and is never recorded, so no stop path can signal it.
     */
   override def adopt(node: RunningNode): IO[Unit] = IO.blocking {
+    // A reservation made by reservePorts passes to the adopted node: its stop releases the port.
+    reserved.remove(node.port)
     ports.markLeased(node.port)
     tokens.put(node.nodeId, node.token)
     nodePorts.put(node.nodeId, node.port)
-    node.pid.foreach(p => adoptedPids.put(node.nodeId, p))
+    NodeProcess.of(node) match
+      case Some(h) => adoptedProcs.put(node.nodeId, h)
+      case None    => adoptedProcs.remove(node.nodeId)
     ()
+  }
+
+  /** Lease the port of every row whose process is still running but not held here, until that
+    * process exits. A verified leftover is adopted or stopped in its pool's turn; an unverified one
+    * (its start time disagrees with the row: a wall-clock step on Linux across an unclean manager
+    * exit, or a reused pid) is never signalled, so its port stays out of the allocator instead and
+    * an operator is told which pid to check. Without this, a replacement or another pool's spawn
+    * earlier in the same pass could be started onto a port a leftover still listens on, and never
+    * pass its health probe.
+    */
+  override def reservePorts(nodes: List[RunningNode]): IO[Unit] = IO.blocking {
+    nodes.foreach { n =>
+      val heldHere = processes.contains(n.nodeId) || adoptedProcs.contains(n.nodeId)
+      if !heldHere && !reserved.contains(n.port) then
+        n.pid
+          .flatMap(p => Option(ProcessHandle.of(p).orElse(null)))
+          .filter(_.isAlive)
+          .foreach { h =>
+            if ports.tryLease(n.port) then
+              reserved.put(n.port, h)
+              h.onExit().thenRun(() => if reserved.remove(n.port, h) then ports.release(n.port))
+              if NodeProcess.of(n).isEmpty then
+                logger.warn(
+                  s"${n.nodeId}: pid ${h.pid()} is running but is not this node's process as " +
+                    s"recorded (start time differs from the row); it is not signalled, and port " +
+                    s"${n.port} stays reserved until it exits. If it is a leftover quack node, " +
+                    "stop it by hand."
+                )
+          }
+    }
   }
 
   def discoverExisting(): IO[List[RunningNode]] = IO.pure(List.empty)
@@ -146,44 +257,24 @@ final class LocalQuackBackend(
     * state.
     */
   def cleanup(): IO[Unit] = IO.blocking {
-    val procs = processes.toList
+    // Adopt-only nodes carry no Process handle, only the adopted ProcessHandle; without them a node
+    // inherited from a previous manager generation survives SIGTERM deterministically.
+    val handles = (processes.values.map(_.toHandle) ++
+      adoptedProcs.collect { case (id, h) if !processes.contains(id) => h }).toList
+      .filter(_.isAlive)
     // First pass: SIGTERM everyone in parallel (`taskkill /T` on Windows so
     // the duckdb.exe grandchild of each spawn wrapper goes down too).
-    procs.foreach { case (_, p) => LocalQuackBackend.terminate(p.pid(), force = false) }
+    handles.foreach(h => LocalQuackBackend.terminate(h, force = false))
     // Second pass: bounded wait, then SIGKILL stragglers.
-    procs.foreach { case (_, p) =>
-      if !p.waitFor(
-          LocalQuackBackend.ShutdownGracePerProcessSec,
-          java.util.concurrent.TimeUnit.SECONDS
-        )
-      then LocalQuackBackend.terminate(p.pid(), force = true)
-    }
-    // Adopt-only nodes carry no Process handle, only a pid; without this
-    // pass a node inherited from a previous manager generation survives
-    // SIGTERM deterministically. Same TERM -> bounded wait -> KILL idiom as
-    // `stop(nodeId)`'s adopted branch.
-    val adopted = adoptedPids.toList
-    adopted.foreach { case (_, pid) => LocalQuackBackend.terminate(pid, force = false) }
-    adopted.foreach { case (_, pid) =>
-      val handle = Option(java.lang.ProcessHandle.of(pid))
-        .flatMap(o => if o.isPresent then Some(o.get()) else None)
-      val exited = handle match
-        case Some(h) =>
-          try
-            h.onExit()
-              .get(
-                LocalQuackBackend.ShutdownGracePerProcessSec,
-                java.util.concurrent.TimeUnit.SECONDS
-              )
-            true
-          catch case _: Throwable => false
-        case None => true // already gone
-      if !exited then LocalQuackBackend.terminate(pid, force = true)
+    handles.foreach { h =>
+      if !LocalQuackBackend.awaitExit(h, LocalQuackBackend.ShutdownGracePerProcessSec) then
+        LocalQuackBackend.terminate(h, force = true)
     }
     processes.clear()
     tokens.clear()
     nodePorts.clear()
-    adoptedPids.clear()
+    adoptedProcs.clear()
+    reserved.clear()
   }
 
 object LocalQuackBackend:
@@ -219,22 +310,40 @@ object LocalQuackBackend:
     sys.props.getOrElse("os.name", "").toLowerCase(Locale.ROOT).contains("win")
 
   /** Default command. Invokes `script` (the bundled spawn script in production), which starts
-    * DuckDB, attaches the DuckLake catalog, and calls `quack_serve(...)`.
+    * DuckDB, attaches the DuckLake catalog, and calls `quack_serve(...)`. The token is NOT on the
+    * command line (any local user reads argv): the script reads it from the secrets directory.
     */
   def defaultCommand(script: String): (NodeSpec, Int, String) => List[String] =
-    (_, port, token) => List(script, port.toString, token)
+    (_, port, _) => List(script, port.toString)
+
+  /** This manager process's spawn marker: its REST port plus a per-boot random id, e.g.
+    * `20900-3fa9c1e2`. Every node gets it as the spawn script's second argument, and the script
+    * puts it in the node directory name (`quack-node.<marker>.XXXXXX`, which duckdb's `-init` argv
+    * carries). `stop-jar`, `kill-quack-nodes` and `qod stop` match on `<port>-`, so stopping one
+    * manager only touches that manager's nodes, not those of another manager on the same host (an
+    * isolated test stack next to the one on :20900). The boot id tells two lives of the same port
+    * apart in the node directory names.
+    */
+  def managerMarker(restPort: Int): String = s"$restPort-$bootId"
+
+  private lazy val bootId: String =
+    val b = new Array[Byte](4)
+    new SecureRandom().nextBytes(b)
+    b.map(x => f"${x & 0xff}%02x").mkString
 
   /** OS-aware default command. On Windows the child is
-    * `powershell.exe -File <winScript> <port> <token>` (the wrapper process the manager holds a
+    * `powershell.exe -File <winScript> <port> <marker>` (the wrapper process the manager holds a
     * `Process` handle for; its `duckdb.exe` grandchild is reaped via `taskkill /T`). On Unix it is
-    * the bash `<unixScript> <port> <token>` invocation, byte-identical to [[defaultCommand]].
+    * `<unixScript> <port> <marker>`. `marker` is [[managerMarker]]; it is required so no production
+    * spawn goes out unmarked (an unmarked node is invisible to the per-manager stop paths).
     */
   def defaultCommand(
       unixScript: String,
-      winScript: String
+      winScript: String,
+      marker: String
   ): (NodeSpec, Int, String) => List[String] =
     if isWindows then
-      (_, port, token) =>
+      (_, port, _) =>
         List(
           "powershell.exe",
           "-NoProfile",
@@ -244,47 +353,60 @@ object LocalQuackBackend:
           "-File",
           winScript,
           port.toString,
-          token
+          marker
         )
-    else (_, port, token) => List(unixScript, port.toString, token)
+    else (_, port, _) => List(unixScript, port.toString, marker)
 
-  /** Terminate a spawned node by pid. On Windows uses `taskkill /PID <pid> /T` (`/F` when `force`)
-    * so the whole process tree — the PowerShell wrapper and its `duckdb.exe` child — is killed;
-    * `Process.destroy()` alone would leave the grandchild orphaned. On Unix routes through
-    * `ProcessHandle` so behavior matches the prior `destroy()` / `destroyForcibly()` path.
+  /** Terminate a spawned node's process tree. On Windows uses `taskkill /PID <pid> /T` (`/F` when
+    * `force`) so the whole process tree (the PowerShell wrapper and its `duckdb.exe` child) is
+    * killed; `Process.destroy()` alone would leave the grandchild orphaned. On Unix signals through
+    * the handle, which carries the process start time, so a pid reused by another process is never
+    * signalled.
     */
-  private[runtime] def terminate(pid: Long, force: Boolean): Unit =
+  private[runtime] def terminate(h: ProcessHandle, force: Boolean): Unit =
     if isWindows then
-      val cmd =
-        if force then List("taskkill", "/PID", pid.toString, "/T", "/F")
-        else List("taskkill", "/PID", pid.toString, "/T")
-      try
-        val p = new java.lang.ProcessBuilder(cmd*)
-          .redirectOutput(
-            java.lang.ProcessBuilder.Redirect.DISCARD
-          )
-          .redirectError(java.lang.ProcessBuilder.Redirect.DISCARD)
-          .start()
-        p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
-        ()
-      catch case _: Throwable => ()
+      // taskkill names a bare pid: only signal while this handle's own process still runs.
+      if h.isAlive then
+        val cmd =
+          if force then List("taskkill", "/PID", h.pid().toString, "/T", "/F")
+          else List("taskkill", "/PID", h.pid().toString, "/T")
+        try
+          val p = new java.lang.ProcessBuilder(cmd*)
+            .redirectOutput(
+              java.lang.ProcessBuilder.Redirect.DISCARD
+            )
+            .redirectError(java.lang.ProcessBuilder.Redirect.DISCARD)
+            .start()
+          p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+          ()
+        catch case _: Throwable => ()
+    else if force then
+      // SIGKILL bypasses the wrapper's trap, which is what normally
+      // forwards TERM to the duckdb grandchild; sweep the descendants
+      // first so the tree cannot outlive its wrapper.
+      h.descendants().forEach { (d: java.lang.ProcessHandle) =>
+        d.destroyForcibly(); ()
+      }
+      h.destroyForcibly()
+      ()
     else
-      Option(java.lang.ProcessHandle.of(pid))
-        .flatMap(o => if o.isPresent then Some(o.get()) else None)
-        .foreach { h =>
-          if force then
-            // SIGKILL bypasses the wrapper's trap, which is what normally
-            // forwards TERM to the duckdb grandchild; sweep the descendants
-            // first so the tree cannot outlive its wrapper.
-            h.descendants().forEach { (d: java.lang.ProcessHandle) =>
-              d.destroyForcibly(); ()
-            }
-            h.destroyForcibly()
-            ()
-          else
-            h.destroy()
-            ()
-        }
+      h.destroy()
+      ()
+
+  /** True once `h` has exited, waiting at most `seconds`. */
+  private[runtime] def awaitExit(h: ProcessHandle, seconds: Long): Boolean =
+    try
+      h.onExit().get(seconds, java.util.concurrent.TimeUnit.SECONDS)
+      true
+    catch case _: Throwable => !h.isAlive
+
+  /** TERM, bounded wait, then KILL with a descendant sweep. A process that already exited is left
+    * alone: its pid may belong to someone else by now.
+    */
+  private[runtime] def stopTree(h: ProcessHandle, graceSec: Long): Unit =
+    if h.isAlive then
+      terminate(h, force = false)
+      if !awaitExit(h, graceSec) then terminate(h, force = true)
 
   private val rnd           = new SecureRandom()
   def randomToken(): String =

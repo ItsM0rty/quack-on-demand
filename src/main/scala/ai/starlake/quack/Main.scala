@@ -192,9 +192,9 @@ object Main extends IOApp with LazyLogging:
     * `guarantee`, including a failed boot, including a failure in the control-plane database ensure
     * step.
     *
-    * This is deliberately NOT `DemoConfig.overlay`: it does not touch `apiKey`, `runtimeType`,
-    * `nativeClient`, TLS, or ACL, so a persistent embedded install keeps the normal secure posture.
-    * `DemoConfig.overlay` remains reachable only from `DemoRunner.runDemo`.
+    * This is deliberately NOT `DemoConfig.overlay`: it does not touch `apiKey`, `runtimeType`, TLS,
+    * or ACL, so a persistent embedded install keeps the normal secure posture. `DemoConfig.overlay`
+    * remains reachable only from `DemoRunner.runDemo`.
     */
   private[quack] def withEmbeddedControlPlane(
       mgrCfg: ManagerConfig,
@@ -283,6 +283,14 @@ object Main extends IOApp with LazyLogging:
 
     TelemetryConfig
       .validate(mgrCfg.telemetry.store, mgrCfg.telemetry.stmtHistoryRetentionDays)
+      .left
+      .foreach(msg => sys.error(msg))
+
+    // The native Quack client (libquackwire) is the manager's only client to its nodes: load it
+    // now, so a platform without a working build refuses to boot with the reason instead of
+    // failing every statement later.
+    ai.starlake.quack.edge.adapter.QuackNativeSupport
+      .bootCheck()
       .left
       .foreach(msg => sys.error(msg))
 
@@ -735,6 +743,13 @@ object Main extends IOApp with LazyLogging:
       logger.warn(
         "SL_ENABLED=true but SL_URL is empty; the Starlake menu and logout callback are disabled"
       )
+    DuckDbExtensionSource.fromEnv.dir.foreach { d =>
+      logger.warn(
+        s"${DuckDbExtensionSource.EnvVar}=$d: the manager's DuckDB loads extensions from this " +
+          "directory with allow_unsigned_extensions on. Use only for the DuckDB pre-release " +
+          "toolchain or an air-gapped mirror you control."
+      )
+    }
     // Management-plane auth wiring; component contracts in ManagementAuthWiring.
     val mgmtAuth = ManagementAuthWiring.build(
       mgrCfg,
@@ -831,14 +846,9 @@ object Main extends IOApp with LazyLogging:
     )
     val sessions       = new SessionRegistry
     val arrowAllocator = new org.apache.arrow.memory.RootAllocator()
-    val client         = new QuackHttpClient(
-      arrowAllocator,
-      // Degrades to the embedded HTTP client on platforms with no bundled
-      // libquackwire native (Windows on ARM64) instead of crashing at JNI load.
-      nativeClient = ai.starlake.quack.edge.adapter.QuackNativeSupport
-        .effectiveNativeClient(mgrCfg.nativeClient),
-      nodeDisableSsl = mgrCfg.nodeDisableSsl
-    )
+    // The native client is the only client; the boot gate above already refused a platform
+    // where it cannot load.
+    val client  = new QuackHttpClient(arrowAllocator, nodeLeaseSec = mgrCfg.nodeLeaseSec)
     val adapter = new QuackHttpAdapter(client, tracker)
     if lockdownCfg.enabled then logger.info("node lockdown: enabled")
     else

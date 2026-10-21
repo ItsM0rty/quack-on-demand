@@ -1,6 +1,6 @@
 package ai.starlake.quack.ondemand.runtime
 
-import ai.starlake.quack.model.{NodeSpec, PoolKey, RunningNode}
+import ai.starlake.quack.model.{InitSqlScreen, NodeSpec, PoolKey, RunningNode}
 import cats.effect.IO
 
 trait QuackBackend:
@@ -32,6 +32,20 @@ trait QuackBackend:
     */
   def adopt(node: RunningNode): IO[Unit] = IO.unit
 
+  /** Stop `node`'s process when it is still running but this backend does not hold it (it outlived
+    * an earlier manager and was never adopted). Reconcile calls it before replacing a node it
+    * judged dead, so the replacement cannot leave the old process running untracked. The default
+    * has nothing to stop: a pod name or a fleet assignment is unique per node id.
+    */
+  def stopStray(node: RunningNode): IO[Unit] = IO.unit
+
+  /** Keep the ports of `nodes` whose process is still running but not held by this backend (left by
+    * an earlier manager) from being handed to a new node. Reconcile calls it with every node row at
+    * the start of each pass, before any spawn. The default has nothing to reserve: pods and fleet
+    * servers do not share a port space with the manager.
+    */
+  def reservePorts(nodes: List[RunningNode]): IO[Unit] = IO.unit
+
   /** `node` as its runtime currently places it. A backend that can move a live node without the
     * supervisor writing the row (fleet: a claim committed, then the manager died before the node
     * row write) answers the real address and token, and reconcile rewrites the row. The same
@@ -44,3 +58,15 @@ trait QuackBackend:
     * and never prunes or respawns on it.
     */
   def liveNodeIds(key: PoolKey): IO[Option[Set[String]]] = IO.pure(None)
+
+object QuackBackend:
+
+  /** Fails when the boot SQL of `spec` holds a DuckDB CLI dot-command line ([[InitSqlScreen]]): the
+    * values as resolved for this spawn, `{{secret.NAME}}` values and rows stored before the
+    * write-time screens included. Every backend's `start` runs it before anything else, so no
+    * caller (a serving spawn, a maintenance or merge node, a module) can hand one to a node.
+    */
+  def screenBootSql(spec: NodeSpec): IO[Unit] =
+    InitSqlScreen.nodeSpecError(spec) match
+      case Some(msg) => IO.raiseError(new IllegalArgumentException(msg))
+      case None      => IO.unit

@@ -79,11 +79,7 @@ class FlightSqlRouterHistorySpec extends AnyFlatSpec with Matchers {
     val store   = new RecordingTelemetryStore
     val journal = new EventJournal(store)
     val tracker = new NodeLoadTracker
-    val client  = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ) {
+    val client  = new QuackHttpClient(TestArrow.sharedAllocator) {
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(stub())
     }
@@ -151,11 +147,7 @@ class FlightSqlRouterHistorySpec extends AnyFlatSpec with Matchers {
   it should "record nothing and throw nothing with the default noop journal" in {
     val sup     = buildSupervisor()
     val tracker = new NodeLoadTracker
-    val client  = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ) {
+    val client  = new QuackHttpClient(TestArrow.sharedAllocator) {
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(defaultStub())
     }

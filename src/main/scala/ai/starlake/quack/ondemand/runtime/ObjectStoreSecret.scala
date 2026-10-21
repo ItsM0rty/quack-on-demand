@@ -44,7 +44,7 @@ object ObjectStoreSecret:
         s"  ENDPOINT ${lit(stripped)},\n"
       }
       .getOrElse("")
-    "INSTALL httpfs; LOAD httpfs;\n" +
+    "INSTALL httpfs;\nLOAD httpfs;\n" +
       s"CREATE OR REPLACE SECRET $SecretName (\n" +
       "  TYPE s3,\n" +
       s"  KEY_ID ${lit(m.getOrElse("s3_access_key_id", ""))},\n" +
@@ -57,7 +57,7 @@ object ObjectStoreSecret:
       ");"
 
   private def gcsSecret(m: Map[String, String], scope: String): String =
-    "INSTALL httpfs; LOAD httpfs;\n" +
+    "INSTALL httpfs;\nLOAD httpfs;\n" +
       s"CREATE OR REPLACE SECRET $SecretName (\n" +
       "  TYPE gcs,\n" +
       s"  KEY_ID ${lit(m.getOrElse("gcs_hmac_key_id", ""))},\n" +
@@ -70,7 +70,7 @@ object ObjectStoreSecret:
     val key     = m.getOrElse("azure_account_key", "")
     val conn    =
       s"DefaultEndpointsProtocol=https;AccountName=$account;AccountKey=$key;EndpointSuffix=core.windows.net"
-    "INSTALL azure; LOAD azure;\n" +
+    "INSTALL azure;\nLOAD azure;\n" +
       s"CREATE OR REPLACE SECRET $SecretName (\n" +
       "  TYPE azure,\n" +
       s"  CONNECTION_STRING ${lit(conn)},\n" +

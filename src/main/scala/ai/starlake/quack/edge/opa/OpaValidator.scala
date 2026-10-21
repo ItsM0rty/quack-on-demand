@@ -33,7 +33,14 @@ final class OpaValidator(
           case Some(t) =>
             val config = AccessGate.parserConfig(context, defaultDatabase, defaultSchema, dialect)
             val sessionCatalog = context.defaultDatabase.getOrElse(defaultDatabase)
-            AccessGate.evaluate(context.statement, config, sessionCatalog, filteredMetadata) match
+            AccessGate.evaluate(
+              context.statement,
+              config,
+              sessionCatalog,
+              filteredMetadata,
+              context.clientDataScans,
+              context.rewriteOf
+            ) match
               case GateOutcome.Refuse(msg, _, _) =>
                 logger.info(s"OPA gate refused for user:${context.username}: $msg")
                 Denied(msg, meta = Source)

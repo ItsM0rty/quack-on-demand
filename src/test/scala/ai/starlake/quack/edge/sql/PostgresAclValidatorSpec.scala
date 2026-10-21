@@ -72,12 +72,67 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     validator.validate(ctx) shouldBe Allowed
   }
 
+  it should "deny a SET VARIABLE that reads a table the user holds no grant on" in {
+    // `SET VARIABLE x = (SELECT ...); SELECT getvariable('x')` hands the row back on DuckDB 1.5.6
+    // and 2.0. The SET used to pass as table-free control flow and getvariable() names no table,
+    // so a user with no grant at all could read any table the node could reach.
+    val eff = effectiveWith(permissions = List(perm("tpch", "main", "lineitem", "RO")))
+    List(
+      "SET VARIABLE x = (SELECT string_agg(o_comment, ',') FROM tpch.other.orders); " +
+        "SELECT getvariable('x')",
+      "SET VARIABLE x = (SELECT count(*) FROM orders)"
+    ).foreach { sql =>
+      withClue(sql)(validator.validate(mkCtx(sql, eff)) shouldBe a[Denied])
+    }
+    validator.validate(mkCtx("SET VARIABLE x = 42; SELECT getvariable('x')", eff)) shouldBe
+      Allowed
+  }
+
+  it should "deny a subquery read passed as a function argument without its own parentheses" in {
+    // DuckDB's ARRAY(SELECT ...) returned the rows of a table the user holds no grant on: the
+    // walker skipped the bare select, so the statement had no gated access at all.
+    val eff = effectiveWith(permissions = List(perm("tpch", "main", "lineitem", "RO")))
+    List(
+      "SELECT ARRAY(SELECT o_comment FROM tpch.other.orders)",
+      "SET VARIABLE x = ARRAY(SELECT o_comment FROM tpch.other.orders)",
+      "SELECT list_value(ARRAY(SELECT o_comment FROM tpch.other.orders))",
+      "SELECT * FROM lineitem WHERE EXISTS (SELECT 1 FROM tpch.other.orders)"
+    ).foreach { sql =>
+      withClue(sql)(validator.validate(mkCtx(sql, eff)) shouldBe a[Denied])
+    }
+    validator.validate(mkCtx("SELECT ARRAY(SELECT l FROM lineitem)", eff)) shouldBe Allowed
+  }
+
+  it should "deny a quoted name holding a dot, even to a holder of the schema it splits into" in {
+    // DuckDB reads `"a.b"` as the table main."a.b"; JSqlParser read schema a, table b, so a grant
+    // on tpch.a.* (or the tenant-wide wildcard) let the user read, write and alter main."a.b".
+    List(
+      effectiveWith(permissions = List(perm("tpch", "a", "*", "ALL"))),
+      effectiveWith(permissions = List(perm("*", "*", "*", "ALL")))
+    ).foreach { eff =>
+      List(
+        "SELECT * FROM \"a.b\"",
+        "INSERT INTO \"a.b\" VALUES (1)",
+        "CREATE TABLE \"a.c\" (x INT)",
+        "ALTER TABLE \"a.b\" ADD COLUMN y INT"
+      ).foreach { sql =>
+        withClue(sql) {
+          validator.validate(mkCtx(sql, eff)) match
+            case Denied(msg, _, _) => msg should include("quoted identifier containing a dot")
+            case other             => fail(s"expected Denied, got $other")
+        }
+      }
+    }
+    val holder = effectiveWith(permissions = List(perm("tpch", "a", "*", "ALL")))
+    validator.validate(mkCtx("SELECT * FROM tpch.\"a\".\"b\"", holder)) shouldBe Allowed
+  }
+
   it should "deny SELECT against a federated alias when no grant exists" in {
     val eff = effectiveWith(permissions = Nil)
     val ctx = mkCtx("SELECT * FROM fedpg.public.orders", eff)
     validator.validate(ctx) match
       case Denied(msg, _, _) => msg should include("fedpg")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
   }
 
   it should "allow SELECT joining DuckLake + federated alias when both grants exist" in {
@@ -102,7 +157,7 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     )
     validator.validate(ctx) match
       case Denied(msg, _, _) => msg should (include("fedpg") or include("orders"))
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
   }
 
   it should "allow with catalog-level wildcard on the federated alias" in {
@@ -129,7 +184,7 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     )
     validator.validate(ctx) match
       case Denied(msg, _, _) => msg should include("no RBAC")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
   }
 
   // ---- two-part name resolution (schema.table under the pool catalog) --
@@ -177,7 +232,7 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     val ctx = mkAcmeCtx("SELECT * FROM tpch1.customer", eff)
     catalogAware.validate(ctx) match
       case Denied(msg, _, _) => msg should include("acme_tpch.tpch1.customer")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
   }
 
   it should "allow when the principal is a superuser (tenant=None)" in {
@@ -336,7 +391,7 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
       mkAcmeCtx("INSERT INTO tpch1.mine SELECT table_name FROM information_schema.tables", eff)
     ) match
       case Denied(msg, _, _) => msg should include("information_schema")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
 
     filteredMeta.validate(
       mkAcmeCtx(
@@ -345,14 +400,14 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
       )
     ) match
       case Denied(msg, _, _) => msg should include("information_schema")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
   }
 
   it should "keep requiring the grant when the flag is off" in {
     val eff = effectiveWith(permissions = Nil)
     catalogAware.validate(mkAcmeCtx("SELECT * FROM information_schema.tables", eff)) match
       case Denied(msg, _, _) => msg should include("information_schema")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
   }
 
   it should "still deny unparseable statements for non-wildcard principals with the flag on" in {
@@ -405,12 +460,12 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
       mkAcmeCtx("SELECT * FROM read_parquet('/data/secret.parquet')", eff)
     ) match
       case Denied(msg, _, _) => msg should include("read_parquet")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
     // A qualified call and an argument-carrying call are not the shape the rewriter filters.
     filteredMeta.validate(mkAcmeCtx("SELECT * FROM main.duckdb_tables()", eff)) shouldBe a[Denied]
     filteredMeta.validate(mkAcmeCtx("SELECT * FROM duckdb_tables('x')", eff)) match
       case Denied(msg, _, _) => msg should include("duckdb_tables")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
   }
 
   it should "deny the bare spelling even under a schema-wide grant, flag on or off" in {
@@ -420,7 +475,7 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     val eff = effectiveWith(List(perm("acme_tpch", "*", "*", "RO")))
     filteredMeta.validate(mkAcmeCtx("SELECT sql FROM duckdb_tables", eff)) match
       case Denied(msg, _, _) => msg should include("duckdb_tables")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
     catalogAware.validate(mkAcmeCtx("SELECT sql FROM duckdb_tables", eff)) shouldBe a[Denied]
     filteredMeta
       .validate(mkAcmeCtx("SELECT * FROM system.main.duckdb_views", eff)) shouldBe a[Denied]
@@ -434,19 +489,19 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
       mkAcmeCtx("INSERT INTO tpch1.mine SELECT table_name FROM duckdb_tables()", eff)
     ) match
       case Denied(msg, _, _) => msg should include("duckdb_tables")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
     filteredMeta.validate(
       mkAcmeCtx("CREATE TABLE tpch1.mine2 AS SELECT table_name FROM duckdb_tables()", eff)
     ) match
       case Denied(msg, _, _) => msg should include("duckdb_tables")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
   }
 
   it should "keep requiring wildcard ALL for catalog functions when the flag is off" in {
     val eff = effectiveWith(permissions = Nil)
     catalogAware.validate(mkAcmeCtx(ClientSync, eff)) match
       case Denied(msg, _, _) => msg should include("duckdb_tables")
-      case other          => fail(s"expected Denied, got $other")
+      case other             => fail(s"expected Denied, got $other")
     val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
     catalogAware.validate(mkAcmeCtx(ClientSync, wildcard)) shouldBe Allowed
   }
@@ -500,10 +555,63 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
         withClue(sql) {
           catalogAware.validate(mkAcmeCtx(sql, wildcard)) match
             case Denied(msg, _, _) => msg should include("resolves its target at run time")
-            case other          => fail(s"expected Denied, got $other")
+            case other             => fail(s"expected Denied, got $other")
         }
       }
     }
+
+  it should "deny the node-escaping calls under the tenant wildcard ALL" in {
+    // Owner ruling 2026-10-11: postgres_query / postgres_execute, the postgres connection
+    // functions and getenv reach data the ACL never parses; denied to a tenant-scoped principal
+    // even under *.*.* ALL, allowed for superusers (next test).
+    val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
+    List(
+      "SELECT * FROM postgres_query('acme_other', 'SELECT 1')",
+      "CALL postgres_execute('acme_other', 'DROP TABLE t')",
+      "SELECT * FROM postgres_scan('host=h dbname=qod user=postgres', 'public', 'qodstate_user')",
+      "SELECT * FROM postgres_attach('dbname=qod', source := 'pg')",
+      "SELECT * FROM quack_query('quack:h:9494', 'SELECT 1', token := 't')",
+      "SELECT * FROM quack_query_by_name('c', 'SELECT 1')",
+      "CALL postgres_configure_pool(health_check_query := 'SELECT 1')",
+      "SELECT * FROM destroy_external_resource('read_text', '/x')",
+      "SELECT getenv('pgPassword')"
+    ).foreach { sql =>
+      withClue(sql) {
+        catalogAware.validate(mkAcmeCtx(sql, wildcard)) match
+          case Denied(msg, _, _) => msg should include("cannot authorize")
+          case other             => fail(s"expected Denied, got $other")
+      }
+    }
+  }
+
+  it should "refuse SQL-valued settings to a tenant principal, even under the wildcard ALL" in {
+    val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
+    List(
+      "SET pg_staleness_query = 'SELECT 1 ${SCHEMA}'",
+      "SET GLOBAL pg_pool_health_check_query = 'SELECT 1'",
+      "SET quack_authorization_function = 'f'"
+    ).foreach { sql =>
+      withClue(sql) {
+        catalogAware.validate(mkAcmeCtx(sql, wildcard)) match
+          case Denied(msg, _, _) => msg should include("runs SQL")
+          case other             => fail(s"expected Denied, got $other")
+      }
+    }
+    catalogAware.validate(mkAcmeCtx("SET schema = 'main'", wildcard)) shouldBe Allowed
+  }
+
+  it should "treat the 2.0 single-file readers like read_csv for a tenant principal" in {
+    // File reads are reserved to superusers: denied with or without the wildcard ALL grant.
+    val narrow   = effectiveWith(List(perm("acme_tpch", "main", "orders", "RO")))
+    val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
+    for fn <- List("read_csv", "read_single_csv_file", "read_duckdb", "read_postgres_binary") do
+      withClue(fn) {
+        catalogAware.validate(mkAcmeCtx(s"SELECT * FROM $fn('/etc/x')", narrow)) shouldBe a[Denied]
+        catalogAware.validate(mkAcmeCtx(s"SELECT * FROM $fn('/etc/x')", wildcard)) match
+          case Denied(msg, _, _) => msg should include("direct file access")
+          case other             => fail(s"expected Denied, got $other")
+      }
+  }
 
   it should "still be available to superusers" in {
     val superuser = RbacUser(id = "u-su", tenant = None, username = "admin", kind = "admin")
@@ -511,6 +619,10 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     catalogAware.validate(
       mkAcmeCtx("SELECT * FROM query_table('acme_other.main.secret')", eff)
     ) shouldBe Allowed
+    catalogAware.validate(
+      mkAcmeCtx("SELECT * FROM postgres_query('acme_other', 'SELECT 1')", eff)
+    ) shouldBe Allowed
+    catalogAware.validate(mkAcmeCtx("SET pg_staleness_query = 'SELECT 1'", eff)) shouldBe Allowed
   }
 
   it should "not trip on identifiers that merely contain the function names" in {

@@ -54,19 +54,26 @@ cd /src/ui && npm ci
 cd /src && sbt -no-colors assembly
 cp distrib/quack-on-demand-assembly-*.jar /quack-on-demand.jar
 
-# Strip non-Linux DuckDB JNI natives from the assembly jar (saves ~190MB).
-# The jar bundles libduckdb_java.so_{osx_universal,linux_amd64,linux_arm64,
-# windows_amd64} so it can run anywhere; only the matching Linux one is
-# ever loaded inside the runtime container.
+# Strip the DuckDB JNI natives this image never loads from the assembly jar
+# (saves ~170MB): the jar bundles one per platform so it can run anywhere
+# (2.0.0.0: libduckdb_java.so_{linux_amd64,linux_arm64,macos_arm64,
+# windows_amd64}; the set and its names change between DuckDB releases, so
+# they are listed from the jar rather than named here), and only the
+# matching Linux one is loaded inside the runtime container.
 apt-get update
-apt-get install -y --no-install-recommends zip
-zip -dq /quack-on-demand.jar \
-  libduckdb_java.so_osx_universal \
-  libduckdb_java.so_windows_amd64
+apt-get install -y --no-install-recommends zip unzip
 case "${TARGETARCH:-amd64}" in
-  amd64) zip -dq /quack-on-demand.jar libduckdb_java.so_linux_arm64 ;;
-  arm64) zip -dq /quack-on-demand.jar libduckdb_java.so_linux_amd64 ;;
+  amd64) keep=libduckdb_java.so_linux_amd64 ;;
+  arm64) keep=libduckdb_java.so_linux_arm64 ;;
+  *)     echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;;
 esac
+unzip -Z1 /quack-on-demand.jar | grep -qx "$keep" \
+  || { echo "the DuckDB JDBC in the jar has no $keep" >&2; exit 1; }
+drop="$(unzip -Z1 /quack-on-demand.jar | grep '^libduckdb_java\.so_' | grep -vx "$keep" || true)"
+if [ -n "$drop" ]; then
+  # shellcheck disable=SC2086  # one entry name per word
+  zip -dq /quack-on-demand.jar $drop
+fi
 rm -rf /var/lib/apt/lists/*
 EOF
 
@@ -75,7 +82,7 @@ EOF
 # =========================================================================
 FROM eclipse-temurin:21-jre
 
-ARG DUCKDB_VERSION=1.5.6
+ARG DUCKDB_VERSION=2.0.0
 ARG TARGETARCH
 
 # Runtime deps:
@@ -87,31 +94,34 @@ RUN <<EOF
 set -eu
 apt-get update
 apt-get install -y --no-install-recommends \
-  bash tini curl ca-certificates unzip postgresql-client openssl
+  bash tini curl ca-certificates postgresql-client openssl
 
 case "${TARGETARCH:-amd64}" in
   amd64) DUCKDB_ARCH=linux-amd64 ;;
   arm64) DUCKDB_ARCH=linux-arm64 ;;
   *)     echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;;
 esac
-curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-${DUCKDB_ARCH}.zip" \
-  -o /tmp/duckdb-cli.zip
-unzip -d /usr/local/bin /tmp/duckdb-cli.zip
+# DuckDB 2.x release assets are flat .tar.gz archives (duckdb-cli-*, duckdb-shared-libs-*).
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-cli-${DUCKDB_ARCH}.tar.gz" \
+  -o /tmp/duckdb-cli.tar.gz
+tar -xzf /tmp/duckdb-cli.tar.gz -C /usr/local/bin duckdb
 chmod +x /usr/local/bin/duckdb
-rm /tmp/duckdb-cli.zip
+rm /tmp/duckdb-cli.tar.gz
 
-# libduckdb.so is required at runtime by libquackwire (the JNI shim that
-# powers QOD_NATIVE_CLIENT=true) because the shim links against
-# DuckDB::LibraryVersion / ArrowConverter / etc. The duckdb CLI above is
-# self-contained and does not provide a system-installed libduckdb.so.
-curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-${DUCKDB_ARCH}.zip" \
-  -o /tmp/libduckdb.zip
-unzip -d /tmp/libduckdb /tmp/libduckdb.zip
+# libduckdb.so is required at runtime by libquackwire (the JNI shim that is
+# the manager's only client to its nodes), which links the pinned libduckdb
+# dynamically (DuckDB::LibraryVersion / ArrowConverter / etc.). The duckdb
+# CLI above is self-contained and does not provide a system-installed
+# libduckdb.so.
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-${DUCKDB_ARCH}.tar.gz" \
+  -o /tmp/libduckdb.tar.gz
+mkdir -p /tmp/libduckdb
+tar -xzf /tmp/libduckdb.tar.gz -C /tmp/libduckdb
 install -m 0755 /tmp/libduckdb/libduckdb.so /usr/local/lib/libduckdb.so
 ldconfig
-rm -rf /tmp/libduckdb.zip /tmp/libduckdb
+rm -rf /tmp/libduckdb.tar.gz /tmp/libduckdb
 
-apt-get purge -y --auto-remove curl unzip
+apt-get purge -y --auto-remove curl
 rm -rf /var/lib/apt/lists/*
 EOF
 

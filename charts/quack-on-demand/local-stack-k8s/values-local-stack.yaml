@@ -8,6 +8,9 @@ image:
 
 postgres:
   host:              postgres
+  # The in-cluster rig's superuser. Fine for a throwaway kind cluster, never
+  # for a real deploy (see postgres.user in ../values.yaml).
+  user:              postgres
   existingSecret:    postgres
   existingSecretKey: POSTGRES_PASSWORD
 

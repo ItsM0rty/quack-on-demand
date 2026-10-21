@@ -30,13 +30,15 @@ class StampedWriteIntegrationSpec extends AnyFunSpec with Matchers with BeforeAn
   override def beforeAll(): Unit =
     if duckdbPresent then
       dir = Files.createTempDirectory("qod-stamp-it")
+      // disable_ssl: DuckDB 2.0 serves HTTPS on any non-localhost listen address, and the client
+      // here speaks plain HTTP, like the spawn scripts' nodes.
       val init =
         s"""INSTALL quack; LOAD quack;
            |INSTALL ducklake; LOAD ducklake;
            |ATTACH 'ducklake:$dir/meta.ducklake' AS lake (DATA_PATH '$dir/data');
            |USE lake;
            |CREATE TABLE t(i INT);
-           |CALL quack_serve('quack:0.0.0.0:$port', token := '$token', allow_other_hostname := true);
+           |CALL quack_serve('quack:0.0.0.0:$port', token := '$token', allow_other_hostname := true, disable_ssl := true);
            |.shell sleep 600
            |""".stripMargin
       Files.writeString(dir.resolve("init.sql"), init)
@@ -81,7 +83,7 @@ class StampedWriteIntegrationSpec extends AnyFunSpec with Matchers with BeforeAn
           )
 
   private def client() =
-    new QuackHttpClient(allocator, nativeClient = true, nodeDisableSsl = true)
+    new QuackHttpClient(allocator)
 
   private def rows(resp: QuackResponse): List[List[Any]] =
     val ok   = resp.asInstanceOf[QuackResponse.Ok]

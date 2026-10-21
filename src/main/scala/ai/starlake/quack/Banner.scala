@@ -68,8 +68,11 @@ object Banner:
       aclEnabled: Boolean,
       /** The global node-lockdown default (`quack-flightsql.nodeLockdown.enabled`, env
         * `QOD_NODE_LOCKDOWN`). Required for the same reason as `aclEnabled`: without lockdown a
-        * tenant can ATTACH, INSTALL, read local files and the node environment, which holds the
-        * catalog password, object-store keys and federation secrets.
+        * tenant can ATTACH, INSTALL, read local files and the node environment. The catalog
+        * password, object-store keys and federation secrets reach the node as files under
+        * `QOD_SECRETS_DIR` (on Kubernetes a mounted volume, so within reach of a local file read),
+        * not as variables; only inherited cloud SDK variables (`AWS_*`, `AZURE_*`, `GOOGLE_*`) can
+        * still sit in the node environment.
         */
       nodeLockdown: Boolean,
       /** Pools whose effective lockdown is off (per-pool override, else the global default). */

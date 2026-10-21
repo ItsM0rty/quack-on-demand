@@ -48,9 +48,7 @@ object FlightEdgeHarness:
     val client = new QuackHttpClient(
       // Use the test-shared allocator (never closed) so we don't fight
       // over allocator lifetimes with the harness's own RootAllocator.
-      ai.starlake.quack.edge.adapter.TestArrow.sharedAllocator,
-      nativeClient = false,
-      nodeDisableSsl = true
+      ai.starlake.quack.edge.adapter.TestArrow.sharedAllocator
     ):
       override def query(
           endpoint: String,

@@ -159,14 +159,21 @@ object AttachErrorRedactor:
   /** How many times a run is decoded before giving up, so base64(base64(secret)) is caught. */
   private val MaxDecodeDepth = 2
 
+  /** Both generators' credential options: the Iceberg ones and the Postgres / MySQL `PASSWORD`
+    * ([[ai.starlake.quack.ondemand.federation.rdbms.RdbmsSetupSql.CredentialOption]]).
+    */
+  private val CredentialOptionNames: List[String] =
+    (IcebergSetupSql.CredentialOption.values.map(_.optionName) ++
+      ai.starlake.quack.ondemand.federation.rdbms.RdbmsSetupSql.CredentialOption.values
+        .map(_.optionName)).toList.distinct
+
   /** The credential-bearing options [[IcebergSetupSql.secretBlock]] emits, DERIVED from the
     * generator's own declaration rather than hand-copied next to it: a new credential option has to
     * be added to [[IcebergSetupSql.CredentialOption]] to be rendered at all, and adding it there
     * widens this pattern in the same commit. `CLIENT_ID` is not one; see the class scaladoc.
     */
   private val CredentialLiteral: Regex =
-    ("(?i)\\b(?:" + IcebergSetupSql.CredentialOption.values.map(_.optionName).mkString("|") +
-      ")\\s+'((?:[^']|'')*)'").r
+    ("(?i)\\b(?:" + CredentialOptionNames.mkString("|") + ")\\s+'((?:[^']|'')*)'").r
 
   /** Runs handed to the decode search: standard base64, base64url, hex and base32 all live in here.
     */

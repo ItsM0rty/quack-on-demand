@@ -2,6 +2,7 @@ package ai.starlake.quack.mcp
 
 import ai.starlake.quack.edge.adapter.NodeLoadTracker
 import ai.starlake.quack.model.Tenant
+import ai.starlake.quack.ondemand.InProcessDuckDb
 import ai.starlake.quack.ondemand.PoolSupervisor
 import ai.starlake.quack.ondemand.api.{
   PoolPermissionHandlers,
@@ -31,7 +32,7 @@ class McpAccessToolsSpec extends AnyFlatSpec with Matchers:
     val tmpFile = java.nio.file.Files.createTempFile("qod-mcp-access-test-users", ".duckdb")
     tmpFile.toFile.delete()
     tmpFile.toFile.deleteOnExit()
-    val jdbcUrl = s"jdbc:duckdb:${tmpFile.toAbsolutePath}"
+    val jdbcUrl = InProcessDuckDb.url(tmpFile.toAbsolutePath.toString)
     val c       = java.sql.DriverManager.getConnection(jdbcUrl)
     try
       c.createStatement()

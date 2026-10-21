@@ -30,8 +30,8 @@ object IcebergSetupSql:
     * [[AttachErrorRedactor]] builds its parser from `CredentialOption.values`, and
     * [[credentialOpt]] is the ONLY way [[secretBlock]] can emit one, so a new credential-bearing
     * option cannot be rendered without first appearing here -- which widens the redactor in the
-    * same edit. A non-credential option (CLIENT_ID, the oauth2 knobs, ENDPOINT) goes through
-    * [[opt]] as before.
+    * same edit. A non-credential option (CLIENT_ID, the oauth2 knobs, URI) goes through [[opt]] as
+    * before.
     */
   enum CredentialOption(val optionName: String):
     case ClientSecret    extends CredentialOption("CLIENT_SECRET")
@@ -84,7 +84,7 @@ object IcebergSetupSql:
     val alias  = v.alias
     val secret = secretBlock(cfg, alias)
     val opts   = attachOptions(cfg, alias, needsSecret(cfg)) ++ Option.when(readOnly)("READ_ONLY")
-    "INSTALL iceberg; LOAD iceberg;\n" +
+    "INSTALL iceberg;\nLOAD iceberg;\n" +
       extensionPrelude(cfg) +
       secret +
       s"ATTACH ${lit(cfg.warehouse.trim)} AS ${ident(alias)} (\n  " +
@@ -108,14 +108,15 @@ object IcebergSetupSql:
     cfg.isAwsSigned && cfg.awsCredentials.isDefined
 
   /** The s3 secret type lives in httpfs, and `PROVIDER credential_chain` in the aws extension.
-    * Loaded explicitly rather than trusting autoload: the CLI reading piped stdin carries on past a
-    * failed statement, so a missing extension would surface later as a confusing attach error.
+    * Loaded explicitly rather than trusting autoload: the node's CLI reads its init SQL through
+    * `-init` with `.bail off` and carries on past a failed statement, so a missing extension would
+    * surface later as a confusing attach error.
     */
   private def extensionPrelude(cfg: IcebergRestConfig): String =
     if !awsSecret(cfg) then ""
     else if cfg.awsCredentials.contains(AwsCredentials.CredentialChain) then
-      "INSTALL httpfs; LOAD httpfs;\nINSTALL aws; LOAD aws;\n"
-    else "INSTALL httpfs; LOAD httpfs;\n"
+      "INSTALL httpfs;\nLOAD httpfs;\nINSTALL aws;\nLOAD aws;\n"
+    else "INSTALL httpfs;\nLOAD httpfs;\n"
 
   /** `NAME '<trimmed value>'`, or `None` when `value` is unset or blank after trimming. Trimming
     * here - not just at the `isSet`/`filter` check upstream - matters because
@@ -135,12 +136,13 @@ object IcebergSetupSql:
     opt(option.optionName, value)
 
   /** The oauth2-server-endpoint fallback DuckDB reads off the SECRET (see [[secretBlock]]'s
-    * comment) and the ATTACH's own `ENDPOINT` are textually identical but SEMANTICALLY DISTINCT -
-    * DuckDB reads one for the oauth2 token exchange and the other for catalog operations - so both
-    * call sites keep their own emission even though they share this computation.
+    * comment) and the ATTACH's own `URI` are textually identical but SEMANTICALLY DISTINCT - DuckDB
+    * reads one for the oauth2 token exchange and the other for catalog operations - so both call
+    * sites keep their own emission even though they share this computation. DuckDB 2.0's Iceberg
+    * extension deprecates the older `ENDPOINT` spelling on both, with a warning per use.
     */
   private def endpointOpt(cfg: IcebergRestConfig): Option[String] =
-    Option.when(cfg.uri.trim.nonEmpty)(s"ENDPOINT ${lit(cfg.uri.trim)}")
+    Option.when(cfg.uri.trim.nonEmpty)(s"URI ${lit(cfg.uri.trim)}")
 
   private def secretBlock(cfg: IcebergRestConfig, alias: String): String =
     if !needsSecret(cfg) then ""
@@ -154,12 +156,12 @@ object IcebergSetupSql:
             opt("OAUTH2_SERVER_URI", cfg.oauth2ServerUri),
             opt("OAUTH2_SCOPE", cfg.oauth2Scope),
             opt("OAUTH2_GRANT_TYPE", cfg.oauth2GrantType),
-            // DuckDB derives the oauth2 server URI fallback (<endpoint>/v1/oauth/tokens) from the
-            // SECRET's own ENDPOINT, not from the ATTACH's ENDPOINT option: with authType=oauth2
-            // and no explicit oauth2ServerUri, omitting this makes ATTACH fail before any network
-            // call ("no 'oauth2_server_uri' was provided, and no 'endpoint' was provided to fall
-            // back on"). Kept oauth2-only: a Token secret does no exchange, so ENDPOINT here would
-            // be inert, and the ATTACH already carries its own ENDPOINT for catalog operations.
+            // DuckDB derives the oauth2 server URI fallback (<uri>/v1/oauth/tokens) from the
+            // SECRET's own URI, not from the ATTACH's URI option: with authType=oauth2 and no
+            // explicit oauth2ServerUri, omitting this makes ATTACH fail before any network call
+            // ("no 'oauth2_server_uri' was provided, and no 'endpoint' was provided to fall back
+            // on"). Kept oauth2-only: a Token secret does no exchange, so URI here would be
+            // inert, and the ATTACH already carries its own URI for catalog operations.
             endpointOpt(cfg)
           ).flatten
         case Some(IcebergAuthType.Token) =>

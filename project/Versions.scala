@@ -30,7 +30,8 @@ object Versions {
   val wireMock       = "3.9.2"
   val blobstore      = "0.10.1"
   val starlakeJdbc   = "0.7"
-  val duckdb         = "1.5.6.0" // before bumping: docs/duckdb-pin-bump-checklist.md
+  val duckdb         = "2.0.0.0" // before bumping: docs/duckdb-pin-bump-checklist.md
+  val duckdbJdbc     = duckdb
   val micrometer     = "1.13.6"
   val liquibase      = "4.29.2"
   val caffeine       = "3.1.8"

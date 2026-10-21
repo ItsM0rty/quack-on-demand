@@ -7,10 +7,13 @@
 # spawn-quack-node.sh so the same boot script that LocalQuackBackend uses
 # also runs in K8s. Env-var contract:
 #
-#   QOD_NODE_PORT, QOD_NODE_TOKEN  - set by the manager's pod template
-#   pgHost / pgPort / pgUser / pgPassword / dbName / schemaName / dataPath
+#   QOD_NODE_PORT            - set by the manager's pod template
+#   QOD_SECRETS_DIR          - read-only Secret volume: token, pgPassword, encryptionKey,
+#                              federation / object-store SQL, object-store credentials
+#                              (one file per key; never env vars)
+#   pgHost / pgPort / pgUser / dbName / schemaName / dataPath
 #                            - merged from defaultMetastore + spec.metastore
-#   QOD_S3_* / QOD_AZURE_*   - optional object-store creds
+#   QOD_S3_ENDPOINT / _REGION / _URL_STYLE / _USE_SSL - optional object-store settings
 #   HTTP_PROXY / HTTPS_PROXY           - optional egress proxy
 #
 # Build: docker build -t starlakeai/quack-on-demand-node:local -f docker/quack-node/Dockerfile .
@@ -18,13 +21,13 @@
 FROM debian:bookworm-slim AS base
 
 ARG TARGETARCH
-ARG DUCKDB_VERSION=1.5.6
+ARG DUCKDB_VERSION=2.0.0
 
 RUN <<EOF
 set -eu
 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates curl unzip bash postgresql-client tini
+  ca-certificates curl bash postgresql-client tini
 rm -rf /var/lib/apt/lists/*
 EOF
 
@@ -36,10 +39,10 @@ case "${TARGETARCH:-$(dpkg --print-architecture)}" in
   arm64) ARCH=linux-arm64 ;;
   *) echo "unsupported architecture" >&2; exit 1 ;;
 esac
-curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-${ARCH}.zip" -o /tmp/duckdb.zip
-unzip /tmp/duckdb.zip -d /usr/local/bin
+curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-cli-${ARCH}.tar.gz" -o /tmp/duckdb.tar.gz
+tar -xzf /tmp/duckdb.tar.gz -C /usr/local/bin duckdb
 chmod +x /usr/local/bin/duckdb
-rm /tmp/duckdb.zip
+rm /tmp/duckdb.tar.gz
 duckdb -c 'SELECT version()'
 EOF
 

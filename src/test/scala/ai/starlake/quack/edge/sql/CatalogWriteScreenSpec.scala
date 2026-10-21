@@ -197,11 +197,19 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     r.value should include("read-only")
   }
 
-  it should "deny a batch that throws at the whole-submission level with a write fragment (CHECKPOINT)" in {
-    // Second witness: CHECKPOINT classifies Other, so the collapsed snippet's first token is
-    // equally uninformative.
-    val r = screen("CHECKPOINT; INSERT INTO sales_lake.main.orders VALUES (1)")
+  it should "deny a batch that throws at the whole-submission level with a write fragment (VACUUM)" in {
+    // Second witness: VACUUM classifies Other, so the collapsed snippet's first token is
+    // equally uninformative. (Every fragment-list witness in this spec used CHECKPOINT until F09
+    // made CHECKPOINT a DDL statement; VACUUM plays the same part: Other, and a throw in JSqlParser.)
+    val r = screen("VACUUM; INSERT INTO sales_lake.main.orders VALUES (1)")
     r.value should include("read-only")
+  }
+
+  it should "deny CHECKPOINT itself while a read-only catalog is attached" in {
+    // F09: CHECKPOINT classifies Ddl (on DuckLake it merges and deletes data files), so it is
+    // write-shaped and an unparseable one is judged fail closed like any other write.
+    screen("CHECKPOINT sales_lake").value should include("read-only")
+    screen("CHECKPOINT; SELECT * FROM sales_lake.main.orders").value should include("read-only")
   }
 
   it should "admit a batch that collapses at the whole-submission level but has no write fragment" in {
@@ -259,7 +267,7 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
   }
 
   it should "deny the full comment-blind witness batch (collapsed batch, comment-prefixed PREPARE/EXECUTE)" in {
-    // This is the robust witness from the review: CHECKPOINT forces SqlParser.extract to throw on
+    // This is the robust witness from the review: VACUUM forces SqlParser.extract to throw on
     // the whole submission (collapsing it to one ParseError), which routes judgment through the
     // fragment-list fallback rather than the per-statement path -- so this also proves the fix
     // reaches isWriteShaped when called from the P1 fallback, not just from the per-statement rule.
@@ -269,7 +277,7 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // comments. Pinning why the fallback fires at all (m1's ask), rather than trusting it: three
     // fragments collapse to one StatementResult.
     val batch =
-      "CHECKPOINT; /*x*/PREPARE p AS INSERT INTO sales_lake.main.orders VALUES (1); /*x*/EXECUTE p"
+      "VACUUM; /*x*/PREPARE p AS INSERT INTO sales_lake.main.orders VALUES (1); /*x*/EXECUTE p"
     SqlParser.extract(batch, cfg).statements.length shouldBe 1
     LockdownScreen.splitStatements(batch).length shouldBe 3
     val r = screen(batch)
@@ -337,10 +345,10 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
   }
 
   it should "deny a batch whose write fragment alone carries a leading NBSP" in {
-    // Mirrors the existing CHECKPOINT witness below (P1), but only the write fragment is
+    // Mirrors the existing VACUUM witness below (P1), but only the write fragment is
     // NBSP-prefixed, pinning that normalization runs per-fragment through the P1 fallback and not
     // only on a lone single-statement submission.
-    val batch = "CHECKPOINT; \u00A0INSERT INTO sales_lake.main.orders VALUES (1)"
+    val batch = "VACUUM; \u00A0INSERT INTO sales_lake.main.orders VALUES (1)"
     SqlParser.extract(batch, cfg).statements.length shouldBe 1
     LockdownScreen.splitStatements(batch).length shouldBe 2
     val r = screen(batch)
@@ -352,12 +360,12 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // returned at the cheap path (step 2): every fragment classifies read-side without being
     // parsed, so isWriteShaped -- and therefore this commit's strip -- was never reached. It pinned
     // a pre-existing StatementClassifier property, not this fix, and its stated purpose was false.
-    // Pairing the read with CHECKPOINT forces SqlParser.extract to throw on the whole submission,
+    // Pairing the read with VACUUM forces SqlParser.extract to throw on the whole submission,
     // routing judgment through the P1 fragment-list fallback, where the /*x*/-prefixed SELECT
     // fragment is actually judged by isWriteShaped with the strip live.
     // Mutation-tested: this DOES flip (Some) if isWriteShaped is changed to treat every
     // non-blank normalized snippet as write-shaped, confirming it now exercises the changed code.
-    screen("CHECKPOINT; /*x*/SELECT * FROM sales_lake.main.orders") shouldBe None
+    screen("VACUUM; /*x*/SELECT * FROM sales_lake.main.orders") shouldBe None
   }
 
   it should "still admit CALL, which classifies Other like PREPARE/EXECUTE but is not treated as write-shaped" in {
@@ -440,22 +448,35 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // reads INSERT as the verb and returns Dml regardless of whether the snippet handed to it was
     // already normalized. Kept anyway as a coverage/regression witness that the PREPARE/EXECUTE
     // fix's composition (comments -> strip leading -> normalize) does not regress this
-    // already-protected path; pairing with CHECKPOINT (as the P1 witness above does) forces the
+    // already-protected path; pairing with VACUUM (as the P1 witness above does) forces the
     // fragment-list fallback so the raw, un-reconstructed fragment is what gets judged.
-    val batch = "CHECKPOINT; INSERT\u00A0INTO sales_lake.main.orders VALUES (1)"
+    val batch = "VACUUM; INSERT\u00A0INTO sales_lake.main.orders VALUES (1)"
     SqlParser.extract(batch, cfg).statements.length shouldBe 1
     LockdownScreen.splitStatements(batch).length shouldBe 2
     val r = screen(batch)
     r.value should include("read-only")
   }
 
+  it should "judge a fragment by its original text, not a trivia-normalized copy (soft hyphen before a dollar tag)" in {
+    // DuckDB 2.0 reads U+00AD as an identifier character, so `a<U+00AD>$q$` and `b$q$` are CTE
+    // names and the DELETE CTE runs (verified on the 2.0 CLI). Normalizing first turned the soft
+    // hyphen into a space, opened a dollar-quoted string at `$q$` that closed inside `b$q$` and
+    // hid the DELETE from the classifier. VACUUM forces the fragment-list fallback.
+    val batch =
+      "VACUUM; WITH a\u00AD$q$ AS (DELETE FROM sales_lake.main.orders RETURNING 1), " +
+        "b$q$ AS (SELECT 1) SELECT * FROM b$q$"
+    LockdownScreen.splitStatements(batch).length shouldBe 2
+    SqlParser.extract(batch, cfg).statements.length shouldBe 1
+    screen(batch) should not be None
+  }
+
   it should "still admit a read with interior trivia against a read-only catalog, via the parsed path" in {
     // Over-denial guard: this must reach the parsed per-statement path (denialFor), not just the
-    // cheap classify-only path at step 2 -- CHECKPOINT forces the fragment-list fallback, and
+    // cheap classify-only path at step 2 -- VACUUM forces the fragment-list fallback, and
     // fragments.exists(isWriteShaped) must come back false for a read with interior trivia, not
     // true. Mutation-tested: flips to Some if isWriteShaped treats every non-blank normalized
     // snippet as write-shaped (the same mutation the leading-trivia read guard above pins).
-    screen("CHECKPOINT; SELECT\u00A0* FROM sales_lake.main.orders") shouldBe None
+    screen("VACUUM; SELECT\u00A0* FROM sales_lake.main.orders") shouldBe None
   }
 
   // ---- C1/C2 sibling: an interior comment must not hide a write from isWriteShaped either ----
@@ -490,13 +511,13 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
   // jsqlparser's own `toString` re-renders a `PrepareStatement`/`Execute` node WITHOUT the
   // original comment -- confirmed by running the un-fixed code before this commit, which already
   // denied a bare `screen("/* a /* b */ c */ PREPARE p AS INSERT INTO sales_lake.main.orders
-  // VALUES (1)")`. The FRAGMENT-LIST fallback (forced by `CHECKPOINT`, below) has no such
+  // VALUES (1)")`. The FRAGMENT-LIST fallback (forced by `VACUUM`, below) has no such
   // rescue: it calls `isWriteShaped` directly on the raw, comment-intact split fragment, and with
   // the pre-fix ordering this test's batch was ADMITTED (`None`) instead of denied -- confirmed by
   // running the un-fixed code before writing this test.
-  it should "deny a CHECKPOINT-forced batch whose PREPARE/EXECUTE writes hide behind a nested leading comment" in {
+  it should "deny a VACUUM-forced batch whose PREPARE/EXECUTE writes hide behind a nested leading comment" in {
     val batch =
-      "CHECKPOINT; /* a /* b */ c */ PREPARE p AS INSERT INTO sales_lake.main.orders VALUES (1); " +
+      "VACUUM; /* a /* b */ c */ PREPARE p AS INSERT INTO sales_lake.main.orders VALUES (1); " +
         "/* a /* b */ c */ EXECUTE p"
     SqlParser.extract(batch, cfg).statements.length shouldBe 1
     LockdownScreen.splitStatements(batch).length shouldBe 3
@@ -504,94 +525,94 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     r.value should include("read-only")
   }
 
-  it should "deny a CHECKPOINT-forced batch whose plain INSERT hides behind a nested leading comment" in {
-    val batch = "CHECKPOINT; /* a /* b */ c */ INSERT INTO sales_lake.main.orders VALUES (1)"
+  it should "deny a VACUUM-forced batch whose plain INSERT hides behind a nested leading comment" in {
+    val batch = "VACUUM; /* a /* b */ c */ INSERT INTO sales_lake.main.orders VALUES (1)"
     val r     = screen(batch)
     r.value should include("read-only")
   }
 
-  it should "deny a CHECKPOINT-forced batch whose CREATE TABLE hides behind a nested leading comment" in {
-    val batch = "CHECKPOINT; /* a /* b */ c */ CREATE TABLE sales_lake.main.newtable(a int)"
+  it should "deny a VACUUM-forced batch whose CREATE TABLE hides behind a nested leading comment" in {
+    val batch = "VACUUM; /* a /* b */ c */ CREATE TABLE sales_lake.main.newtable(a int)"
     val r     = screen(batch)
     r.value should include("read-only")
   }
 
   it should "close arbitrarily deep nesting, not just two levels" in {
     val batch =
-      "CHECKPOINT; /* L1 /* L2 /* L3 */ back2 */ back1 */ INSERT INTO sales_lake.main.orders VALUES (1)"
+      "VACUUM; /* L1 /* L2 /* L3 */ back2 */ back1 */ INSERT INTO sales_lake.main.orders VALUES (1)"
     val r = screen(batch)
     r.value should include("read-only")
   }
 
   it should "deny a nested leading comment preceded by a plain trivia character" in {
-    val batch = "CHECKPOINT; \u00A0/* a /* b */ c */ INSERT INTO sales_lake.main.orders VALUES (1)"
+    val batch = "VACUUM; \u00A0/* a /* b */ c */ INSERT INTO sales_lake.main.orders VALUES (1)"
     val r     = screen(batch)
     r.value should include("read-only")
   }
 
-  it should "not over-correct: a non-nested leading comment in a CHECKPOINT batch still denies as before" in {
+  it should "not over-correct: a non-nested leading comment in a VACUUM batch still denies as before" in {
     // Over-correction guard: this exact batch shape (single-level comment) was already denied
     // before this fix -- see the existing "comment-blind witness batch" test above -- pinning that
     // the reordering did not regress the already-working non-nested case.
     val batch =
-      "CHECKPOINT; /*x*/PREPARE p AS INSERT INTO sales_lake.main.orders VALUES (1); /*x*/EXECUTE p"
+      "VACUUM; /*x*/PREPARE p AS INSERT INTO sales_lake.main.orders VALUES (1); /*x*/EXECUTE p"
     val r = screen(batch)
     r.value should include("read-only")
   }
 
-  it should "still admit a CHECKPOINT-forced read whose nested leading comment is not write-shaped (over-denial guard)" in {
-    screen("CHECKPOINT; /* a /* b */ c */ SELECT * FROM sales_lake.main.orders") shouldBe None
+  it should "still admit a VACUUM-forced read whose nested leading comment is not write-shaped (over-denial guard)" in {
+    screen("VACUUM; /* a /* b */ c */ SELECT * FROM sales_lake.main.orders") shouldBe None
   }
 
   // ---- gate 3 inherits the classifier's two remaining comment holes ----
   //
-  // Both shapes below reach this screen through the FRAGMENT-LIST fallback (forced by CHECKPOINT),
+  // Both shapes below reach this screen through the FRAGMENT-LIST fallback (forced by VACUUM),
   // which calls `isWriteShaped` on the raw split fragment with no jsqlparser re-rendering to fall
   // back on -- the same path the nested-leading-comment witnesses above use. Both execute as
   // writes on a real DuckDB 1.5.4.
-  it should "deny a CHECKPOINT-forced batch whose write hides behind a bare carriage return" in {
+  it should "deny a VACUUM-forced batch whose write hides behind a bare carriage return" in {
     // `SqlTrivia.stripLeading` scanned a `--` comment to a line feed alone, so the whole fragment
     // was consumed and `isWriteShaped` judged an empty string: `isPrepareOrExecute` false,
     // `classify("")` Other, ADMITTED. DuckDB ends the comment at the CR and runs the INSERT.
     val batch =
-      "CHECKPOINT; -- x" + "\r" + "INSERT INTO sales_lake.main.orders VALUES (1)"
+      "VACUUM; -- x" + "\r" + "INSERT INTO sales_lake.main.orders VALUES (1)"
     val r = screen(batch)
     r.value should include("read-only")
   }
 
-  it should "deny a CHECKPOINT batch whose EXPLAIN ANALYZE write hides behind a nested comment" in {
+  it should "deny a VACUUM batch whose EXPLAIN ANALYZE write hides behind a nested comment" in {
     // `EXPLAIN ANALYZE` executes its inner statement. A stripper that closed the nested comment at
     // the inner marker left the residue exactly where the EXPLAIN arm reads its next token, so the
     // fragment classified read-shaped and was admitted.
     val batch =
-      "CHECKPOINT; EXPLAIN ANALYZE /* a /* b */ c */ INSERT INTO sales_lake.main.orders VALUES (1)"
+      "VACUUM; EXPLAIN ANALYZE /* a /* b */ c */ INSERT INTO sales_lake.main.orders VALUES (1)"
     val r = screen(batch)
     r.value should include("read-only")
   }
 
-  it should "deny a CHECKPOINT batch whose WITH write hides behind a quoted comment marker" in {
+  it should "deny a VACUUM batch whose WITH write hides behind a quoted comment marker" in {
     // The marker sits inside a double-quoted identifier, which DuckDB accepts verbatim; the
     // single-quote-only stripper opened a comment there that never closed and truncated the
     // fragment, so the WITH arm ran out of text and fell to the legacy select bucket.
     val batch =
-      "CHECKPOINT; WITH x AS (SELECT 1 AS " + "\"" + "a/*b" + "\"" + ") " +
+      "VACUUM; WITH x AS (SELECT 1 AS " + "\"" + "a/*b" + "\"" + ") " +
         "INSERT INTO sales_lake.main.orders SELECT 1"
     val r = screen(batch)
     r.value should include("read-only")
   }
 
-  it should "still admit a CHECKPOINT-forced read behind the same shapes (over-denial guard)" in {
+  it should "still admit a VACUUM-forced read behind the same shapes (over-denial guard)" in {
     // GUARD: these are reads, and they must stay admitted through exactly the same code path.
-    screen("CHECKPOINT; -- x" + "\r" + "SELECT * FROM sales_lake.main.orders") shouldBe None
+    screen("VACUUM; -- x" + "\r" + "SELECT * FROM sales_lake.main.orders") shouldBe None
     screen(
-      "CHECKPOINT; EXPLAIN /* a /* b */ c */ SELECT * FROM sales_lake.main.orders"
+      "VACUUM; EXPLAIN /* a /* b */ c */ SELECT * FROM sales_lake.main.orders"
     ) shouldBe None
   }
 
   // ---- the SPLITTER had the same carriage-return hole, on the CHEAP admit path ----
   //
-  // Different arm from every CHECKPOINT witness above. Those force the fragment-list fallback
-  // precisely because CHECKPOINT is not read-shaped. Here every fragment the splitter produces IS
+  // Different arm from every VACUUM witness above. Those force the fragment-list fallback
+  // precisely because VACUUM is not read-shaped. Here every fragment the splitter produces IS
   // read-shaped, so `screen` takes its `fragments.forall(...)` cheap admit path and never parses
   // at all -- and `LockdownScreen.splitStatements` is that path's ONLY per-statement isolation.
   // Its line-comment state was cleared by a line feed alone, so a bare CR left the comment open

@@ -4,15 +4,13 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <random>
 #include <string>
 
-// Pulls in duckdb-quack's message-layer types. quack_message.cpp transitively
-// references QuackServer::QUACK_VERSION, which is normally declared in
-// quack_server.hpp; the upstream header drags in httplib.hpp. We sidestep
-// that by shipping a minimal shim header at
-// `native/quackwire/include/shim/quack_server.hpp`, placed BEFORE the
-// upstream `src/include/` on the search path via CMakeLists.txt's
-// `target_include_directories(... BEFORE PRIVATE ...)`. See design doc 9.4.
+// Pulls in duckdb-quack's message-layer types. Since protocol v3,
+// QUACK_VERSION lives in quack_message.hpp itself, so the message-layer
+// sources no longer reach for quack_server.hpp (which drags in httplib.hpp)
+// and no shim header is needed. See design doc 9.4.
 #include "quack_message.hpp"
 
 #include "duckdb/common/allocator.hpp"
@@ -22,11 +20,13 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_properties.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -41,6 +41,41 @@
 extern "C" JNIEXPORT jint JNICALL
 Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_smokeAnswer(JNIEnv*, jobject) {
   return 42;
+}
+
+// Build marker: what this binary was compiled against, as one literal so the
+// release scripts can read it straight from the file (grep -a) without loading
+// it, and QuackNativeSupport.bootCheck can read it through buildInfo() below.
+// CMakeLists.txt supplies every value: the protocol generation parsed from
+// quack_message.hpp (cross-checked by the static_assert), the DuckDB version
+// and source id asked of the libduckdb being linked, and the quack submodule
+// commit. Keep the format in step with QuackNativeBridge.scala's NativeBuildInfo
+// and scripts/release/quackwire-build-info.sh.
+#if !defined(QUACKWIRE_PROTOCOL) || !defined(QUACKWIRE_DUCKDB_VERSION) || \
+    !defined(QUACKWIRE_DUCKDB_SOURCE_ID) || !defined(QUACKWIRE_QUACK_SHA)
+#error "build through native/quackwire/CMakeLists.txt: it defines the QUACKWIRE_* build marker"
+#endif
+#define QUACKWIRE_STR2(x) #x
+#define QUACKWIRE_STR(x) QUACKWIRE_STR2(x)
+static_assert(duckdb::QUACK_VERSION == QUACKWIRE_PROTOCOL,
+              "QUACKWIRE_PROTOCOL disagrees with quack_message.hpp's QUACK_VERSION");
+static const char kQuackwireBuildInfo[] =
+    "quackwire-build-info:protocol=" QUACKWIRE_STR(QUACKWIRE_PROTOCOL)
+    ";duckdb=" QUACKWIRE_DUCKDB_VERSION ";duckdb_source=" QUACKWIRE_DUCKDB_SOURCE_ID
+    ";quack=" QUACKWIRE_QUACK_SHA;
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_buildInfo(JNIEnv* env, jobject) {
+  return env->NewStringUTF(kQuackwireBuildInfo);
+}
+
+// The libduckdb actually loaded into the process, in the marker's key=value
+// form, for bootCheck to compare against the one this binary was built for.
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_linkedDuckDb(JNIEnv* env, jobject) {
+  std::string out = std::string("duckdb=") + duckdb::DuckDB::LibraryVersion() +
+                    ";duckdb_source=" + duckdb::DuckDB::SourceID();
+  return env->NewStringUTF(out.c_str());
 }
 
 namespace {
@@ -73,6 +108,27 @@ void throw_runtime(JNIEnv* env, const char* what) {
   if (cls != nullptr) {
     env->ThrowNew(cls, what);
   }
+}
+
+// A random version-4 UUID as DuckDB's UUIDv4::GenerateRandomUUID lays it
+// out (big-endian bytes, upper word first), for the query id a v3 PREPARE
+// carries. Generated here because duckdb.dll does not export
+// UUID::GenerateRandomUUID, so the Windows native could not link it.
+duckdb::hugeint_t random_query_uuid() {
+  thread_local std::mt19937_64 engine{[] {
+    std::random_device rd;
+    std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
+    return std::mt19937_64(seq);
+  }()};
+  uint64_t upper = engine();
+  uint64_t lower = engine();
+  // version 4: byte 6 is 0100xxxx; variant: byte 8 is 10xxxxxx
+  upper = (upper & ~(uint64_t(0xF0) << 8)) | (uint64_t(0x40) << 8);
+  lower = (lower & ~(uint64_t(0xC0) << 56)) | (uint64_t(0x80) << 56);
+  duckdb::hugeint_t result;
+  result.upper = static_cast<int64_t>(upper);
+  result.lower = lower;
+  return result;
 }
 
 // Pulls a 128-bit magnitude out of a Java BigInteger via the standard
@@ -148,10 +204,17 @@ duckdb::hugeint_t jbiginteger_to_hugeint(JNIEnv* env, jobject big_integer) {
 
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_serializeConnectionRequest(
-    JNIEnv* env, jobject, jstring token_j) {
+    JNIEnv* env, jobject, jstring token_j, jlong heartbeat_timeout_j) {
   try {
     auto token = jstring_to_std(env, token_j);
-    duckdb::ConnectionRequestMessage msg(token);
+    // v3 handshake: the client id groups the manager's connections server-side; the lease is
+    // renewed by every request. The node checks it only when the connection's next message
+    // arrives; once lapsed, that message fails and the node interrupts what still runs on the
+    // connection and drops it. A lapse by itself interrupts nothing, so the lease does not bound
+    // work orphaned by a dead manager. The Scala side sends HEARTBEAT_REQUESTs at a third of it
+    // to keep the connection usable.
+    duckdb::ConnectionRequestMessage msg(token, "quack-on-demand",
+                                         static_cast<duckdb::idx_t>(heartbeat_timeout_j));
     duckdb::MemoryStream stream;
     msg.ToMemoryStream(stream);
     return to_jbyte_array(env, stream);
@@ -170,7 +233,9 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_serializePrepareRequ
   try {
     auto connection_id = jstring_to_std(env, connection_id_j);
     auto sql = jstring_to_std(env, sql_j);
-    duckdb::PrepareRequestMessage msg(connection_id, sql);
+    // v3: the client names the query; FETCH and CANCEL refer to it, and the
+    // PREPARE_RESPONSE echoes it back (extractResultUuid).
+    duckdb::PrepareRequestMessage msg(connection_id, sql, random_query_uuid());
     duckdb::MemoryStream stream;
     msg.ToMemoryStream(stream);
     return to_jbyte_array(env, stream);
@@ -185,14 +250,21 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_serializePrepareRequ
 
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_serializeFetchRequest(
-    JNIEnv* env, jobject, jstring connection_id_j, jobject result_uuid_j) {
+    JNIEnv* env, jobject, jstring connection_id_j, jobject result_uuid_j, jlong batch_index_j) {
   try {
     auto connection_id = jstring_to_std(env, connection_id_j);
     duckdb::hugeint_t uuid = jbiginteger_to_hugeint(env, result_uuid_j);
     if (env->ExceptionCheck()) {
       return nullptr;
     }
-    duckdb::FetchRequestMessage msg(connection_id, uuid);
+    if (batch_index_j < 1) {
+      throw_runtime(env, "FetchRequest batchIndex must be >= 1");
+      return nullptr;
+    }
+    // v3: every FETCH names its batch (1-based, after the batches PREPARE carried inline) and acks
+    // everything before it: the manager reads strictly in order and never asks twice.
+    auto batch_index = static_cast<duckdb::idx_t>(batch_index_j);
+    duckdb::FetchRequestMessage msg(connection_id, uuid, batch_index, batch_index - 1);
     duckdb::MemoryStream stream;
     msg.ToMemoryStream(stream);
     return to_jbyte_array(env, stream);
@@ -219,6 +291,23 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_serializeDisconnect(
     return nullptr;
   } catch (...) {
     throw_runtime(env, "unknown C++ exception in serializeDisconnect");
+    return nullptr;
+  }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_serializeHeartbeat(
+    JNIEnv* env, jobject, jstring connection_id_j) {
+  try {
+    duckdb::HeartbeatRequestMessage msg(jstring_to_std(env, connection_id_j));
+    duckdb::MemoryStream stream;
+    msg.ToMemoryStream(stream);
+    return to_jbyte_array(env, stream);
+  } catch (const std::exception& e) {
+    throw_runtime(env, e.what());
+    return nullptr;
+  } catch (...) {
+    throw_runtime(env, "unknown C++ exception in serializeHeartbeat");
     return nullptr;
   }
 }
@@ -401,7 +490,7 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_extractResultUuid(
       return nullptr;
     }
     const auto& resp = msg->Cast<duckdb::PrepareResponseMessage>();
-    return hugeint_to_jbiginteger(env, resp.ResultUUID());
+    return hugeint_to_jbiginteger(env, resp.QueryUUID());
   } catch (const std::exception& e) {
     throw_runtime(env, e.what());
     return nullptr;
@@ -539,6 +628,12 @@ namespace {
 //
 // This is the cheapest viable workaround. A v2 would let the gateway
 // hand in a real ClientContext from its own DuckLake-backed connection.
+//
+// The instance is opened with a fixed thread budget (`threads=1`,
+// `async_threads=1`): DuckDB 2.0 defaults to one worker per core plus an
+// async I/O pool of 4 x cores, ~79 native threads on a 16-core host for an
+// instance that never runs a query. Same budget as the manager's JDBC instances
+// (DuckDbExtensionSource.connectionProperties on the Scala side).
 duckdb::ClientProperties& shared_client_properties() {
   static std::mutex mtx;
   static std::unique_ptr<duckdb::DuckDB> db;
@@ -546,7 +641,15 @@ duckdb::ClientProperties& shared_client_properties() {
   static std::unique_ptr<duckdb::ClientProperties> props;
   std::lock_guard<std::mutex> lock(mtx);
   if (!props) {
-    db = std::make_unique<duckdb::DuckDB>(nullptr);
+    duckdb::DBConfig config;
+    config.SetOptionByName("threads", duckdb::Value::BIGINT(1));
+    config.SetOptionByName("async_threads", duckdb::Value::BIGINT(1));
+    // Never load the OS user's persistent secrets (~/.duckdb/stored_secrets) into this helper
+    // instance. The JVM side (InProcessDuckDb.Settings) points secret_directory below a read-only
+    // marker file instead, because there allow_persistent_secrets=false would refuse every postgres
+    // ATTACH naming no SECRET; this instance never runs SQL, so the simpler setting is enough.
+    config.SetOptionByName("allow_persistent_secrets", duckdb::Value::BOOLEAN(false));
+    db = std::make_unique<duckdb::DuckDB>(nullptr, &config);
     conn = std::make_unique<duckdb::Connection>(*db);
     props = std::make_unique<duckdb::ClientProperties>(conn->context->GetClientProperties());
   }
@@ -556,7 +659,11 @@ duckdb::ClientProperties& shared_client_properties() {
 struct ChunkStreamHolder {
   // `duckdb::vector` is what `Mutable*Results()` returns - keep the same
   // alias so we can `std::move` straight in without a transcribe loop.
-  duckdb::vector<duckdb::unique_ptr<duckdb::DataChunkWrapper>> chunks;
+  // PREPARE_RESPONSE still carries DataChunkWrappers; a v3 FETCH_RESPONSE decodes its blob into
+  // plain DataChunks. Exactly one owner is filled and `chunks` points into it.
+  duckdb::vector<duckdb::unique_ptr<duckdb::DataChunkWrapper>> wrapped;
+  duckdb::vector<duckdb::unique_ptr<duckdb::DataChunk>> owned;
+  duckdb::vector<duckdb::DataChunk*> chunks;
   duckdb::vector<duckdb::LogicalType> types;
   // Column names, populated from `PrepareResponseMessage::Names()` for a
   // PREPARE_RESPONSE; synthesised as `column_0..N-1` for FETCH_RESPONSE
@@ -604,7 +711,7 @@ int chunk_stream_get_next(struct ArrowArrayStream* stream, struct ArrowArray* ou
       out->release = nullptr;
       return 0;
     }
-    auto& chunk = h->chunks[h->next]->Chunk();
+    auto& chunk = *h->chunks[h->next];
     // ArrowConverter::ToArrowArray takes
     //   const unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>>&
     // where both aliases live in the `duckdb::` namespace. Building an
@@ -665,14 +772,20 @@ ChunkStreamHolder* steal_results_into_holder(JNIEnv* env, duckdb::QuackMessage& 
     auto& resp = msg.Cast<duckdb::PrepareResponseMessage>();
     holder->types = resp.Types();
     holder->names = resp.Names();
-    holder->chunks = std::move(resp.MutableResults());
+    holder->wrapped = std::move(resp.MutableResults());
+    for (auto& w : holder->wrapped) {
+      holder->chunks.push_back(&w->Chunk());
+    }
   } else if (msg.Type() == duckdb::MessageType::FETCH_RESPONSE) {
     auto& resp = msg.Cast<duckdb::FetchResponseMessage>();
-    holder->chunks = std::move(resp.MutableResults());
+    holder->owned = std::move(resp.MutableResults());
+    for (auto& c : holder->owned) {
+      holder->chunks.push_back(c.get());
+    }
     // FetchResponseMessage carries no schema; derive it from the first
     // chunk. An empty fetch response has no schema and no rows.
     if (!holder->chunks.empty()) {
-      holder->types = holder->chunks.front()->Chunk().GetTypes();
+      holder->types = holder->chunks.front()->GetTypes();
       holder->names.reserve(holder->types.size());
       for (size_t i = 0; i < holder->types.size(); ++i) {
         holder->names.push_back("column_" + std::to_string(i));
@@ -711,6 +824,22 @@ Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_extractArrowStream(
   }
 }
 
+// Frees the struct extractArrowStream allocated. The Arrow Java importer moves its contents into
+// a struct of its own and marks this one released, so only the 40-byte shell is left; a stream
+// the import never took still owns its chunks and is released here first.
+extern "C" JNIEXPORT void JNICALL
+Java_ai_starlake_quack_edge_adapter_QuackNativeBridge_00024_freeStreamShell(
+    JNIEnv*, jobject, jlong ptr) {
+  auto* stream = reinterpret_cast<ArrowArrayStream*>(ptr);
+  if (stream == nullptr) {
+    return;
+  }
+  if (stream->release != nullptr) {
+    stream->release(stream);
+  }
+  delete stream;
+}
+
 // =====================================================================
 // Test-only JNI fixture helpers (Task 5.3)
 // =====================================================================
@@ -738,8 +867,11 @@ std::unique_ptr<duckdb::DataChunk> make_one_row_one_col_int_chunk() {
   types.push_back(duckdb::LogicalType::INTEGER);
   auto chunk = std::make_unique<duckdb::DataChunk>();
   chunk->Initialize(duckdb::Allocator::DefaultAllocator(), types);
-  chunk->SetValue(0, 0, duckdb::Value::INTEGER(42));
-  chunk->SetCardinality(1);
+  // 2.0 vectors carry their own size: Vector::Append sizes the column (the
+  // deprecated SetCardinality leaves it empty and the chunk would serialize
+  // zero data bytes). Not SetChildCardinality: duckdb.dll does not export it.
+  chunk->data[0].Append(duckdb::Value::INTEGER(42));
+  chunk->SetCardinalityUnsafe(1);
   return chunk;
 }
 
@@ -756,7 +888,7 @@ Java_ai_starlake_quack_edge_adapter_QuackTestFixtures_00024_serializeSampleConne
     JNIEnv* env, jobject, jstring connection_id_j) {
   try {
     auto connection_id = jstring_to_std(env, connection_id_j);
-    duckdb::ConnectionResponseMessage msg(connection_id);
+    duckdb::ConnectionResponseMessage msg(connection_id, 30);
     return serialize_to_jbyte_array(env, msg);
   } catch (const std::exception& e) {
     throw_runtime(env, e.what());
@@ -830,14 +962,27 @@ extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_starlake_quack_edge_adapter_QuackTestFixtures_00024_serializeSampleFetchResponse(
     JNIEnv* env, jobject, jboolean with_one_row_one_col_chunk_j) {
   try {
-    duckdb::vector<duckdb::unique_ptr<duckdb::DataChunkWrapper>> chunks;
-    std::unique_ptr<duckdb::DataChunk> backing_chunk;
-    if (with_one_row_one_col_chunk_j == JNI_TRUE) {
-      backing_chunk = make_one_row_one_col_int_chunk();
-      chunks.push_back(duckdb::make_uniq<duckdb::DataChunkWrapper>(*backing_chunk));
+    // v3: chunks travel as a raw blob after the message, built like the server builds them.
+    duckdb::FetchResponseMessage header;
+    header.SetBatchIndex(duckdb::optional_idx(1));
+    if (with_one_row_one_col_chunk_j != JNI_TRUE) {
+      header.SetTotalBatches(duckdb::optional_idx(0));
+      return serialize_to_jbyte_array(env, header);
     }
-    duckdb::FetchResponseMessage msg(std::move(chunks));
-    return serialize_to_jbyte_array(env, msg);
+    auto chunk = make_one_row_one_col_int_chunk();
+    duckdb::QuackChunkPayloadWriter writer(0);
+    writer.AppendChunk(*chunk);
+    auto sealed = writer.Seal();
+    header.SetChunkCount(sealed.chunk_count);
+    auto start = duckdb::QuackPrependHeader(*sealed.payload, header);
+    auto len = static_cast<jsize>(sealed.payload_size - start);
+    jbyteArray arr = env->NewByteArray(len);
+    if (arr == nullptr) {
+      return nullptr;
+    }
+    env->SetByteArrayRegion(arr, 0, len,
+                            reinterpret_cast<const jbyte*>(sealed.payload->GetData() + start));
+    return arr;
   } catch (const std::exception& e) {
     throw_runtime(env, e.what());
     return nullptr;

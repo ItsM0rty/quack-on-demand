@@ -26,7 +26,7 @@ on:
   push:
     branches: [main]
   # Auto-rebuild after every successful `quackwire native build`. libquackwire's
-  # 5 platform binaries (linux x2, macOS x2, windows-x86_64) are vendored under
+  # 6 platform binaries (linux x2, macOS x2, windows x2) are vendored under
   # libquackwire/binaries/ and bundled into the manager assembly at build time,
   # so a refreshed binary (same libquackwireVersion, new content after a
   # rebuild) only reaches users once we rebuild the assembly + docker image.
@@ -65,6 +65,19 @@ jobs:
       version: ${{ steps.extract-version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+
+      # A pre-release DuckDB JDBC or a mavenLocal resolver cannot resolve on a
+      # runner: say so up front instead of failing deep in `sbt update`.
+      - name: Guard - release-grade DuckDB pins
+        run: scripts/release/check-release-pins.sh
+
+      # Same gate release.yml runs: every vendored native's build marker must
+      # match the pin, or the snapshot would ship natives the manager refuses.
+      - name: Verify vendored libquackwire binaries match the pin
+        run: |
+          set -euo pipefail
+          source scripts/release/release-lib.sh
+          verify_quackwire_binaries
 
       - name: Set up Temurin 21
         uses: actions/setup-java@v5

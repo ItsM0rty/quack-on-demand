@@ -167,16 +167,17 @@ jobs:
       - name: Setup sbt launcher
         uses: sbt/setup-sbt@v1
 
-      # v1.5.4 is the build the end-to-end specs were verified against locally. Bumping it is
-      # fine but is a behaviour change, not a version bump: the specs pin engine behaviour
-      # (READ_ONLY enforcement, continue-past-a-failed-ATTACH) that a new DuckDB could alter.
+      # The node engine must be the pinned release: the manager speaks Quack protocol v3, which a
+      # 1.x node refuses. Bumping it is a behaviour change, not only a version bump: the specs pin
+      # engine behaviour (READ_ONLY enforcement, continue-past-a-failed-ATTACH) that a new DuckDB
+      # could alter.
       - name: Install the duckdb CLI
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
-          curl -fsSL -o duckdb.zip \
-            https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip
-          unzip -o duckdb.zip -d "$HOME/.local/bin"
+          curl -fsSL -o duckdb.tar.gz \
+            https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz
+          tar -xzf duckdb.tar.gz -C "$HOME/.local/bin" duckdb
           chmod +x "$HOME/.local/bin/duckdb"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/duckdb" -noheader -list -c "select version();"

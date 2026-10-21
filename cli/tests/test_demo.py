@@ -1,5 +1,7 @@
+import os
 import pathlib
 import hashlib
+import re
 import sys
 
 import httpx
@@ -7,6 +9,7 @@ import respx
 import pytest
 
 from qod_cli import launcher
+from tests import _duckdb_cache
 
 JAR_037 = "quack-on-demand-assembly-0.3.7.jar"
 URL_037 = f"https://github.com/starlake-ai/quack-on-demand/releases/download/v0.3.7/{JAR_037}"
@@ -256,6 +259,9 @@ def _capture_exec(monkeypatch):
         launcher, "ensure_duckdb_cli", lambda cache_dir=None, **kw: pathlib.Path("/stub/db/bin")
     )
     monkeypatch.setattr(
+        launcher, "ensure_libduckdb", lambda cache_dir=None, **kw: pathlib.Path("/stub/db/lib")
+    )
+    monkeypatch.setattr(
         launcher,
         "materialize_spawn_scripts",
         lambda dest: (pathlib.Path("/stub/spawn.sh"), pathlib.Path("/stub/spawn.ps1")),
@@ -428,25 +434,35 @@ def test_demo_refuses_when_latest_release_predates_the_demo(runner, monkeypatch)
     assert "0.3.8" in result.output
 
 
-def test_duckdb_cli_url_platform_mapping():
-    base = "https://github.com/duckdb/duckdb/releases/download/v1.5.6"
-    assert launcher.duckdb_cli_url("darwin", "arm64") == f"{base}/duckdb_cli-osx-universal.zip"
-    assert launcher.duckdb_cli_url("linux", "x86_64") == f"{base}/duckdb_cli-linux-amd64.zip"
-    assert launcher.duckdb_cli_url("linux", "aarch64") == f"{base}/duckdb_cli-linux-arm64.zip"
-    assert launcher.duckdb_cli_url("win32", "AMD64") == f"{base}/duckdb_cli-windows-amd64.zip"
+def test_duckdb_cli_url_platform_mapping(monkeypatch):
+    monkeypatch.delenv("DUCKDB_VERSION", raising=False)
+    base = f"https://github.com/duckdb/duckdb/releases/download/v{launcher.DUCKDB_CLI_VERSION}"
+    assert launcher.duckdb_cli_url("darwin", "arm64") == f"{base}/duckdb-cli-osx-universal.tar.gz"
+    assert launcher.duckdb_cli_url("linux", "x86_64") == f"{base}/duckdb-cli-linux-amd64.tar.gz"
+    assert launcher.duckdb_cli_url("linux", "aarch64") == f"{base}/duckdb-cli-linux-arm64.tar.gz"
+    assert launcher.duckdb_cli_url("win32", "AMD64") == f"{base}/duckdb-cli-windows-amd64.tar.gz"
     # Windows on ARM (e.g. Parallels on Apple Silicon): platform.machine() is
     # "ARM64"; duckdb ships native windows-arm64 assets.
-    assert launcher.duckdb_cli_url("win32", "ARM64") == f"{base}/duckdb_cli-windows-arm64.zip"
+    assert launcher.duckdb_cli_url("win32", "ARM64") == f"{base}/duckdb-cli-windows-arm64.tar.gz"
 
 
-def _duckdb_zip():
+def _tar_gz(name, content):
+    """A DuckDB 2.x release asset: a flat .tar.gz holding one file."""
     import io
-    import zipfile
+    import tarfile
 
+    data = content.encode()
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("duckdb", "#!/bin/sh\n")
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.mode = 0o755
+        t.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
+def _duckdb_cli_archive():
+    return _tar_gz("duckdb", "#!/bin/sh\n")
 
 
 @pytest.mark.skipif(
@@ -456,7 +472,7 @@ def _duckdb_zip():
 @respx.mock
 def test_ensure_duckdb_cli_downloads_and_extracts(tmp_path):
     respx.get(launcher.duckdb_cli_url("linux", "x86_64")).mock(
-        return_value=httpx.Response(200, content=_duckdb_zip())
+        return_value=httpx.Response(200, content=_duckdb_cli_archive())
     )
     bin_dir = launcher.ensure_duckdb_cli(cache_dir=tmp_path, os_name="linux", arch="x86_64")
     duckdb = pathlib.Path(bin_dir) / "duckdb"
@@ -465,13 +481,50 @@ def test_ensure_duckdb_cli_downloads_and_extracts(tmp_path):
 
 
 def test_ensure_duckdb_cli_reuses_cached(tmp_path):
-    duckdb = tmp_path / "duckdb" / "bin" / "duckdb"
-    duckdb.parent.mkdir(parents=True)
-    duckdb.write_text("")
-    duckdb.chmod(0o755)
+    bin_dir, _ = _duckdb_cache.plant(tmp_path, os_name="linux")
     with respx.mock:  # no routes: reuse must not hit the network
-        bin_dir = launcher.ensure_duckdb_cli(cache_dir=tmp_path, os_name="linux", arch="x86_64")
-    assert pathlib.Path(bin_dir) == duckdb.parent
+        got = launcher.ensure_duckdb_cli(cache_dir=tmp_path, os_name="linux", arch="x86_64")
+    assert pathlib.Path(got) == bin_dir == tmp_path / "duckdb" / launcher.DUCKDB_CLI_VERSION / "bin"
+
+
+def _plant_legacy_and_other_version(tmp_path):
+    # The pre-2.0 unversioned layout and another release's versioned dir, both "provisioned".
+    for home in (tmp_path / "duckdb", tmp_path / "duckdb" / "1.5.6"):
+        for f in (home / "bin" / "duckdb", home / "lib" / "libduckdb.so"):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("1.5.6")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="NTFS has no POSIX exec bit; duckdb.chmod(0o755) is a no-op on Windows",
+)
+@respx.mock
+def test_ensure_duckdb_cli_does_not_reuse_another_versions_cache(tmp_path):
+    # An upgraded CLI must not keep the duckdb a previous release provisioned: nodes would run
+    # the old engine (Quack v1) against a manager speaking v3.
+    _plant_legacy_and_other_version(tmp_path)
+    route = respx.get(launcher.duckdb_cli_url("linux", "x86_64")).mock(
+        return_value=httpx.Response(200, content=_duckdb_cli_archive())
+    )
+    bin_dir = launcher.ensure_duckdb_cli(cache_dir=tmp_path, os_name="linux", arch="x86_64")
+    assert route.called
+    assert pathlib.Path(bin_dir) == tmp_path / "duckdb" / launcher.DUCKDB_CLI_VERSION / "bin"
+    assert (pathlib.Path(bin_dir) / "duckdb").read_text() != "1.5.6"
+
+
+@respx.mock
+def test_ensure_duckdb_cli_honours_a_duckdb_version_override_over_the_cached_pin(
+    tmp_path, monkeypatch
+):
+    _duckdb_cache.plant(tmp_path, os_name="linux")
+    monkeypatch.setenv("DUCKDB_VERSION", "2.0.1")
+    route = respx.get(launcher.duckdb_cli_url("linux", "x86_64")).mock(
+        return_value=httpx.Response(200, content=_duckdb_cli_archive())
+    )
+    bin_dir = launcher.ensure_duckdb_cli(cache_dir=tmp_path, os_name="linux", arch="x86_64")
+    assert route.called and "v2.0.1/" in str(route.calls.last.request.url)
+    assert pathlib.Path(bin_dir) == tmp_path / "duckdb" / "2.0.1" / "bin"
 
 
 def test_bundled_spawn_scripts_match_the_canonical_ones():
@@ -481,6 +534,56 @@ def test_bundled_spawn_scripts_match_the_canonical_ones():
         assert bundled.read_bytes() == (repo_scripts / name).read_bytes(), (
             f"{name} drifted: re-copy scripts/{name} into cli/src/qod_cli/scripts/"
         )
+
+
+# A duckdb CLI launch on a code line: `duckdb <` / `duckdb -x` / `"$DUCKDB" <` / `.../duckdb" -x` in
+# bash, `Invoke-DuckDb` / `& $duck...` / `FileName = $duckdb...` in PowerShell (not the
+# `Get-Process duckdb -ErrorAction ...` teardown lookup).
+_DUCKDB_CALL = re.compile(
+    r'(?<!Process )\bduckdb"?\s+(<|-)|"\$DUCKDB"\s|Invoke-DuckDb\b|&\s*\$duck'
+    r"|FileName\s*=\s*\$duck"
+)
+_AGENT_MODE_OFF = re.compile(r"DUCKDB_AGENT_MODE\s*=\s*'?0'?|-no-agent\b")
+
+
+def test_scripts_running_the_duckdb_cli_pin_agent_mode_off():
+    # DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+    # (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal, e.g. a manager started from
+    # inside Claude Code. Every script that runs the CLI must pin DUCKDB_AGENT_MODE=0 (or -no-agent).
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    candidates = [
+        *(repo / "scripts").rglob("*.sh"),
+        *(repo / "scripts").rglob("*.ps1"),
+        *(repo / "cli" / "src" / "qod_cli" / "scripts").glob("*"),
+    ]
+    flagged = set()
+    for path in sorted(p for p in candidates if p.is_file()):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        code = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+        if _DUCKDB_CALL.search(code):
+            rel = path.relative_to(repo).as_posix()
+            flagged.add(rel)
+            assert _AGENT_MODE_OFF.search(code), f"{rel} runs the duckdb CLI without DUCKDB_AGENT_MODE=0"
+    # The detector must keep seeing the known launchers, or the loop above proves nothing.
+    known = {
+        f"{d}/{name}"
+        for d in ("scripts", "cli/src/qod_cli/scripts")
+        for name in (
+            "spawn-quack-node.sh",
+            "_load-common.sh",
+            "load-tpch-dbgen.sh",
+            "load-tpcds-dbgen.sh",
+            "load-ssb-dbgen.sh",
+        )
+    } | {
+        "scripts/spawn-quack-node.ps1",
+        "cli/src/qod_cli/scripts/spawn-quack-node.ps1",
+        "scripts/_load-common.ps1",
+        "scripts/load-tpch-dbgen.ps1",
+        "scripts/run-jar.sh",
+        "scripts/run-jar.ps1",
+    }
+    assert known <= flagged, sorted(known - flagged)
 
 
 @pytest.mark.skipif(
@@ -500,6 +603,7 @@ def test_demo_env_wires_spawn_script_duckdb_and_app_home(tmp_path):
         duckdb_bin=tmp_path / "duckdb" / "bin",
         spawn_sh=tmp_path / "scripts" / "spawn-quack-node.sh",
         spawn_ps1=tmp_path / "scripts" / "spawn-quack-node.ps1",
+        libduckdb_lib=tmp_path / "duckdb" / "lib",
     )
     assert env["QOD_SPAWN_SCRIPT"] == str(tmp_path / "scripts" / "spawn-quack-node.sh")
     assert env["QOD_SPAWN_SCRIPT_WINDOWS"] == str(tmp_path / "scripts" / "spawn-quack-node.ps1")
@@ -512,6 +616,8 @@ def test_demo_env_wires_spawn_script_duckdb_and_app_home(tmp_path):
     # actually runs under (duckdb.exe on Windows).
     exe = "duckdb.exe" if sys.platform == "win32" else "duckdb"
     assert env["DUCKDB_BIN"] == str(tmp_path / "duckdb" / "bin" / exe)
+    # Nodes, loaders and the seeder run the duckdb CLI with DuckDB 2.0's agent mode off.
+    assert env["DUCKDB_AGENT_MODE"] == "0"
 
 
 def test_runtime_env_pins_duckdb_bin_windows(tmp_path):
@@ -524,12 +630,35 @@ def test_runtime_env_pins_duckdb_bin_windows(tmp_path):
         duckdb_bin=tmp_path / "duckdb" / "bin",
         spawn_sh=tmp_path / "s.sh",
         spawn_ps1=tmp_path / "s.ps1",
+        libduckdb_lib=tmp_path / "duckdb" / "lib",
         os_name="win32",
     )
     assert env["DUCKDB_BIN"] == str(tmp_path / "duckdb" / "bin" / "duckdb.exe")
 
 
-def test_demo_provisions_app_home_and_passes_env(runner, monkeypatch, tmp_path):
+def test_runtime_env_windows_hands_the_jvm_its_duckdb_dll(tmp_path):
+    # duckdb.dll is extracted into the lib dir: it must be both preloadable through
+    # DUCKDB_CACHE_DIR and on PATH (the Windows DLL search has no loader variable).
+    bin_dir, lib_dir = _duckdb_cache.plant(tmp_path, os_name="win32")
+    # Split on the host's os.pathsep, so the base entry carries no drive colon.
+    env = launcher.runtime_env(
+        {"PATH": "/windows/system32"},
+        app_home=tmp_path,
+        duckdb_bin=bin_dir,
+        spawn_sh=tmp_path / "s.sh",
+        spawn_ps1=tmp_path / "s.ps1",
+        libduckdb_lib=lib_dir,
+        os_name="win32",
+    )
+    assert _duckdb_cache.preload_target(env, os_name="win32").is_file()
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[:2] == [str(bin_dir), str(lib_dir)]
+    assert entries[-1] == "/windows/system32"
+    assert "DYLD_LIBRARY_PATH" not in env and "LD_LIBRARY_PATH" not in env
+
+
+@pytest.mark.parametrize("command", [["serve", "--demo"], ["start", "--demo"]])
+def test_demo_provisions_app_home_and_passes_env(runner, monkeypatch, tmp_path, command):
     from qod_cli.commands import demo as demo_cmd
     from qod_cli.main import app
 
@@ -537,9 +666,9 @@ def test_demo_provisions_app_home_and_passes_env(runner, monkeypatch, tmp_path):
     jar.write_text("")
     sh = tmp_path / "scripts" / "spawn-quack-node.sh"
     monkeypatch.setattr(launcher, "find_java", lambda: "/usr/bin/java")
-    monkeypatch.setattr(
-        launcher, "ensure_duckdb_cli", lambda cache_dir=None, **kw: tmp_path / "duckdb" / "bin"
-    )
+    monkeypatch.setattr(launcher, "default_cache_dir", lambda: tmp_path / "cache")
+    # The real ensure_* over a provisioned cache: the demo must provision libduckdb too.
+    bin_dir, lib_dir = _duckdb_cache.plant(tmp_path / "cache")
     monkeypatch.setattr(
         launcher,
         "materialize_spawn_scripts",
@@ -551,10 +680,15 @@ def test_demo_provisions_app_home_and_passes_env(runner, monkeypatch, tmp_path):
         captured["cmd"], captured["env"] = cmd, env
 
     monkeypatch.setattr(demo_cmd, "_exec", fake_exec)
-    result = runner.invoke(app, ["start", "--demo", "--jar", str(jar)])
+    with respx.mock:  # no routes: a provisioned cache must not hit the network
+        result = runner.invoke(app, [*command, "--jar", str(jar)])
     assert result.exit_code == 0, result.output
-    assert captured["env"]["QOD_SPAWN_SCRIPT"] == str(sh)
-    assert str(tmp_path / "duckdb" / "bin") in captured["env"]["PATH"]
+    env = captured["env"]
+    assert env["QOD_SPAWN_SCRIPT"] == str(sh)
+    assert str(bin_dir) in env["PATH"]
+    # The manager preloads libduckdb by absolute path, immune to SIP stripping DYLD_*.
+    assert _duckdb_cache.preload_target(env) == lib_dir / _duckdb_cache.LIB_NAMES[sys.platform]
+    assert _duckdb_cache.preload_target(env).is_file()
 
 
 def test_demo_honors_qod_version_env(runner, monkeypatch, tmp_path):
@@ -587,39 +721,45 @@ def test_demo_rejects_non_release_version_with_hint(runner, monkeypatch):
     assert "--jar" in result.output
 
 
-def test_libduckdb_url_platform_mapping():
-    base = "https://github.com/duckdb/duckdb/releases/download/v1.5.6"
-    assert launcher.libduckdb_url("darwin", "arm64") == f"{base}/libduckdb-osx-universal.zip"
-    assert launcher.libduckdb_url("linux", "x86_64") == f"{base}/libduckdb-linux-amd64.zip"
-    assert launcher.libduckdb_url("win32", "ARM64") == f"{base}/libduckdb-windows-arm64.zip"
+def test_libduckdb_url_platform_mapping(monkeypatch):
+    monkeypatch.delenv("DUCKDB_VERSION", raising=False)
+    base = f"https://github.com/duckdb/duckdb/releases/download/v{launcher.DUCKDB_CLI_VERSION}"
+    assert launcher.libduckdb_url("darwin", "arm64") == f"{base}/duckdb-shared-libs-osx-universal.tar.gz"
+    assert launcher.libduckdb_url("linux", "x86_64") == f"{base}/duckdb-shared-libs-linux-amd64.tar.gz"
+    assert launcher.libduckdb_url("win32", "ARM64") == f"{base}/duckdb-shared-libs-windows-arm64.tar.gz"
 
 
-def _libduckdb_zip(name):
-    import io
-    import zipfile
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr(name, "not really a dylib")
-    return buf.getvalue()
+def _libduckdb_archive(name):
+    return _tar_gz(name, "not really a dylib")
 
 
 @respx.mock
 def test_ensure_libduckdb_downloads_and_extracts(tmp_path):
     respx.get(launcher.libduckdb_url("linux", "x86_64")).mock(
-        return_value=httpx.Response(200, content=_libduckdb_zip("libduckdb.so"))
+        return_value=httpx.Response(200, content=_libduckdb_archive("libduckdb.so"))
     )
     lib_dir = launcher.ensure_libduckdb(cache_dir=tmp_path, os_name="linux", arch="x86_64")
     assert (pathlib.Path(lib_dir) / "libduckdb.so").is_file()
 
 
 def test_ensure_libduckdb_reuses_cached(tmp_path):
-    lib = tmp_path / "duckdb" / "lib" / "libduckdb.dylib"
-    lib.parent.mkdir(parents=True)
-    lib.write_text("")
+    _, lib_dir = _duckdb_cache.plant(tmp_path, os_name="darwin")
     with respx.mock:  # no routes: reuse must not hit the network
-        lib_dir = launcher.ensure_libduckdb(cache_dir=tmp_path, os_name="darwin", arch="arm64")
-    assert pathlib.Path(lib_dir) == lib.parent
+        got = launcher.ensure_libduckdb(cache_dir=tmp_path, os_name="darwin", arch="arm64")
+    assert pathlib.Path(got) == lib_dir == tmp_path / "duckdb" / launcher.DUCKDB_CLI_VERSION / "lib"
+
+
+@respx.mock
+def test_ensure_libduckdb_does_not_reuse_another_versions_cache(tmp_path):
+    # A 1.5.x libduckdb lacks symbols the 2.0 libquackwire binds at load: reusing it refuses boot.
+    _plant_legacy_and_other_version(tmp_path)
+    route = respx.get(launcher.libduckdb_url("linux", "x86_64")).mock(
+        return_value=httpx.Response(200, content=_libduckdb_archive("libduckdb.so"))
+    )
+    lib_dir = launcher.ensure_libduckdb(cache_dir=tmp_path, os_name="linux", arch="x86_64")
+    assert route.called
+    assert pathlib.Path(lib_dir) == tmp_path / "duckdb" / launcher.DUCKDB_CLI_VERSION / "lib"
+    assert (pathlib.Path(lib_dir) / "libduckdb.so").read_text() != "1.5.6"
 
 
 def test_runtime_env_adds_library_path_darwin(tmp_path):
@@ -633,6 +773,23 @@ def test_runtime_env_adds_library_path_darwin(tmp_path):
         os_name="darwin",
     )
     assert env["DYLD_LIBRARY_PATH"].startswith(str(tmp_path / "duckdb" / "lib"))
+
+
+@pytest.mark.parametrize("os_name", ["darwin", "linux", "win32"])
+def test_runtime_env_exports_the_versioned_cache_root_for_the_preload(tmp_path, os_name):
+    # DUCKDB_CACHE_DIR, not the loader path, is what reaches a SIP-protected /usr/bin/java.
+    bin_dir, lib_dir = _duckdb_cache.plant(tmp_path, os_name=os_name)
+    env = launcher.runtime_env(
+        {"PATH": "/usr/bin", "DUCKDB_CACHE_DIR": "/somewhere/else"},
+        app_home=tmp_path,
+        duckdb_bin=bin_dir,
+        spawn_sh=tmp_path / "s.sh",
+        spawn_ps1=tmp_path / "s.ps1",
+        libduckdb_lib=lib_dir,
+        os_name=os_name,
+    )
+    assert env["DUCKDB_CACHE_DIR"] == str(tmp_path / "duckdb")
+    assert _duckdb_cache.preload_target(env, os_name=os_name).is_file()
 
 
 @pytest.mark.skipif(
@@ -750,8 +907,8 @@ def test_jar_cache_dir_env_overrides_cache(tmp_path, monkeypatch):
 
 def test_duckdb_version_env_overrides_pin(monkeypatch):
     monkeypatch.setenv("DUCKDB_VERSION", "1.6.0")
-    assert "v1.6.0/duckdb_cli-" in launcher.duckdb_cli_url("linux", "x86_64")
-    assert "v1.6.0/libduckdb-" in launcher.libduckdb_url("linux", "x86_64")
+    assert "v1.6.0/duckdb-cli-" in launcher.duckdb_cli_url("linux", "x86_64")
+    assert "v1.6.0/duckdb-shared-libs-" in launcher.libduckdb_url("linux", "x86_64")
 
 
 def test_duckdb_cache_dir_env_uses_run_jar_layout(tmp_path, monkeypatch):
@@ -763,3 +920,15 @@ def test_duckdb_cache_dir_env_uses_run_jar_layout(tmp_path, monkeypatch):
     with respx.mock:  # pre-populated cache must not touch the network
         bin_dir = launcher.ensure_duckdb_cli(os_name="linux", arch="x86_64")
     assert pathlib.Path(bin_dir) == duckdb.parent
+
+
+def test_default_cache_and_duckdb_cache_dir_share_one_layout(tmp_path, monkeypatch):
+    # <root>/<version>/{bin,lib} either way, so runtime_env can hand <root> to the preload.
+    lib_dir = launcher._duckdb_dir("lib", tmp_path)
+    assert lib_dir == launcher.duckdb_cache_root(tmp_path) / launcher.DUCKDB_CLI_VERSION / "lib"
+    assert launcher.duckdb_cache_root(tmp_path) == tmp_path / "duckdb"
+    monkeypatch.setenv("DUCKDB_CACHE_DIR", str(tmp_path / "dcache"))
+    assert launcher.duckdb_cache_root(tmp_path) == tmp_path / "dcache"
+    assert launcher._duckdb_dir("lib", tmp_path) == tmp_path / "dcache" / launcher.DUCKDB_CLI_VERSION / "lib"
+    monkeypatch.setenv("DUCKDB_CACHE_DIR", "  ")
+    assert launcher.duckdb_cache_root(tmp_path) == tmp_path / "duckdb"

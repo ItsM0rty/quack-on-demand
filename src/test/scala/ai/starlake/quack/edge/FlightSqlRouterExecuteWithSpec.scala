@@ -73,7 +73,7 @@ class FlightSqlRouterExecuteWithSpec extends AnyFlatSpec with Matchers:
     val store   = new RecordingTelemetryStore
     val journal = new EventJournal(store)
     val client  =
-      new QuackHttpClient(TestArrow.sharedAllocator, nativeClient = true, nodeDisableSsl = true)
+      new QuackHttpClient(TestArrow.sharedAllocator)
     val router = new FlightSqlRouter(
       sup,
       new SessionRegistry,

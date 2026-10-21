@@ -8,9 +8,10 @@ import java.time.Instant
   * Two shapes, discriminated by `sourceType`:
   *   - `Sql`: `setupSql` is user-typed and may include INSTALL/LOAD/CREATE SECRET/ATTACH
   *     statements, with `{{alias}}` and `{{secret.NAME}}` placeholders resolved at node spawn.
-  *   - `IcebergRest`: `config` holds the typed JSON
-  *     (`ondemand.federation.iceberg.IcebergRestConfig`) and the SQL is rendered from it. Stored as
-  *     text here because `model` is a leaf package.
+  *   - Typed (`IcebergRest`, `Postgres`, `Mysql`): `config` holds the typed JSON
+  *     (`ondemand.federation.iceberg.IcebergRestConfig`, or `ondemand.federation.rdbms.RdbmsConfig`
+  *     for the two relational types) and the SQL is rendered from it. Stored as text here because
+  *     `model` is a leaf package.
   *
   * `readOnly` is persisted here; enforcement at the edge is
   * [[ai.starlake.quack.edge.sql.CatalogWriteScreen]], a defence-in-depth screen wired into
@@ -31,9 +32,9 @@ import java.time.Instant
   * is not parity with `PostgresAclValidator` and it makes no promise beyond writes -- and even
   * within writes it promises only that a write this screen can resolve, or can prove write-shaped
   * by one of the rules above, is denied; it is not a guarantee that every conceivable way of
-  * driving a write past this catalog has been enumerated. The REST create path defaults a new
-  * `iceberg_rest` source to true (Task 5). This field defaults to false so pre-0038 sources keep
-  * their behaviour.
+  * driving a write past this catalog has been enumerated. The REST create path defaults a new typed
+  * (`iceberg_rest`, `postgres`, `mysql`) source to true. This field defaults to false so pre-0038
+  * sources keep their behaviour.
   *
   * Enforcement is a two-layer split by `sourceType`, and the layers are NOT equally strong, NOT
   * equally proven, and NOT synchronized with each other:
@@ -56,6 +57,23 @@ import java.time.Instant
   *     closes that the screen alone cannot (`CatalogWriteScreen` cannot resolve `CALL` and admits
   *     it) - though the live spec above covers those DML/DDL verbs rather than `CALL` itself, and
   *     this layer binds only once the pool has recycled.
+  *   - `Postgres` / `Mysql`: engine-level the same way, through
+  *     [[ai.starlake.quack.ondemand.federation.rdbms.RdbmsSetupSql.render]], with one residual the
+  *     Iceberg layer does not have. The postgres extension runs every statement on the remote in a
+  *     `READ ONLY` transaction, which refuses DML and `postgres_execute` writes alike, but a caller
+  *     who may run the raw-SQL passthroughs can end that transaction itself: inside one DuckDB
+  *     transaction, `CALL postgres_execute('<alias>', 'COMMIT')` followed by a write ran the write
+  *     in autocommit on the 2.0 CLI. The SQL ACL and node lockdown both default OFF, so on a
+  *     default install that was every principal. `CatalogWriteScreen` (which always runs) now
+  *     refuses, for EVERY caller, superusers included, while any catalog on the pool is read-only:
+  *     `postgres_execute`, `postgres_query`, `mysql_execute` and `mysql_query` whose first argument
+  *     names a read-only catalog or is not a string literal, `query` / `query_table` with a
+  *     computed argument, and `json_execute_serialized_sql`. It reads statement text only, so a
+  *     table macro or view that already wraps a passthrough (created before the catalog became
+  *     read-only, e.g. in a DuckLake catalog) or lives in an attached database is not seen. A
+  *     database role without write privileges on the remote is the complete guarantee. For MySQL,
+  *     whether `READ_ONLY` itself refuses writes through the extension is unverified (no extension
+  *     in the 2.0 toolchain).
   *   - `Sql`: edge-screen-only. The operator writes the ATTACH text (`setupSql`), so QoD has no
   *     rendering step to add the flag to; `CatalogWriteScreen` is the ONLY enforcement for these
   *     sources, with every gap documented above PLUS a mutating `CALL`, which the screen cannot
@@ -76,7 +94,7 @@ final case class FederatedSource(
 ):
 
   /** Empty list when the shape invariant holds. Format-specific validation of `config` lives in the
-    * iceberg package, which this leaf package cannot reach.
+    * iceberg and rdbms packages, which this leaf package cannot reach.
     */
   def validate: List[String] =
     val hasSql    = setupSql.trim.nonEmpty
@@ -87,5 +105,5 @@ final case class FederatedSource(
       sourceType match
         case FederatedSourceType.Sql =>
           if hasSql then Nil else List("setupSql is required for sourceType 'sql'")
-        case FederatedSourceType.IcebergRest =>
-          if hasConfig then Nil else List("config is required for sourceType 'iceberg_rest'")
+        case typed =>
+          if hasConfig then Nil else List(s"config is required for sourceType '${typed.wire}'")

@@ -7,6 +7,7 @@ import ai.starlake.quack.edge.opa.{OpaAuthorizer, OpaClient, OpaDecisionCache}
 import ai.starlake.quack.edge.sql.StatementValidator
 import ai.starlake.quack.model.{Pool, RoleDistribution, TenantAcl}
 import ai.starlake.quack.observability.metrics.OpaInstruments
+import ai.starlake.quack.ondemand.InProcessDuckDb
 import ai.starlake.quack.ondemand.PoolSupervisor
 import ai.starlake.quack.ondemand.state.PoolPermission
 import at.favre.lib.crypto.bcrypt.BCrypt
@@ -17,8 +18,6 @@ import com.github.tomakehurst.wiremock.matching.RequestPatternBuilder
 import org.apache.arrow.flight.sql.FlightSqlClient
 import org.apache.arrow.flight.sql.impl.FlightSql
 import org.apache.arrow.flight.{FlightCallHeaders, HeaderCallOption, Ticket}
-import org.apache.arrow.vector.ipc.ArrowReader
-import org.duckdb.{DuckDBConnection, DuckDBResultSet}
 
 import java.sql.DriverManager
 import java.util.Base64
@@ -199,13 +198,19 @@ object OpaEdgeFixtures:
     * in the result rows the client receives.
     */
   def duckNode(setup: String): String => QuackResponse = sql =>
-    val conn  = DriverManager.getConnection("jdbc:duckdb:").asInstanceOf[DuckDBConnection]
-    val stmt  = conn.createStatement()
-    val parts = (setup.split(";") ++ sql.split(";")).map(_.trim).filter(_.nonEmpty).toList
-    parts.init.foreach(stmt.execute)
-    val rs     = stmt.executeQuery(parts.last).asInstanceOf[DuckDBResultSet]
-    val reader = rs.arrowExportStream(TestArrow.sharedAllocator, 1024L).asInstanceOf[ArrowReader]
-    QuackResponse.Ok(reader, 1L, () => ())
+    val conn = DriverManager.getConnection("jdbc:duckdb:", InProcessDuckDb.properties)
+    // The reader owns `conn` once built; until then any failure (a statement that throws, an
+    // empty script) closes it here, so a failing statement never leaks an instance.
+    try
+      val stmt  = conn.createStatement()
+      val parts = (setup.split(";") ++ sql.split(";")).map(_.trim).filter(_.nonEmpty).toList
+      parts.init.foreach(stmt.execute)
+      val rs = stmt.executeQuery(parts.last)
+      QuackResponse.Ok(TestArrow.fromResultSet(conn, rs), 1L, () => ())
+    catch
+      case e: Throwable =>
+        conn.close()
+        throw e
 
   /** `orders(id, email)` with two rows, shared by the Flight specs. */
   val OrdersSetup: String =

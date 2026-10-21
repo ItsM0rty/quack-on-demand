@@ -105,6 +105,9 @@ final class FleetQuackBackend(
     }
 
   def start(spec: NodeSpec): IO[RunningNode] =
+    QuackBackend.screenBootSql(spec) *> startScreened(spec)
+
+  private def startScreened(spec: NodeSpec): IO[RunningNode] =
     val token = LocalQuackBackend.randomToken()
     // The supervisor only starts a node id it believes has no live node, so any server still
     // holding this id is stale: a dead or drained server, a crash orphan (claimed and running, but

@@ -3,6 +3,7 @@ package ai.starlake.quack.security
 
 import ai.starlake.quack.edge.adapter.NodeLoadTracker
 import ai.starlake.quack.model.{FederatedSecret, FederatedSource}
+import ai.starlake.quack.ondemand.InProcessDuckDb
 import ai.starlake.quack.ondemand.PoolSupervisor
 import ai.starlake.quack.ondemand.api.*
 import ai.starlake.quack.ondemand.auth.SessionScope
@@ -45,7 +46,7 @@ class HandlerAuditSpec extends AnyFlatSpec with Matchers with OptionValues:
     val tmpFile = java.nio.file.Files.createTempFile("qod-audit-test-users", ".duckdb")
     tmpFile.toFile.delete()
     tmpFile.toFile.deleteOnExit()
-    val jdbcUrl = s"jdbc:duckdb:${tmpFile.toAbsolutePath}"
+    val jdbcUrl = InProcessDuckDb.url(tmpFile.toAbsolutePath.toString)
     val c       = DriverManager.getConnection(jdbcUrl)
     try
       c.createStatement()

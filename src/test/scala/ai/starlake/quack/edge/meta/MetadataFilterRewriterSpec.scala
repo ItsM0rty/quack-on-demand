@@ -12,7 +12,11 @@ class MetadataFilterRewriterSpec extends AnyFlatSpec with Matchers:
 
   private val rw  = new MetadataFilterRewriter(enabled = true)
   private val ctx =
-    SchemaContext(defaultDatabase = Some("acme_tpch"), defaultSchema = Some("tpch1"))
+    SchemaContext(
+      defaultDatabase = Some("acme_tpch"),
+      defaultSchema = Some("tpch1"),
+      attachedCatalogs = Set.empty
+    )
 
   private val tenantUser =
     RbacUser(id = "u-1", tenant = Some("acme"), username = "alice", kind = "user")
@@ -460,6 +464,22 @@ class MetadataFilterRewriterSpec extends AnyFlatSpec with Matchers:
       case other     => fail(s"expected Rewritten or Denied, got $other")
   }
 
+  it should "filter a metadata read behind a time-travel shape in a dollar-quoted string" in {
+    // The shape is not a clause on DuckDB's tokens; stripping it deleted the subquery from what
+    // this filter parsed, so the node read information_schema unfiltered.
+    go(
+      "SELECT $$ at (VERSION => $$ || (SELECT count(*) FROM information_schema.tables) || $$ ) $$",
+      eff(tenantUser, grant("acme_tpch", "tpch1", "customer"))
+    ) should not be Passthrough
+  }
+
+  it should "deny rather than ship a filtered rewrite that would drop a time-travel clause" in {
+    go(
+      "SELECT it.* FROM information_schema.tables it, tpch1.customer AT (VERSION => 1) c",
+      eff(tenantUser, grant("acme_tpch", "tpch1", "customer"))
+    ) should matchPattern { case Denied(_) => }
+  }
+
   it should "deny an unparseable statement that names a filterable table" in {
     // Two arms: text the parser rejects outright, and text it swallows into an opaque
     // statement that serializes to nothing.
@@ -709,4 +729,21 @@ class MetadataFilterRewriterSpec extends AnyFlatSpec with Matchers:
 
   it should "leave unparseable non-SHOW statements untouched" in {
     go("THIS IS NOT SQL", eff(tenantUser)) shouldBe Passthrough
+  }
+
+  "a filterable reference inside a MAP literal" should "be refused, not forwarded" in {
+    go(
+      "SELECT map {'a': (SELECT count(*) FROM information_schema.tables)}",
+      eff(tenantUser, grant("acme_tpch", "tpch1", "customer"))
+    ) match
+      case Denied(_) => succeed
+      case other     => fail(s"expected Denied, got $other")
+  }
+
+  "a TABLE statement in expression position naming a filterable table" should "be denied" in {
+    // `ARRAY(TABLE information_schema.tables)` reads every row with no FROM slot to substitute;
+    // the ACL gate admits the read implicitly under filtered metadata, so the filter must refuse.
+    val e = eff(tenantUser, grant("acme_tpch", "tpch1", "*"))
+    go("SELECT ARRAY(TABLE information_schema.tables)", e) shouldBe a[Denied]
+    go("SELECT 1 WHERE 'x' = ANY (TABLE information_schema.schemata)", e) shouldBe a[Denied]
   }

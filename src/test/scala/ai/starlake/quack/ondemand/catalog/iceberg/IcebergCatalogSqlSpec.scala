@@ -21,12 +21,19 @@ class IcebergCatalogSqlSpec extends AnyFlatSpec with Matchers:
     sql should include(
       "CASE WHEN manifest_content = 'DATA' THEN 'DATA' ELSE content END AS content"
     )
-    sql should include("iceberg_metadata(\"ice\".\"probe\".\"t\")")
+    sql should include("""iceberg_metadata('"ice"."probe"."t"')""")
+  }
+
+  it should "pass the table as a string literal that escapes a quote in a name" in {
+    // DuckDB 2.0 deprecates a bare identifier in a table function argument (and converts it to an
+    // unquoted dotted string); the literal keeps each name quoted and whole.
+    val sql = IcebergCatalogSql.files("ice", "probe", "o'x")
+    sql should include("""iceberg_metadata('"ice"."probe"."o''x"')""")
   }
 
   "snapshots" should "read only snapshots and current-snapshot-id, never credentials" in {
     val sql = IcebergCatalogSql.snapshots("ice", "probe", "t", SnapshotFilter.Page(None, None), 50)
-    sql should include("iceberg_load_table_response(\"ice\".\"probe\".\"t\")")
+    sql should include("""iceberg_load_table_response('"ice"."probe"."t"')""")
     sql should include("'snapshots'")
     sql should include("'current-snapshot-id'")
     sql should not include "storage_credentials"

@@ -51,6 +51,7 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       case Passthrough            => s"$sql  [passthrough]"
       case PassthroughParseFailed => s"$sql  [parse-failed]"
       case Failed(reason)         => s"$sql  [failed: $reason]"
+      case Refused(reason)        => s"$sql  [refused: $reason]"
     info(s"original:  $sql")
     info(s"predicate: ${if preds.isEmpty then "(none)" else preds.mkString("  ;  ")}")
     info(s"result:    $result")
@@ -144,6 +145,24 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
     )
     sql should include("c_region = 'eu'")
   }
+
+  it should "wrap a backtick-quoted table reference like its double-quoted twin" in
+    // DuckDB 2.0 reads a backtick pair as an identifier quote, and the ACL authorizes
+    // `customer` for it: a match that strips only double quotes left the read unfiltered.
+    Seq(
+      "SELECT * FROM `customer`",
+      "SELECT c_id FROM `tpch1`.`customer`",
+      "SELECT c_id FROM `acme_tpch`.`tpch1`.`customer` AS c",
+      "SELECT c_id FROM `Customer` WHERE c_id > 1",
+      "SELECT * FROM (SELECT c_id FROM `customer`) s",
+      "SELECT c_id FROM customer WHERE c_id IN (SELECT c_id FROM `customer`)"
+    ).foreach { q =>
+      withClue(q) {
+        val sql = rewritten(go(q, eff(tenantUser, List(policy("c_region = 'eu'")))))
+        sql should include("c_region = 'eu'")
+        sql should not include "`"
+      }
+    }
 
   it should "still not match a policy for a different quoted table" in {
     go(
@@ -336,4 +355,133 @@ class RowPolicyRewriterSpec extends AnyFlatSpec with Matchers:
       rewritten(go("SELECT #1, #2 FROM customer", eff(tenantUser, List(policy("c_region = 'EU'")))))
     out should include("c_region = 'eu'")
     out should include("#1, #2")
+  }
+
+  // ---- lexer-canonical parser input -------------------------------------------------------
+
+  "a statement whose literals JSqlParser lexes differently from DuckDB" should
+    "still have its policy table filtered" in {
+      // DuckDB reads one escape-string literal, then the subquery; JSqlParser's own lexer read the
+      // subquery as part of a string and left it unfiltered
+      val out = rewritten(
+        go(
+          "SELECT E'\\'' AS a, (SELECT count(*) FROM customer) AS n --'",
+          eff(tenantUser, List(policy("c_region = 'EU'")))
+        )
+      )
+      out should include("c_region = 'eu'")
+    }
+
+  it should "ship a rewrite that keeps each literal's value" in {
+    val out = rewritten(
+      go(
+        "SELECT E'it\\'s' AS a, $$x'y$$ AS b FROM customer",
+        eff(tenantUser, List(policy("c_region = 'EU'")))
+      )
+    )
+    out should include("'it''s' as a")
+    out should include("'x''y' as b")
+  }
+
+  it should "refuse rather than ship a rewrite whose parser input is not the statement" in {
+    // `//` reaches JSqlParser as `/`: a rewrite printed from that would divide differently
+    go(
+      "SELECT c_custkey // 2 FROM customer",
+      eff(tenantUser, List(policy("c_region = 'EU'")))
+    ) match
+      case Refused(reason) => reason should include("//")
+      case other           => fail(s"expected Refused, got $other")
+    go("SELECT 7 // 2", eff(tenantUser, List(policy("c_region = 'EU'")))) shouldBe Passthrough
+  }
+
+  // ---- statements in table position -------------------------------------------------------
+
+  "a parenthesized statement naming a policy table" should "be refused, not passed through" in {
+    // JSqlParser reads `(TABLE customer)` as a table named TABLE aliased customer: no slot to wrap,
+    // while DuckDB returns every row of customer
+    val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
+    go("SELECT * FROM (TABLE customer)", effSet) shouldBe a[Refused]
+    go("SELECT * FROM (SUMMARIZE customer)", effSet) shouldBe a[Refused]
+    go("SELECT * FROM orders JOIN (TABLE \"customer\") c ON true", effSet) shouldBe a[Refused]
+  }
+
+  it should "pass through when the named table carries no policy" in {
+    go(
+      "SELECT * FROM (TABLE orders)",
+      eff(tenantUser, List(policy("c_region = 'EU'")))
+    ) shouldBe Passthrough
+  }
+
+  "a TABLE statement passed to ARRAY() or ANY naming a policy table" should "be refused" in {
+    // JSqlParser holds `ARRAY(TABLE customer)` as a function whose argument is a column: no slot
+    // to wrap, while DuckDB reads every row of customer.
+    val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
+    go("SELECT ARRAY(TABLE customer)", effSet) shouldBe a[Refused]
+    go("SELECT len(ARRAY(TABLE tpch1.customer))", effSet) shouldBe a[Refused]
+    go("SELECT 1 WHERE 'x' = ANY (TABLE \"customer\")", effSet) shouldBe a[Refused]
+    go("SELECT ARRAY(TABLE orders)", effSet) shouldBe Passthrough
+  }
+
+  // ---- expression positions outside JSqlParser's node types --------------------------------
+
+  "a policy table read in a MAP literal or a json_object argument" should "be filtered" in {
+    val effSet = eff(tenantUser, List(policy("c_region = 'EU'")))
+    rewritten(go("SELECT map {'a': (SELECT count(*) FROM customer)}", effSet)) should include(
+      "c_region = 'eu'"
+    )
+    rewritten(go("SELECT MAP {(SELECT max(c_id) FROM customer): 1}", effSet)) should include(
+      "c_region = 'eu'"
+    )
+    rewritten(go("SELECT json_object('a', (SELECT count(*) FROM customer))", effSet)) should
+      include("c_region = 'eu'")
+  }
+
+  // ---- audit F21: reads the walk cannot filter are refused, never passed through -----------
+
+  private val frOnly = eff(tenantUser, List(policy("c_nation = 'FR'")))
+
+  "a PIVOT or UNPIVOT source naming a policy table" should "be refused in every position" in
+    // JSqlParser holds `PIVOT customer ...` as a PivotQuery with customer as a bare child: no
+    // slot the walk wraps, while DuckDB pivots every row of customer.
+    List(
+      "SELECT * FROM (PIVOT customer ON c_nation USING count(*))",
+      "FROM (PIVOT customer ON c_nation USING count(*))",
+      "WITH p AS (PIVOT customer ON c_nation USING count(*)) SELECT * FROM p",
+      "SELECT (SELECT count(*) FROM (PIVOT customer ON c_nation USING count(*)))",
+      "SELECT * FROM customer c JOIN (PIVOT customer ON c_nation USING count(*)) p ON true",
+      "SELECT 1 WHERE EXISTS (SELECT 1 FROM (PIVOT customer ON c_nation USING count(*)) p " +
+        "WHERE p.c_email LIKE 'bob%')",
+      "SELECT * FROM (PIVOT tpch1.customer ON c_nation USING count(*))"
+    ).foreach { sql =>
+      withClue(sql)(go(sql, frOnly) shouldBe a[Refused])
+    }
+
+  it should "leave UNPIVOT, which JSqlParser cannot parse, to the router's parse-failed denial" in {
+    go(
+      "SELECT * FROM (UNPIVOT customer ON c_email, c_phone INTO NAME k VALUE v)",
+      frOnly
+    ) shouldBe PassthroughParseFailed
+  }
+
+  it should "still filter a pivoted subquery, and pass a table with no policy" in {
+    rewritten(
+      go("SELECT * FROM (PIVOT (SELECT * FROM customer) ON c_nation USING count(*))", frOnly)
+    ) should include("c_nation = 'fr'")
+    go("SELECT * FROM (PIVOT orders ON o_status USING count(*))", frOnly) shouldBe Passthrough
+  }
+
+  "an EXPLAIN of a statement reading a policy table" should "be refused" in
+    // DuckDB runs the statement under EXPLAIN ANALYZE, unfiltered, and every plan reports row
+    // counts; the walk never entered an ExplainStatement.
+    List(
+      "EXPLAIN ANALYZE SELECT count(*) FROM customer",
+      "EXPLAIN ANALYZE SELECT error(string_agg(c_email, ',')) FROM customer",
+      "EXPLAIN SELECT * FROM customer",
+      "EXPLAIN ANALYZE SELECT * FROM orders o WHERE EXISTS (SELECT 1 FROM customer)"
+    ).foreach { sql =>
+      withClue(sql)(go(sql, frOnly) shouldBe a[Refused])
+    }
+
+  it should "pass when the explained statement reads no policy table" in {
+    go("EXPLAIN ANALYZE SELECT count(*) FROM orders", frOnly) shouldBe Passthrough
   }

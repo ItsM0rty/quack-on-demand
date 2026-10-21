@@ -37,6 +37,8 @@ class KubernetesQuackBackendSecuritySpec
       podLabel = "managed-by=quack-on-demand",
       startupTimeoutSec = 5,
       readPodReady = _ => true,
+      // Deterministic: the test JVM's own QOD_S3_* must not leak into the node-env Secret.
+      readEnv = _ => None,
       podTemplateEnabled = podTemplateEnabled
     )
 
@@ -168,13 +170,9 @@ class KubernetesQuackBackendSecuritySpec
 
   private def plainEnv(nodeId: String): List[EnvVar] = podEnv(nodeId).filter(_.getValue != null)
 
+  /** File name -> (Secret, key) of the pod's read-only secrets volume. */
   private def secretRefs(nodeId: String): Map[String, (String, String)] =
-    podEnv(nodeId)
-      .filter(e => e.getValueFrom != null && e.getValueFrom.getSecretKeyRef != null)
-      .map(e =>
-        e.getName -> (e.getValueFrom.getSecretKeyRef.getName, e.getValueFrom.getSecretKeyRef.getKey)
-      )
-      .toMap
+    SecretsVolumeView.files(server.getClient.pods.inNamespace(ns).withName(nodeId).get())
 
   /** Every key the named Secret holds, decoded. The mock server keeps `stringData` populated where
     * a real apiserver materialises base64 `data`; tolerate both, like the production reader.
@@ -218,7 +216,7 @@ class KubernetesQuackBackendSecuritySpec
     plain.map(_.getName) should not contain "encryptionKey"
     plain.map(_.getValue) should not contain "c2VjcmV0"
 
-  it should "reference both secrets through secretKeyRef" in:
+  it should "deliver both secrets as files of the read-only secrets volume" in:
     val backend = makeBackend()
     backend
       .start(
@@ -231,6 +229,23 @@ class KubernetesQuackBackendSecuritySpec
     val refs = secretRefs("quack-nodeenv-3")
     refs.get("pgPassword") shouldBe Some((nodeEnvSecretName, "pgPassword"))
     refs.get("encryptionKey") shouldBe Some((nodeEnvSecretName, "encryptionKey"))
+
+  it should "carry no secret in its env at all, not even as a secretKeyRef" in:
+    val backend = makeBackend()
+    backend
+      .start(
+        nodeEnvSpec(
+          "quack-nodeenv-noenv",
+          lakeMeta ++ Map("pgPassword" -> "p", "encryptionKey" -> "k")
+        )
+          .copy(extraSetupSql = "SELECT 1;", objectStoreSql = "SELECT 2;")
+      )
+      .unsafeRunSync()
+    val env = podEnv("quack-nodeenv-noenv")
+    env.filter(_.getValueFrom != null) shouldBe empty
+    env.map(_.getName).filter(NodeSecretFiles.isKey) shouldBe empty
+    secretRefs("quack-nodeenv-noenv").keySet shouldBe
+      Set("pgPassword", "encryptionKey", "extraSetupSql", "objectStoreSql", "QOD_NODE_TOKEN")
 
   it should "leave non-secret metastore keys as plain env vars" in:
     val backend = makeBackend()
@@ -272,7 +287,8 @@ class KubernetesQuackBackendSecuritySpec
       .unsafeRunSync()
     val plain = plainEnv("quack-nodeenv-case")
     plain.map(_.getValue) should not contain "hunter2"
-    secretRefs("quack-nodeenv-case").get("PgPassword") shouldBe
+    // The Secret keeps the key's spelling; the volume maps it to the file name the script reads.
+    secretRefs("quack-nodeenv-case").get("pgPassword") shouldBe
       Some((nodeEnvSecretName, "PgPassword"))
     secretPayload(nodeEnvSecretName).value shouldBe Map("PgPassword" -> "hunter2")
 

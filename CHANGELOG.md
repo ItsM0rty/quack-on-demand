@@ -2,6 +2,760 @@
 
 ## Unreleased
 
+- **DuckDB 2.0.** Engine, nodes and JDBC move to DuckDB v2.0.0 (`org.duckdb:duckdb_jdbc:2.0.0.0`
+  from Maven Central) and Quack protocol v3, with duckdb-quack at `f96420ed`, the commit the v2.0.0
+  quack extension ships. All six libquackwire natives (linux-x86_64, linux-aarch64, osx-x86_64,
+  osx-aarch64, windows-x86_64, windows-aarch64) are built against the release. DuckDB 2.x renamed its release assets: `run-jar.sh`,
+  `run-jar.ps1`, the qod CLI and the images download `duckdb-cli-<platform>.tar.gz` and
+  `duckdb-shared-libs-<platform>.tar.gz` (1.x shipped `.zip`s), so they need `tar` instead of
+  `unzip`.
+  BREAKING: the manager and every node upgrade together (restart every node). The native front
+  door requires DuckDB 2.0 clients; a 1.x client gets "requires a DuckDB 2.0 client". It also
+  admits a 2.0 client's `BEGIN TRANSACTION` and its INSERT data path (`scan_data_from_quack_client`,
+  scoped to the client's own connection). DuckLake catalogs older than the latest version are
+  migrated once by the manager's DuckLake initializer, under its advisory lock, to DuckLake 1.1
+  (a catalog a 2.0 pre-release created at `1.1-dev1` included). Each migration is recorded in a
+  `qod_meta.ducklake_migration` table in the catalog's database, and a current catalog attaches
+  with no DDL, so a boot no longer re-runs the migration DDL (ACCESS EXCLUSIVE in Postgres)
+  on every catalog. The initializer waits at most 5 s for a catalog table lock: when a long-running
+  read holds one, it logs a WARN naming the database and retries on the next reconcile pass instead
+  of stalling boot. Nodes, loaders and the demo seed attach as-is. The migration is one-way: back up catalog databases
+  before upgrading, there is no downgrade.
+  Upgrade, HA (`replicaCount > 1`): there is no rolling upgrade across this release. A manager on
+  the previous version cannot reach a 2.0 node and a 2.0 manager cannot reach a 1.5.6 node, so
+  during a rolling `helm upgrade` every statement routed across versions fails, and a 2.0 replica
+  promoted to leader migrates catalogs that 1.5.6 nodes still serve. Back up the catalog databases,
+  scale the manager to one replica and stop writers, upgrade it, restart every node once no
+  previous-version replica is left, then scale back up.
+  A DuckDB 2.0 client on the native front door gives up on a statement after its `http_timeout`
+  (default 30 s); run `SET http_timeout = <seconds>` in the client session before a longer one
+  (FlightSQL is unaffected). `VARIANT` columns reach FlightSQL clients as the Arrow
+  `arrow.parquet.variant` extension type, a struct of two binary fields to a client that does not
+  know it: cast to JSON for those clients.
+  Fixed: native front door catalog sync on multi-node pools. A DuckDB client attaching a pool with
+  more than one read-capable node could get an attached catalog with every schema and no table
+  ("Table with name ... does not exist!"): its schema and table listings, joined on node-local
+  oids, were routed to different nodes. A session's catalog reads now stay on one node. A FlightSQL
+  Execute's soft pin to its Prepare node now also falls back to normal routing when that node is
+  unhealthy, draining, quarantined or at its `maxConcurrent` cap.
+
+- **Security: boot SQL can no longer run OS commands on the node host.** Database and pool
+  `initSql`, and a `sql` federated source's `setupSql`, may no longer contain a line whose first
+  non-blank character is `.`: the DuckDB CLI runs such a line from its `-init` channel as a
+  dot-command, and `.shell` / `.system` ran an OS command as the node's OS user (the manager's user
+  on the local backend, the join process's on a fleet server), so a tenant admin could reach the
+  host and the control-plane secrets. Every write path (REST, CLI, MCP, manifest import) answers
+  400. The manager also refuses to start a node whose resolved boot SQL holds one (this covers
+  `{{secret.NAME}}` values spliced in at spawn and rows stored before this release, which now fail
+  their spawn until fixed), and both spawn scripts refuse it too, so Kubernetes pods and fleet
+  servers are covered.
+
+- **Security: a MERGE `THEN DELETE` condition can no longer read past grants and policies.** The
+  subquery in `WHEN MATCHED AND <cond> THEN DELETE` and `WHEN NOT MATCHED BY SOURCE AND <cond>
+  THEN DELETE` was left out of the statement's table reads, so the QoD ACL, the OPA input and the
+  column-mask / row-policy write guard never saw it: a tenant user who could write any table read
+  a table they had no grant on, or the real values behind a mask or row filter (one value at a
+  time through the deleted row count, or whole through an `error((SELECT ...))` message). That
+  subquery is now checked like the `THEN UPDATE` / `THEN INSERT` forms, and an unrecognized MERGE
+  action is refused. The earlier write-guard fix covered MERGE only in those two forms.
+- **Security: one deeply nested statement can no longer crash the manager.** A statement nested
+  deeply enough (`SELECT 1+1+...+1` with tens of thousands of terms, or hundreds of nested
+  subqueries) overflowed the recursive SQL analysis and escaped as a `StackOverflowError`, which
+  cats-effect treats as fatal: any authenticated user halted the whole manager, for every tenant.
+  This reached the default configuration (routing reads the statement's tables even with the ACL
+  off) as well as the ACL, OPA, lockdown, column-mask, row-policy write guard and filtered-metadata
+  steps. Every analysis step now catches the overflow and refuses the statement fail-closed ("nested
+  too deeply to analyse"); with the ACL off and no policy in play it is forwarded unanalysed, and the
+  node answers it.
+- **Security: a result column with no Arrow mapping no longer leaks manager memory.** A statement
+  returning DuckDB's `TYPE` (`SELECT get_type(42)`, `make_type(...)`, `TRY_CAST(... AS TYPE)`, or
+  a list, struct or map holding one) failed when the manager built its Arrow reader, and the node's
+  imported result was never freed: every such statement leaked it for the life of the process, so
+  any pool user, even one with no table grants, could grow the shared manager until it was
+  OOM-killed. FlightSQL queries and schema probes, MCP and REST previews were all affected; the
+  native front door was not. The result is now freed, and the statement fails with "a result column
+  of type TYPE has no Arrow mapping and cannot be returned; cast it to VARCHAR".
+- **Security: a masked column can no longer be read raw by shadowing or aliasing its qualifier.**
+  DuckDB binds `q.name` to the innermost binding `q` only when it has the column; otherwise it reads
+  column `q` and takes its field `name`, and failing that climbs to the enclosing query. A holder
+  of a column mask or deny policy read the protected values raw both ways: a correlated shadow
+  (`SELECT (SELECT x.c_email FROM (SELECT 1 AS a) x) FROM customer x`, the inner `x` a derived
+  table, CTE, VALUES or base table lacking the column) and a struct field through an alias named
+  like the masked column (`SELECT c_addr.city FROM customer AS c_addr`, also three-part, method
+  call, WHERE and ORDER BY forms, and `SELECT *` over a DuckLake table with that alias). Both
+  forms, in every clause and both unresolved-table modes, are now refused. A qualifier that names
+  a covered column is refused even where DuckDB would bind it to the table (`SELECT c_addr.c_id
+  FROM customer AS c_addr`): alias the table differently.
+- **Fixed: a FlightSQL `executeUpdate` whose COMMIT fails is no longer acknowledged.** On a
+  DuckLake pool a write runs inside a stamped transaction whose COMMIT is deferred until its result
+  is read. The DoPut path (JDBC `executeUpdate`, and the prepared-update calls of Arrow JDBC, ADBC
+  and DBeaver) read only the row count, closed the result and then acknowledged it, so a COMMIT
+  that failed there (a DuckLake write-write conflict with a concurrent writer, a node stopped right
+  after the statement, a lapsed lease) was logged at WARN and swallowed: the client got its row
+  count for a write the node had rolled back. The result is now read to the end, committing,
+  before the count is acknowledged; a conflict fails the update with a retryable UNAVAILABLE ("retry
+  the statement"), any other COMMIT failure with INTERNAL, as DoGet already did. A COMMIT failure
+  on a stream nobody reads to the end is now logged at ERROR. Statement history and the write audit
+  still record such a statement as `ok`.
+- **Fixed: a FlightSQL batch led by a read no longer runs twice.** To answer a Prepare,
+  GetFlightInfo or GetSchema with a result schema, the edge ran the statement on a node; for a
+  batch (`SELECT 1; INSERT INTO orders VALUES (1)`, `SET VARIABLE v = 1; INSERT ...`, any lead
+  but a write) and for a single `USE`, `SET`, `CALL` and other non-query statements it ran the
+  whole text, so the write committed at prepare time with no history row or audit, and the Execute
+  ran it again: every such row was written twice (one ADBC `cursor.execute` or `qod sql "..."` is a
+  Prepare plus an Execute), and a lone GetSchema wrote with no trace at all. A batch, and every
+  non-query statement but a lone `PRAGMA`, now reaches a node only when executed, once; its result
+  schema is advertised as absent and read from the result stream, which the ADBC driver accepts. A
+  client that reads the schema before executing (an ODBC driver behind Power BI) gets none for
+  these statements.
+- **Security: a batch led by a read can no longer launder a masked or filtered table.** A
+  statement is classified by its first statement only, so `SELECT 1; INSERT INTO scratch SELECT
+  c_email FROM customer` counted as a read: the protected-write guard let it through, the column
+  and row rewriters (which parse only the first statement) left it unchanged, and the node ran the
+  INSERT, copying the raw masked values or unfiltered rows into a table the holder of a column or
+  row policy could read back. A batch of more than one statement from such a principal now has
+  every statement analysed, whatever leads it: a write reading a protected table is refused as a
+  single one is, and so is a plain read of a protected table after the first statement ("cannot be
+  read in a multi-statement batch; send that query on its own"), which the rewriters never saw.
+- **Security: a CTE shadowing a table can no longer launder a masked column through an INSERT.**
+  In `WITH leak AS (SELECT c_email FROM customer) INSERT INTO leak SELECT * FROM leak` the
+  protected-write guard checked the INSERT's SELECT without its leading WITH, so `leak` resolved to
+  the physical, unpoliced table and the statement was allowed, while DuckDB read the CTE and wrote
+  the raw masked (or `deny`-policied) values into `leak` for the policy holder to read back. The
+  guard now checks the SELECT together with the statement-level WITH, so that INSERT is refused
+  like `INSERT INTO leak SELECT c_email FROM customer`; a CTE reading only unmasked columns is still
+  allowed. An INSERT carrying a WITH both before `INSERT` and inside its SELECT is refused when it
+  reads a masked table.
+- **Security: BREAKING: column masks and row filters hold for `<catalog alias>.table` with the ACL
+  off.** DuckDB reads `acme_tpch.customer` as catalog `acme_tpch`, current schema, so it is the same
+  table as a bare `customer`, but the mask and row-filter checks read `acme_tpch` as a schema and
+  matched no policy. With `QOD_ACL_ENABLED=false` (the default outside `qod serve`), a user holding
+  a column or row policy could copy the raw masked values or the filtered-out rows into a table of
+  their own (`CREATE TABLE mine AS SELECT c_email FROM acme_tpch.customer`), and a user holding a
+  row policy could read every row with a plain `SELECT * FROM acme_tpch.customer`. The same held for
+  a federated alias (`pg_src.customer`). For a user holding a column or row policy, a two-part name
+  whose first part is a catalog attached on the pool is now refused whatever the ACL setting, as the
+  ACL already refuses it when on: "ambiguous two-part name 'acme_tpch.customer': 'acme_tpch' is an
+  attached catalog; qualify fully as 'acme_tpch.<schema>.<table>'". Users without a policy are not
+  affected; a user with one writes `customer`, `main.customer` or `acme_tpch.main.customer`.
+- **Security: row filters hold for PIVOT sources and EXPLAIN.** The row-policy rewrite wraps a
+  table in the positions it knows (FROM, JOIN, FROM-first, a parenthesized TABLE statement) and
+  passed everything else through unchanged, so `SELECT * FROM (PIVOT customer ON ...)`, in any
+  position (a CTE body, a scalar, EXISTS or IN subquery, beside a filtered read of the same table),
+  pivoted every row, and `EXPLAIN ANALYZE SELECT ... FROM customer` ran its query unfiltered,
+  leaking hidden rows through row counts and error messages. A row policy holder's statement is now
+  refused when a table their policy covers is read anywhere the filter cannot reach ("pivot a
+  subquery instead: PIVOT (SELECT * FROM t) ..."), and an EXPLAIN of a statement reading such a
+  table is refused. A pivoted subquery is filtered as before.
+- **Security: node lockdown judges EXPORT DATABASE like COPY ... TO.** EXPORT DATABASE writes
+  `schema.sql`, `load.sql` and one file per table to its target directory, but no lockdown rule
+  looked at it: with the ACL off, a tenant user on a locked-down pool could write to the node's
+  local disk (on a pool with a local data path) or into the denied DuckLake data bucket, both of
+  which `COPY ... TO` is refused. Its target is now judged as a COPY path is: a local path or a
+  denied bucket is refused, another object-store URL is admitted.
+- **Security: a PREPARE named by a string no longer hides the statement it prepares.** DuckDB
+  takes a string as a prepared statement's name (`PREPARE 'p' AS ...`, and `E'p'`, `$$p$$`,
+  `$t$p$t$`), but the screens skipped a `PREPARE <name> AS` head only for an identifier name, so
+  they judged the word `PREPARE` and admitted `PREPARE 'p' AS COPY (...) TO '/tmp/x.csv'; EXECUTE
+  p`: a node-local file write and a write into the denied DuckLake bucket under lockdown, and,
+  with the ACL on, a COPY to any path or URL for a tenant user holding the wildcard ALL grant. The
+  prepared statement is now judged whatever the name's form.
+- **Fix: maintenance no longer deletes files a live branch still reads.** A branch reads its
+  parent's Parquet files by absolute path. The parent's merge step folds small files into one,
+  deleting their catalog rows and scheduling them for cleanup, and a later cleanup deleted them:
+  the branch could no longer scan its pre-fork data, and its unmerged work could no longer be
+  merged. The pinned-file check meant to prevent this could never match. While a database has a
+  live (open or proposed) branch, maintenance now skips the merge and cleanup steps and records the
+  run `partial`, saying why; they resume once the branch is merged, discarded or expired. The
+  pinned-file check is removed, and a run's `filesCleaned` now counts the files cleanup actually
+  deleted rather than every file scheduled for deletion (files inside the grace window stay
+  scheduled and used to be counted too). A DuckLake `CHECKPOINT` run by a superuser still merges
+  and cleans up on its own.
+
+- **Security: BREAKING: CHECKPOINT and DuckLake maintenance are reserved to superusers.** Every
+  CHECKPOINT form (`CHECKPOINT`, `CHECKPOINT <catalog>`, `CALL checkpoint(...)`, `FROM
+  checkpoint(...)`, behind `EXPLAIN` / `PREPARE`) and the destructive DuckLake maintenance and
+  retention calls (`ducklake_merge_adjacent_files`, `ducklake_rewrite_data_files`,
+  `ducklake_flush_inlined_data`, `ducklake_expire_snapshots`, `ducklake_cleanup_old_files`,
+  `ducklake_delete_orphaned_files`, `ducklake_set_option`, and the bare or catalog-qualified
+  `merge_adjacent_files()` / `set_option(...)` macros) are refused to tenant principals in every ACL
+  mode, and to every caller under lockdown, like `FORCE CHECKPOINT`. Before, a tenant user could run
+  DuckLake's whole maintenance chain (the default `qod_all_tables` role covered it, and with the ACL
+  off nothing checked it) and delete parent files a live branch or time travel still reads. QoD's
+  own maintenance and branch merges do not go through the edge and are unaffected. DuckLake's other
+  per-schema macros (`snapshots`, `table_info`, `table_changes`, `table_insertions`,
+  `table_deletions`, `current_snapshot`, `last_committed_snapshot`, `options`, `settings`,
+  `set_commit_message`) are now gated like the `ducklake_*` family whenever the ACL validates.
+  CHECKPOINT classifies as DDL (it joins the default `QOD_CLASSIFIER_DDL` list), so a superuser's
+  reaches a writer and is stamped and audited.
+
+- **Security: `histogram()` / `histogram_values()` with a computed source no longer reach the
+  DuckLake metadata catalog.** These table macros run `query_table(source)`, so a source built at
+  run time (`'__duck' || 'lake_metadata_<alias>.ducklake_data_file'`) passed the metadata-catalog
+  screen in the default ACL-off posture and returned the per-file encryption keys. A non-constant
+  source in a table position is now refused to non-superusers, and a constant one is screened for
+  the metadata prefix; the `histogram(col)` aggregate is unaffected.
+
+- **Security: a backtick-quoted table or column no longer defeats column masks and row filters.**
+  On DuckDB 2.0 a backtick quotes an identifier, and the access checks read it as one, but the
+  policy rewriters only unquoted double quotes: `` FROM `orders` `` skipped the row filter and
+  `` upper(`email`) `` read a masked column raw (and a CTAS laundered it into another table). One
+  shared unquote now serves every policy site, and the edge renders backtick identifiers as double
+  quoted before the checks. A double-quoted masked column inside an expression (`upper("email")`) is
+  now masked instead of refused.
+
+- **Security: the spawn script's stale-directory sweep no longer trusts shared `/tmp`.** It now
+  considers only real directories owned by the current user, never follows a symlink (nor chmods
+  through a symlinked `secrets`), deletes a recorded spill directory only when it is a `qod-node.*`
+  directory directly under the host's spill root, treats another user's live process as alive, and
+  can no longer abort a spawn. Before, any local user sharing `/tmp` with a bare-host manager or
+  fleet server could make the next node spawn `rm -rf` an arbitrary path and block every later
+  spawn. The PowerShell twin gets the same hardening.
+
+- **Security (Helm chart): node lockdown is on by default, and `postgres.user` has no default.**
+  With the chart's former defaults (SQL ACL off, lockdown off, `postgres.user: postgres`), any
+  tenant user could `read_text` the node's mounted `/var/run/qod-secrets/pgPassword`. For a database
+  created without its own metastore credentials that is the control plane's Postgres superuser
+  password, which opens the control-plane database (every tenant's password hashes, tokens and
+  catalog passwords), every other tenant's catalog (including per-file encryption keys) and the
+  server itself (`COPY ... TO PROGRAM`). New `security.nodeLockdown` (default `true`, renders
+  `QOD_NODE_LOCKDOWN`) and `security.aclEnabled` (default `false`, renders `QOD_ACL_ENABLED`)
+  values; `helm install` prints a warning when both are off. Lockdown refuses ATTACH, INSTALL, LOAD,
+  protected settings and local file reads to non-superusers; a pool can still opt out with
+  `POST /api/pool/setLockdown`, and its tenant users can then read the file again unless the ACL is
+  on. Superusers are never screened. BREAKING for chart users: `postgres.user` must now be set; use
+  a dedicated non-superuser role with `CREATEDB` that owns the control-plane database (`CREATE ROLE
+  qod LOGIN CREATEDB PASSWORD '...'; CREATE DATABASE qod OWNER qod;`), and tenant statements that
+  relied on ATTACH, INSTALL, LOAD or local file reads are refused until their pool opts out. This
+  does not bound what the credential reaches once read (a superuser, or a pool that opts out, still
+  gets the shared login); one Postgres role per catalog database is designed but not implemented.
+  The manager's own defaults (`qod start`, `run-jar.sh`, Docker) are unchanged.
+
+- **Fixed: `qod serve --demo`, and `qod start` / `qod serve` with macOS `/usr/bin/java` or on
+  Windows, refused to boot ("native Quack client cannot run on this host").** The launcher never
+  told the manager where its libduckdb was: the demo did not provision libduckdb at all, SIP strips
+  `DYLD_LIBRARY_PATH` from `/usr/bin/java`, and on Windows the lib directory never reached `PATH`.
+  Every launcher path now provisions libduckdb and exports `DUCKDB_CACHE_DIR`, so the manager
+  preloads it by absolute path; on Windows the lib directory is also put on `PATH`. When libduckdb
+  was found but the native still fails, the boot error says provisioning worked, and its hint names
+  the qod CLI cache and `DUCKDB_CACHE_DIR`.
+
+- **Fixed: an upgraded qod CLI kept running the DuckDB it cached for an earlier release.** The
+  manager refused to boot, nodes spoke Quack v1, and `qod fleet join` reported the pin rather than
+  the engine it ran. The CLI cache is now versioned, `<user cache>/qod/duckdb/<version>/{bin,lib}`
+  (the same layout as `DUCKDB_CACHE_DIR`), and `DUCKDB_VERSION` is honoured. Existing qod caches
+  are re-downloaded into the versioned layout on first run; the old unversioned `duckdb/bin` and
+  `duckdb/lib` directories are no longer read and can be deleted. `qod fleet join` reports the
+  version the duckdb binary itself prints.
+
+- **Fixed: `scripts/stop-jar.sh` exited 1 silently, before stopping anything,** when no unmarked
+  `spawn-quack-node.sh` wrapper was running (always the case with this release's own wrappers), so
+  a manual stop left the manager and its nodes running and `run-jar.sh NUKE=1` wiped state under a
+  live manager.
+
+- **Stopping a local manager stops only its own nodes.** BREAKING for anyone scripting
+  `scripts/kill-quack-nodes.sh` as a host-wide reset: `stop-jar.sh`, `stop-jar.ps1`, `qod stop` and
+  `kill-quack-nodes.sh` now stop only the nodes of the manager on their `QOD_ON_DEMAND_PORT`,
+  recognized by the marker `<rest-port>-<boot id>` the manager passes as the spawn script's second
+  argument, so another manager's nodes on the same host (an isolated test stack) are left alone. The
+  old host-wide reset is `kill-quack-nodes.sh --all`. Upgrading with orphan nodes left by an earlier
+  release: their wrappers carry the node token where the marker now goes, so neither the default
+  mode nor `--unmarked` matches them and `stop-jar.sh` / `qod stop` do not report them; use
+  `kill-quack-nodes.sh --all` (with no manager running). The spawn scripts take
+  `<port> [<manager-marker>]`.
+
+- **Typed Postgres and MySQL federated sources.** New source types `postgres` and `mysql` attach an
+  external database from typed fields (host, port, database, user, password, plus `sslMode`, and
+  `schema` for Postgres), with no SQL to write: REST `connection` on the federated-source create,
+  `qod federation create --type postgres|mysql` (`--host`, `--port`, `--database`, `--user`,
+  `--schema`, `--ssl-mode`, `--connection`), the MCP `upsert_federated_source` tool, manifests and
+  the admin UI. The password is always a source secret (inline or `externalRef`) named by a
+  `{{secret.NAME}}` placeholder and is required; the CLI's `--password-stdin` / `--password-prompt`
+  and the UI's write-only password field store it for you. The rendered SQL carries the connection
+  on a temporary DuckDB secret and attaches with no credential in the ATTACH path (only
+  `connect_timeout=10` for Postgres), so the password never shows in `duckdb_databases().path` or
+  connection errors, then drops the secret right after the ATTACH so no session can reuse the
+  credentials once the ATTACH returns (a re-attach without `READ_ONLY` would otherwise write through
+  them); the attached catalog keeps working and reconnects without it. New sources default to
+  read-only, enforced by the engine (`READ_ONLY`) and the edge. The SQL ACL and node lockdown are
+  both off by default, so while a pool has a read-only catalog (any source type) the edge refuses,
+  for every caller, superusers included: `postgres_execute`, `postgres_query`, `mysql_execute` and
+  `mysql_query` targeting a read-only catalog or a catalog it cannot read from a string literal;
+  `query` / `query_table` with a computed argument; and `json_execute_serialized_sql`. Through them
+  a session could end the remote's read-only transaction and write. Calls to writable catalogs and
+  constant `query('...')` bodies (judged by the same rule) are unchanged. This screen reads the SQL
+  text only: a table macro or view that already wraps a passthrough, created before the catalog
+  became read-only (a DuckLake catalog keeps such a macro), and macros or views in attached
+  databases are not seen. A database user without write privileges on the remote is the complete
+  guarantee; configure one. The attach verifier now watches these
+  sources like Iceberg ones (`attachStatus`, per-node failures, retry) and drops the secret when a
+  retried attach fails. Manifest import applies the same validation as REST and MCP to every typed
+  source (Iceberg included). Fixed with it: a secret value containing `{{` no longer fails the
+  tenant-db's whole federation setup (the placeholder check now runs before substitution). A `sql`
+  source's setupSql may not mention the reserved secret prefixes `qod_pg_`, `qod_mysql_`,
+  `qod_ice_` (judged on the text with `{{alias}}` expanded: it prevents an accidental collision
+  with a typed source's secret, not a name spliced in through a `{{secret.NAME}}` value). MySQL is implemented and unit tested but not verified live (the DuckDB 2.0 toolchain
+  has no mysql extension), including whether `READ_ONLY` alone refuses writes through it.
+
+- **Security: nodes and the manager no longer load the OS user's persistent DuckDB secrets.**
+  DuckDB loads every secret stored under `~/.duckdb/stored_secrets` into an instance on first
+  secret use, so a developer's or operator's own cloud keys reached every node (any tenant query
+  could use them) and the manager's in-process DuckDB. Every node now points `secret_directory`
+  below a read-only marker file in a read-only, private directory of its own (`secrets` in the
+  node's working directory: 0500 around a 0400 file; an owner-only ACL denying file creation on
+  Windows), before any secret or ATTACH, then puts the secret manager in use so no session can move
+  it back. The path can never exist as a directory, so no persistent secret loads and
+  `CREATE PERSISTENT SECRET` on a node fails ("File exists"), for root too: use a temporary secret,
+  or the database's `objectStore`. If either setup statement fails the node does not start. The
+  manager's in-process instances use one such path per JVM, and the `qod serve` demo seeder's DuckDB
+  uses it too (and no longer runs `~/.duckdbrc`). Persistent secrets themselves stay enabled, so a
+  postgres or DuckLake ATTACH with inline credentials (for example in federation SQL) keeps working;
+  turning them off instead would have made DuckDB 2.0 refuse every such ATTACH ("Unknown secret
+  storage found").
+
+- **Security: node init SQL no longer lands in `shell_history()`.** On DuckDB 2.0 the CLI records
+  every statement it reads from stdin, and the spawn scripts fed the node's whole init SQL that way,
+  so `SELECT * FROM shell_history()` on a node returned it: the node token, the catalog Postgres
+  password, and the object-store and federation credentials. The init SQL now reaches duckdb through
+  `-init` (a FIFO on Linux and macOS; on Windows a current-user-only secrets file that DuckDB itself
+  deletes the instant it has read it, named from a no-secrets outer init file), which the CLI does
+  not record. The node's stdin is the null device, so no statement or dot-command can be injected on
+  the node's own connection. The `-init` channel itself still interprets dot-commands, which is why
+  boot SQL is screened for them (see the init SQL entry below). The node is kept alive by a `.shell` dot-command that waits for the
+  wrapper process to exit, not by a query: a query pinned a DuckDB transaction (blocking CHECKPOINT
+  on a duckdb-file node and holding a catalog Postgres session idle-in-transaction on a DuckLake
+  node) and on 2.0 could spin a CPU core for the node's life. The wait also means a node no longer
+  outlives a forced kill of its wrapper, best effort: it polls the wrapper's pid, so if the OS hands
+  that pid to another process before the next poll, the node lives until that process exits. A crash before the Windows secrets file is read leaves it
+  only until a later spawn's sweep, and the wrapper stops a node that fails to delete it. On Windows
+  the CLI is only ever handed paths relative to the node's working directory, in ASCII, so a temp
+  directory under a profile with an accented or other non-ASCII name (or a quote) works. A failing init statement still does not stop the node. `-init`
+  also means a node no longer runs the OS user's
+  `~/.duckdbrc`. The CLI only keeps this history in memory when stdin is not a terminal (nothing was
+  written to `~/.duckdb_history`), and 1.x CLIs have no `shell_history()`. If you ran DuckDB 2.0
+  nodes before this release, rotate what they could read: the catalog Postgres passwords, the
+  object-store keys and the federated-source credentials.
+
+- **Nodes run in an empty private working directory.** DuckDB 2.0 reads a file named by an
+  unquoted dotted table name when no such schema exists (`SELECT * FROM x.csv` read `./x.csv` from
+  the manager's own working directory). Every node, on every runtime (local, Windows, fleet,
+  Kubernetes), now starts duckdb in a fresh, empty, per-node directory private to its user, removed
+  when the node stops. A relative local dataPath (the bundled `./ducklake/tpch` default is one) is
+  resolved against the directory the node used to run in and attached with `OVERRIDE_DATA_PATH`,
+  since DuckLake recorded the relative spelling; the override applies to that attach only. Each
+  node now spills to its own `temp_directory` (a per-node directory under `/duckdb-tmp` on
+  Kubernetes, under `.tmp` of the starting directory elsewhere) instead of a `.tmp` shared by every
+  node of the host. An operator's `SET temp_directory` in the database or pool init SQL still wins.
+  Branches of a database with a relative dataPath now record the parent's files by absolute path,
+  and the merge node attaches the branch by its absolute path. BREAKING: a relative path in an
+  operator's database or pool `initSql` or federation SQL (for example `CREATE VIEW ... FROM
+  'data/x.parquet'` or `ATTACH 'x.duckdb'`) no longer resolves against the manager's directory,
+  because the node no longer runs there; use an absolute path or an object-store URL. Every spawn
+  also creates the per-node spill directory under `.tmp/` in the manager's (or `qod start` user's)
+  working directory up front, where duckdb previously created `.tmp` only on first spill.
+  Upgrading: a branch cloned before this release from a relative-dataPath database cannot read the
+  parent's files any more; discard and recreate it.
+
+- **Native client lease.** The manager-to-node native client heartbeats each node connection
+  under a lease: `QOD_QUACK_NODE_LEASE_SEC` (default 30, a heartbeat every third, floor 1 s).
+  Node connections are released on error and on cancel. New `QOD_DUCKDB_EXTENSION_DIR` points the
+  manager's DuckDB at a local extension directory and turns on unsigned extensions.
+
+- **Fixed: the manager leaked 40 bytes per node response.** Every decoded PREPARE and FETCH
+  response left its Arrow stream struct allocated in the native client (about 4 GB a day at 1000
+  statements per second, plus two per healthy node every health-check interval). The struct is
+  freed once Arrow has taken its contents.
+
+- **Fixed: a DuckDB pre-release passed for the release.** `run-jar.sh` and `run-jar.ps1` accepted
+  any cached CLI whose version merely contained the pin (`v2.0.0-alpha46057` for `2.0.0`); they
+  now require the exact version and reinstall otherwise.
+
+- **The native client is the only manager-to-node client.** BREAKING: the embedded fallback client
+  (an in-process DuckDB running `quack_query` over JDBC, behind a JVM-wide mutex) is gone, since
+  the DuckDB 2.0 JDBC disables the Arrow export it needed. `QOD_NATIVE_CLIENT` and
+  `QOD_NODE_DISABLE_SSL` (which only the fallback read) are removed and ignored if still set, and
+  so is the Helm value `quackNode.tls.enabled`. Windows on ARM64, which only ran on that fallback,
+  gets its own native (`windows-aarch64/quackwire.dll`, built on GitHub's Windows ARM runner): run
+  it with an ARM64 JVM, which `qod start` downloads, and `run-jar.ps1` fetches the windows-arm64
+  DuckDB whenever the JVM's `os.arch` is aarch64. A manager whose platform has no bundled
+  libquackwire, or whose native cannot load (for instance libduckdb not found), refuses to boot with a message naming the platform, the expected
+  `libquackwire/binaries/<platform>/` binary and `DUCKDB_CACHE_DIR`, instead of falling back. The
+  demo no longer pins the fallback either.
+  Every native now carries a build marker (Quack protocol, DuckDB version and source id,
+  duckdb-quack commit). The manager refuses to boot with a "stale libquackwire native" message when
+  the marker disagrees with `/native/VERSION` or with the loaded libduckdb, or when the native
+  predates markers, instead of booting on a stamp that vouches for a stale binary (on Linux such a
+  native used to boot and then kill the JVM with "symbol lookup error" at the first node contact).
+  Linux natives link with `-z now`, so a missing symbol fails at load. `verify_quackwire_binaries`
+  and `refresh-quackwire-binaries.sh` check every binary's marker, and the refresh takes the
+  `quackwire.yml` run of the commit being released (or `QUACKWIRE_CI_RUN=<id>`) instead of the
+  latest green run on main. A new `release pins` check, also run before every snapshot and release
+  publish (node and worker images included), refuses a pre-release DuckDB JDBC or a `mavenLocal`
+  resolver on main.
+
+- **Security: DuckDB 2.0 hardening.**
+  - Data-modifying CTEs classify as writes and fail closed in the ACL.
+  - Four-part (nested schema) names fail closed.
+  - Executing EXPLAIN forms (ANALYZE / ANALYSE, option lists) classify as the explained statement.
+  - Lockdown denies `CONNECT` / `DISCONNECT` and extension repository DDL, protects
+    `allow_extension_repositories`, `extension_directories` and the other settings that move
+    extension, secret or file locations, or redirect the node's outbound connections, and judges
+    path-shaped quoted identifiers. It also denies the `enable_logging()` call and protects the
+    logging settings (`enable_logging`, `logging_level`, `logging_storage`, `logging_mode`,
+    `enabled_log_types`, `disabled_log_types`, `pg_debug_show_queries`), denies the functions that
+    run raw SQL on or open a connection to another database (`postgres_query` / `postgres_execute`,
+    `postgres_scan` / `postgres_scan_pushdown` / `postgres_attach` / `postgres_configure_pool`, the
+    `mysql_*` and `sqlite_*` equivalents) and `getenv` (reads the node's environment, including the
+    catalog password), and judges the statement an `EXPLAIN ANALYZE` or a `PREPARE ... AS ...; EXECUTE`
+    carries, which DuckDB 2.0 executes.
+  - BREAKING: settings that change how a node parses SQL (`dialect_compatibility_mode`,
+    `current_dialect`, `active_grammar_extensions`, `allow_parser_override_extension`,
+    `preserve_identifier_case`, `show_behavior`, `table_function_identifier_conversion`) and
+    `redact_http_logs` / `allow_unredacted_secrets` are refused for every caller, superusers
+    included, whatever the ACL mode and the lockdown flag: most are GLOBAL, so one session would
+    change how every session on the node is parsed, or expose the node's credentials in its logs.
+  - BREAKING: `IMPORT DATABASE` (and its `PRAGMA import_database(...)` form) is refused for every
+    caller, superusers included: it replays SQL files the gateway never reads.
+  - `postgres_query` / `postgres_execute` and the other raw-SQL / arbitrary-connection functions
+    and `getenv` are denied to tenant-scoped principals whenever the ACL validates (QoD-grant and
+    OPA modes), the same class as `query()` / `query_table()`. A superuser keeps the raw federation
+    passthrough; with the ACL off and lockdown off nothing is blocked, like any other statement.
+  - Trigger DDL is reserved to superusers and own-tenant admins ("CREATE TRIGGER is restricted to
+    tenant administrators").
+  - The edge's comment stripper, statement splitter and classifier share one lexer ported from
+    DuckDB 2.0's tokenizer (dollar and E-strings, backtick identifiers, unicode spaces), and
+    function calls are detected from its tokens (backtick and double-quoted names).
+  - The edge screens lex the SQL before folding case (dollar-quote tags are case-sensitive in
+    DuckDB), and the catalog write screen classifies the original statement text.
+  - BREAKING: the DuckLake metadata catalog (`__ducklake_metadata_<alias>`, whose
+    `ducklake_data_file` / `ducklake_delete_file` hold every per-file encryption key of an
+    encrypted database) and the key-returning DuckLake functions (`ducklake_list_files`,
+    `ducklake_commit`) are refused to every caller who is not a superuser, whatever the ACL mode
+    (QoD grants, OPA, ACL off) and the grants (the built-in `qod_all_tables` `*.*.* ALL` no longer
+    reaches them), and to every caller on a pool under lockdown. Any quoting, `USE`,
+    `SET search_path`, string arguments and `query()` bodies are covered, and any string literal
+    or comment that mentions the name is refused too (an over-deny, the safe direction); a
+    run-time-computed target (`query_table('__duck' || 'lake...')`, a `search_path` / `schema`
+    set to an expression in any `SET` / `PRAGMA` form, the `postgres_query` / `query` family with a
+    non-constant argument) is refused for the same callers. The string-named table carriers
+    (`query_table('<name>')`, `query('<sql>')`, `duckdb_table_sample('<table>')`) have their
+    literal screened for the metadata catalog and are refused with any non-literal argument.
+    `json_execute_serialized_sql` (table function and pragma) is refused outright to the same
+    callers: a serialized plan names its catalogs in JSON strings DuckDB decodes after the screen
+    reads them. The data tables themselves and the other DuckLake functions are unchanged.
+    The screen knows the metadata catalog by its name: a caller who holds the catalog's Postgres
+    password and may ATTACH (a tenant user with the ACL off and lockdown off) can attach that
+    database again under another alias and read the keys there, so this guarantee also rests on
+    that password staying secret.
+    String literals are read as DuckDB reads them: a literal continued on the next line
+    (`'__duck'` newline `'lake_metadata_x'`, which DuckDB folds into one value) is judged folded,
+    in every carrier, `query()` body and `SET` / `PRAGMA` form.
+  - Lockdown judges a `COPY` path as DuckDB reads it: a path continued on the next line, an
+    escape string or a dollar-quoted string is folded and decoded before the remote and
+    denied-bucket checks (a continued path could name a denied bucket, and the other two forms
+    were not judged by the COPY rule).
+  - `duckdb_table_sample` (new in 2.0; reads the table its string names) and the Iceberg catalog
+    functions that act on a table or schema named by a string outside every table grant
+    (`iceberg_rewrite_data_files`, `iceberg_rollback_to_snapshot`, `iceberg_to_ducklake`,
+    `iceberg_table_properties` / `iceberg_schema_properties` and their `set_` / `remove_` forms) join
+    `query_table` in the tenant-ACL class: refused to tenant-scoped principals under QoD grants and
+    OPA, never covered by the `*.*.* ALL` wildcard.
+  - BREAKING for non-superusers who set these: node-wide settings are reserved to superusers,
+    whatever the ACL mode and the grants, and refused to every caller on a pool under lockdown:
+    in any `SET` / `RESET` / `PRAGMA` form (glued quotes, behind `EXPLAIN` / `PREPARE`), threads
+    (`threads`, `worker_threads`, `external_threads`, `async_threads`), memory and temp space
+    (`memory_limit`, `max_memory`, `max_temp_directory_size`, `temp_directory`), the allocator,
+    checkpoint / WAL / storage knobs, the shared HTTP client and Postgres pool, logging and
+    profiling, extension loading, and every `quack_*` (server limits, `quack_debug_*`), `debug_*`
+    and `verify_*` setting; any `SET GLOBAL` / `RESET GLOBAL`; `FORCE CHECKPOINT`; and the
+    node-control calls `quack_serve`, `quack_stop`, `quack_cancel`, `quack_identify`,
+    `quack_clear_cache`, `pg_clear_cache`, `enable_logging` / `disable_logging`,
+    `truncate_duckdb_logs`, `enable_profiling` / `disable_profiling`, `force_checkpoint`. One
+    session changing them starved or slowed every session of the pool. Operators set them at node
+    start (database / pool `initSql`, `qod pool set-resources`). Session settings a client sends
+    (`search_path`, `schema`, `TimeZone`, `Calendar`, `http_timeout`, `enable_progress_bar`,
+    `errors_as_json`, `max_execution_time`, `s3_*`, `SET VARIABLE`, ...) are unchanged.
+    BREAKING: on DuckDB 2.0 a `SET` / `RESET` / `PRAGMA x = v` without a scope writes a
+    GLOBAL-default setting node-wide, exactly like `SET GLOBAL`, so for non-superusers (and every
+    caller under lockdown) a bare `SET` of such a setting (`default_order`, `null_order`,
+    `default_collation`, `preserve_insertion_order`, `enable_optimizer`,
+    `immediate_transaction_mode`, `extra_http_headers`, `ducklake_*`, `pg_staleness_query*`,
+    `iceberg_use_metadata_log`, ...) is refused: use `SET SESSION <name>` / `RESET SESSION <name>`.
+    Aliases are judged as the setting they name (`force_mbedtls_unsafe` is
+    `debug_force_mbedtls_unsafe`), and a setting name the gateway does not know is refused (fail
+    closed). The scopes come from the engine source (`scripts/dev/gen-duckdb-setting-scopes.py`,
+    regenerated at every pin bump). The `mysql_pool_*` and `mysql_debug_show_queries` settings and
+    `mysql_clear_cache()` join the node-wide set. The list is shared with lockdown's protected
+    settings (one source).
+  - No secret reaches a node process's environment or command line, on any backend: a node user
+    with SQL could read `getenv()` or `/proc/<pid>/environ` of duckdb and of its wrapper script.
+    The catalog password, the encryption key, the federation and object-store SQL, the node token
+    and the object-store credentials now reach the spawn script as files of a private directory
+    (`QOD_SECRETS_DIR`, 0700 / 0600, owner-only ACL on Windows) that the script deletes right after
+    reading (local and `qod fleet join`), or of a read-only Secret volume (mode 0400) on
+    Kubernetes, replacing every `secretKeyRef` env var. Local nodes no longer inherit the manager's
+    own credentials (`QOD_API_KEY`, the session JWT secret, passwords). BREAKING for custom node
+    images and launchers: the spawn script takes `<port> [<manager-marker>]` (no token argument;
+    the token is a file in `QOD_SECRETS_DIR`), ignores secrets passed as env vars,
+    and the node image entrypoint no longer reads `QOD_NODE_TOKEN`; restart every K8s node after
+    upgrading. On Kubernetes the mounted files stay readable by a node user with unrestricted SQL
+    (superuser, or ACL off without lockdown). For a database without its own metastore credentials
+    that file holds the control plane's own Postgres login, which opens the control-plane database
+    and every tenant's catalog (and the server itself when it is a Postgres superuser); the Helm
+    chart now turns lockdown on by default (see the chart entry above).
+  - The DuckLake catalog's Postgres password no longer rides an ATTACH string, where
+    `SELECT path FROM duckdb_databases()` (and connection errors) showed it to any SQL user of the
+    node, who could then reach the catalog and its encryption keys under a name of their own. Nodes
+    (both spawn scripts), the merge node's branch attach, the manager's DuckLake initializer, the
+    demo seed, the TPC-H / TPC-DS / SSB loaders and the demo federation source put it in a
+    temporary `TYPE postgres` secret that the ATTACH names (`SECRET` / DuckLake
+    `METADATA_PARAMETERS`) and drop the secret right after attaching, so no session can reuse it.
+    Restart every node to pick it up. Federation sources you wrote yourself keep whatever their
+    `setupSql` says: use the same pattern for a Postgres or MySQL source.
+  - The ACL parser (and the protected-write guard, the metadata filter and the CLS / RLS
+    rewriters) reads lexer-canonical SQL: escape strings, dollar-quoted strings, `//` and a word
+    glued to a literal could hide a subquery from the ACL while DuckDB read the table. A rewrite
+    that cannot be shipped as the caller's statement (it holds `//` or a time-travel clause) is
+    refused instead.
+  - Time-travel clauses are found on lexer tokens: a clause shape inside a string literal or a
+    comment no longer deletes real SQL before the ACL parse.
+  - Four-part names also fail closed on `QOD_ACL_DIALECT=generic`.
+  - Lockdown denies `query()` / `query_table()` / `json_execute_serialized_sql()` for every caller,
+    judges replacement-scan literals at every depth (subqueries, JOIN, comma joins, parenthesized
+    table positions), and covers the avro and iceberg readers (`read_avro`, `avro_metadata`,
+    `iceberg_scan` and the other `iceberg_*` path readers), the iceberg table-maintenance
+    functions and `quack_serve` / `quack_stop`.
+  - The ACL gates the table `SUMMARIZE <table>` reads (it was admitted as table-free while
+    returning per-column statistics), the query of `DESCRIBE <query>`, and the table named by a
+    parenthesized statement in table position (`(SUMMARIZE t)`, `(TABLE t)`, `(DESCRIBE t)`,
+    `(SHOW t)`), which used to gate the keyword instead. A string literal in those positions is a
+    file reference. The row-policy rewrite refuses a parenthesized statement reading a policy
+    table, and the protected-write guard denies `SUMMARIZE` of one.
+  - A subquery inside a MAP literal or a `json_object` argument is gated and row-filtered (it was
+    invisible to the ACL walk). The ACL and row-policy walks refuse an AST child of a type they
+    have no rule for instead of skipping it, and the column-policy rewrite denies a statement in
+    which a covered column sits where it cannot be masked (a MAP or list literal, a lambda, `->>`,
+    a `JOIN ... USING` list, ...) instead of forwarding it unmasked.
+  - Lockdown judges file literals after `SUMMARIZE`, `DESCRIBE`, `TABLE`, the `PIVOT` / `UNPIVOT`
+    statements and `USING` (`MERGE INTO .. USING`, `DELETE .. USING`), and protects the iceberg
+    `unsafe_enable_version_guessing` setting.
+  - A column- or row-policy rewrite refused for holding `//` says so instead of "could not parse
+    statement".
+  - The column-policy rewrite masks a covered column in `IS [NOT] NULL`, `TRIM`, `QUALIFY`, an
+    aggregate `FILTER` and `JOIN ... ON` instead of denying the statement. It also stops denying a
+    CTE, a derived table or an `IN` / `EXISTS` / scalar subquery that reads a same-named column
+    from a table with no policy (a staging CTE joined to a masked table, common in dbt): a
+    covered-column check now binds unqualified names per query block, innermost first, as DuckDB
+    does. `JOIN ... USING` on a covered column stays denied.
+  - BREAKING for names holding a dot, an `@` or an escaped quote: a double-quoted or
+    backtick-quoted identifier containing a dot (`"a.b"`), an `@` (`"secret@x"`) or its own
+    doubled delimiter (`"a""b"`) is refused for ACL-checked users (QoD grants and OPA), users with
+    column or row policies, and every caller on a lockdown pool. DuckDB reads each as one name,
+    while the access check read `"a.b"` as schema `a`, table `b`, `"secret@x"` as table `secret`
+    (a database link) and `"a""b"` as `a""b`, so a grant on schema `a` reached `main."a.b"` and a
+    grant on `secret` read, wrote and dropped `secret@x`. The rule is lexical, so it also refuses
+    such a quoted COLUMN or struct-field name (`"price.usd"`, `s."a.b"`, common in CSV- or
+    JSON-derived tables), in any position but directly after `AS`. An alias (`AS "t.x"`) is still
+    accepted, and a remote URL starting with a scheme (`"s3://b/x.parquet"`) passes this screen to
+    be refused as the file read it is (see below; a `://` anywhere else, `"other.x://"`, is
+    refused here); rename such tables and columns (an `AS` alias only renames an output label).
+  - `quack_active_connections()` (every session's running query text and connection id) and
+    `quack_server_list()` join the node-control calls reserved to superusers and refused to every
+    caller on a lockdown pool.
+  - The ACL walk scopes a CTE name to the query that declares it: a CTE inside `ARRAY(...)` or a
+    derived table is no longer gated as a table of that name.
+  - A CTE name no longer hides a read of the real table of that name. Every name of a `WITH`
+    clause was in scope before any body was walked, while DuckDB binds a body's reference to its
+    own name, or to a later sibling's, to the real table: `WITH orders AS (SELECT * FROM orders)`
+    (common in dbt SQL) read the table `orders` with nothing gated, top level, nested and on a
+    write's `WITH` clause. The walk now follows DuckDB 2.0's visibility exactly: a body sees the
+    CTEs declared before it, the main query all of them, and in `WITH RECURSIVE` a union body's
+    recursive term also sees its own name. The column-policy residual check binds CTE names by the
+    same rules.
+  - `ARRAY(TABLE t)` and the quantified comparison `x = ANY | ALL | SOME (TABLE t)` read every row
+    of t; JSqlParser holds t as a column, so the ACL admitted them with nothing gated (also in
+    `SET VARIABLE` values and write sources). The table is now gated; the column-policy rewrite
+    denies the form and the row-policy rewrite refuses it on a policy table.
+  - The column-policy rewrite no longer schema-qualifies a CTE reference. It printed
+    `WITH t AS (..) SELECT .. FROM t` as `.. FROM <schema>.t`, a read of the real table `t` the
+    ACL never checked (it saw the CTE), for any principal with a mask policy whose statement
+    touched a masked column; where no such table existed the statement failed instead. Table names
+    now go out exactly as written. As defense in depth, every rewritten statement (column
+    policies, row policies, metadata filter) is refused if it needs a grant on a table or verb the
+    original did not, and is re-validated for the same principal in the same ACL mode before it
+    reaches a node.
+  - BREAKING for principals with a column (mask) policy: `COLUMNS(...)` in any position, the
+    unpacked `*COLUMNS(...)`, star patterns (`* LIKE` / `ILIKE` / `NOT LIKE` / `GLOB` /
+    `SIMILAR TO`, `t.* LIKE`) and any star inside an expression other than `count(*)` are refused
+    where a table with a column policy is in scope: each returned masked columns raw. So are a
+    table referenced as a column (`SELECT c FROM customer c`, `main.customer`, `to_json(c)`: the
+    whole row as a STRUCT) and a statement in table position over such a table (`(TABLE t)`,
+    `(SUMMARIZE t)`). Name the columns instead. `* EXCLUDE (..)` and `* REPLACE (.. AS ..)` (over
+    one table, or `t.*`) are now expanded to an explicit, masked column list: the rewrite used to
+    drop the modifier (excluded columns came back masked, a replacement was lost), and an aliased
+    table's star now expands under its alias (`SELECT * FROM customer c` used to fail on the node).
+    A modifier that cannot be expanded exactly over a table with a column policy is refused.
+  - DuckDB's method-call syntax on a masked column (`c_email.lower()`, `c.c_email.upper()`, in any
+    clause) went out unmasked: JSqlParser holds it as a function with a multi-part name and no
+    column. It is now rewritten to the function form and masked (`lower('***')`); a field read of
+    a masked column (`c_email.x`) is refused.
+  - A `NATURAL` join comparing a masked column is refused, like `JOIN ... USING` on one: joined
+    against a guess list it recovered every value of an enumerable masked column (phone numbers,
+    dates of birth) with its row.
+  - A FROM-first statement (`FROM t`) of a principal with a column policy is refused cleanly
+    instead of failing with an internal error.
+  - A method call on a masked table's binding (`c.to_json()`, `customer.to_json()`,
+    `c.list()`, `c.struct_extract('c_email')`, in any clause) is refused like `to_json(c)`: DuckDB
+    hands the function the whole row, every masked column raw.
+  - BREAKING for principals with a column policy: an alias column list on a table with a column
+    policy (`customer AS c(a, b, e)`, with or without `AS`, in a join or a NATURAL join) is
+    refused. It renamed a masked column positionally (`SELECT e` read `c_email` raw) under the
+    default lenient resolver. Alias each column in the select list instead; a column list on a
+    derived table or a CTE stays accepted, its values masked inside it.
+  - BREAKING: a table name DuckDB reads as a file is refused like the string literal it stands
+    for (`FROM 's3://b/x.parquet'`): whenever the ACL validates, it is refused to every
+    tenant-scoped principal, `*.*.* ALL` included (see the file-access entry below), in every
+    position (FROM, DESCRIBE / SUMMARIZE, write and DDL targets). DuckDB 2.0 replacement-scans a
+    name it cannot resolve, its parts joined with dots, so a quoted URL (`"s3://b/*.parquet"`,
+    `` `file:///d/x.csv` ``) or a quoted path (`"/d/x"."csv"`) read the object or file with the
+    node's credentials, while the access check saw a table a wildcard read grant (`*.*.* RO`,
+    `<db>.*.* RO`) admits: a raw read of the pool's DuckLake data files, past any row policy.
+    Refused now: a name with a part holding `/`, `\`, `*`, `?`, `[` or `{` (a URL's `://`
+    included). A real table named like one (`"data_*"`) is unreachable for tenant principals;
+    rename it. Known gap: an unquoted relative file name (`x.parquet`, schema `x` and table
+    `parquet` not found) is still read as a file under a wildcard read grant.
+  - BREAKING for quoted names JSqlParser misreads: the quoted-identifier screen no longer lists
+    characters but reads each quoted name back through the access check's parser and refuses it
+    unless that reading is the name DuckDB reads. Newly refused: square brackets (`"[secret]"`,
+    `"secret]"` were checked as `secret` while DuckDB reads the table `[secret]`) and a quote of
+    the other style at a name's edge. A re-validated rewrite is screened only for the quoted names
+    the caller wrote, so a star expansion over a column named `a@b` is no longer refused; a star
+    over a column whose name holds a dot is refused under column policies (the rewrite could only
+    print it as another column).
+  - The dbt shape `WITH customer AS (SELECT * FROM customer) SELECT c_email FROM customer` is
+    masked instead of refused for a principal with a column policy.
+  - BREAKING: tenant users can no longer read or write files by path; a superuser or a
+    federated source must do it. Whenever the ACL validates (QoD grants or OPA), a tenant-scoped
+    principal, `*.*.* ALL` included, is refused file-reading table functions (`read_parquet`,
+    `read_csv`, `read_json`, `glob`, `read_text`, `parquet_metadata`, `iceberg_scan`, ...), a
+    path or URL in a table position (`FROM 'x.parquet'`, `JOIN 's3://..'`, `FROM "s3://.."`),
+    `COPY` to or from a path, `EXPORT` / `IMPORT DATABASE`, `ATTACH`, and `sql_auto_complete`
+    (it lists node directories). These were "unsupported constructs" a `*.*.* ALL` grant
+    covered, so a tenant user (the built-in `qod_all_tables` role is `*.*.* ALL`) could read
+    anything the node's process and secrets reach (another tenant's DuckLake data files, the
+    node's disk) and write files with COPY. A statement that parses is judged from the parse (a
+    keyword used as an alias, `FROM range(1) AS values, '/etc/x.csv'`, no longer hides the file
+    after it; `x IS DISTINCT FROM 'y'` is a value, not a file); one that does not parse is judged
+    lexically and conservatively (any string literal after FROM, JOIN, USING, TABLE, a comma or
+    such an opening parenthesis is refused). A quoted name part holding a glob character
+    (`"*".csv`, `"data_*"`) is refused whatever its position or extension (a conservative
+    refusal: DuckDB reads `"data_*"` without an extension as a table name). Superusers, an
+    ACL turned off, the native front door's client data (`scan_data_from_quack_client`),
+    federated and Iceberg catalogs read by table name are unchanged.
+  - BREAKING: tenant users can no longer install extensions or set path-resolution settings, ACL
+    on or off. `INSTALL` (any form), `FORCE INSTALL`, `UPDATE EXTENSIONS` and `LOAD` from a path
+    or URL are reserved to superusers (install at node start; `LOAD httpfs` by its bare name still
+    works), and so are `file_search_path` (`SET file_search_path = '/etc'; SELECT * FROM x.csv`
+    read /etc/x.csv), `home_directory`, `allow_asterisks_in_http_paths`, `ca_cert_file` and the
+    server certificate verification settings, all GLOBAL on DuckDB 2.0. tpch's `dbgen` (creates
+    and fills tables in any catalog at any scale) is reserved to superusers too. Known gap: only
+    lockdown turns off `autoinstall_known_extensions`, so off lockdown a function call or a bare
+    `LOAD` of a known extension still installs it.
+  - `shell_history()` is refused to every caller, superusers included: before this release a
+    node's init SQL reached its DuckDB CLI through stdin, so the history held the object-store
+    secret keys, the catalog password and the node token, readable by any tenant user with
+    `*.*.* ALL`, and by everyone with the ACL off. The init SQL now goes through `-init`, which the
+    CLI does not record (see the `shell_history()` entry above); the refusal stays as defense in
+    depth.
+  - BREAKING: tenant users can no longer read node state, ACL on or off: `duckdb_secrets()`,
+    `which_secret()`, `whoami()`, `duckdb_settings()` / `pg_settings` and `current_setting()`
+    (except over a session setting such as `TimeZone` or `search_path`), `duckdb_logs*`,
+    `duckdb_log_contexts`, `duckdb_external_file_cache`, `duckdb_temporary_files`,
+    `duckdb_databases` / `PRAGMA database_list`, `duckdb_extensions` / `PRAGMA
+    extension_versions`, `duckdb_extension_repositories`, `duckdb_external_resources` and
+    `pragma_storage_info` are reserved to superusers. They showed credentials or their names
+    (`key_id`, hosts, users, unredacted `s3_secret_access_key`), other sessions' statements and
+    file paths, and the node's own paths. `duckdb_settings()` is refused rather than filtered, its
+    values being reachable through `current_setting()` with a computed name.
+  - DuckDB 2.0's `histogram()` / `histogram_values()` table macros run `query_table(source)` in
+    their body, so `SELECT * FROM histogram('/etc/x.csv', b)` read any file, and
+    `histogram('<table>', col)` any table (a row-policy table unfiltered), for a `*.*.* ALL` tenant
+    and on a lockdown pool with the ACL off. Every 2.0 macro is now judged by its body: these two
+    are refused in a table position (the aggregate `histogram(expr)` in a select list stays
+    admitted), and `duckdb_profiling_settings()` (a macro over `duckdb_settings`) is reserved to
+    superusers.
+  - `pg_get_viewdef(oid)` and `pg_get_constraintdef(oid)` (DuckDB 2.0 macros over
+    `duckdb_views()` / `duckdb_constraints()`, outside the metadata filter) printed the SQL of every
+    view and every CHECK expression of the node to any principal enumerating oids. They now need the
+    unrestricted `*.*.* ALL` grant, like a direct read of those listings (refused under OPA).
+  - On a lockdown pool, a file in table position is judged like a tenant's: from the parse when the
+    statement parses, conservatively otherwise. A keyword used as an alias no longer hides a local
+    file after the next comma (`FROM range(1) AS values, '/etc/x.csv'`), and a relative path
+    (`FROM 'x.csv'`) or a quoted glob (`FROM "*".csv`) is denied; remote object-store URLs stay
+    admitted outside the DuckLake buckets.
+  - An alias column list on a parenthesized FROM item holding a table with a column policy
+    (`(customer) AS c(a, b, e)`, `(customer JOIN orders ..) AS j(..)`) is refused like one on
+    the table itself: it renamed a masked column out of the policy's reach.
+
+- **Fixed: an unaliased expression over a masked column no longer fails under column policies.**
+  For a user with a column mask, a query projecting a masked column through an unaliased
+  expression (`SELECT min(c_phone) FROM customer`, `c_phone || 'x'`) failed on FlightSQL with
+  `Binder Error: Values list "_qod_probe" does not have a column named "min"`, and so did any
+  `SELECT * FROM (<such a query>) s`: the column-policy rewrite expanded a star over a derived
+  table under its own name for the unaliased column, which DuckDB does not bind. A star over
+  derived tables only is now kept as written; the derived tables are masked inside it.
+
+- **Fixed: native front door transactions survive a client pause.** Client heartbeats now reach an
+  open transaction's node connection too, so a statement after an idle pause longer than the
+  node lease no longer fails with "Connection heartbeat lease expired".
+
+- **Fixed: a slow-starting local node is no longer respawned into an orphan.** The local runtime
+  records a node as soon as its process starts, before it listens. A reconcile pass in that window
+  (more likely with a slow init SQL or a short `QOD_RECONCILE_INTERVAL_SEC`) read the node as dead
+  and started a second process under the same node id without stopping the first, which kept
+  running untracked, held its port and outlived the manager. A node whose process is alive now
+  counts as starting for 120 s after its spawn, and replacing a node stops its old process first,
+  including one an earlier manager left running. A node's process is recognized by its start time,
+  not its pid alone, so a pid reused by another process after a restart is never adopted or
+  signalled; such a process's port is kept out of new nodes until it exits, with a warning naming
+  the pid. Kubernetes and fleet nodes were not affected: their
+  start returns only once the node is ready, and a pod name or fleet assignment is unique per id.
+
+- **Security: a batched `USE` or `SET search_path` no longer reaches tables outside a user's
+  grants.** The access check resolves a bare table name against the pool's default schema, but a
+  `USE`, `SET search_path`, `SET schema` (any spelling, including `SET SESSION`, `TO`, `PRAGMA
+  search_path`, `RESET`, a backtick-quoted name and the `SET` an `EXPLAIN ANALYZE` carries) in the
+  same request moved the node elsewhere first, so
+  `SET search_path='db.other'; SELECT * FROM t` read `db.other.t` with a grant on the default
+  schema's `t` only, over FlightSQL and the native front door alike. For ACL-checked users such a
+  batch is now refused: send `USE` / `SET search_path` as its own statement, which works as
+  before. Superusers are unaffected. Every multi-statement request now also starts from the pool's
+  default schema, even when it opens with `BEGIN` or `SET`; one opening with `ROLLBACK` / `COMMIT`
+  switches to it right after that statement, so a rollback out of a failed transaction still runs.
+
+- **Security (DuckDB 1.x builds only): a backtick outside a string or comment is refused for
+  ACL-checked users, users with column or row policies, on lockdown pools and on pools with a
+  read-only catalog.** On DuckDB 1.5 a backtick is an operator, not an identifier quote, so with a
+  macro named after it the text between two backticks runs: statement separators and function
+  calls there were hidden from the access checks. The screen is keyed on the DuckDB version the
+  build pins and is inert on DuckDB 2.0, where a backtick quotes an identifier and the edge's lexer
+  reads it as one. On 2.0 the edge renders a backtick-quoted identifier as the equivalent
+  double-quoted one before the access checks and the column and row policy rewriters see the
+  statement, so a backtick-quoted table or column is masked and filtered like its double-quoted
+  twin.
+
+- **Security: `SET VARIABLE` can no longer read a table without a grant.** Its value is a query,
+  so `SET VARIABLE x = (SELECT ... FROM any_table); SELECT getvariable('x')` returned rows from any
+  table the node could reach, with no grant at all: the `SET` passed as table-free control flow.
+  A `SET` whose value reads a table is now denied unless the user holds the unrestricted `ALL`
+  grant; `SET VARIABLE x = 42` still works.
+
+- **Security: a subquery passed straight to a function is access-checked.** DuckDB's
+  `ARRAY(SELECT ... FROM t)` hands its subquery to the function without parentheses of its own, and
+  the access check skipped such a subquery entirely, so the statement needed no grant on `t` at all.
+  A subquery passed as a function argument is now access-checked like any other read; one inside
+  a table function's argument is refused as an unsupported construct.
+
 - **`qod admin reset-password` never starts Postgres.** It used to start the `qod serve` embedded
   Postgres on demand whenever that data dir existed and `QOD_PG_HOST` was unset, so a data dir left
   by an earlier `qod serve` captured the default: on a machine running `qod start` against its own
@@ -17,9 +771,11 @@
   `forgot-password`, `reset-password`) now show the server's message.
 
 - **The boot banner shows the node lockdown state.** A new `NODE LOCKDOWN` line sits under
-  `SQL ACL`. Lockdown is off by default, and without it a tenant can ATTACH, INSTALL, read local
-  files and the node environment (catalog password, object-store keys, federation secrets), which
-  nothing on screen said. The line counts unlocked pools, so a per-pool `lockdown: off` under a
+  `SQL ACL`. Lockdown is off by default, and without it (and with the ACL off) a tenant can ATTACH,
+  LOAD and autoinstall extensions, and read local files, including the node's secret files on
+  Kubernetes, and the cloud SDK variables (`AWS_*`, `AZURE_*`, `GOOGLE_*`) a node inherits, which
+  nothing on screen said. The catalog password and the federation and object-store secrets are no
+  longer in the node environment (see the `QOD_SECRETS_DIR` entry above). The line counts unlocked pools, so a per-pool `lockdown: off` under a
   global `QOD_NODE_LOCKDOWN=true` shows up too.
 
 ## 0.9.11
