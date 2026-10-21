@@ -21,7 +21,7 @@
                         a build when distrib\ is empty).
 
   Boot extras (parity with run-jar.sh):
-    - DuckDB CLI + libduckdb self-install (windows-amd64) onto PATH
+    - DuckDB CLI + libduckdb self-install (windows-amd64 or windows-arm64) onto PATH
     - Postgres reachability probe + PG16 version gate (when psql present)
     - NUKE=1 teardown (drop control-plane + demo tenant-db DBs, wipe local dirs)
     - idempotent CREATE DATABASE of the control-plane DB
@@ -103,7 +103,7 @@ function Get-EnvOr([string]$Name, [string]$Default) {
   return $v
 }
 
-# ---- DuckDB CLI + libduckdb self-install (windows-amd64) ------------------
+# ---- DuckDB CLI + libduckdb self-install (windows-amd64 / windows-arm64) --
 function Resolve-DuckDbVersion {
   if (-not [string]::IsNullOrEmpty($env:DUCKDB_VERSION)) { return $env:DUCKDB_VERSION }
   $buildSbt = Join-Path $RepoDir 'build.sbt'
@@ -114,8 +114,27 @@ function Resolve-DuckDbVersion {
   return '2.0.0'
 }
 
+# The DuckDB build must match the JVM's architecture, not only the OS's: the JVM loads the
+# libquackwire native for its own os.arch (windows-x86_64 or windows-aarch64), and that native
+# loads duckdb.dll into the same process. An x64 JVM emulated on an ARM64 host needs x64 DuckDB.
+function Resolve-DuckDbPlatform {
+  $java = if (-not [string]::IsNullOrEmpty($env:JAVA_HOME)) { Join-Path $env:JAVA_HOME 'bin\java.exe' } else { 'java' }
+  $arch = $null
+  if (Get-Command $java -ErrorAction SilentlyContinue) {
+    $props = & { $ErrorActionPreference = 'Continue'; & $java -XshowSettings:properties -version 2>&1 }
+    $line = $props | ForEach-Object { "$_" } | Where-Object { $_ -match '^\s*os\.arch\s*=' } | Select-Object -First 1
+    if ($line -match '=\s*(\S+)') { $arch = $Matches[1] }
+  }
+  if (-not $arch) {
+    $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+  }
+  if ("$arch" -match '^(aarch64|arm64)$') { return 'windows-arm64' }
+  return 'windows-amd64'
+}
+
 function Install-DuckDb {
   $version = Resolve-DuckDbVersion
+  $plat = Resolve-DuckDbPlatform
   $cacheRoot = if ([string]::IsNullOrEmpty($env:DUCKDB_CACHE_DIR)) { Join-Path $RepoDir '.duckdb' } else { $env:DUCKDB_CACHE_DIR }
   $cache  = Join-Path $cacheRoot $version
   $binDir = Join-Path $cache 'bin'
@@ -136,22 +155,22 @@ function Install-DuckDb {
     }
   }
 
-  Write-Host "duckdb: installing v$version (windows-amd64) into $cache"
+  Write-Host "duckdb: installing v$version ($plat) into $cache"
   New-Item -ItemType Directory -Force -Path $binDir, $libDir | Out-Null
   $base = "https://github.com/duckdb/duckdb/releases/download/v$version"
   $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ("qod-duckdb-" + [System.Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   try {
     # DuckDB 2.x release assets are flat .tar.gz archives; tar.exe ships with Windows 10 1803+.
-    Write-Host "  fetching CLI from $base/duckdb-cli-windows-amd64.tar.gz"
-    Invoke-WebRequest -Uri "$base/duckdb-cli-windows-amd64.tar.gz" -OutFile "$tmp\cli.tar.gz"
+    Write-Host "  fetching CLI from $base/duckdb-cli-$plat.tar.gz"
+    Invoke-WebRequest -Uri "$base/duckdb-cli-$plat.tar.gz" -OutFile "$tmp\cli.tar.gz"
     tar -xzf "$tmp\cli.tar.gz" -C $binDir
-    if ($LASTEXITCODE -ne 0) { throw "failed to unpack $base/duckdb-cli-windows-amd64.tar.gz" }
+    if ($LASTEXITCODE -ne 0) { throw "failed to unpack $base/duckdb-cli-$plat.tar.gz" }
 
-    Write-Host "  fetching libduckdb from $base/duckdb-shared-libs-windows-amd64.tar.gz"
-    Invoke-WebRequest -Uri "$base/duckdb-shared-libs-windows-amd64.tar.gz" -OutFile "$tmp\lib.tar.gz"
+    Write-Host "  fetching libduckdb from $base/duckdb-shared-libs-$plat.tar.gz"
+    Invoke-WebRequest -Uri "$base/duckdb-shared-libs-$plat.tar.gz" -OutFile "$tmp\lib.tar.gz"
     tar -xzf "$tmp\lib.tar.gz" -C $libDir
-    if ($LASTEXITCODE -ne 0) { throw "failed to unpack $base/duckdb-shared-libs-windows-amd64.tar.gz" }
+    if ($LASTEXITCODE -ne 0) { throw "failed to unpack $base/duckdb-shared-libs-$plat.tar.gz" }
     # duckdb.dll must sit next to the CLI too so `duckdb.exe` starts standalone.
     $srcDll = Join-Path $libDir 'duckdb.dll'
     if (Test-Path $srcDll) { Copy-Item $srcDll (Join-Path $binDir 'duckdb.dll') -Force }

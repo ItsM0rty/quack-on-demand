@@ -126,8 +126,8 @@ lazy val root = (project in file("."))
     // retired Maven classifier jars produced, so QuackNativeBridge's
     // getResourceAsStream("/native/<platform>/...") lookup is unchanged.
     // Mandatory platforms fail the build when absent so an incomplete
-    // checkout cannot produce a silently-broken uber-jar; Windows rides in
-    // whenever its dll is present (no env flag).
+    // checkout cannot produce a silently-broken uber-jar; each Windows dll
+    // (x86_64, aarch64) rides in whenever present (no env flag).
     Compile / resourceGenerators += Def.task {
       val srcRoot   = baseDirectory.value / "libquackwire" / "binaries"
       val outRoot   = (Compile / resourceManaged).value / "native"
@@ -137,7 +137,7 @@ lazy val root = (project in file("."))
         "osx-x86_64"    -> "libquackwire.dylib",
         "osx-aarch64"   -> "libquackwire.dylib"
       )
-      val optional = Seq("windows-x86_64" -> "quackwire.dll")
+      val optional = Seq("windows-x86_64" -> "quackwire.dll", "windows-aarch64" -> "quackwire.dll")
       val missing  = mandatory.filterNot { case (p, f) => (srcRoot / p / f).exists }
       if (missing.nonEmpty)
         sys.error(

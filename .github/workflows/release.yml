@@ -119,7 +119,7 @@ jobs:
       - name: sbt assembly
         env:
           SBT_OPTS: "-Xss8M -Xmx5g -XX:+UseG1GC"
-        # All five platform natives (incl. windows-x86_64/quackwire.dll) come
+        # All six platform natives (incl. windows-{x86_64,aarch64}/quackwire.dll) come
         # from the vendored libquackwire/binaries/ tree automatically; the
         # old QOD_WITH_WINDOWS_NATIVE opt-in flag is retired.
         run: sbt --no-colors assembly

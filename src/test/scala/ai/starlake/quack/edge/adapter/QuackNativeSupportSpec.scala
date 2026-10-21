@@ -17,7 +17,7 @@ class QuackNativeSupportSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "not see a native for a platform with no bundled binary" in {
-    QuackNativeSupport.available("windows-aarch64", "quackwire.dll") shouldBe false
+    QuackNativeSupport.available("linux-riscv64", "libquackwire.so") shouldBe false
   }
 
   "QuackNativeSupport.bootCheck" should "pass when the native is bundled and loads" in {

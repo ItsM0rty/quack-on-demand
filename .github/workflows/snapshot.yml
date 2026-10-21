@@ -26,7 +26,7 @@ on:
   push:
     branches: [main]
   # Auto-rebuild after every successful `quackwire native build`. libquackwire's
-  # 5 platform binaries (linux x2, macOS x2, windows-x86_64) are vendored under
+  # 6 platform binaries (linux x2, macOS x2, windows x2) are vendored under
   # libquackwire/binaries/ and bundled into the manager assembly at build time,
   # so a refreshed binary (same libquackwireVersion, new content after a
   # rebuild) only reaches users once we rebuild the assembly + docker image.

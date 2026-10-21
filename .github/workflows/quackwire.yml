@@ -237,22 +237,41 @@ jobs:
           retention-days: 30
 
   # -----------------------------------------------------------------------
-  # 1b. Windows native build (MSVC) -> quackwire.dll
+  # 1b. Windows native builds (MSVC) -> quackwire.dll, x64 and ARM64
   # -----------------------------------------------------------------------
-  # Separate job (not a matrix row) because the toolchain is MSVC + a
-  # hand-assembled DUCKDB_HOME rather than a system package. Produces the
+  # Separate job (not rows of the Unix matrix) because the toolchain is MSVC +
+  # a hand-assembled DUCKDB_HOME rather than a system package. Produces the
   # un-prefixed `quackwire.dll` (System.mapLibraryName has no "lib" prefix on
-  # Windows), uploaded as quackwire-windows-x86_64 alongside the four Unix
-  # artifacts so scripts/release/refresh-quackwire-binaries.sh's `quackwire-*` glob
-  # picks it up when it downloads from the latest green run on main.
+  # Windows), uploaded as quackwire-windows-<arch> alongside the four Unix
+  # artifacts so scripts/release/refresh-quackwire-binaries.sh's `quackwire-*`
+  # glob picks them up. ARM64 builds natively on the windows-11-arm runner
+  # (the configure-time probe runs duckdb.dll, so no cross-compile); the dll
+  # must match the JVM's architecture, which loads it next to duckdb.dll.
   build-windows:
-    name: build windows-x86_64
+    name: build ${{ matrix.platform }}
     needs: pin
-    runs-on: windows-2022
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     env:
       DUCKDB_VERSION: ${{ needs.pin.outputs.duckdb }}
       LIBQUACKWIRE_VERSION: ${{ needs.pin.outputs.libquackwire }}
+      DUCKDB_PLATFORM: ${{ matrix.duckdb_platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: windows-x86_64
+            duckdb_platform: windows-amd64
+            cmake_arch: x64
+            java_distribution: temurin
+            java_arch: x64
+          - runner: windows-11-arm
+            platform: windows-aarch64
+            duckdb_platform: windows-arm64
+            cmake_arch: ARM64
+            java_distribution: microsoft
+            java_arch: aarch64
     steps:
       - name: Checkout (with duckdb-quack submodule)
         uses: actions/checkout@v7
@@ -262,8 +281,9 @@ jobs:
       - name: Set up JDK 21 (for jni.h / jni_md.h win32)
         uses: actions/setup-java@v5
         with:
-          distribution: temurin
+          distribution: ${{ matrix.java_distribution }}
           java-version: '21'
+          architecture: ${{ matrix.java_arch }}
 
       # Assemble DUCKDB_HOME the way CMakeLists.txt expects: duckdb.lib + the
       # FULL include tree. The release archive ships only the C headers; the
@@ -280,8 +300,8 @@ jobs:
           tmp="$(mktemp -d)"
           mkdir -p "$tmp/dl"
           curl -fsSL -o "$tmp/libduckdb.tar.gz" \
-            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/duckdb-shared-libs-windows-amd64.tar.gz" \
-            || { echo "::error::no DuckDB v$DUCKDB_VERSION release archive duckdb-shared-libs-windows-amd64.tar.gz (not released yet?)"; exit 1; }
+            "https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/duckdb-shared-libs-$DUCKDB_PLATFORM.tar.gz" \
+            || { echo "::error::no DuckDB v$DUCKDB_VERSION release archive duckdb-shared-libs-$DUCKDB_PLATFORM.tar.gz (not released yet?)"; exit 1; }
           tar -xzf "$tmp/libduckdb.tar.gz" -C "$tmp/dl"
           cp "$tmp/dl/duckdb.lib" "$home/lib/duckdb.lib"
           cp "$tmp/dl/duckdb.dll" "$home/lib/duckdb.dll"
@@ -296,7 +316,7 @@ jobs:
 
       - name: CMake configure (Visual Studio 2022)
         working-directory: native/quackwire
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DDUCKDB_HOME="$env:DUCKDB_HOME"
+        run: cmake -B build -A ${{ matrix.cmake_arch }} -DCMAKE_BUILD_TYPE=Release -DDUCKDB_HOME="$env:DUCKDB_HOME"
 
       - name: CMake build (Release)
         working-directory: native/quackwire
@@ -323,11 +343,22 @@ jobs:
           source ../../../../scripts/release/quackwire-build-info.sh
           quackwire_build_marker quackwire.dll
           quackwire_check_build_marker quackwire.dll "$LIBQUACKWIRE_VERSION"
+          # The PE machine type must be the leg's architecture (8664 x64,
+          # aa64 ARM64): a dll for the other one fails System.load in the JVM.
+          pe=$(od -An -t u4 -j 60 -N 4 quackwire.dll | tr -d ' ')
+          machine=$(od -An -t x2 -j $((pe + 4)) -N 2 quackwire.dll | tr -d ' ')
+          case "${{ matrix.cmake_arch }}" in
+            x64)   want=8664 ;;
+            ARM64) want=aa64 ;;
+          esac
+          echo "PE machine: $machine"
+          [[ "$machine" == "$want" ]] \
+            || { echo "::error::quackwire.dll is PE machine $machine, expected $want for ${{ matrix.platform }}"; exit 1; }
 
       - name: Upload native artifact
         uses: actions/upload-artifact@v7
         with:
-          name: quackwire-windows-x86_64
+          name: quackwire-${{ matrix.platform }}
           path: native/quackwire/build/Release/quackwire.dll
           if-no-files-found: error
           retention-days: 30

@@ -16,15 +16,16 @@ one file per supported platform:
 | `osx-x86_64`      | `libquackwire.dylib`  |
 | `osx-aarch64`     | `libquackwire.dylib`  |
 | `windows-x86_64`  | `quackwire.dll`       |
+| `windows-aarch64` | `quackwire.dll`       |
 
 Each binary ships with a `.sha256` companion, and `binaries/VERSION`
 stamps the version all of them were built at. `build.sbt`'s
 resourceGenerator copies these into the assembly at
 `native/<platform>/<lib>` on every `sbt compile`/`sbt assembly` - no
 Maven coordinate, no classifier jars, no publish step. The first four
-platforms are mandatory (the build fails without them); the Windows
-dll rides in automatically whenever it is present, no env flag
-required.
+platforms are mandatory (the build fails without them); each Windows
+dll (x86_64, aarch64) rides in automatically whenever it is present, no
+env flag required.
 
 Refreshed by `scripts/release/refresh-quackwire-binaries.sh`: it rebuilds the
 host platform locally via CMake and downloads the rest from the latest

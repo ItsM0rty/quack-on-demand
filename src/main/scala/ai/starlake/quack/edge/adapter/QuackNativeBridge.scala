@@ -152,8 +152,8 @@ object QuackNativeBridge:
 
 /** Classpath probe and load gate for the bundled libquackwire native, the manager's only client to
   * its nodes. Deliberately separate from [[QuackNativeBridge]]: touching that object triggers the
-  * JNI load at init, which must not happen on a platform with no bundled binary (Windows on ARM64,
-  * until it gets a build).
+  * JNI load at init, which must not happen on a platform with no bundled binary (one NativeLoader
+  * does not know, or a jar assembled without that platform's binary).
   *
   * Main runs [[bootCheck]] early in boot, so a platform with no bundled binary, or one whose
   * bundled native cannot load (an old glibc, a missing MSVC runtime, libduckdb not found) or was
@@ -479,8 +479,8 @@ private object NativeLoader:
     else "libquackwire.so"
 
   def loadFromResources(resourcePath: String): Unit =
-    // Resolved before the preload: a platform with no bundled native (Windows on ARM64) has
-    // nothing to preload libduckdb for.
+    // Resolved before the preload: a platform with no bundled native has nothing to preload
+    // libduckdb for.
     val resource = Option(getClass.getResourceAsStream(resourcePath))
       .getOrElse(sys.error(s"libquackwire resource not found: $resourcePath"))
     // libquackwire links libduckdb dynamically. Loading the pinned one first lets the dynamic

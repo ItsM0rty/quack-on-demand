@@ -4,8 +4,8 @@
 
 - **DuckDB 2.0.** Engine, nodes and JDBC move to DuckDB v2.0.0 (`org.duckdb:duckdb_jdbc:2.0.0.0`
   from Maven Central) and Quack protocol v3, with duckdb-quack at `f96420ed`, the commit the v2.0.0
-  quack extension ships. All five libquackwire natives (linux-x86_64, linux-aarch64, osx-x86_64,
-  osx-aarch64, windows-x86_64) are rebuilt against the release. DuckDB 2.x renamed its release assets: `run-jar.sh`,
+  quack extension ships. All six libquackwire natives (linux-x86_64, linux-aarch64, osx-x86_64,
+  osx-aarch64, windows-x86_64, windows-aarch64) are built against the release. DuckDB 2.x renamed its release assets: `run-jar.sh`,
   `run-jar.ps1`, the qod CLI and the images download `duckdb-cli-<platform>.tar.gz` and
   `duckdb-shared-libs-<platform>.tar.gz` (1.x shipped `.zip`s), so they need `tar` instead of
   `unzip`.
@@ -374,9 +374,11 @@
   (an in-process DuckDB running `quack_query` over JDBC, behind a JVM-wide mutex) is gone, since
   the DuckDB 2.0 JDBC disables the Arrow export it needed. `QOD_NATIVE_CLIENT` and
   `QOD_NODE_DISABLE_SSL` (which only the fallback read) are removed and ignored if still set, and
-  so is the Helm value `quackNode.tls.enabled`. A manager whose platform has no bundled
-  libquackwire (Windows on ARM64 for now), or whose native cannot load (for instance libduckdb not
-  found), refuses to boot with a message naming the platform, the expected
+  so is the Helm value `quackNode.tls.enabled`. Windows on ARM64, which only ran on that fallback,
+  gets its own native (`windows-aarch64/quackwire.dll`, built on GitHub's Windows ARM runner): run
+  it with an ARM64 JVM, which `qod start` downloads, and `run-jar.ps1` fetches the windows-arm64
+  DuckDB whenever the JVM's `os.arch` is aarch64. A manager whose platform has no bundled
+  libquackwire, or whose native cannot load (for instance libduckdb not found), refuses to boot with a message naming the platform, the expected
   `libquackwire/binaries/<platform>/` binary and `DUCKDB_CACHE_DIR`, instead of falling back. The
   demo no longer pins the fallback either.
   Every native now carries a build marker (Quack protocol, DuckDB version and source id,

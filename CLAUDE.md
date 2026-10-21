@@ -32,10 +32,12 @@ closed, and a `.shell` dot-command waiting on the wrapper's pid keeps DuckDB ali
 as the bash script's FIFO-fed `-init` does). Teardown uses `taskkill /T` so
 the `duckdb.exe` grandchild dies with its wrapper. The native `quackwire.dll` is
 bundled automatically whenever `libquackwire/binaries/windows-x86_64/quackwire.dll`
-exists in the checkout. The native client is the manager's only client to its nodes (the embedded
+(and `windows-aarch64/quackwire.dll` for Windows on ARM64) exists in the checkout; the
+JVM loads the one for its own `os.arch`, so an ARM64 host needs an ARM64 JVM and the
+windows-arm64 DuckDB (`run-jar.ps1` picks the DuckDB build from the JVM's `os.arch`). The native client is the manager's only client to its nodes (the embedded
 JDBC fallback, `QOD_NATIVE_CLIENT` and `QOD_NODE_DISABLE_SSL` were dropped with DuckDB 2.0, whose
 JDBC disables Arrow export): `QuackNativeSupport.bootCheck` loads it early in `Main.bootManager`
-and a platform with no bundled binary (Windows ARM64 until it gets a build) or a native that
+and a platform with no bundled binary or a native that
 cannot load refuses to boot, naming `os.name`/`os.arch`, the expected
 `libquackwire/binaries/<platform>/` file and the `DUCKDB_CACHE_DIR` hint.
 Each libquackwire binary embeds `quackwire-build-info:protocol=..;duckdb=..;duckdb_source=..;quack=..`

@@ -125,8 +125,8 @@ verify_quackwire_binaries() {
   [[ ${#missing[@]} -eq 0 ]] \
     || { echo "missing vendored libquackwire binaries: ${missing[*]}. Run scripts/release/refresh-quackwire-binaries.sh." >&2; return 1; }
 
-  # windows-x86_64/quackwire.dll rides along whenever present; only its
-  # checksum is verified below, same as every other platform's binary.
+  # windows-{x86_64,aarch64}/quackwire.dll ride along whenever present; when
+  # present they are verified below like every other platform's binary.
   local f
   for f in libquackwire/binaries/*/libquackwire.* libquackwire/binaries/*/quackwire.dll; do
     [[ -f "$f" && "$f" != *.sha256 ]] || continue
