@@ -163,7 +163,9 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
       val parsed = ParserInput
         .render(sql)
         .toOption
-        .flatMap(in => Try(CCJSqlParserUtil.parse(in.text)).toOption.map(_ -> in.exact))
+        .flatMap(in =>
+          Try(ai.starlake.sql.JSqlStatements.parseFirst(in.text)).toOption.map(_ -> in.exact)
+        )
       parsed match
         case None                        => PassthroughParseFailed
         case Some((stmt: Select, exact)) =>
@@ -270,6 +272,13 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
             TableExtractor
               .tableStatementSources(f)
               .filter(_.exists(_.forall(t => matchingPolicies(t, eff, ctx).nonEmpty)))
+              .foreach(_ => throw new Refusal(TableStatementRefusal))
+          case ts: net.sf.jsqlparser.statement.select.TableStatement =>
+            // JSqlParser 5.4.16x reads `TABLE t` as a statement wherever it appears (`x = ANY
+            // (TABLE t)`, `IN (TABLE t)`, `FROM (TABLE t)`, the whole statement): t has no FROM
+            // slot to wrap while DuckDB reads every row of it. Refused when t carries a policy.
+            Option(ts.getTable)
+              .filter(t => matchingPolicies(t, eff, ctx).nonEmpty)
               .foreach(_ => throw new Refusal(TableStatementRefusal))
           case _ => ()
         // Only the reflective call is guarded (some jsqlparser getters cast `this` and throw on

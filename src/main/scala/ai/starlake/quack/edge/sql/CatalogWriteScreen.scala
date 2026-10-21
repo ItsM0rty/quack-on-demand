@@ -37,17 +37,20 @@ import java.util.Locale
   *      - If jsqlparser can split the submission into one node per statement, each result is judged
   *        on its own, using the `StatementKind` of ITS OWN snippet (not the submission's) -- see
   *        rule 4 below.
-  *      - If jsqlparser THROWS on the whole submission (e.g. `START TRANSACTION; INSERT ...;
-  *        COMMIT`, `CHECKPOINT; INSERT ...`), `SqlParser.extract`'s outer catch collapses the batch
-  *        into a SINGLE `ParseError` whose snippet is the ENTIRE submission -- there is no
-  *        per-statement snippet to judge. Trusting that collapsed snippet with rule 4 would reduce
-  *        to classifying the whole submission by its first token, which is the exact bypass this
-  *        screen exists to close. Detected by `result.statements.length < fragments.length`: the
-  *        screen falls back to judging the FRAGMENT list instead, and denies the whole submission
-  *        if ANY fragment looks write-shaped (rule 4's own `isWriteShaped`, applied per fragment).
-  *        Otherwise it admits, so a batch that merely happens to collapse (e.g. `BEGIN; PRAGMA
-  *        database_list; COMMIT`, which jsqlparser also swallows into one blank node) is not
-  *        blanket-denied just because it collapsed.
+  *      - `SqlParser.extract` parses statement by statement (`JSqlStatements.parseBatch`), so this
+  *        is the normal case. A ParseError there is judged on its original fragment too.
+  *      - If the submission still fails as a whole (its rendering is refused: up to jsqlparser
+  *        5.4.15 also `START TRANSACTION; INSERT ...; COMMIT`, `CHECKPOINT; INSERT ...`, which the
+  *        parser threw on), `SqlParser.extract`'s outer catch collapses the batch into a SINGLE
+  *        `ParseError` whose snippet is the ENTIRE submission -- there is no per-statement snippet
+  *        to judge. Trusting that collapsed snippet with rule 4 would reduce to classifying the
+  *        whole submission by its first token, which is the exact bypass this screen exists to
+  *        close. Detected by `result.statements.length < fragments.length`: the screen falls back
+  *        to judging the FRAGMENT list instead, and denies the whole submission if ANY fragment
+  *        looks write-shaped (rule 4's own `isWriteShaped`, applied per fragment). Otherwise it
+  *        admits, so a batch that merely happens to collapse (e.g. `BEGIN; PRAGMA database_list;
+  *        COMMIT`, which jsqlparser also swallows into one blank node) is not blanket-denied just
+  *        because it collapsed.
   *   4. The per-statement rule, for a statement with its own trustworthy snippet:
   *      - a statement that classifies `Dml` or `Ddl` is judged FAIL CLOSED: a parse error on it, a
   *        qualification error on it, an unsupported ref on it, or a resolved `Write`/`Ddl` access
@@ -338,8 +341,12 @@ object CatalogWriteScreen extends LazyLogging:
         }
 
       def denialFor(stmt: StatementResult): Option[String] = stmt match
-        case StatementResult.ParseError(_, snippet, msg) =>
-          if isWriteShaped(snippet) then
+        case StatementResult.ParseError(index, snippet, msg) =>
+          // The snippet is printed from the lexer-canonical rendering the parser read, which can
+          // hide the statement's head: `<U+00AD>INSERT ..` renders as the quoted identifier
+          // `"<U+00AD>INSERT"`. Its original fragment is judged too (the counts match here: the
+          // collapsed case is handled below), and either one write-shaped denies.
+          if isWriteShaped(snippet) || fragments.lift(index).exists(isWriteShaped) then
             Some(
               "write statement could not be parsed while a read-only catalog " +
                 s"($deniedList) is attached: $msg ($snippet)"

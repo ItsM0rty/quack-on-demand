@@ -147,8 +147,8 @@ final class ColumnPolicyRewriter(
     * window subqueries included, unlike jsqlparser's own traversal), so a policy-bearing table
     * hidden anywhere still reaches the resolver. Exactly one statement: `parse` truncates a batch
     * to its first statement, so a shortcut judged on a batch's head would forward its tail
-    * unmasked. The resolver below still parses only that first statement; what keeps a batch's
-    * tail from going out unmasked is the protected-write guard, which runs before this rewriter and
+    * unmasked. The resolver below still parses only that first statement; what keeps a batch's tail
+    * from going out unmasked is the protected-write guard, which runs before this rewriter and
     * analyses every statement of a multi-statement batch, denying it when any statement reads a
     * table under a column or row policy. Any other table function (`read_parquet`, ...) keeps the
     * fail-closed path, as does a catalog function beside a physical table.
@@ -180,7 +180,7 @@ final class ColumnPolicyRewriter(
     * closed (worst case: a denied metadata query, never a leak).
     */
   private def buildSchema(sql: String, ctx: SchemaContext): IO[Map[String, List[String]]] =
-    Try(CCJSqlParserUtil.parse(sql)) match
+    Try(ai.starlake.sql.JSqlStatements.parseFirst(sql)) match
       case Failure(_)            => IO.pure(Map.empty)
       case Success(stmt: Select) =>
         val tables = collectTables(stmt, ctx)

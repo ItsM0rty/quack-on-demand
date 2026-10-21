@@ -454,6 +454,24 @@ class JsqltranspilerRewriterSpec extends AnyFlatSpec with Matchers:
       "SELECT ARRAY(TABLE v_customer)"
     ).foreach(sql => withClue(sql)(outcome(sql) shouldBe a[RewriteOutcome.Denied]))
 
+  // JSqlParser 5.4.16x reads `TABLE t` as a statement in every position below (quantified
+  // comparisons included), where 5.4.15 rejected most of them: each reads every column raw.
+  it should "be denied wherever the parser reads it as a statement" in
+    List(
+      "SELECT 1 WHERE 'a@x' = ALL (TABLE customer)",
+      "SELECT 1 WHERE 'a@x' = SOME (TABLE customer)",
+      "SELECT 1 WHERE 'a@x' IN (TABLE customer)",
+      "SELECT 1 WHERE EXISTS (TABLE customer)",
+      "SELECT (TABLE customer)",
+      "TABLE customer"
+    ).foreach { sql =>
+      withClue(sql) {
+        // ParseFailed is denied by the router (fail-closed): the resolver cannot model a scalar
+        // TABLE subquery at all.
+        outcome(sql) should (be(a[RewriteOutcome.Denied]) or be(RewriteOutcome.ParseFailed))
+      }
+    }
+
   // ---- CTE visibility in the residual check -----------------------------------------------------
   //
   // A CTE body does not see its own name nor a later sibling's (DuckDB 2.0 binds both to the real

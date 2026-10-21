@@ -267,8 +267,8 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
   }
 
   it should "deny the full comment-blind witness batch (collapsed batch, comment-prefixed PREPARE/EXECUTE)" in {
-    // This is the robust witness from the review: VACUUM forces SqlParser.extract to throw on
-    // the whole submission (collapsing it to one ParseError), which routes judgment through the
+    // This is the robust witness from the review: VACUUM forced SqlParser.extract to throw on
+    // the whole submission (up to jsqlparser 5.4.15) (collapsing it to one ParseError), which routes judgment through the
     // fragment-list fallback rather than the per-statement path -- so this also proves the fix
     // reaches isWriteShaped when called from the P1 fallback, not just from the per-statement rule.
     // Mutation-tested: this DOES flip when the strip is removed from isPrepareOrExecute, because
@@ -278,7 +278,11 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // fragments collapse to one StatementResult.
     val batch =
       "VACUUM; /*x*/PREPARE p AS INSERT INTO sales_lake.main.orders VALUES (1); /*x*/EXECUTE p"
-    SqlParser.extract(batch, cfg).statements.length shouldBe 1
+    // Since jsqlparser 5.4.16x (JSqlStatements) the batch is parsed statement by statement, so
+    // it no longer collapses: each fragment is judged on the per-statement path, against its
+    // original text as well as the parser's rendering.
+    SqlParser.extract(batch, cfg).statements.length shouldBe
+      LockdownScreen.splitStatements(batch).length
     LockdownScreen.splitStatements(batch).length shouldBe 3
     val r = screen(batch)
     r.value should include("read-only")
@@ -349,7 +353,11 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // NBSP-prefixed, pinning that normalization runs per-fragment through the P1 fallback and not
     // only on a lone single-statement submission.
     val batch = "VACUUM; \u00A0INSERT INTO sales_lake.main.orders VALUES (1)"
-    SqlParser.extract(batch, cfg).statements.length shouldBe 1
+    // Since jsqlparser 5.4.16x (JSqlStatements) the batch is parsed statement by statement, so
+    // it no longer collapses: each fragment is judged on the per-statement path, against its
+    // original text as well as the parser's rendering.
+    SqlParser.extract(batch, cfg).statements.length shouldBe
+      LockdownScreen.splitStatements(batch).length
     LockdownScreen.splitStatements(batch).length shouldBe 2
     val r = screen(batch)
     r.value should include("read-only")
@@ -360,8 +368,9 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // returned at the cheap path (step 2): every fragment classifies read-side without being
     // parsed, so isWriteShaped -- and therefore this commit's strip -- was never reached. It pinned
     // a pre-existing StatementClassifier property, not this fix, and its stated purpose was false.
-    // Pairing the read with VACUUM forces SqlParser.extract to throw on the whole submission,
-    // routing judgment through the P1 fragment-list fallback, where the /*x*/-prefixed SELECT
+    // Pairing the read with VACUUM forced SqlParser.extract to throw on the whole submission up to
+    // jsqlparser 5.4.15, routing judgment through the P1 fragment-list fallback (now the
+    // per-statement path, which judges the original fragment too), where the /*x*/-prefixed SELECT
     // fragment is actually judged by isWriteShaped with the strip live.
     // Mutation-tested: this DOES flip (Some) if isWriteShaped is changed to treat every
     // non-blank normalized snippet as write-shaped, confirming it now exercises the changed code.
@@ -451,7 +460,11 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // already-protected path; pairing with VACUUM (as the P1 witness above does) forces the
     // fragment-list fallback so the raw, un-reconstructed fragment is what gets judged.
     val batch = "VACUUM; INSERT\u00A0INTO sales_lake.main.orders VALUES (1)"
-    SqlParser.extract(batch, cfg).statements.length shouldBe 1
+    // Since jsqlparser 5.4.16x (JSqlStatements) the batch is parsed statement by statement, so
+    // it no longer collapses: each fragment is judged on the per-statement path, against its
+    // original text as well as the parser's rendering.
+    SqlParser.extract(batch, cfg).statements.length shouldBe
+      LockdownScreen.splitStatements(batch).length
     LockdownScreen.splitStatements(batch).length shouldBe 2
     val r = screen(batch)
     r.value should include("read-only")
@@ -461,19 +474,24 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     // DuckDB 2.0 reads U+00AD as an identifier character, so `a<U+00AD>$q$` and `b$q$` are CTE
     // names and the DELETE CTE runs (verified on the 2.0 CLI). Normalizing first turned the soft
     // hyphen into a space, opened a dollar-quoted string at `$q$` that closed inside `b$q$` and
-    // hid the DELETE from the classifier. VACUUM forces the fragment-list fallback.
+    // hid the DELETE from the classifier. VACUUM forced the fragment-list fallback up to jsqlparser
+    // 5.4.15.
     val batch =
       "VACUUM; WITH a\u00AD$q$ AS (DELETE FROM sales_lake.main.orders RETURNING 1), " +
         "b$q$ AS (SELECT 1) SELECT * FROM b$q$"
     LockdownScreen.splitStatements(batch).length shouldBe 2
-    SqlParser.extract(batch, cfg).statements.length shouldBe 1
+    // Since jsqlparser 5.4.16x (JSqlStatements) the batch is parsed statement by statement, so
+    // it no longer collapses: each fragment is judged on the per-statement path, against its
+    // original text as well as the parser's rendering.
+    SqlParser.extract(batch, cfg).statements.length shouldBe
+      LockdownScreen.splitStatements(batch).length
     screen(batch) should not be None
   }
 
   it should "still admit a read with interior trivia against a read-only catalog, via the parsed path" in {
     // Over-denial guard: this must reach the parsed per-statement path (denialFor), not just the
-    // cheap classify-only path at step 2 -- VACUUM forces the fragment-list fallback, and
-    // fragments.exists(isWriteShaped) must come back false for a read with interior trivia, not
+    // cheap classify-only path at step 2 -- VACUUM forced the fragment-list fallback up to
+    // jsqlparser 5.4.15 (the per-statement path now), and fragments.exists(isWriteShaped) must come back false for a read with interior trivia, not
     // true. Mutation-tested: flips to Some if isWriteShaped treats every non-blank normalized
     // snippet as write-shaped (the same mutation the leading-trivia read guard above pins).
     screen("VACUUM; SELECT\u00A0* FROM sales_lake.main.orders") shouldBe None
@@ -511,7 +529,7 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
   // jsqlparser's own `toString` re-renders a `PrepareStatement`/`Execute` node WITHOUT the
   // original comment -- confirmed by running the un-fixed code before this commit, which already
   // denied a bare `screen("/* a /* b */ c */ PREPARE p AS INSERT INTO sales_lake.main.orders
-  // VALUES (1)")`. The FRAGMENT-LIST fallback (forced by `VACUUM`, below) has no such
+  // VALUES (1)")`. The FRAGMENT-LIST fallback (forced by `VACUUM` up to jsqlparser 5.4.15) has no such
   // rescue: it calls `isWriteShaped` directly on the raw, comment-intact split fragment, and with
   // the pre-fix ordering this test's batch was ADMITTED (`None`) instead of denied -- confirmed by
   // running the un-fixed code before writing this test.
@@ -519,7 +537,11 @@ class CatalogWriteScreenSpec extends AnyFlatSpec with Matchers with OptionValues
     val batch =
       "VACUUM; /* a /* b */ c */ PREPARE p AS INSERT INTO sales_lake.main.orders VALUES (1); " +
         "/* a /* b */ c */ EXECUTE p"
-    SqlParser.extract(batch, cfg).statements.length shouldBe 1
+    // Since jsqlparser 5.4.16x (JSqlStatements) the batch is parsed statement by statement, so
+    // it no longer collapses: each fragment is judged on the per-statement path, against its
+    // original text as well as the parser's rendering.
+    SqlParser.extract(batch, cfg).statements.length shouldBe
+      LockdownScreen.splitStatements(batch).length
     LockdownScreen.splitStatements(batch).length shouldBe 3
     val r = screen(batch)
     r.value should include("read-only")

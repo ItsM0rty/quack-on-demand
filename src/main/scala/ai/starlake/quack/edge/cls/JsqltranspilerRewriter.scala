@@ -107,7 +107,9 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
       case Right(resolvedText) =>
         // None for a shape the resolver builds no result set for (the FROM-first `FROM t`): it
         // cannot be masked, so it fails closed below.
-        val rsMeta = Option(resolver.getResultSetMetaData(sql))
+        val rsMeta = Option(
+          resolver.getResultSetMetaData(ai.starlake.sql.JSqlStatements.firstText(sql))
+        )
         val projectionOrigins: IndexedSeq[(String, String)] = rsMeta.toIndexedSeq.flatMap { m =>
           (1 to m.getColumnCount).map { i =>
             (
@@ -118,7 +120,7 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
         }
 
         val parseAttempt: Either[RewriteOutcome, net.sf.jsqlparser.statement.Statement] =
-          try Right(CCJSqlParserUtil.parse(resolvedText))
+          try Right(ai.starlake.sql.JSqlStatements.parseFirst(resolvedText))
           catch case _: Throwable => Left(ParseFailed)
 
         parseAttempt match
@@ -171,7 +173,7 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
       metaData: JdbcMetaData,
       sql: String
   ): String =
-    val statement = CCJSqlParserUtil.parse(sql)
+    val statement = ai.starlake.sql.JSqlStatements.parseFirst(sql)
     statement match
       case select: Select =>
         val written =
@@ -206,8 +208,7 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
       si.getAlias == null && (si.getExpression match
         case star: AllColumns
             if star.getClass == classOf[AllColumns] || star.getClass == classOf[AllTableColumns] =>
-          Option(star.getExceptColumns).forall(_.isEmpty) &&
-          Option(star.getReplaceExpressions).forall(_.isEmpty)
+          StarExpansion.unmodified(star)
         case _ => false)
     StarExpansion.plainSelects(select).filter { ps =>
       val items = Option(ps.getSelectItems).map(_.asScala.toList).getOrElse(Nil)
@@ -234,7 +235,7 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
         // Scan the ORIGINAL text, not the resolved statement: the resolver
         // schema-qualifies CTE references (FROM x -> tpch1.x), which would defeat
         // the finder's own WITH-name exclusion and false-deny every CTE read.
-        val parsed = CCJSqlParserUtil.parse(originalSql)
+        val parsed = ai.starlake.sql.JSqlStatements.parseFirst(originalSql)
         val finder = new net.sf.jsqlparser.util.TablesNamesFinder()
         val list   = finder.getTableList(parsed)
         scala.jdk.CollectionConverters.ListHasAsScala(list).asScala.toList
@@ -900,8 +901,7 @@ private[cls] object ResidualColumns:
       case List(star: AllColumns)
           if Option(f.getMultipartName).exists(_.size == 1) &&
             Option(f.getName).exists(_.equalsIgnoreCase("count")) &&
-            Option(star.getExceptColumns).forall(_.isEmpty) &&
-            Option(star.getReplaceExpressions).forall(_.isEmpty) =>
+            StarExpansion.unmodified(star) =>
         Some(star)
       case _ => None
 
@@ -995,6 +995,11 @@ private[cls] object ResidualColumns:
       new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
     )
     var unknown = Option.empty[String]
+    // TABLE statements a FROM clause reads (`FROM (TABLE t)`), marked by identity when the walk
+    // reaches the select that holds them, which is before it reaches the statements themselves.
+    val inTablePosition = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[AnyRef, java.lang.Boolean]()
+    )
     def walk(node: AnyRef, scopes: List[Scope], ctes: Map[String, Option[Set[String]]]): Unit =
       if visited.add(node) then
         node match
@@ -1009,6 +1014,16 @@ private[cls] object ResidualColumns:
           case f: net.sf.jsqlparser.expression.Function
               if ai.starlake.acl.parser.TableExtractor.tableStatementSources(f).isDefined =>
             forms += (Form.TableStatement -> scopes)
+          // JSqlParser 5.4.16x reads `TABLE t` as a statement wherever it appears (`x = ANY (TABLE
+          // t)`, `IN (TABLE t)`, `EXISTS (TABLE t)`, `SELECT (TABLE t)`, `FROM (TABLE t)`), not as a
+          // flagged function: it reads every column of t raw. In a FROM clause, or as the whole
+          // statement, it is refused like `(TABLE t)` in table position (when t has a policy);
+          // anywhere else like a TABLE statement in expression position (always).
+          case ts: net.sf.jsqlparser.statement.select.TableStatement =>
+            if (ts eq root) || inTablePosition.contains(ts) then
+              val table = Option(ts.getTable).flatMap(t => Option(t.getName)).map(unquote)
+              forms += (Form.StatementSource(table) -> scopes)
+            else forms += (Form.TableStatement -> scopes)
           case f: net.sf.jsqlparser.expression.Function if isColumnsCall(f) =>
             forms += (Form.Expansion -> scopes)
           case f: net.sf.jsqlparser.expression.Function =>
@@ -1018,9 +1033,7 @@ private[cls] object ResidualColumns:
               if Option(ae.getName).exists(_.equalsIgnoreCase("count")) =>
             // `count(*) FILTER (..)` / `count(*) OVER (..)`
             ae.getExpression match
-              case star: AllColumns
-                  if Option(star.getExceptColumns).forall(_.isEmpty) &&
-                    Option(star.getReplaceExpressions).forall(_.isEmpty) =>
+              case star: AllColumns if StarExpansion.unmodified(star) =>
                 counted.add(star): Unit
               case _ => ()
           case k: net.sf.jsqlparser.expression.Function.KeywordArgument
@@ -1089,6 +1102,13 @@ private[cls] object ResidualColumns:
         val inner = fromItemsOf(node) match
           case Nil   => scopes
           case items => items.filter(_ != null).flatMap(sourcesOf(_, inCtes)) :: scopes
+        fromItemsOf(node).foreach {
+          case ps: ParenthesedSelect =>
+            ps.getSelect match
+              case ts: net.sf.jsqlparser.statement.select.TableStatement => inTablePosition.add(ts)
+              case _                                                     => ()
+          case _ => ()
+        }
         AstChildren.accessors(node.getClass).foreach { m =>
           AstChildren.read(m, node) match
             // A column's qualifier is not a table the statement reads.

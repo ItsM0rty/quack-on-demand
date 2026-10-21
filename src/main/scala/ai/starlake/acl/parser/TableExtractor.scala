@@ -468,6 +468,13 @@ private[parser] class TableExtractorVisitor:
             val onExpressions = j.getOnExpressions
             if onExpressions != null then onExpressions.asScala.foreach(visitExpression)
           }
+      case ts: TableStatement =>
+        // `TABLE t` reads every row and column of t: `SELECT * FROM t`. JSqlParser 5.4.16x reads
+        // it as this statement wherever it appears (`FROM (TABLE t)`, `x = ANY (TABLE t)`,
+        // `IN (TABLE t)`, `EXISTS (TABLE t)`), so it is a read of t like any FROM item.
+        Option(ts.getTable) match
+          case Some(t) => visitFromItem(t)
+          case None    => unsupported += "a TABLE statement with no table"
       case other =>
         // Fail closed: a Select subtype this walker does not recognize may
         // carry table refs we would otherwise silently drop.

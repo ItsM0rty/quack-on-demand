@@ -227,7 +227,7 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
       .toOption
       .flatMap { input =>
         Try(
-          CCJSqlParserUtil.parseStatements(
+          ai.starlake.sql.JSqlStatements.parseBatch(
             input.text,
             (parser: net.sf.jsqlparser.parser.CCJSqlParser) => {
               val featureConfig = new net.sf.jsqlparser.parser.feature.FeatureConfiguration()
