@@ -4,10 +4,8 @@
 
 - **DuckDB 2.0.** Engine, nodes and JDBC move to DuckDB v2.0.0 (`org.duckdb:duckdb_jdbc:2.0.0.0`
   from Maven Central) and Quack protocol v3, with duckdb-quack at `f96420ed`, the commit the v2.0.0
-  quack extension ships. libquackwire is rebuilt against the release on osx-aarch64; the
-  linux-x86_64, linux-aarch64, osx-x86_64 and windows-x86_64 natives are refreshed from the
-  `quackwire.yml` run of the release commit, and until then the manager refuses to boot on them
-  (see the build marker below). DuckDB 2.x renamed its release assets: `run-jar.sh`,
+  quack extension ships. All five libquackwire natives (linux-x86_64, linux-aarch64, osx-x86_64,
+  osx-aarch64, windows-x86_64) are rebuilt against the release. DuckDB 2.x renamed its release assets: `run-jar.sh`,
   `run-jar.ps1`, the qod CLI and the images download `duckdb-cli-<platform>.tar.gz` and
   `duckdb-shared-libs-<platform>.tar.gz` (1.x shipped `.zip`s), so they need `tar` instead of
   `unzip`.
