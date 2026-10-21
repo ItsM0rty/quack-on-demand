@@ -21,11 +21,14 @@ import com.typesafe.scalalogging.LazyLogging
   * RouterFailure; nothing here ever reaches a DuckDB node.
   *
   * `audit` mirrors the REST RBAC handlers' pattern (see e.g. RoleHandlers): each mutation arm of
-  * `run` fires the family-specific [[AuditActions]] event on success, right after the mutating
-  * supervisor call returns, exactly where the handlers do it. A denial at [[authorize]] fires the
-  * generic [[AuditActions.SqlAdminDenied]] instead - none of the family actions have a distinct
-  * "denied" variant, and the denied statement's target is not yet resolved at that point. Defaults
-  * to [[AuditRecorder.noop]] so every unwired construction (tests) stays a no-op.
+  * `run` fires the family-specific
+  * [[ai.starlake.quack.ondemand.telemetry.AuditActions AuditActions]] event on success, right after
+  * the mutating supervisor call returns, exactly where the handlers do it. A denial at
+  * [[authorize]] fires the generic
+  * [[ai.starlake.quack.ondemand.telemetry.AuditActions.SqlAdminDenied AuditActions.SqlAdminDenied]]
+  * instead - none of the family actions have a distinct "denied" variant, and the denied
+  * statement's target is not yet resolved at that point. Defaults to `AuditRecorder.noop` so every
+  * unwired construction (tests) stays a no-op.
   */
 final class AdminStatementExecutor(
     supervisor: PoolSupervisor,

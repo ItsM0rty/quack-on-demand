@@ -8,9 +8,10 @@ import ai.starlake.quack.ondemand.rbac.{AuthzRequest, EffectiveSet, HandshakeDen
 import ai.starlake.quack.route.StatementClassifier
 import cats.effect.IO
 
-/** The routed executor behind every [[CatalogPreviewHandlers.PreviewExecutor]] (REST preview, data
-  * diff, restore, undrop, branch change counts, the MCP data tools): token restriction checks,
-  * EffectiveSet resolution and attenuation, then the router.
+/** The routed executor behind every
+  * [[ai.starlake.quack.ondemand.api.CatalogPreviewHandlers.PreviewExecutor CatalogPreviewHandlers.PreviewExecutor]]
+  * (REST preview, data diff, restore, undrop, branch change counts, the MCP data tools): token
+  * restriction checks, EffectiveSet resolution and attenuation, then the router.
   */
 object RoutedExecutor:
 

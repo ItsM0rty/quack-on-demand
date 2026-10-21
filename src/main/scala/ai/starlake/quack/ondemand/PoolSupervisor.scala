@@ -53,8 +53,8 @@ import scala.collection.concurrent.TrieMap
 import scala.util.Try
 
 /** Patch for [[PoolSupervisor.updateTenantDb]]. Absent fields unchanged; present fields replace.
-  * Map fields carry over response-redacted keys ([[TenantDb.SecretKeys]]) the incoming map omits
-  * (see [[PoolSupervisor.mergeSecretKeys]]). An empty string clears a scalar Option field.
+  * Map fields carry over response-redacted keys (`TenantDb.SecretKeys`) the incoming map omits (see
+  * [[PoolSupervisor.mergeSecretKeys]]). An empty string clears a scalar Option field.
   */
 final case class TenantDbPatch(
     metastore: Option[Map[String, String]] = None,
@@ -73,7 +73,8 @@ final case class TenantDbUpdateResult(
     failedRestarts: List[(String, String)]
 )
 
-/** Owns the in-memory topology and mediates every mutation through [[ControlPlaneStore]]:
+/** Owns the in-memory topology and mediates every mutation through
+  * [[ai.starlake.quack.ondemand.state.ControlPlaneStore ControlPlaneStore]]:
   *   - `Tenant`: ownership umbrella (id, displayName, disabled).
   *   - `TenantDb`: one DuckLake/Postgres database under a tenant; owns (metastore, dataPath,
   *     objectStore). Pools and metastore live here.
@@ -1331,8 +1332,9 @@ final class PoolSupervisor(
 
   // ---------- Read API ----------
 
-  /** True when the [[QuackBackend]] honors placement hints (K8s nodeSelector / tolerations).
-    * Exposed so `/client-config` can flag the UI to hide cohort controls in local mode.
+  /** True when the [[ai.starlake.quack.ondemand.runtime.QuackBackend QuackBackend]] honors
+    * placement hints (K8s nodeSelector / tolerations). Exposed so `/client-config` can flag the UI
+    * to hide cohort controls in local mode.
     */
   def supportsPlacement: Boolean = backend.supportsPlacement
 
@@ -1377,8 +1379,8 @@ final class PoolSupervisor(
     */
   def poolId(key: PoolKey): Option[String] = poolIdByKey.get(key)
 
-  /** The persisted [[Pool]] row by id, for fields the runtime [[PoolState]] doesn't carry (the
-    * cohorts placement plan).
+  /** The persisted [[ai.starlake.quack.model.Pool Pool]] row by id, for fields the runtime
+    * [[PoolState]] doesn't carry (the cohorts placement plan).
     */
   def poolEntity(id: String): Option[Pool]         = poolRows.get(id)
   def list(): List[PoolState]                      = pools.values.toList
@@ -1967,7 +1969,7 @@ final class PoolSupervisor(
   /** Merge a patch into a tenant-db, persist, refresh caches, and restart every node of its pools
     * when node-affecting fields (metastore, objectStore, initSql) changed. Restart is all-at-once
     * via restartNode's path; per-node failures are collected, not thrown (reconcile heals).
-    * Response-redacted keys ([[TenantDb.SecretKeys]]) are preserved when omitted; an empty value
+    * Response-redacted keys (`TenantDb.SecretKeys`) are preserved when omitted; an empty value
     * removes the key. For DuckLake, clearing a required key such as `pgPassword` reverts that key
     * to the manager default at runtime.
     */
@@ -2877,9 +2879,10 @@ final class PoolSupervisor(
   // ---------- RBAC: users ----------
 
   /** Persist a new (tenant, username) principal with its bcrypt hash, and register it with the
-    * resolver so role grants can FK to it. Returns the persisted [[RbacUser]]. `tenant = None`
-    * creates a superuser. `mustChangePassword = true` marks `password` as temporary: the principal
-    * cannot log in until it is swapped through the self-service change-password path.
+    * resolver so role grants can FK to it. Returns the persisted
+    * [[ai.starlake.quack.ondemand.state.RbacUser RbacUser]]. `tenant = None` creates a superuser.
+    * `mustChangePassword = true` marks `password` as temporary: the principal cannot log in until
+    * it is swapped through the self-service change-password path.
     */
   def createUser(
       tenant: Option[String],
@@ -3802,11 +3805,12 @@ final class PoolSupervisor(
 
   /** End-to-end FlightSQL handshake gate, in order:
     *   1. resolve `(tenant, pool) -> PoolKey` + tenant/pool kill switches
-    *   2. lookup the user via [[ControlPlaneStore.findUserForLogin]]; reject `enabled = false`.
-    *      This query ALSO enforces tenant scope (returns `tenant IS NULL` superusers OR
-    *      `tenant = <tenantId>`), so no app-layer `user.tenant == tenantRow.id` re-check. If
-    *      findUserForLogin ever drops the tenant filter, reinstate the scope check between gates 2
-    *      and 3.
+    *   2. lookup the user via
+    *      [[ai.starlake.quack.ondemand.state.ControlPlaneStore.findUserForLogin ControlPlaneStore.findUserForLogin]];
+    *      reject `enabled = false`. This query ALSO enforces tenant scope (returns `tenant IS NULL`
+    *      superusers OR `tenant = <tenantId>`), so no app-layer `user.tenant == tenantRow.id`
+    *      re-check. If findUserForLogin ever drops the tenant filter, reinstate the scope check
+    *      between gates 2 and 3.
     *   3. compute the effective set (groups, roles, permissions, pool grants), carrying the
     *      request's verified token claims
     *   4. pool-access check (skipped for superusers): QoD pool grants, or the tenant's OPA in opa

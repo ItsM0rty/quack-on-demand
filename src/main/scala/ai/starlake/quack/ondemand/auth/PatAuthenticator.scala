@@ -23,9 +23,10 @@ final case class PatPrincipal(
 /** Turns a raw PAT bearer token into a principal, mirroring what `AuthHandlers.mintSessionFor`
   * derives from a password login so a PAT is accepted wherever a session JWT is.
   *
-  * Layering: [[PatStore.verify]] answers "is this token live" (unknown hash, revoked, expired all
-  * collapse to `None`) but deliberately says nothing about the owning user, so the `enabled` gate
-  * lives HERE -- disabling a user must lock their tokens out without revoking them one by one.
+  * Layering: [[ai.starlake.quack.ondemand.state.PatStore.verify PatStore.verify]] answers "is this
+  * token live" (unknown hash, revoked, expired all collapse to `None`) but deliberately says
+  * nothing about the owning user, so the `enabled` gate lives HERE -- disabling a user must lock
+  * their tokens out without revoking them one by one.
   *
   * Scope, from the owning row plus any sibling grant `grantsFor` reports:
   *   - `superuser` = the owning row is tenant-less AND carries role `admin`, the definition
@@ -66,8 +67,9 @@ final class PatAuthenticator(
 
   /** The principal behind `token`, or `None` when the token is not a PAT at all, is unknown /
     * revoked / expired, or its owner no longer exists or is disabled. A value without the
-    * [[PatStore.TokenPrefix]] (a session JWT, an API key) is rejected before any store call, so the
-    * shared bearer path can try PATs first without paying a query per request.
+    * [[ai.starlake.quack.ondemand.state.PatStore.TokenPrefix PatStore.TokenPrefix]] (a session JWT,
+    * an API key) is rejected before any store call, so the shared bearer path can try PATs first
+    * without paying a query per request.
     */
   def resolve(token: String): Option[PatPrincipal] =
     if !token.startsWith(PatStore.TokenPrefix) then None

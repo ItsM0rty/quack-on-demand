@@ -145,6 +145,9 @@ object Main extends IOApp with LazyLogging:
   given ConfigReader[AuthenticationConfig]     = deriveReader[AuthenticationConfig]
   import MetricsConfigCodec.given
 
+  /** Runs the subcommand `args` names (`manifest export`, `manifest import`, `admin
+    * reset-password`, `demo`), or boots the manager when they name none.
+    */
   def run(args: List[String]): IO[ExitCode] =
     // Route JUL through slf4j: grpc-netty logs via JUL directly, and without the
     // bridge its benign stream-cancel warnings print raw to stderr, unfilterable.

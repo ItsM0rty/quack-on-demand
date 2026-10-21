@@ -26,11 +26,13 @@ object AuthScope:
 
 /** Typed failure of the basic (password) auth chain.
   *
-  *   - [[InvalidCredentials]]: unknown user, wrong password, disabled account, provider error. The
-  *     detail string is what the legacy `Either[String, _]` carried.
-  *   - [[PasswordChangeRequired]]: the password VERIFIED but is flagged `must_change_password` --
-  *     the caller must be told to rotate it, not that the credentials were wrong. Only reachable
-  *     with a correct password on an enabled account, so surfacing it leaks nothing.
+  *   - [[ai.starlake.quack.edge.auth.AuthFailure.InvalidCredentials InvalidCredentials]]: unknown
+  *     user, wrong password, disabled account, provider error. The detail string is what the legacy
+  *     `Either[String, _]` carried.
+  *   - [[ai.starlake.quack.edge.auth.AuthFailure.PasswordChangeRequired PasswordChangeRequired]]:
+  *     the password VERIFIED but is flagged `must_change_password` -- the caller must be told to
+  *     rotate it, not that the credentials were wrong. Only reachable with a correct password on an
+  *     enabled account, so surfacing it leaks nothing.
   */
 enum AuthFailure:
   case InvalidCredentials(detail: String)

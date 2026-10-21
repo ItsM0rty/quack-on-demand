@@ -6,7 +6,7 @@ import java.sql.{Connection, Types}
 
 /** The single `(tenant, username)`-keyed upsert into `qodstate_user`, shared by [[UserStore]] (its
   * own Hikari pool) and [[PostgresControlPlaneStore]] (the control-plane pool). Both stores own
-  * separate connection pools, so this operates on a caller-supplied [[Connection]] rather than
+  * separate connection pools, so this operates on a caller-supplied `Connection` rather than
   * holding one. Keeping the lookup + column set in exactly one place is what stops the two call
   * sites from drifting -- the `enabled` column silently becoming a no-op on one path is precisely
   * the bug this consolidation removes.

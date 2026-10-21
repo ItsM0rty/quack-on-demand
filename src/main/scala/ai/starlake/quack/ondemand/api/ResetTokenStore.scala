@@ -9,14 +9,14 @@ import java.time.Instant
 import java.util.Date
 import scala.concurrent.duration.{DurationInt, FiniteDuration}
 
-/** Stateless single-use password-reset token: an HS256 JWT over [[secret]], carrying no server-side
+/** Stateless single-use password-reset token: an HS256 JWT over `secret`, carrying no server-side
   * row. "Single-use" comes from a custom `pwfp` claim -- a short fingerprint of the `password_hash`
-  * at mint time -- rather than from tracking redemption: [[verify]] recomputes the fingerprint from
+  * at mint time -- rather than from tracking redemption: `verify` recomputes the fingerprint from
   * the row's CURRENT hash and rejects on mismatch, so the moment the password changes (including
   * via this very reset), every outstanding link for that user stops verifying.
   *
-  * [[subjectOf]] checks signature + `exp` only (no hash), so the reset handler can look the user
-  * row up (and read its current hash) before it has anything to fingerprint against.
+  * `subjectOf` checks signature + `exp` only (no hash), so the reset handler can look the user row
+  * up (and read its current hash) before it has anything to fingerprint against.
   *
   * Mirrors [[SessionTokenStore]]'s nimbus HS256 idiom. `clock` is injectable so tests fast-forward
   * without sleeping.
@@ -80,7 +80,7 @@ final class ResetTokenStore(
 
   // ---------- internals ----------
 
-  /** Parse + HMAC-verify + expiry-check. Shared by [[subjectOf]] and [[verify]] since both need a
+  /** Parse + HMAC-verify + expiry-check. Shared by [[subjectOf]] and `verify` since both need a
     * live, correctly-signed token before doing anything hash-specific.
     */
   private def parse(token: String): Either[Error, JWTClaimsSet] =

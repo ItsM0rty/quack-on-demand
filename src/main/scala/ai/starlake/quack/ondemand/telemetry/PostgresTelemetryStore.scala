@@ -10,7 +10,8 @@ import java.time.Instant
 import scala.collection.mutable.ListBuffer
 
 /** Postgres-backed [[TelemetryStore]]. Assumes the schema produced by changelog `0018-audit.yaml`
-  * is already in place (run [[LiquibaseRunner]] first).
+  * is already in place (run [[ai.starlake.quack.ondemand.state.LiquibaseRunner LiquibaseRunner]]
+  * first).
   *
   * Connections come from a HikariCP pool (size [[poolSize]], default 5, minimum idle 1). Call
   * [[close]] on shutdown to release idle connections.

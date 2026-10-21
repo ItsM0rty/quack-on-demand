@@ -14,10 +14,11 @@ trait QuackBackend:
   def discoverExisting(): IO[List[RunningNode]]
   def cleanup(): IO[Unit]
 
-  /** True when this backend can honor [[NodeSpec.placement]] (K8s pod scheduling hints). The local
-    * backend has nowhere to put a node label and ignores placement entirely; the supervisor drops
-    * cohort data on create when this is false so the persisted pool row matches what was actually
-    * scheduled.
+  /** True when this backend can honor
+    * [[ai.starlake.quack.model.NodeSpec.placement NodeSpec.placement]] (K8s pod scheduling hints).
+    * The local backend has nowhere to put a node label and ignores placement entirely; the
+    * supervisor drops cohort data on create when this is false so the persisted pool row matches
+    * what was actually scheduled.
     */
   def supportsPlacement: Boolean = false
 
@@ -61,10 +62,11 @@ trait QuackBackend:
 
 object QuackBackend:
 
-  /** Fails when the boot SQL of `spec` holds a DuckDB CLI dot-command line ([[InitSqlScreen]]): the
-    * values as resolved for this spawn, `{{secret.NAME}}` values and rows stored before the
-    * write-time screens included. Every backend's `start` runs it before anything else, so no
-    * caller (a serving spawn, a maintenance or merge node, a module) can hand one to a node.
+  /** Fails when the boot SQL of `spec` holds a DuckDB CLI dot-command line
+    * ([[ai.starlake.quack.model.InitSqlScreen InitSqlScreen]]): the values as resolved for this
+    * spawn, `{{secret.NAME}}` values and rows stored before the write-time screens included. Every
+    * backend's `start` runs it before anything else, so no caller (a serving spawn, a maintenance
+    * or merge node, a module) can hand one to a node.
     */
   def screenBootSql(spec: NodeSpec): IO[Unit] =
     InitSqlScreen.nodeSpecError(spec) match

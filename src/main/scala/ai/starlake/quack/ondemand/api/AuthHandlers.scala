@@ -47,11 +47,11 @@ enum RequiredScope:
   *   - `Oidc`: the JWT's `role` and any tenant claim are discarded; `grantsForIdentity` is
   *     consulted with the JWT's `preferred_username` (and `email` as fallback).
   *
-  * Either path collapses to a [[SessionScope]] carrying `superuser` and `manageableTenants`. Empty
-  * grants => `403 not_provisioned`. The admin console is admin-only, so a principal with no admin
-  * grant is still refused `403 admin_required` on the system login and on any tenant it does not
-  * hold a grant on; logging into a tenant it DOES hold a grant on mints a non-admin, profile-only
-  * session instead (`LoginResponse.admin = false`).
+  * Either path collapses to a [[ai.starlake.quack.ondemand.auth.SessionScope SessionScope]]
+  * carrying `superuser` and `manageableTenants`. Empty grants => `403 not_provisioned`. The admin
+  * console is admin-only, so a principal with no admin grant is still refused `403 admin_required`
+  * on the system login and on any tenant it does not hold a grant on; logging into a tenant it DOES
+  * hold a grant on mints a non-admin, profile-only session instead (`LoginResponse.admin = false`).
   *
   * Transport: on successful login the handler sets a `qod_session` cookie carrying the same JWT
   * returned in `LoginResponse.token`. The browser auto-attaches the cookie on subsequent `/api/...`
@@ -157,9 +157,10 @@ final class AuthHandlers(
     cookie("", 0L, forwardedProto)
 
   /** Best-effort Starlake logout callback, started as a detached fiber so QoD's own logout never
-    * blocks -- or fails -- on Starlake's availability. `starlakeNotifier` is [[NoopStarlakeNotifier]]
-    * (a no-op) unless the Starlake SSO integration is on, so this only ever reaches the network when
-    * `slIntegrationOn` is true. Failures are logged at warn and never surfaced to the caller.
+    * blocks -- or fails -- on Starlake's availability. `starlakeNotifier` is
+    * [[NoopStarlakeNotifier]] (a no-op) unless the Starlake SSO integration is on, so this only
+    * ever reaches the network when `slIntegrationOn` is true. Failures are logged at warn and never
+    * surfaced to the caller.
     */
   private def dispatchStarlakeLogout(tokenOpt: Option[String]): IO[Unit] =
     tokenOpt match
@@ -703,12 +704,12 @@ final class AuthHandlers(
   }
 
   /** Mint a single-use Starlake SSO ticket carrying the caller's session grant. Session-authed
-    * (token via header or cookie, [[Endpoints.authToken]]); any valid session may call this,
-    * admin or not -- the minted grant mirrors whatever admin-ness the QoD session already has
+    * (token via header or cookie, [[Endpoints.authToken]]); any valid session may call this, admin
+    * or not -- the minted grant mirrors whatever admin-ness the QoD session already has
     * ([[SessionTokenStore.isAdmin]]'s exact `role` check), it grants nothing new. `401
-    * unauthorized` on no/invalid/expired/revoked session, collapsed to one code (unlike
-    * [[whoami]]) since the caller here is Starlake's redirect target, not a UI that needs to
-    * distinguish failure reasons.
+    * unauthorized` on no/invalid/expired/revoked session, collapsed to one code (unlike [[whoami]])
+    * since the caller here is Starlake's redirect target, not a UI that needs to distinguish
+    * failure reasons.
     */
   def ssoTicket(token: Option[String]): Out[SsoTicketResponse] = IO {
     val t = token.getOrElse("")
@@ -740,12 +741,12 @@ final class AuthHandlers(
         Left((StatusCode.Unauthorized, ErrorResponse("unauthorized", "session required")))
   }
 
-  /** Redeem a Starlake SSO ticket for the QoD session grant it carries. Public: no
-    * X-API-Key/cookie input, the ticket itself is the (single-use, 128-bit random, short-TTL)
-    * credential. `401 invalid_ticket` on unknown / expired / already-redeemed.
+  /** Redeem a Starlake SSO ticket for the QoD session grant it carries. Public: no X-API-Key/cookie
+    * input, the ticket itself is the (single-use, 128-bit random, short-TTL) credential.
+    * `401 invalid_ticket` on unknown / expired / already-redeemed.
     *
-    * No rate limiting here on purpose: this endpoint is public and unauthenticated, so any
-    * limiter keyed on caller-supplied input (the ticket string) would itself be an unbounded,
+    * No rate limiting here on purpose: this endpoint is public and unauthenticated, so any limiter
+    * keyed on caller-supplied input (the ticket string) would itself be an unbounded,
     * attacker-controlled memory-retention vector while providing no real protection -- a 128-bit
     * single-use ticket with a 60s TTL is already infeasible to brute force.
     */

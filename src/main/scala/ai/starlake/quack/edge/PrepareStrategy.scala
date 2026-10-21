@@ -10,19 +10,22 @@ import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
   * schema off the materialized result. For everything except a plain SELECT this is wasted work
   * (DDL/DML) or actively harmful (an INSERT runs twice).
   *
-  *   - [[SkipExecute]] - the statement has no result rows (DML / DDL / transaction control). The
-  *     producer returns an empty `dataset_schema` without touching a Quack node.
-  *   - [[ProbeWrap]] - the statement is a subquery-safe SELECT. Send `SELECT * FROM (<sql>) AS x
-  *     LIMIT 0` instead; DuckDB plans the inner query but the executor short-circuits on LIMIT 0,
-  *     so the Arrow stream comes back with the correct schema and zero rows.
-  *   - [[FullExecute]] - a single statement that reads and isn't subquery-safe (SHOW / EXPLAIN /
-  *     DESCRIBE, a lone PRAGMA). The original SQL runs to read the schema off its result.
-  *   - [[Unprobed]] - a statement a probe could not run without running its effects: any batch of
-  *     more than one statement (the node runs every statement of the text it is sent, so `SELECT 1;
-  *     INSERT ...` wrote at probe time and again at Execute) and every `Other`-kind statement but a
-  *     lone PRAGMA (`CALL postgres_execute(..)`, `SET VARIABLE v = (SELECT nextval(..))`, `IMPORT
-  *     DATABASE`, ...). No node call: the schema is advertised as absent and the Execute stream
-  *     carries it.
+  *   - [[ai.starlake.quack.edge.PrepareStrategy.SkipExecute SkipExecute]] - the statement has no
+  *     result rows (DML / DDL / transaction control). The producer returns an empty
+  *     `dataset_schema` without touching a Quack node.
+  *   - [[ai.starlake.quack.edge.PrepareStrategy.ProbeWrap ProbeWrap]] - the statement is a
+  *     subquery-safe SELECT. Send `SELECT * FROM (<sql>) AS x LIMIT 0` instead; DuckDB plans the
+  *     inner query but the executor short-circuits on LIMIT 0, so the Arrow stream comes back with
+  *     the correct schema and zero rows.
+  *   - [[ai.starlake.quack.edge.PrepareStrategy.FullExecute FullExecute]] - a single statement that
+  *     reads and isn't subquery-safe (SHOW / EXPLAIN / DESCRIBE, a lone PRAGMA). The original SQL
+  *     runs to read the schema off its result.
+  *   - [[ai.starlake.quack.edge.PrepareStrategy.Unprobed Unprobed]] - a statement a probe could not
+  *     run without running its effects: any batch of more than one statement (the node runs every
+  *     statement of the text it is sent, so `SELECT 1; INSERT ...` wrote at probe time and again at
+  *     Execute) and every `Other`-kind statement but a lone PRAGMA (`CALL postgres_execute(..)`,
+  *     `SET VARIABLE v = (SELECT nextval(..))`, `IMPORT DATABASE`, ...). No node call: the schema
+  *     is advertised as absent and the Execute stream carries it.
   */
 enum PrepareStrategy:
   case SkipExecute

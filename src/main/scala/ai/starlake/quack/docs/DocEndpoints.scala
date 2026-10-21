@@ -7,7 +7,9 @@ import sttp.tapir.AnyEndpoint
   * a newly added endpoint is picked up by the OpenAPI generator with no extra wiring. Only public
   * zero-arg members whose runtime return type is a `sttp.tapir.Endpoint` are included; the private
   * `base` and `fedBase` builders are excluded because `getMethods` returns public members only. The
-  * holder objects come from [[EndpointModules.all]] - register new endpoint objects there.
+  * holder objects come from
+  * [[ai.starlake.quack.ondemand.api.EndpointModules.all EndpointModules.all]] - register new
+  * endpoint objects there.
   */
 object DocEndpoints:
 

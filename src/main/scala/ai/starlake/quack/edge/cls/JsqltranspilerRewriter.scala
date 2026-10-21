@@ -237,8 +237,8 @@ final class JsqltranspilerRewriter extends SchemaAwareSqlRewriter:
         // the finder's own WITH-name exclusion and false-deny every CTE read.
         val parsed = ai.starlake.sql.JSqlStatements.parseFirst(originalSql)
         val finder = new net.sf.jsqlparser.util.TablesNamesFinder()
-        val list   = finder.getTableList(parsed)
-        scala.jdk.CollectionConverters.ListHasAsScala(list).asScala.toList
+        val tables = finder.getTables(parsed)
+        scala.jdk.CollectionConverters.SetHasAsScala(tables).asScala.toList
       catch case _: Throwable => Nil
     def unquote(s: String) = ai.starlake.sql.QuotedIdentifier.unquote(s)
     // Known = the caller's catalog produced a NON-EMPTY column list for the name (an

@@ -66,8 +66,9 @@ object ColumnPolicyRewriter:
   * policies) and delegates the actual SQL walk to the inner rewriter.
   *
   * `enabled` is the kill switch, on by default. When false, every call short-circuits to
-  * [[Passthrough]] without touching the catalog or the inner rewriter. Operators opt out via
-  * `quack-on-demand.cls.enabled = false` (or `QOD_CLS_ENABLED=false`).
+  * [[ai.starlake.quack.edge.cls.ColumnPolicyRewriter.Passthrough Passthrough]] without touching the
+  * catalog or the inner rewriter. Operators opt out via `quack-on-demand.cls.enabled = false` (or
+  * `QOD_CLS_ENABLED=false`).
   */
 final class ColumnPolicyRewriter(
     catalog: ColumnCatalog,
@@ -155,7 +156,6 @@ final class ColumnPolicyRewriter(
     */
   private def readsOnlyCatalogFunctions(sql: String): Boolean =
     Try(CCJSqlParserUtil.parseStatements(sql)).toOption
-      .map(_.getStatements)
       .filter(_.size == 1)
       .flatMap(sts => Option(sts.get(0)).collect { case sel: Select => sel })
       .exists { sel =>
@@ -261,7 +261,7 @@ private[cls] object PositionalReferences:
     if textualCount(sql) == 0 then Right(sql)
     else
       Try(CCJSqlParserUtil.parseStatements(sql)).toOption
-        .map(_.getStatements.asScala.toList) match
+        .map(_.asScala.toList) match
         case Some(List(ps: PlainSelect))
             if ps.getWithItemsList == null || ps.getWithItemsList.isEmpty =>
           val single = Option(ps.getJoins).forall(_.isEmpty)
@@ -273,7 +273,7 @@ private[cls] object PositionalReferences:
                 Left(s"positional column references (#n) on ${t.getName}: table columns unknown")
               else
                 val walk = new Numbering(cols)
-                Try(walk.getTableList(ps: net.sf.jsqlparser.statement.Statement)).toOption match
+                Try(walk.getTables(ps: net.sf.jsqlparser.statement.Statement)).toOption match
                   case None    => Left(UnsupportedShape)
                   case Some(_) =>
                     walk.failure match
