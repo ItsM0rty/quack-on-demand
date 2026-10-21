@@ -4,9 +4,10 @@ import org.apache.arrow.vector.ipc.ArrowReader
 
 /** Outcome of a single forwarded query to a Quack node.
   *
-  * [[Ok]] carries the streaming [[ArrowReader]] the native Quack wire client decodes from the node.
-  * The caller is responsible for fully consuming the reader and then calling `close()` to release
-  * the node connection and its allocator buffers. [[Failed]] is non-streaming and carries no
+  * [[ai.starlake.quack.edge.adapter.QuackResponse.Ok Ok]] carries the streaming `ArrowReader` the
+  * native Quack wire client decodes from the node. The caller is responsible for fully consuming
+  * the reader and then calling `close()` to release the node connection and its allocator buffers.
+  * [[ai.starlake.quack.edge.adapter.QuackResponse.Failed Failed]] is non-streaming and carries no
   * resources to release.
   */
 enum QuackResponse:

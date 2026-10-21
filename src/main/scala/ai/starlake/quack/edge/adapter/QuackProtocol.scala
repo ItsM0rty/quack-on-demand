@@ -30,10 +30,10 @@ object QuackWireError:
   final case class Permanent(msg: String) extends RuntimeException(msg) with QuackWireError
 
 /** Pluggable POST transport. Tests inject a stub that records the request body and returns canned
-  * response bytes (see [[QuackProtocolSpec]]); production uses [[QuackProtocol.JdkHttpTransport]]
-  * which wraps a [[HttpClient]].
+  * response bytes (see `QuackProtocolSpec`); production uses [[QuackProtocol.JdkHttpTransport]]
+  * which wraps a `HttpClient`.
   *
-  * Why an abstraction rather than mocking [[HttpClient]] directly: Java's `HttpClient` is a
+  * Why an abstraction rather than mocking `HttpClient` directly: Java's `HttpClient` is a
   * sealed-class hierarchy that does not lend itself to interception without an embedded HTTP
   * server. An injected `Transport` keeps the state-machine tests dependency-free, which is what
   * Task 6.4 asks for ("the injectable-producer approach").
@@ -48,7 +48,7 @@ trait QuackTransport:
   def post(uri: URI, body: Array[Byte]): IO[Array[Byte]]
 
 /** Owns Quack connection lifecycle over an injectable [[QuackTransport]] and produces a lazy
-  * chained [[ArrowReader]] for callers.
+  * chained `ArrowReader` for callers.
   *
   * Wire-level state machine (per design §6.2):
   * {{{
@@ -165,7 +165,7 @@ object QuackProtocol:
     val hostPort = s.substring("quack:".length).stripSuffix("/")
     URI.create(s"http://$hostPort/quack")
 
-  /** JDK [[HttpClient]]-backed transport. Used in production; tests use a stub [[QuackTransport]]
+  /** JDK `HttpClient`-backed transport. Used in production; tests use a stub [[QuackTransport]]
     * instead.
     *
     * `IO.blocking` wraps the synchronous send because the JDK HttpClient's `send` blocks the
@@ -189,7 +189,7 @@ object QuackProtocol:
     }
 
 /** Per logical query handle. Construction by [[QuackProtocol.open]] captures the server-assigned
-  * `connectionId`. [[execute]] runs one SQL statement and returns a streaming [[ArrowReader]];
+  * `connectionId`. [[execute]] runs one SQL statement and returns a streaming `ArrowReader`;
   * [[close]] sends `DISCONNECT_MESSAGE` best-effort.
   *
   * Concurrency note: `Connection` is one-shot -- call `execute` once, drain the returned reader to
@@ -244,15 +244,15 @@ final class Connection private[adapter] (
     heartbeat.fold(IO.unit)(_.cancel.start.void)
   }
 
-  /** Posts a PREPARE_REQUEST for `sql` and returns a streaming [[ArrowReader]] that chains the
+  /** Posts a PREPARE_REQUEST for `sql` and returns a streaming `ArrowReader` that chains the
     * initial PREPARE_RESPONSE batches with subsequent FETCH_RESPONSE batches until the server
     * signals end-of-stream (empty `results` vector on a FETCH_RESPONSE -- see upstream
     * `quack_scan.cpp:331`).
     *
     * The returned reader's `close()` cascades to [[close]] on this connection, so callers only
     * manage one resource. The reader is synchronous (Arrow Java's contract); the IO it needs to
-    * perform FETCH round-trips is materialised via the supplied [[IORuntime]] -- the standard
-    * pattern for bridging IO into a synchronous caller, mirroring what http4s does for its IO ←→
+    * perform FETCH round-trips is materialised via the supplied `IORuntime` -- the standard pattern
+    * for bridging IO into a synchronous caller, mirroring what http4s does for its IO ←→
     * blocking-API edges.
     */
   def execute(sql: String)(using runtime: IORuntime): IO[ArrowReader] = IO.defer {

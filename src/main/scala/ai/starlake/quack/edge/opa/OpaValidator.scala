@@ -4,10 +4,11 @@ import ai.starlake.quack.edge.sql.*
 import ai.starlake.quack.model.{PoolKey, Tenant}
 import com.typesafe.scalalogging.LazyLogging
 
-/** Statement gate for `opa` tenants. Shares [[AccessGate]] with PostgresAclValidator, so OPA sees
-  * exactly the accesses QoD would have checked. Every `Refuse` denies (there is no wildcard escape:
-  * OPA cannot judge what the parser could not resolve). Transport errors become
-  * [[ValidatorUnavailable]].
+/** Statement gate for `opa` tenants. Shares [[ai.starlake.quack.edge.sql.AccessGate AccessGate]]
+  * with PostgresAclValidator, so OPA sees exactly the accesses QoD would have checked. Every
+  * `Refuse` denies (there is no wildcard escape: OPA cannot judge what the parser could not
+  * resolve). Transport errors become
+  * [[ai.starlake.quack.edge.sql.ValidatorUnavailable ValidatorUnavailable]].
   */
 final class OpaValidator(
     authorizer: OpaAuthorizer,

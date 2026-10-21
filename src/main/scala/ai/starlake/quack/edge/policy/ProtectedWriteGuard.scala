@@ -38,12 +38,13 @@ enum GuardOutcome:
   * policies, denies when the read side exposes a protected table: any read of an RLS table, or a
   * CLS table whose masked columns actually appear in the read. Any read it cannot isolate denies
   * fail-closed. Never rewrites; only allows or denies. On EVERY statement kind, a plain SELECT
-  * included, it also denies a [[CatalogReachingCalls]] call (`query_table('t')`, `query('...')`):
-  * the rewriters cannot see a table named in a string, so that read would bypass them entirely.
-  * Likewise on every kind it denies a two-part name headed by an attached catalog
-  * (`acme_tpch.customer`), which DuckDB binds catalog-first while the rewriters and this guard's
-  * policy match read it schema-first (audit F20, F22): the ACL gate refuses it when it runs, and
-  * this keeps the refusal for a policy holder when the ACL is off.
+  * included, it also denies a
+  * [[ai.starlake.quack.edge.sql.CatalogReachingCalls CatalogReachingCalls]] call
+  * (`query_table('t')`, `query('...')`): the rewriters cannot see a table named in a string, so
+  * that read would bypass them entirely. Likewise on every kind it denies a two-part name headed by
+  * an attached catalog (`acme_tpch.customer`), which DuckDB binds catalog-first while the rewriters
+  * and this guard's policy match read it schema-first (audit F20, F22): the ACL gate refuses it
+  * when it runs, and this keeps the refusal for a policy holder when the ACL is off.
   *
   * The guard owns its CLS detection oracle: it builds a `ColumnPolicyRewriter` internally in
   * `UnresolvedMode.Deny`, so a table whose columns the catalog cannot enumerate denies rather than
@@ -244,7 +245,7 @@ final class ProtectedWriteGuard(
     ai.starlake.sql.ParserInput.renderWithoutTimeTravel(sql).toOption.flatMap { input =>
       try
         val stmts = ai.starlake.sql.JSqlStatements.parseBatch(input.text, configure)
-        Option(stmts.getStatements).map(_.asScala.toList)
+        Option(stmts).map(_.asScala.toList)
       catch case _: Throwable => None
     }
 

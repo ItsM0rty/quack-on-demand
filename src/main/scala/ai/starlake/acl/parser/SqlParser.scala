@@ -49,8 +49,9 @@ object SqlParser:
     * JSqlParser's grammar (any statement carrying one is a ParseException, which the validator
     * denies fail-closed). For ACL purposes a time-travel read of a table is exactly a read of that
     * table, so the clause is removed before parsing. The clause is found on DuckDB's own tokens
-    * ([[ParserInput.stripTimeTravel]], the same pass [[extract]] parses through), so a clause shape
-    * inside a string literal or a comment is left alone.
+    * ([[ai.starlake.sql.ParserInput.stripTimeTravel ParserInput.stripTimeTravel]], the same pass
+    * [[extract]] parses through), so a clause shape inside a string literal or a comment is left
+    * alone.
     */
   def stripTimeTravelClauses(sql: String): String = ParserInput.stripTimeTravel(sql)
 

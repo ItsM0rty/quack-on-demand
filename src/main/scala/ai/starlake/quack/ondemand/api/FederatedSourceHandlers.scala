@@ -20,7 +20,8 @@ import sttp.model.StatusCode
 /** REST handlers for FederatedSource + FederatedSecret rows.
   *
   * @param fedStore
-  *   the federation store (any [[FederatedSourceOps]] implementation)
+  *   the federation store (any
+  *   [[ai.starlake.quack.ondemand.state.FederatedSourceOps FederatedSourceOps]] implementation)
   * @param resolver
   *   resolves (tenantName, tenantDbName) to the surrogate tenantDbId, or None if not found
   * @param tenantIdResolver

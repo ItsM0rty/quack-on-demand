@@ -134,6 +134,17 @@ class MetadataFilterRewriterSpec extends AnyFlatSpec with Matchers:
       case other => fail(s"expected Rewritten, got $other")
   }
 
+  it should "wrap a reference nested inside a parenthesized predicate" in {
+    go(
+      "SELECT 1 WHERE (1 = 0 OR EXISTS (SELECT 1 FROM information_schema.tables " +
+        "WHERE table_name = 'x'))",
+      eff(tenantUser, grant("acme_tpch", "tpch1", "customer"))
+    ) match
+      case Rewritten(sql) =>
+        sql should include("table_schema = 'tpch1' AND table_name = 'customer'")
+      case other => fail(s"expected Rewritten, got $other")
+  }
+
   it should "wrap a reference nested inside a CTE body" in {
     go(
       "WITH t AS (SELECT table_name FROM information_schema.tables) SELECT * FROM t",

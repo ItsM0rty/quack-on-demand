@@ -20,8 +20,9 @@ import sttp.model.StatusCode
   * query, so the reader would 500 with a Postgres "relation does not exist" error) and the browser
   * keeps its empty-result UX; admins can still browse via FlightSQL.
   *
-  * When `auditReads` is on, each gated read emits one [[AuditActions.CatalogRead]] event (endpoint
-  * + tenant + db); off by default because reads are chatty.
+  * When `auditReads` is on, each gated read emits one
+  * [[ai.starlake.quack.ondemand.telemetry.AuditActions.CatalogRead AuditActions.CatalogRead]] event
+  * (endpoint + tenant + db); off by default because reads are chatty.
   */
 final class CatalogHandlers(
     resolveReader: (String, String) => DuckLakeCatalogReader,

@@ -37,15 +37,18 @@ object IcebergCatalogHandlers:
   * tenant-db kind), then resolves `alias` to an enabled `iceberg_rest` federated source of that
   * tenant-db (case-insensitive, 404 `catalog_not_found` otherwise) and uses the source's folded
   * alias in SQL. Metadata statements (browse, detail, history, snapshot-selector resolution) run
-  * privileged through [[NodeMetadataQuery]]; the preview and diff DATA statements go through the
-  * routed [[CatalogPreviewHandlers.PreviewExecutor]] as the caller, exactly like the DuckLake
-  * preview, so the ACL applies to them: `callerOf` ([[RestCaller]]) turns the `apiKey` into the
-  * [[ExecCaller]] (static key: system; session: its user; PAT: its owner with the token's
-  * restriction and id; any other token: 401 `unauthorized` and the executor is never called).
+  * privileged through
+  * [[ai.starlake.quack.ondemand.catalog.iceberg.NodeMetadataQuery NodeMetadataQuery]]; the preview
+  * and diff DATA statements go through the routed [[CatalogPreviewHandlers.PreviewExecutor]] as the
+  * caller, exactly like the DuckLake preview, so the ACL applies to them: `callerOf`
+  * ([[RestCaller]]) turns the `apiKey` into the [[ExecCaller]] (static key: system; session: its
+  * user; PAT: its owner with the token's restriction and id; any other token: 401 `unauthorized`
+  * and the executor is never called).
   *
-  * Audit: browse/detail/history emit [[AuditActions.CatalogRead]] only under
-  * `cfg.auditCatalogReads` (outcome tracks the gate, like [[CatalogHandlers]]); preview and diff
-  * are audited every time, like [[CatalogPreviewHandlers]].
+  * Audit: browse/detail/history emit
+  * [[ai.starlake.quack.ondemand.telemetry.AuditActions.CatalogRead AuditActions.CatalogRead]] only
+  * under `cfg.auditCatalogReads` (outcome tracks the gate, like [[CatalogHandlers]]); preview and
+  * diff are audited every time, like [[CatalogPreviewHandlers]].
   */
 final class IcebergCatalogHandlers(
     sup: PoolSupervisor,
@@ -150,7 +153,10 @@ final class IcebergCatalogHandlers(
 
   // ---- metadata reads -------------------------------------------------------------------------
 
-  /** Gate + alias + selective [[AuditActions.CatalogRead]] audit around a metadata read. */
+  /** Gate + alias + selective
+    * [[ai.starlake.quack.ondemand.telemetry.AuditActions.CatalogRead AuditActions.CatalogRead]]
+    * audit around a metadata read.
+    */
   private def metaRead[T](
       endpoint: String,
       tenant: String,

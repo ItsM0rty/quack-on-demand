@@ -10,8 +10,8 @@ import io.circe.yaml.v12.parser
 import scala.util.Try
 
 /** Reads the bundled (or operator-provided) demo manifest pointed at by `QOD_BOOTSTRAP_YAML` and
-  * imports it via [[ManifestImporter]]. Non-fatal at every failure boundary -- a broken YAML loses
-  * you the demo, not the manager.
+  * imports it via [[ai.starlake.quack.ondemand.manifest.ManifestImporter ManifestImporter]].
+  * Non-fatal at every failure boundary -- a broken YAML loses you the demo, not the manager.
   *
   * Dependencies are injected so the hook is unit-testable without touching the filesystem or the
   * real process environment.

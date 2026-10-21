@@ -24,12 +24,13 @@ import java.util.Locale
   * name's edges (`"[secret]"`, `"secret]"`, `` "`secret`" `` are all checked as `secret`, while
   * DuckDB 2.0 reads the table literally named `[secret]`). Tracking which positions JSqlParser
   * splits would mean modelling its grammar, so the rule is lexical and covers every position: each
-  * double-quoted or backtick-quoted identifier token, read from [[SqlLexer]] tokens so a string
-  * literal or a comment never counts, is read back through JSqlParser as a table name and refused
-  * unless that reading is the one name DuckDB reads (the token's body, its doubled delimiters
-  * undone; a doubled delimiter is always refused, JSqlParser keeping it doubled). No character list
-  * to keep current: a name of plain ASCII letters, digits and `_` skips the read-back.
-  * DottedIdentifierScreenSpec probes every printable ASCII character in both quoting styles.
+  * double-quoted or backtick-quoted identifier token, read from
+  * [[ai.starlake.sql.SqlLexer SqlLexer]] tokens so a string literal or a comment never counts, is
+  * read back through JSqlParser as a table name and refused unless that reading is the one name
+  * DuckDB reads (the token's body, its doubled delimiters undone; a doubled delimiter is always
+  * refused, JSqlParser keeping it doubled). No character list to keep current: a name of plain
+  * ASCII letters, digits and `_` skips the read-back. DottedIdentifierScreenSpec probes every
+  * printable ASCII character in both quoting styles.
   *
   * Two exceptions. A name directly after the keyword `AS` is an alias (`SELECT x AS "t.x"`, `FROM t
   * AS "a.b"`), the shape BI tools generate for column labels; in DuckDB's grammar `AS` is never

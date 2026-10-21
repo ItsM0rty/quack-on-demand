@@ -29,9 +29,10 @@ import java.util.concurrent.ConcurrentHashMap
   *     auth.
   *
   * Per-tenant secrets are never stored as literals: `authConfig.clientSecretRef` must be a prefixed
-  * reference (e.g. `env:GOOGLE_CS_TPCH`) that the [[SecretRefResolver]] turns into the plaintext
-  * value at registry-build time. AWS Cognito JWT validation doesn't need a client secret, so the
-  * AWS builder skips the secret-ref lookup entirely.
+  * reference (e.g. `env:GOOGLE_CS_TPCH`) that the
+  * [[ai.starlake.quack.secrets.SecretRefResolver SecretRefResolver]] turns into the plaintext value
+  * at registry-build time. AWS Cognito JWT validation doesn't need a client secret, so the AWS
+  * builder skips the secret-ref lookup entirely.
   */
 final class TenantOidcRegistry(
     loadTenant: String => Option[Tenant],

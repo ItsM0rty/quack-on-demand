@@ -995,7 +995,7 @@ end KubernetesQuackBackend
 object KubernetesQuackBackend:
 
   /** Key inside the per-pool federation Secret holding the resolved SQL. Same string as the env var
-    * name [[buildPod]] sets on the pod, so an operator who shells into the pod and runs
+    * name `buildPod` sets on the pod, so an operator who shells into the pod and runs
     * `env | grep extraSetupSql` sees a familiar value -- the kubelet-injected env mirrors the
     * Secret's keyed payload.
     */
@@ -1007,7 +1007,7 @@ object KubernetesQuackBackend:
   val TokenSecretKey: String = "QOD_NODE_TOKEN"
 
   /** Key inside the per-pod object-store Secret holding the scoped `CREATE SECRET` SQL. Same string
-    * as the env var name [[buildPod]] sets on the pod (matches the `objectStoreSql` env var
+    * as the env var name `buildPod` sets on the pod (matches the `objectStoreSql` env var
     * `scripts/spawn-quack-node.sh` reads), mirroring [[FederationSecretKey]] / [[TokenSecretKey]].
     */
   val ObjectStoreSecretKey: String = "objectStoreSql"

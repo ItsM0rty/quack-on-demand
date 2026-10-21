@@ -35,7 +35,8 @@ final case class SchemaContext(
 )
 
 /** Row-level security rewriter. For every base table referenced by a SELECT that carries a matching
-  * [[RoleRowPolicy]] for the requesting principal, the table is replaced by an inline filtered view
+  * [[ai.starlake.quack.ondemand.state.RoleRowPolicy RoleRowPolicy]] for the requesting principal,
+  * the table is replaced by an inline filtered view
   * `(SELECT * FROM <table> WHERE <predicate>) <alias>`, so the node only ever sees the rows the
   * predicate admits. Predicates from multiple policies on the same table are combined with **OR**
   * (permissive union - a row is visible if ANY of the principal's roles allow it).
@@ -45,8 +46,8 @@ final case class SchemaContext(
   * means row filtering runs on the true values before any column masking is applied.
   *
   * `enabled` is the kill switch, on by default. When false every call short-circuits to
-  * [[Outcome.Passthrough]]. Operators opt out via `quack-on-demand.rls.enabled = false`
-  * (`QOD_RLS_ENABLED=false`).
+  * [[ai.starlake.quack.edge.rls.RowPolicyRewriter.Passthrough Outcome.Passthrough]]. Operators opt
+  * out via `quack-on-demand.rls.enabled = false` (`QOD_RLS_ENABLED=false`).
   */
 object RowPolicyRewriter:
   sealed trait Outcome

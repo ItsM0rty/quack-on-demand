@@ -162,8 +162,9 @@ final class CatalogPreviewHandlers(
     * snapshot id (all-digits) or a tag name, resolved independently through [[SnapshotSelector]] so
     * each side gets its own 410 `snapshot_expired` / 422 `invalid_snapshot` / 404 `not_found`
     * (unknown tag) outcome. Once both bounds resolve to concrete snapshot ids, the table is looked
-    * up at `to` falling back to `from` (mirrors [[DuckLakeCatalogReader.schemaDiff]]'s own
-    * resolution order, via the cheap [[DuckLakeCatalogReader.tableExistsAt]] probe) so an unknown
+    * up at `to` falling back to `from` (mirrors
+    * [[ai.starlake.quack.ondemand.catalog.DuckLakeCatalogReader.schemaDiff DuckLakeCatalogReader.schemaDiff]]'s
+    * own resolution order, via the cheap `DuckLakeCatalogReader.tableExistsAt` probe) so an unknown
     * table surfaces as 404 `not_found` from the handler instead of the reader's silent empty-diff
     * fallback. `from == to` is a valid request and yields an all-empty diff
     * (added/removed/typeChanged/nullabilityChanged all empty).

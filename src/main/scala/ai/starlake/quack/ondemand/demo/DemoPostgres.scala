@@ -9,7 +9,7 @@ import java.sql.DriverManager
 final case class PgCoords(host: String, port: Int, user: String, password: String):
   def jdbcUrl(db: String): String = s"jdbc:postgresql://$host:$port/$db"
 
-/** Ephemeral embedded Postgres for `qod demo`. Wraps a zonky [[EmbeddedPostgres]] whose data
+/** Ephemeral embedded Postgres for `qod demo`. Wraps a zonky `EmbeddedPostgres` whose data
   * directory lives under the demo home, so teardown removes it with the rest of the demo state.
   */
 final class DemoPostgres private (instance: EmbeddedPostgres, val coords: PgCoords):

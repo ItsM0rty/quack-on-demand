@@ -5,14 +5,17 @@ import ai.starlake.quack.edge.cls.SchemaContext
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.state.RolePermission
 import ai.starlake.sql.TooDeep
-import net.sf.jsqlparser.expression.operators.relational.{ExistsExpression, InExpression}
+import net.sf.jsqlparser.expression.operators.relational.{
+  ExistsExpression,
+  InExpression,
+  ParenthesedExpressionList
+}
 import net.sf.jsqlparser.expression.{
   Alias,
   AnyComparisonExpression,
   BinaryExpression,
   Expression,
-  NotExpression,
-  Parenthesis
+  NotExpression
 }
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.schema.Table
@@ -51,7 +54,10 @@ enum MetadataFilterOutcome:
   * granted rows (issue #114: the quack client's ATTACH syncs the remote catalog through
   * `duckdb_tables() UNION ALL duckdb_views()`). Runs for every non-superuser principal without an
   * explicit information_schema grant; the ACL validator implicitly admits exactly the references
-  * this class filters (same flag, same [[FilterableTables]] / [[FilterableFunctions]] lists).
+  * this class filters (same flag, same
+  * [[ai.starlake.quack.edge.meta.MetadataFilterRewriter.FilterableTables FilterableTables]] /
+  * [[ai.starlake.quack.edge.meta.MetadataFilterRewriter.FilterableFunctions FilterableFunctions]]
+  * lists).
   *
   * Fail-closed, and DENIAL is how it stays that way: a filterable reference the substitution walk
   * cannot reach is refused, not filtered. The walk alone cannot promise this (SQL puts tables in
@@ -119,7 +125,7 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
               // unsupported statement is unaffected.
               if textualRefCount(sql) > 0 then Denied(AnalysisRefusal) else Passthrough
             case Some((stmts, exact)) =>
-              val parts = stmts.getStatements.asScala.toList.map(processOne(_, grants, ctx))
+              val parts = stmts.asScala.toList.map(processOne(_, grants, ctx))
               parts.collectFirst { case StmtOutcome.Refused(reason) => reason } match
                 // One refused statement denies the batch: the node executes it whole.
                 case Some(reason) => Denied(reason)
@@ -270,7 +276,7 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
   private def filterableOccurrences(sel: Select, ctx: SchemaContext): Option[RefCounts] =
     val counter = new FilterableOccurrences(ctx.defaultDatabase.getOrElse(""))
     Try {
-      counter.getTableList(sel: Statement)
+      counter.getTables(sel: Statement)
       RefCounts(counter.count, counter.crossCatalogCount)
     }.toOption
 
@@ -320,9 +326,10 @@ final class MetadataFilterRewriter(enabled: Boolean = true):
         case s: ParenthesedSelect => walkSelect(s.getSelect)
         case s: Select            => walkSelect(s)
         case n: NotExpression     => visitExpr(n.getExpression)
-        case p: Parenthesis       => visitExpr(p.getExpression)
-        case ex: ExistsExpression => visitExpr(ex.getRightExpression)
-        case ix: InExpression     =>
+        // jsqlparser 5 reads `(expr)` as a one-element list; the old Parenthesis node is gone.
+        case p: ParenthesedExpressionList[?] => p.asScala.foreach(visitExpr)
+        case ex: ExistsExpression            => visitExpr(ex.getRightExpression)
+        case ix: InExpression                =>
           visitExpr(ix.getLeftExpression); visitExpr(ix.getRightExpression)
         case ac: AnyComparisonExpression => Option(ac.getSelect).foreach(walkSelect)
         case b: BinaryExpression         =>

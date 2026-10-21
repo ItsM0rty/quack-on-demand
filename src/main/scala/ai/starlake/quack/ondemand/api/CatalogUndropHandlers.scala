@@ -14,7 +14,7 @@ import scala.concurrent.duration.DurationInt
 
 /** Undrop (Spec 03): list recoverable dropped tables and recreate one at its last-live snapshot.
   *
-  * Discovery is a catalog read ([[DuckLakeCatalogReader.listDroppedTables]]); recovery is a
+  * Discovery is a catalog read (`DuckLakeCatalogReader.listDroppedTables`); recovery is a
   * `CREATE TABLE ... AS SELECT * FROM t AT (VERSION => n)` routed through the same executor shape
   * as [[CatalogPreviewHandlers]] but wired with `recordExecution = true` in Main, so the recovery
   * snapshot carries the principal's author stamp. The engine primitive (time-travel-reading a

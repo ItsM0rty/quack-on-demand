@@ -49,9 +49,10 @@ final case class HandshakeBound(
   * @param resolveTenant
   *   resolves a wire tenant (the tenant id, case-insensitive) to the tenant.
   * @param authorize
-  *   gates 2-4 over an [[AuthzRequest]]; its `superuserAdmissible` is false when the credential was
-  *   validated by a TENANT realm, so such a principal can never bind to a tenant-IS-NULL superuser
-  *   row. A `HandshakeDenial.Unavailable` (OPA unreachable) becomes `HandshakeFailure.Unavailable`.
+  *   gates 2-4 over an [[ai.starlake.quack.ondemand.rbac.AuthzRequest AuthzRequest]]; its
+  *   `superuserAdmissible` is false when the credential was validated by a TENANT realm, so such a
+  *   principal can never bind to a tenant-IS-NULL superuser row. A `HandshakeDenial.Unavailable`
+  *   (OPA unreachable) becomes `HandshakeFailure.Unavailable`.
   * @param edge
   *   the front door's name (`flightsql`, `quack`), carried into the OPA input's `client.edge`.
   */

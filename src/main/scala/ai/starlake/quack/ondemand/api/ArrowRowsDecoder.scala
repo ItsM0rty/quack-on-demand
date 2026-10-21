@@ -8,10 +8,9 @@ import org.apache.arrow.vector.util.Text
 import scala.jdk.CollectionConverters._
 
 /** Bounded Arrow-to-JSON row decoder for the catalog preview endpoint ([[CatalogPreviewHandlers]]).
-  * `decode` drains an [[ArrowReader]] one `loadNextBatch()` at a time and stops as soon as
-  * `maxRows` rows have been collected, so a query that would return millions of rows never fully
-  * buffers in the manager process -- once the cap is hit, no further batch is pulled from the
-  * reader.
+  * `decode` drains an `ArrowReader` one `loadNextBatch()` at a time and stops as soon as `maxRows`
+  * rows have been collected, so a query that would return millions of rows never fully buffers in
+  * the manager process -- once the cap is hit, no further batch is pulled from the reader.
   *
   * Value rendering: DuckDB integers/floats decode through Arrow's numeric vectors and render as
   * native `Json` numbers; booleans render as `Json` booleans; strings (`Text`/`VarCharVector`)
