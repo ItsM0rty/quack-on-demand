@@ -1,0 +1,28 @@
+name: release pins
+
+# Fails a pull request into main, or a push to main, whose DuckDB pins only
+# resolve on a developer machine: a pre-release `Versions.duckdbJdbc`
+# (`-pre-`, built into ~/.m2 by scripts/dev/build-duckdb-prerelease.sh) or a
+# `Resolver.mavenLocal` in the build. Such a merge breaks every sbt workflow,
+# the manager Docker build and fresh clones. The snapshot and release
+# workflows run the same script before publishing anything.
+#
+# Other branches are untouched: a pre-release branch (feat/duckdb-2.0) carries
+# both until release day and only this check stands between it and main. Make
+# the `release pins` check required on main for the guard to block a merge.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  guard:
+    name: release-grade DuckDB pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Guard - release-grade DuckDB pins
+        run: scripts/release/check-release-pins.sh

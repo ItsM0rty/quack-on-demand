@@ -8,7 +8,9 @@ import ai.starlake.quack.model.{
   Names
 }
 import ai.starlake.quack.ondemand.auth.SessionScope
+import ai.starlake.quack.ondemand.federation.FederatedSourceRules
 import ai.starlake.quack.ondemand.federation.iceberg.IcebergRestConfig
+import ai.starlake.quack.ondemand.federation.rdbms.RdbmsConfig
 import ai.starlake.quack.ondemand.state.FederatedSourceOps
 import ai.starlake.quack.ondemand.telemetry.{AuditActions, AuditRecorder}
 import cats.effect.IO
@@ -18,7 +20,8 @@ import sttp.model.StatusCode
 /** REST handlers for FederatedSource + FederatedSecret rows.
   *
   * @param fedStore
-  *   the federation store (any [[FederatedSourceOps]] implementation)
+  *   the federation store (any
+  *   [[ai.starlake.quack.ondemand.state.FederatedSourceOps FederatedSourceOps]] implementation)
   * @param resolver
   *   resolves (tenantName, tenantDbName) to the surrogate tenantDbId, or None if not found
   * @param tenantIdResolver
@@ -32,7 +35,7 @@ import sttp.model.StatusCode
   *   its pool's nodes, from the in-memory AttachStatusRegistry (Task 7) -- `"attached"`,
   *   `"unknown"`, or `"failed on N of M nodes"`. Replica-local like [[PoolHandlers]]'s
   *   `attachFailuresOf`; inert default so existing callers/tests keep compiling. Consulted ONLY for
-  *   enabled `iceberg_rest` rows, which is exactly what `IcebergAttachVerifier` looks at: a `sql`
+  *   enabled typed (rendered) rows, which is exactly what `IcebergAttachVerifier` looks at: a `sql`
   *   row or a disabled one has no attach state at all, and reporting `"unknown"` for it forever
   *   reads as "we could not tell" rather than the truthful "does not apply". Called unguarded, same
   *   reasoning as [[PoolHandlers]]'s `attachFailuresOf`.
@@ -76,11 +79,18 @@ final class FederatedSourceHandlers(
       description = s.description,
       disabled = s.disabled,
       sourceType = s.sourceType.wire,
-      config = s.config.flatMap(j => IcebergRestConfig.fromJson(j).toOption),
+      // Each typed shape is decoded only for its own type: every IcebergRestConfig field is
+      // defaulted, so a postgres row's JSON would otherwise decode as an empty Iceberg config.
+      config =
+        if s.sourceType == FederatedSourceType.IcebergRest then
+          s.config.flatMap(j => IcebergRestConfig.fromJson(j).toOption)
+        else None,
       readOnly = s.readOnly,
       attachStatus =
-        if s.sourceType == FederatedSourceType.IcebergRest && !s.disabled then
-          attachStatusOf(s.tenantDbId, s.alias)
+        if s.sourceType.rendered && !s.disabled then attachStatusOf(s.tenantDbId, s.alias)
+        else None,
+      connection =
+        if s.sourceType.rdbms then s.config.flatMap(j => RdbmsConfig.fromJson(j).toOption)
         else None
     )
 
@@ -103,7 +113,9 @@ final class FederatedSourceHandlers(
         FederatedSourceType
           .fromWire(wr)
           .toRight(
-            badRequest(s"unknown sourceType '$wr' (expected one of: sql, iceberg_rest)")
+            badRequest(
+              s"unknown sourceType '$wr' (expected one of: ${FederatedSourceType.wireList})"
+            )
           )
 
     // OWNER DECISION (session audit): EVERY federated alias, sql or iceberg_rest, is normalized
@@ -139,7 +151,7 @@ final class FederatedSourceHandlers(
     typeOrError.flatMap { sourceType =>
       aliasOrError.flatMap { alias =>
         // An alias already claimed by a source of a DIFFERENT sourceType is a collision, not an
-        // update: silently flipping "sql" <-> "iceberg_rest" through this upsert would replace
+        // update: silently flipping, say, "sql" <-> "iceberg_rest" through this upsert would replace
         // operator-written setupSql with a rendered config (or vice versa) with no chance to
         // review the change. A same-type re-POST (config/setupSql edit) still upserts in place.
         existing.filter(_.sourceType != sourceType) match
@@ -160,43 +172,58 @@ final class FederatedSourceHandlers(
               description = req.description,
               disabled = req.disabled,
               sourceType = sourceType,
-              config = req.config.map(_.toJson),
-              // An external catalog is one QoD does not own, so a new iceberg_rest source is
-              // read-only until an operator says otherwise. A sql source keeps today's behaviour,
-              // where writes are governed by the ACL graph alone.
-              readOnly = req.readOnly.getOrElse(sourceType == FederatedSourceType.IcebergRest)
+              // Each typed shape arrives on its own wire field and is stored in the one `config`
+              // column; the field a type does not use is refused below, not silently dropped.
+              config =
+                if sourceType.rdbms then req.connection.map(_.toJson)
+                else req.config.map(_.toJson),
+              // An external catalog is one QoD does not own, so a new typed source is read-only
+              // until an operator says otherwise. A sql source keeps today's behaviour, where
+              // writes are governed by the ACL graph alone.
+              readOnly = req.readOnly.getOrElse(sourceType.rendered)
             )
 
-            val shapeErrors  = source.validate
-            val configErrors = (sourceType, req.config) match
-              case (FederatedSourceType.IcebergRest, Some(cfg)) =>
-                // `validated` is the same gate the blob builder uses before render, so a config
-                // the handler accepts is one the node will attach.
-                // Reserve the tenant-db's own DuckDB catalog alias and every sibling federated
-                // alias. Without these, `ATTACH 'x' AS "<tenant-db alias>"` reaches the node,
-                // DuckDB answers "database with name ... already exists", and because the piped
-                // CLI does not bail the node comes up with a half-applied federation blob and no
-                // loud signal. This is the last point at which the operator can simply be told.
-                //
-                // Exclude the row being upserted BY ID, not by alias equality: `existing` (like
-                // the createSource lookup that produced it) can be a legacy row whose STORED
-                // alias differs in case from the normalized `alias` here, so `_.alias == alias`
-                // would fail to exclude it and the row would reserve its own alias against
-                // itself, 400ing an upsert that should succeed. Lowercased for the same reason --
-                // `validate` already compares case-insensitively, but the set itself should not
-                // rely on that to stay correct.
-                val selfId   = existing.map(_.id)
-                val reserved =
-                  catalogAliasOf(tenantDbId).toSet ++
-                    fedStore
-                      .listSources(tenantDbId)
-                      .filterNot(s => selfId.contains(s.id))
-                      .map(s => FederatedAlias.fold(s.alias))
-                      .toSet
-                IcebergRestConfig.validated(cfg, alias, reserved).left.getOrElse(Nil)
-              case _ => Nil
-
-            val all = shapeErrors ++ configErrors
+            val fieldErrors =
+              List(
+                Option.when(req.config.isDefined && sourceType != FederatedSourceType.IcebergRest)(
+                  s"config is for sourceType 'iceberg_rest', not '${sourceType.wire}'" +
+                    (if sourceType.rdbms then "; use connection" else "")
+                ),
+                Option.when(req.connection.isDefined && !sourceType.rdbms)(
+                  s"connection is for sourceType 'postgres' / 'mysql', not '${sourceType.wire}'"
+                ),
+                Option.when(sourceType.rdbms && req.setupSql.exists(_.trim.nonEmpty))(
+                  s"setupSql is for sourceType 'sql', not '${sourceType.wire}'"
+                )
+              ).flatten
+            // Reserve the tenant-db's own DuckDB catalog alias and every sibling federated alias.
+            // Without these, `ATTACH 'x' AS "<tenant-db alias>"` reaches the node, DuckDB answers
+            // "database with name ... already exists", and because the piped CLI does not bail
+            // the node comes up with a half-applied federation blob and no loud signal. This is
+            // the last point at which the operator can simply be told.
+            //
+            // Exclude the row being upserted BY ID, not by alias equality: `existing` (like the
+            // createSource lookup that produced it) can be a legacy row whose STORED alias differs
+            // in case from the normalized `alias` here, so `_.alias == alias` would fail to
+            // exclude it and the row would reserve its own alias against itself, 400ing an upsert
+            // that should succeed. Folded for the same reason.
+            def reserved: Set[String] =
+              val selfId = existing.map(_.id)
+              catalogAliasOf(tenantDbId).toSet ++
+                fedStore
+                  .listSources(tenantDbId)
+                  .filterNot(s => selfId.contains(s.id))
+                  .map(s => FederatedAlias.fold(s.alias))
+                  .toSet
+            // The row rules are shared with the manifest importer (`FederatedSourceRules`), so no
+            // path admits what another refuses; the typed config check there is the same
+            // `validated` gate the blob builder uses before render, so a config the handler
+            // accepts is one the node will attach. A missing connection is named by its wire
+            // field: the row rules can only say "config", the column it is stored in.
+            val all =
+              if sourceType.rdbms && req.connection.isEmpty then
+                fieldErrors :+ s"connection is required for sourceType '${sourceType.wire}'"
+              else (fieldErrors ++ FederatedSourceRules.errors(source, reserved)).distinct
             if all.nonEmpty then Left(badRequest(all.mkString("; ")))
             else
               // This endpoint is a create-request-as-upsert: every field is replaced by what the

@@ -6,6 +6,7 @@ import ai.starlake.quack.model.{
   FederatedSecret,
   FederatedSource,
   FederatedSourceType,
+  InitSqlScreen,
   LockdownTriState,
   Names,
   NodePlacement,
@@ -19,6 +20,7 @@ import ai.starlake.quack.model.{
   TenantDbKind
 }
 import ai.starlake.quack.ondemand.EncryptionKeyGen
+import ai.starlake.quack.ondemand.federation.FederatedSourceRules
 import ai.starlake.quack.ondemand.state.{
   BuiltinRbac,
   ControlPlaneStore,
@@ -156,6 +158,11 @@ object ManifestImporter extends LazyLogging:
         // manifest fields are rejected: accumulate a validation error rather
         // than throwing at apply time.
         LockdownTriState.parse(p.lockdown).left.foreach { msg =>
+          errs += s"tenant '${t.name}' pool '${p.name}': $msg"
+        }
+        // The pool's boot SQL, refused here because apply writes pool rows straight to the store
+        // (a tenant-db's initSql goes through TenantDb.validateSafety at apply).
+        InitSqlScreen.error("initSql", p.initSql).foreach { msg =>
           errs += s"tenant '${t.name}' pool '${p.name}': $msg"
         }
         // Reject a malformed demand scale-out band (one-sided, inverted,
@@ -485,7 +492,13 @@ object ManifestImporter extends LazyLogging:
                   case None =>
                     store.upsertTenantDb(upserted)
                     localDbs.put(mtd.name, upserted)
-                    applyFederatedSources(federatedStore, mtd, tdId, errs)
+                    applyFederatedSources(
+                      federatedStore,
+                      mtd,
+                      tdId,
+                      TenantDb.catalogAlias(upserted.metastore, upserted.name),
+                      errs
+                    )
         }
 
         // ---- Pools: delete-then-upsert, keyed by (tenant, pool name).
@@ -864,10 +877,11 @@ object ManifestImporter extends LazyLogging:
     * through `FederatedSourceHandlers`, so the guards that handler applies are applied here too:
     * the alias is normalized through `Names.normalizeOrError` (an invalid one is reported and the
     * source skipped, never written under a name every other path rejects), the constructed row is
-    * run through `FederatedSource.validate`, and a blank inline secret value is refused the way
-    * `upsertSecret` refuses it. The one guard NOT replicated here is `IcebergRestConfig.validated`:
-    * an `iceberg_rest` config that parses but does not validate is stored, and
-    * `FederationBlobBuilder.bodyTemplate` is what catches it, at node spawn.
+    * run through `FederatedSourceRules.errors` (the SAME row rules the REST and MCP paths apply,
+    * typed config validation included: a postgres config with a literal password or a socket host
+    * is refused here exactly as REST refuses it), and a blank inline secret value is refused the
+    * way `upsertSecret` refuses it. Aliases are reserved against the tenant-db's own catalog alias
+    * and every other source the manifest declares for it, as the blob builder reserves them.
     *
     * Identity is the ROW ID throughout, never the alias string: aliases are case-insensitive to
     * DuckDB, and rows written before normalization landed may carry a case the manifest does not
@@ -878,6 +892,7 @@ object ManifestImporter extends LazyLogging:
       federatedStore: Option[FederatedSourceStore],
       mtd: ManifestTenantDb,
       tdId: String,
+      ownCatalogAlias: String,
       errs: scala.collection.mutable.ListBuffer[String]
   ): Unit =
     if federatedStore.isDefined && mtd.federatedSources.nonEmpty then
@@ -999,7 +1014,13 @@ object ManifestImporter extends LazyLogging:
             readOnly = msrc.readOnly
           )
 
-          val shapeErrors = source.validate
+          val reserved =
+            resolvedAliases
+              .flatMap(_._2)
+              .filterNot(_ == alias)
+              .map(fold)
+              .toSet ++ Option(ownCatalogAlias).filter(_.nonEmpty).map(fold)
+          val shapeErrors = FederatedSourceRules.errors(source, reserved)
           if shapeErrors.nonEmpty then
             errs += s"tenant-db '${mtd.name}' source '$alias': ${shapeErrors.mkString("; ")}"
           else

@@ -459,7 +459,7 @@ class BranchServiceSpec extends AnyFlatSpec with Matchers:
     f.sup.deletePool(f.parentKey, force = true).unsafeRunSync()
     val refused = f.sup.deleteTenantDb("acme", f.parent.name).unsafeRunSync()
     refused.left.map(_.message).left.toOption.get should include("live branch")
-    val pins = new PinnedSetResolver(f.store, (_, _) => fail("no reader needed"))
+    val pins = new PinnedSetResolver(f.store)
     pins.pinnedSnapshots(f.tenant.id, f.parent.name) shouldBe Set(10L)
     f.service
       .discard("acme", f.parent.name, "x", f.admin1, None)

@@ -13,8 +13,8 @@ object Versions {
   val nimbusJoseJwt  = "9.47"
   val scalaTest      = "3.2.17"
   // jsqlParser must match the version jsqltranspiler's pom pins (its manticore line)
-  val jsqlParser     = "5.4.15"
-  val jsqltranspiler = "1.12"
+  val jsqlParser     = "5.4.162"
+  val jsqltranspiler = "1.16"
   val circeYaml      = "0.16.1"
   val cats           = "2.13.0"
   val netty          = "4.1.118.Final"
@@ -30,7 +30,8 @@ object Versions {
   val wireMock       = "3.9.2"
   val blobstore      = "0.10.1"
   val starlakeJdbc   = "0.7"
-  val duckdb         = "1.5.6.0" // before bumping: docs/duckdb-pin-bump-checklist.md
+  val duckdb         = "2.0.0.0" // before bumping: docs/duckdb-pin-bump-checklist.md
+  val duckdbJdbc     = duckdb
   val micrometer     = "1.13.6"
   val liquibase      = "4.29.2"
   val caffeine       = "3.1.8"

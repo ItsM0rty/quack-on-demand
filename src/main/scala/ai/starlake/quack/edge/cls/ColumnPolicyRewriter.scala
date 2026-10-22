@@ -6,6 +6,7 @@ import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import cats.effect.IO
 import cats.syntax.traverse._
 import ai.starlake.acl.parser.TableExtractor
+import ai.starlake.sql.{ParserInput, TooDeep}
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
 import net.sf.jsqlparser.statement.select.{ParenthesedSelect, PlainSelect, Select, SetOperationList}
 
@@ -14,10 +15,16 @@ import scala.util.{Failure, Success, Try}
 
 /** Resolves the schema/catalog defaults in scope when parsing a SQL statement so the rewriter can
   * qualify bare table references (`customer` -> `acme_tpch.tpch1.customer`).
+  *
+  * `attachedCatalogs`: the catalogs attached on the pool's nodes (the tenant-db alias, federated
+  * aliases, DuckDB's built-ins), as `ValidationContext.attachedCatalogs`. DuckDB binds a two-part
+  * `X.t` catalog-first when `X` is one of them, so the protected-write guard refuses that name
+  * instead of reading it schema-first (audit F20). Required: an empty set disables that refusal.
   */
 final case class SchemaContext(
     defaultDatabase: Option[String],
-    defaultSchema: Option[String]
+    defaultSchema: Option[String],
+    attachedCatalogs: Set[String]
 )
 
 object ColumnPolicyRewriter:
@@ -26,11 +33,19 @@ object ColumnPolicyRewriter:
   final case class Denied(reason: String) extends Outcome
   case object Passthrough                 extends Outcome
 
-  /** Inner rewriter could not parse the SQL. Routed identically to [[Passthrough]] (the original
-    * SQL is forwarded to the node) but tagged separately on the `column_policy_rewrites_total`
-    * counter so dashboards can distinguish "no policy applied" from "rewriter blind".
+  /** The rewriter could not parse the SQL, so it cannot prove the masked columns absent. The router
+    * DENIES it (fail-closed), tagged `parse_failed` on the `column_policy_rewrites_total` counter
+    * so dashboards can tell "rewriter blind" from a policy deny.
     */
   case object PassthroughParseFailed extends Outcome
+
+  /** The deny reason for a rewrite that would be printed from a parser input that is not the
+    * caller's statement (DuckDB's `//` integer division reaches JSqlParser as `/`), so shipping it
+    * would run a different statement.
+    */
+  private[cls] val InexactRefusal: String =
+    "column policies cannot be applied to a statement using integer division (//); " +
+      "split the statement or select the division without the masked columns"
 
   /** Inner rewriter raised a deny because the table/schema/catalog could not be resolved, not
     * because a policy matched. Same wire-level error as [[Denied]] but tagged separately so
@@ -51,8 +66,9 @@ object ColumnPolicyRewriter:
   * policies) and delegates the actual SQL walk to the inner rewriter.
   *
   * `enabled` is the kill switch, on by default. When false, every call short-circuits to
-  * [[Passthrough]] without touching the catalog or the inner rewriter. Operators opt out via
-  * `quack-on-demand.cls.enabled = false` (or `QOD_CLS_ENABLED=false`).
+  * [[ai.starlake.quack.edge.cls.ColumnPolicyRewriter.Passthrough Passthrough]] without touching the
+  * catalog or the inner rewriter. Operators opt out via `quack-on-demand.cls.enabled = false` (or
+  * `QOD_CLS_ENABLED=false`).
   */
 final class ColumnPolicyRewriter(
     catalog: ColumnCatalog,
@@ -72,26 +88,53 @@ final class ColumnPolicyRewriter(
     else if eff.user.tenant.isEmpty then IO.pure(Passthrough)
     else if kind != StatementKind.Select then IO.pure(Passthrough)
     else if eff.columnPolicies.isEmpty then IO.pure(Passthrough)
-    else if readsOnlyCatalogFunctions(sql) then IO.pure(Passthrough)
+    else
+      // Every parse below reads the lexer-canonical rendering, never the raw text: JSqlParser
+      // tokenizes DuckDB's escape and dollar-quoted strings differently, and a table it cannot see
+      // is a table no policy masks. A rendering refusal is input DuckDB rejects anyway.
+      // A too-deep statement overflows the parse and resolver walks below: denied (TooDeep).
+      // Guarded twice because the walks run both eagerly (here) and inside the IO's map.
+      TooDeep.orElse(IO.pure(Denied(TooDeep.Reason))) {
+        ParserInput.render(sql) match
+          case Left(_)      => IO.pure(PassthroughParseFailed)
+          case Right(input) =>
+            rewriteCanonical(input.text, eff, ctx).map {
+              // The rewrite is printed from the parser input, which is not the caller's statement
+              // here (ParserInput.Rendered.exact): shipping it would run a different statement.
+              case Rewritten(_) if !input.exact => Denied(InexactRefusal)
+              case other                        => other
+            }
+      }
+
+  private def rewriteCanonical(sql: String, eff: EffectiveSet, ctx: SchemaContext): IO[Outcome] =
+    if readsOnlyCatalogFunctions(sql) then IO.pure(Passthrough)
     else
       buildSchema(sql, ctx).map { schema =>
-        PositionalReferences.resolve(sql, schema) match
-          case Left(reason) => Denied(reason)
-          case Right(named) =>
-            inner.rewrite(
-              sql = named,
-              schema = schema,
-              policies = eff.columnPolicies,
-              defaultCatalog = ctx.defaultDatabase,
-              defaultSchema = ctx.defaultSchema,
-              unresolvedMode = unresolvedMode
-            ) match
-              case RewriteOutcome.Rewritten(s)   => Rewritten(s)
-              case RewriteOutcome.Denied(reason) =>
-                if looksUnresolvedTable(reason) then DeniedUnresolvedTable else Denied(reason)
-              case RewriteOutcome.Passthrough => Passthrough
-              case RewriteOutcome.ParseFailed => PassthroughParseFailed
+        TooDeep.orElse(Denied(TooDeep.Reason))(rewriteResolved(sql, schema, eff, ctx))
       }
+
+  private def rewriteResolved(
+      sql: String,
+      schema: Map[String, List[String]],
+      eff: EffectiveSet,
+      ctx: SchemaContext
+  ): Outcome =
+    PositionalReferences.resolve(sql, schema) match
+      case Left(reason) => Denied(reason)
+      case Right(named) =>
+        inner.rewrite(
+          sql = named,
+          schema = schema,
+          policies = eff.columnPolicies,
+          defaultCatalog = ctx.defaultDatabase,
+          defaultSchema = ctx.defaultSchema,
+          unresolvedMode = unresolvedMode
+        ) match
+          case RewriteOutcome.Rewritten(s)   => Rewritten(s)
+          case RewriteOutcome.Denied(reason) =>
+            if looksUnresolvedTable(reason) then DeniedUnresolvedTable else Denied(reason)
+          case RewriteOutcome.Passthrough => Passthrough
+          case RewriteOutcome.ParseFailed => PassthroughParseFailed
 
   /** True for a single statement whose only FROM items are DuckDB's filterable catalog functions
     * (`duckdb_tables()`, `duckdb_views()`, `duckdb_schemas()`, `duckdb_columns()`) and which reads
@@ -104,13 +147,15 @@ final class ColumnPolicyRewriter(
     * Decided on the ACL parser's walk, which is complete by construction (ORDER BY, GROUP BY and
     * window subqueries included, unlike jsqlparser's own traversal), so a policy-bearing table
     * hidden anywhere still reaches the resolver. Exactly one statement: `parse` truncates a batch
-    * to its first statement, and a batch is refused by the resolver today; a shortcut on its head
-    * would forward the tail unmasked. Any other table function (`read_parquet`, ...) keeps the
+    * to its first statement, so a shortcut judged on a batch's head would forward its tail
+    * unmasked. The resolver below still parses only that first statement; what keeps a batch's tail
+    * from going out unmasked is the protected-write guard, which runs before this rewriter and
+    * analyses every statement of a multi-statement batch, denying it when any statement reads a
+    * table under a column or row policy. Any other table function (`read_parquet`, ...) keeps the
     * fail-closed path, as does a catalog function beside a physical table.
     */
   private def readsOnlyCatalogFunctions(sql: String): Boolean =
     Try(CCJSqlParserUtil.parseStatements(sql)).toOption
-      .map(_.getStatements)
       .filter(_.size == 1)
       .flatMap(sts => Option(sts.get(0)).collect { case sel: Select => sel })
       .exists { sel =>
@@ -135,7 +180,7 @@ final class ColumnPolicyRewriter(
     * closed (worst case: a denied metadata query, never a leak).
     */
   private def buildSchema(sql: String, ctx: SchemaContext): IO[Map[String, List[String]]] =
-    Try(CCJSqlParserUtil.parse(sql)) match
+    Try(ai.starlake.sql.JSqlStatements.parseFirst(sql)) match
       case Failure(_)            => IO.pure(Map.empty)
       case Success(stmt: Select) =>
         val tables = collectTables(stmt, ctx)
@@ -148,25 +193,22 @@ final class ColumnPolicyRewriter(
           .map(_.flatten.toMap)
       case Success(_) => IO.pure(Map.empty)
 
-  /** Every physical table referenced ANYWHERE in the statement, keyed by its raw (bare) name.
-    * [[net.sf.jsqlparser.util.TablesNamesFinder]] walks FROM items, joins, CTE bodies, set-op arms
-    * AND expression subqueries (EXISTS / IN / ANY / scalar) while excluding CTE names - the
-    * hand-rolled FROM-walker this replaces missed expression-nested subqueries, which left their
-    * tables out of the schema map entirely (the root of the subquery fail-open gap: a table the map
-    * never mentions can neither resolve nor deny).
+  /** Every physical table referenced ANYWHERE in the statement, keyed by its raw (bare) name: the
+    * ACL parser's walk ([[TableExtractor]]), which reaches FROM items, joins, CTE bodies, set-op
+    * arms AND expression subqueries (a table the map never mentions can neither resolve nor deny),
+    * and binds CTE names as DuckDB does. JSqlParser's own TablesNamesFinder dropped every table
+    * named like a CTE of the statement, so the dbt shape `WITH customer AS (SELECT * FROM customer)
+    * SELECT c_email FROM customer`, whose body reads the real table, could not be resolved and was
+    * denied.
     */
   private def collectTables(
       stmt: Select,
       ctx: SchemaContext
   ): Map[String, (String, String, String)] =
-    val names =
-      Try {
-        val finder = new net.sf.jsqlparser.util.TablesNamesFinder()
-        finder.getTableList(stmt: net.sf.jsqlparser.statement.Statement).asScala.toList
-      }.getOrElse(Nil)
-    def unquote(s: String) = s.stripPrefix("\"").stripSuffix("\"")
-    names.flatMap { raw =>
-      raw.split('.').toList.map(unquote) match
+    val tables             = Try(TableExtractor.extract(stmt).tables).getOrElse(Nil)
+    def unquote(s: String) = ai.starlake.sql.QuotedIdentifier.unquote(s)
+    tables.flatMap { t =>
+      t.getNameParts.asScala.toList.reverse.map(unquote) match
         case tab :: Nil =>
           Some(tab -> (ctx.defaultDatabase.getOrElse(""), ctx.defaultSchema.getOrElse(""), tab))
         case sch :: tab :: Nil =>
@@ -219,7 +261,7 @@ private[cls] object PositionalReferences:
     if textualCount(sql) == 0 then Right(sql)
     else
       Try(CCJSqlParserUtil.parseStatements(sql)).toOption
-        .map(_.getStatements.asScala.toList) match
+        .map(_.asScala.toList) match
         case Some(List(ps: PlainSelect))
             if ps.getWithItemsList == null || ps.getWithItemsList.isEmpty =>
           val single = Option(ps.getJoins).forall(_.isEmpty)
@@ -231,7 +273,7 @@ private[cls] object PositionalReferences:
                 Left(s"positional column references (#n) on ${t.getName}: table columns unknown")
               else
                 val walk = new Numbering(cols)
-                Try(walk.getTableList(ps: net.sf.jsqlparser.statement.Statement)).toOption match
+                Try(walk.getTables(ps: net.sf.jsqlparser.statement.Statement)).toOption match
                   case None    => Left(UnsupportedShape)
                   case Some(_) =>
                     walk.failure match

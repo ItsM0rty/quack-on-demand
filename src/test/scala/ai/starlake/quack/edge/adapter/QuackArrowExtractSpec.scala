@@ -6,18 +6,17 @@ import org.scalatest.matchers.should.Matchers
 
 /** End-to-end round-trip for the Arrow C-data pipeline:
   *
-  *   1. C++ fixture serializes a sample FETCH_RESPONSE (or
-  *      PREPARE_RESPONSE) containing one `INTEGER` column with the
-  *      value `42`.
-  *   2. `QuackNativeBridge.extractArrowStream` decodes the message and
-  *      hands us an `ArrowArrayStream*` cast to a `Long`.
-  *   3. `QuackArrowImport.importStream` wraps the pointer as an
-  *      `ArrowReader` via Arrow Java's C-data importer.
+  *   1. C++ fixture serializes a sample FETCH_RESPONSE (or PREPARE_RESPONSE) containing one
+  *      `INTEGER` column with the value `42`.
+  *   2. `QuackNativeBridge.extractArrowStream` decodes the message and hands us an
+  *      `ArrowArrayStream*` cast to a `Long`.
+  *   3. `QuackArrowImport.importStream` wraps the pointer as an `ArrowReader` via Arrow Java's
+  *      C-data importer.
   *   4. We drain the reader and assert schema + row count + value.
   *
-  * Successful close of the reader also exercises the native
-  * `chunk_stream_release` callback path -- leaks here would show up as
-  * RootAllocator's outstanding-allocation assert when the reader closes.
+  * Successful close of the reader also exercises the native `chunk_stream_release` callback path --
+  * leaks here would show up as RootAllocator's outstanding-allocation assert when the reader
+  * closes.
   */
 class QuackArrowExtractSpec extends AnyFunSpec with Matchers:
 
@@ -37,7 +36,7 @@ class QuackArrowExtractSpec extends AnyFunSpec with Matchers:
           root.getSchema.getFields.size() shouldBe 1
           // DuckDB INTEGER (int32) -> Arrow IntVector with field type Int(32,true).
           val field = root.getSchema.getFields.get(0)
-          field.getType.toString.toLowerCase should include ("int")
+          field.getType.toString.toLowerCase should include("int")
           root.getRowCount shouldBe 1
           val vec = root.getVector(0)
           vec.getObject(0).toString shouldBe "42"
@@ -70,11 +69,11 @@ class QuackArrowExtractSpec extends AnyFunSpec with Matchers:
     }
 
     it("raises RuntimeException for a non-response message type") {
-      val bytes = QuackNativeBridge.serializeConnectionRequest("any-token")
-      val ex = intercept[RuntimeException] {
+      val bytes = QuackNativeBridge.serializeConnectionRequest("any-token", 30L)
+      val ex    = intercept[RuntimeException] {
         QuackNativeBridge.extractArrowStream(bytes)
       }
-      ex.getMessage should include ("PREPARE_RESPONSE or FETCH_RESPONSE")
+      ex.getMessage should include("PREPARE_RESPONSE or FETCH_RESPONSE")
     }
 
     it("raises RuntimeException on garbage bytes") {

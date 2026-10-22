@@ -507,12 +507,6 @@ final case class ManagerConfig(
     )
     maxNodesTotal: Int,
     @field @ConfigField(
-      envVar = "QOD_NATIVE_CLIENT",
-      description =
-        "Use the JNI-backed native Quack wire client. False falls back to the embedded path."
-    )
-    nativeClient: Boolean,
-    @field @ConfigField(
       envVar = "QOD_STAMP_WRITES",
       description =
         "Stamp DuckLake snapshots created by FlightSQL DML/DDL with author and commit message " +
@@ -520,11 +514,15 @@ final case class ManagerConfig(
     )
     stampWrites: Boolean,
     @field @ConfigField(
-      envVar = "QOD_NODE_DISABLE_SSL",
+      envVar = "QOD_QUACK_NODE_LEASE_SEC",
       description =
-        "Disable TLS on the embedded path's quack_query() call. Ignored on the native path."
+        "Lease (seconds, >= 1) the manager asks a node for on each native connection. The manager " +
+          "heartbeats at a third of it. The node checks the lease only when the connection's " +
+          "next message arrives; once lapsed, that message fails and the node interrupts what " +
+          "still runs on the connection and drops it. A lapse by itself interrupts nothing, so " +
+          "the lease does not bound work orphaned by a dead manager."
     )
-    nodeDisableSsl: Boolean,
+    nodeLeaseSec: Int = 30,
     @field @ConfigField(
       envVar = "QOD_SPAWN_SCRIPT",
       description = "Path to spawn-quack-node.sh invoked by LocalQuackBackend on Unix."
@@ -597,7 +595,11 @@ final case class ManagerConfig(
     k8s: K8sConfig,
     federation: FederationConfig,
     auth: ManagerAuthConfig
-)
+):
+  require(
+    nodeLeaseSec >= 1,
+    s"nodeLeaseSec (QOD_QUACK_NODE_LEASE_SEC) must be >= 1, got $nodeLeaseSec"
+  )
 
 final case class RoutingConfig(
     @field @ConfigField(

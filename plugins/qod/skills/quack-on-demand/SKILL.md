@@ -91,7 +91,9 @@ Not sure which command you want?
 
 On Kubernetes, the Helm chart is published as an OCI artifact per release:
 `helm install qod oci://ghcr.io/starlake-ai/charts/quack-on-demand --version <release>`
-(external Postgres required; see https://docs.starlake.ai/qod). Locally,
+(external Postgres required, and `postgres.user` must be set to a dedicated
+non-superuser role; the chart turns node lockdown on, so tenant users cannot
+read the node's mounted catalog password; see https://docs.starlake.ai/qod). Locally,
 `qod start` supervises the released uber-jar, downloaded and cached on first
 use (Java 21+ required; the `duckdb` CLI and node spawn scripts are
 provisioned automatically):
@@ -654,8 +656,9 @@ ordinary user: the DuckDB client syncs the remote catalog with
 denied for anyone without a `*.*.*` ALL grant (`unsupported constructs (deny,
 fail-closed): table function duckdb_tables`). The attached catalog then lists only the
 tables the user is granted; an ungranted table is simply absent (`does not exist` on
-the client), never described. Other table functions (`read_parquet`, ...) are unchanged
-and stay denied without a wildcard ALL grant.
+the client), never described. Other table functions stay denied without a wildcard ALL
+grant, and the file-reading ones (`read_parquet`, `read_csv`, `glob`, ...) are refused to
+every tenant user, `*.*.* ALL` included (see "Direct file access" under Hardening).
 
 An **explicit** `information_schema` grant is still meaningful: it is the escape hatch
 that turns the filter off for that principal and restores the unfiltered read (useful
@@ -941,7 +944,7 @@ what the later Execute actually delivers.
 
 ## Federation - external catalogs via DuckDB extensions
 
-Quack-on-Demand supports per-tenant-db federated catalogs that attach external sources (Postgres, S3, Iceberg, any DuckDB extension) under DuckDB catalog aliases. Existing RBAC covers federated tables - a `RolePermission(catalog='fedpg', schema='public', table='orders', verb='RO')` grants read access to a federated alias just like a DuckLake table. Sources come in two flavours: `sql`, where the operator writes the `ATTACH` text, and `iceberg-rest`, a typed source where QoD writes it (see "Register an Iceberg REST catalog").
+Quack-on-Demand supports per-tenant-db federated catalogs that attach external sources (Postgres, S3, Iceberg, any DuckDB extension) under DuckDB catalog aliases. Existing RBAC covers federated tables - a `RolePermission(catalog='fedpg', schema='public', table='orders', verb='RO')` grants read access to a federated alias just like a DuckLake table. **Known limitation, column policies:** with column-level security on (the default), a principal holding ANY column policy, even one on an unrelated table, is denied (fail-closed, "column policy rewrite could not parse statement" or "unresolved table") every read of a table outside the session's default catalog and schema: a federated alias, another attached catalog such as an Iceberg one, or another schema of the same DuckLake database. A table grant alone does not make such a table readable for that principal, and a mask on a federated table never masks: the read is denied instead. Principals with no column policy are unaffected. Sources come in two flavours: `sql`, where the operator writes the `ATTACH` text, and typed sources where QoD writes it: `iceberg-rest` (see "Register an Iceberg REST catalog") and `postgres` / `mysql` (see "Register a Postgres or MySQL database").
 
 ### Tenant-db kinds
 
@@ -1176,17 +1179,56 @@ Two operator cautions:
 
 ### Register a federated source
 
+A `sql` source runs the setup SQL you write, verbatim, on every node of the
+tenant-db. For a Postgres or MySQL database, prefer the typed source ("Register a
+Postgres or MySQL database" below): QoD writes this same block for you and the
+source is read-only by default. A hand-written one looks like this:
+
 ```bash
+# One statement per line. --setup-sql takes the text itself (there is no file
+# option), so read it from a heredoc.
+SETUP_SQL=$(cat <<'SQL'
+INSTALL postgres;
+LOAD postgres;
+CREATE OR REPLACE TEMPORARY SECRET {{alias}}_pg (TYPE postgres, HOST 'pg.prod', PORT 5432, DATABASE 'warehouse', USER 'svc_qod', PASSWORD '{{secret.PG_PWD}}');
+ATTACH '' AS {{alias}} (TYPE postgres, SECRET {{alias}}_pg, READ_ONLY);
+DROP SECRET IF EXISTS {{alias}}_pg;
+SQL
+)
+
+# 1. Save it disabled: the PG_PWD secret can only be set once the source exists.
 qod federation create acme acme_fed --alias fedpg \
-  --description "Prod warehouse Postgres" \
-  --setup-sql "INSTALL postgres; LOAD postgres; CREATE OR REPLACE SECRET fedpg_sec (TYPE POSTGRES, HOST 'pg.prod', PORT 5432, DATABASE 'warehouse', USER 'svc_qod', PASSWORD '{{secret.PG_PWD}}'); ATTACH '' AS {{alias}} (TYPE POSTGRES, SECRET fedpg_sec, READ_ONLY);"
+  --description "Prod warehouse Postgres" --read-only --disabled \
+  --setup-sql "$SETUP_SQL"
+# 2. Set the secret ("Add a Postgres-backed secret" below).
+qod federation secret set acme acme_fed fedpg --name PG_PWD --value "$PG_PWD"
+# 3. Enable it: the same create, without --disabled.
+qod federation create acme acme_fed --alias fedpg \
+  --description "Prod warehouse Postgres" --read-only \
+  --setup-sql "$SETUP_SQL"
 ```
+
+Why it is shaped this way:
+- **A temporary secret, dropped right after the ATTACH.** A DuckDB secret is
+  visible to every session on the node and outlives the ATTACH. Left in place,
+  any session could re-attach the database with it, writable, under the
+  service account's credentials.
+- **One statement per line.** The node keeps going past a failed statement, so
+  a `DROP SECRET` on its own line still runs when the ATTACH fails (the remote is
+  down at node start, say). On the ATTACH's line it would be skipped and the
+  secret would stay.
+- **`--read-only`.** A `sql` source defaults to writable: `READ_ONLY` on the
+  ATTACH binds that one attachment only, and `--read-only` makes the edge refuse
+  writes to the catalog too.
+- **Disabled until its secret exists.** An enabled source whose
+  `{{secret.NAME}}` names a missing secret fails the whole tenant-db federation
+  blob at node spawn, not just this catalog.
 
 Placeholders:
 - `{{alias}}` - replaced with the source's `alias` field.
 - `{{secret.NAME}}` - replaced with the resolved value of the secret named `NAME`.
 
-Alias rules, for **every** source type (`sql` as well as `iceberg-rest`):
+Alias rules, for **every** source type (`sql` as well as the typed ones):
 
 - **An alias must be a plain lowercase identifier**: ASCII letters, digits and
   underscore, starting with a letter or underscore, 1..63 chars. `--alias ext-s3`
@@ -1310,6 +1352,93 @@ qod federation secret set acme acme_fed glue_lake --name AWS_SECRET --value "$AW
 - `--aws-secret-access-key` / `--aws-session-token` must be `{{secret.NAME}}`
   placeholders, like `--client-secret`.
 
+### Register a Postgres or MySQL database
+
+A typed source for an external Postgres or MySQL database: no SQL to write, and
+the password never sits in an `ATTACH` string. QoD renders a temporary DuckDB
+secret holding the connection, an `ATTACH '' AS <alias> (TYPE postgres, SECRET
+..., READ_ONLY)` and a `DROP SECRET` right after it, so no session can reuse
+the credentials once the ATTACH returns (for instance to re-attach the server
+writable).
+
+```bash
+# Read the password from stdin (or --password-prompt): the CLI stores it as the
+# source's secret PASSWORD and puts the {{secret.PASSWORD}} placeholder in the source.
+printf '%s' "$PG_PASSWORD" | qod federation create acme acme_fed --alias shop \
+  --type postgres --host pg.prod.internal --database shop --user qod_reader \
+  --schema sales --ssl-mode require --password-stdin
+
+# MySQL: same flags, no --schema, MySQL TLS mode names
+qod federation create acme acme_fed --alias crm --type mysql \
+  --host mysql.prod.internal --database crm --user qod_reader \
+  --ssl-mode required --password-prompt
+
+# Or point at a secret you manage yourself (an --external-ref one, say).
+# 1. Save the source disabled: its secret can only be set once the source exists,
+#    and an enabled source naming a missing secret fails the whole tenant-db
+#    federation blob at node spawn.
+qod federation create acme acme_fed --alias shop --type postgres \
+  --host pg.prod.internal --database shop --user qod_reader \
+  --password '{{secret.SHOP_PG}}' --disabled
+# 2. Set the secret. --external-ref needs a superuser session: a tenant admin gets
+#    403 superuser_required and stores an inline --value instead.
+qod federation secret set acme acme_fed shop --name SHOP_PG --external-ref env:SHOP_PG_PASSWORD
+# 3. Enable it: the same create, without --disabled.
+qod federation create acme acme_fed --alias shop --type postgres \
+  --host pg.prod.internal --database shop --user qod_reader \
+  --password '{{secret.SHOP_PG}}'
+```
+
+Then recycle the pool's nodes, as for any new source.
+
+- `--host` (a host name or an IP address; a socket path is refused), `--database`,
+  `--user` and a password are required. `--port` defaults to 5432 / 3306.
+- **The password is required and is always a secret.** `--password` takes only a
+  `{{secret.NAME}}` placeholder (a literal is refused: it would land in shell
+  history); `--password-stdin` / `--password-prompt` store the value as the
+  secret named by `--password-secret` (default `PASSWORD`). With no password at
+  all, the client library would fall back to the node's own credentials, which
+  is why QoD refuses that.
+- `--ssl-mode`: postgres `disable | allow | prefer | require | verify-ca |
+  verify-full`; mysql `disabled | preferred | required | verify_ca |
+  verify_identity`. `--schema` (postgres only) attaches just that schema.
+- `--connection '<json>'` passes the whole object (`host`, `port`, `database`,
+  `user`, `password`, `schema`, `sslMode`) instead of the flags.
+- `--read-only` **defaults ON**, enforced by the engine (`READ_ONLY` on the
+  ATTACH) and by the edge. The raw-SQL passthroughs `postgres_execute`,
+  `postgres_query`, `mysql_execute` and `mysql_query` could end the remote's
+  read-only transaction and write, and the SQL ACL and node lockdown are both
+  OFF by default, so while the pool has any read-only catalog the edge
+  refuses, for every caller (superusers included): those four when their
+  first argument names a read-only catalog or is not a plain string literal;
+  `query` / `query_table` with a computed argument; and
+  `json_execute_serialized_sql`. Calls to a writable catalog are unchanged.
+  The screen reads the statement text only: a table macro or view that
+  already wraps a passthrough (for example one created in the DuckLake
+  catalog before the source became read-only), or one in an attached
+  database, is not seen. **Connect as a database user without write
+  privileges**: that is the complete guarantee. For `mysql`, whether
+  `READ_ONLY` alone refuses writes is unverified (the extension is not in the
+  DuckDB 2.0 toolchain).
+- A `sql` source's setup SQL may not mention `qod_pg_`, `qod_mysql_` or
+  `qod_ice_`: those secret-name prefixes belong to the typed sources, whose
+  blocks create and drop them.
+- A manifest import validates typed sources exactly as `create` does.
+- `create` upserts, so re-running it edits the source, and every field it
+  leaves out is RESET (see "Register a federated source"). A re-run that
+  repeats only the required flags puts `--port`, `--schema`, `--ssl-mode` and
+  `--description` back to their defaults (no `--ssl-mode` means the client
+  library's own default, which for postgres is `prefer` and falls back to
+  plaintext), and enables a disabled source; the manager warns only about a
+  `--read-only` downgrade. So to rotate the password, re-run `create` with
+  `--password-stdin` (or `--password-prompt`) **and every flag you want kept**,
+  `--password-secret` included if you changed it. To rotate the secret alone,
+  `qod federation secret set ... --name PASSWORD --value ...` leaves the source
+  untouched but puts the password on the command line; the admin UI (its edit
+  form keeps every stored field) and the MCP `set_federated_secret` tool rotate
+  it without that exposure. Recycle the pool to apply.
+- The attach state is reported like an Iceberg catalog's (next section).
+
 ### Check whether an Iceberg catalog actually attached
 
 A failed `ATTACH` does NOT fail the node: it comes up healthy, serves
@@ -1325,8 +1454,8 @@ qod federation get acme acme_fed icelake     # -> .attachStatus
 qod pool status --tenant acme --db acme_fed --pool bi   # -> .nodes[].catalogAttachFailures
 ```
 
-`attachStatus` is reported only for enabled `iceberg-rest` sources (a `sql` or
-disabled source has no attach state), and both views are **replica-local**: each
+`attachStatus` is reported only for enabled typed sources (`iceberg-rest`,
+`postgres`, `mysql`; a `sql` or disabled source has no attach state), and both views are **replica-local**: each
 manager replica verifies only the nodes it tracks, so under HA the same node can
 read differently depending on which replica answered.
 
@@ -1721,18 +1850,23 @@ FlightSQL prepare-time probe needs a real table - schema-qualify
 
 Two-part names are only unambiguous when the head is a schema in the pool's default catalog, as in `tpch1.customer` above. When the head instead names an attached catalog (the tenant-db itself, e.g. `acme_tpch`, or a federation alias) under ACL, it's rejected as ambiguous - the engine would bind it catalog-first while the ACL check can't tell which catalog you meant. Write the full three-part form instead: `acme_tpch.tpch1.customer`.
 
+`VARIANT` columns reach FlightSQL clients as the Arrow `arrow.parquet.variant` extension type. A
+client that does not know that extension sees a struct of two binary fields (`metadata`,
+`value`); cast to JSON in the query for such clients (`SELECT v::JSON AS v ...`).
+
 ## Connecting from DuckDB (native Quack protocol)
 
 Besides FlightSQL, the manager serves DuckDB's own Quack protocol on a dedicated port
 (default `9494`, env `QOD_QUACK_PORT`; `QOD_QUACK_ENABLED=false` turns the listener off).
-Any DuckDB that carries the `quack` extension (the CLI, the Python package, an embedded
+Any DuckDB 2.0 that carries the `quack` extension (the CLI, the Python package, an embedded
 DuckDB) attaches the gateway as a database, with no driver in between, and joins it with
 its local tables. The token string is the same set of parameters the FlightSQL JDBC URL
 takes after `?`; a superuser adds `&superuser=true`, an OIDC bearer replaces
 `user`/`password` with `token=<jwt>`.
 
 ```sql
--- attach once, then query like any other catalog
+-- attach once (DuckDB 2.0 client; a 1.x client fails with
+-- "requires a DuckDB 2.0 client"), then query like any other catalog
 ATTACH 'quack:localhost:9494' AS qod
   (TYPE quack, TOKEN 'tenant=acme&pool=bi&user=alice&password=<password>');
 SELECT count(*) FROM qod.tpch1.customer WHERE c_mktsegment = 'BUILDING';
@@ -1771,6 +1905,10 @@ Things to know:
   raw node): a multi-column result larger than the client's inline batch (about 24k rows)
   fails inside the client with `Attempted to access index 1 within vector of size 1`.
   Single-column results of any size, and multi-column results that fit inline, work.
+- **Long statements.** A DuckDB 2.0 client gives up on a request after its `http_timeout`
+  (default 30 seconds) and fails with `Timeout was reached`, whatever the gateway is doing.
+  Before a statement that may run longer, raise it in the client session:
+  `SET http_timeout = 600;` (seconds). FlightSQL clients are not affected.
 - **Personal access tokens are not accepted** on this wire (same rule as FlightSQL); use
   a user and password or an OIDC bearer.
 
@@ -1886,6 +2024,53 @@ Self-serve / hosted deployments need a tighter isolation posture than the OSS
 default (single trusted-operator assumption). Four independent knobs, all
 opt-in except pod security:
 
+- **Always on, superuser-only (no flag)** - whatever the ACL mode (QoD
+  grants, OPA, ACL off) and the grants (`*.*.* ALL` included), a caller who is
+  not a superuser is refused, and on a locked-down pool so is a superuser:
+  - the DuckLake metadata catalog `__ducklake_metadata_<alias>` (it holds the
+    per-file encryption keys) and `ducklake_list_files` / `ducklake_commit`
+    ("catalog: the DuckLake metadata catalog is internal ...");
+  - node-wide settings in any `SET` / `RESET` / `PRAGMA` form (threads,
+    `memory_limit`, `max_temp_directory_size`, `temp_directory`, checkpoint /
+    WAL / allocator knobs, logging and profiling, every `quack_*`, `debug_*`,
+    `verify_*`), any `SET GLOBAL` / `RESET GLOBAL`, `FORCE CHECKPOINT`, and the
+    node-control calls (`quack_serve`, `quack_stop`, `enable_logging`, ...)
+    ("node: settings that act on the whole node are reserved to superusers").
+    Set resources at node start instead: database / pool `initSql` or
+    `qod pool set-resources`. Session settings (`search_path`, `TimeZone`,
+    `http_timeout`, `SET VARIABLE`, ...) stay open.
+- **Direct file access, superuser-only whenever the ACL validates** (QoD grants or
+  OPA; not with the ACL off) - a tenant user, `*.*.* ALL` included, cannot read or
+  write a file by path: file-reading table functions (`read_parquet`, `read_csv`,
+  `read_json`, `glob`, `read_text`, `parquet_metadata`, `iceberg_scan`, ...), a path
+  or URL in a table position (`FROM 's3://b/x.parquet'`, `FROM "s3://b/x.parquet"`),
+  `COPY ... TO` / `COPY ... FROM` a path, `EXPORT` / `IMPORT DATABASE`, and `ATTACH`
+  ("direct file access is not available to tenant-scoped principals"). Load files as a
+  superuser, or expose them through a federated source and grant its tables. The
+  native front door's client data (`INSERT INTO t SELECT * FROM <client table>`) still
+  flows.
+- **Extensions and path settings, superuser-only in every mode** (ACL on or off) -
+  a tenant user cannot `INSTALL` / `FORCE INSTALL` / `UPDATE EXTENSIONS` or `LOAD` an
+  extension from a path or URL ("installing an extension ... is reserved to
+  superusers"); install extensions at node start and `LOAD httpfs` by its bare name
+  (`LOAD 'httpfs'`, quoted, is refused). **This does not cover autoinstall
+  outside lockdown**: only node lockdown sets `autoinstall_known_extensions =
+  false`, so with lockdown off (the default) calling a function of a known
+  DuckDB extension the node lacks (`CALL dsdgen(...)`, `CALL start_ui_server()`,
+  or a bare `LOAD ui`) still makes DuckDB download and load that extension
+  wherever the node has network egress. Turn node lockdown on (below) when
+  tenant users must not pull in extensions at all. Nor can a tenant user set
+  `file_search_path`, `home_directory`, `allow_asterisks_in_http_paths`, `ca_cert_file`
+  or the server certificate verification settings, and `shell_history()` is refused to
+  every caller, superusers included (it held the node's init SQL when nodes read it from
+  stdin; kept as defense in depth).
+- **Node-state introspection, superuser-only in every mode** - a tenant user cannot read
+  `duckdb_secrets()`, `which_secret()`, `whoami()`, `duckdb_settings()` / `pg_settings`,
+  `current_setting(..)` (except session settings such as `TimeZone` or `search_path`), the
+  logs (`duckdb_logs*`), `duckdb_external_file_cache()`, `duckdb_temporary_files()`,
+  `duckdb_databases()` / `PRAGMA database_list`, `duckdb_extensions()`, or
+  `pragma_storage_info` ("shows node state ... reserved to superusers"). Catalog
+  listings (`duckdb_tables()`, `information_schema`) stay open and filtered.
 - **Node lockdown** - `QOD_NODE_LOCKDOWN=true` (config
   `quack-on-demand.nodeLockdown.enabled`, default false). Two layers, both
   gated by the same flag:

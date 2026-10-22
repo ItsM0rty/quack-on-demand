@@ -73,7 +73,7 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
     new IcebergAttachVerifier(
       sourcesOf = _ => IO.pure(sources),
       ownCatalogAliasOf = _ => IO.pure(ownAlias),
-      renderOne = s => IO.pure(ResolvedFederationBlock(s"-- rendered ${s.alias}", Set.empty)),
+      renderOne = s => IO.pure(ResolvedFederationBlock(s"-- rendered ${s.alias}", Set.empty, None)),
       runOnNode = run,
       listCatalogs = _ => IO.pure(Right(attached)),
       liveNodes = liveNodes,
@@ -162,7 +162,7 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
     val v   = new IcebergAttachVerifier(
       sourcesOf = _ => IO.pure(List(iceSrc("acme_db"))),
       ownCatalogAliasOf = _ => IO.pure(Some("acme_db")),
-      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty)),
+      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty, None)),
       runOnNode = rec.run(Right(())),
       listCatalogs = _ => IO.pure(Left("node unreachable")),
       liveNodes = () => List(node),
@@ -225,7 +225,8 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
           ResolvedFederationBlock(
             "CREATE OR REPLACE SECRET \"qod_ice_sales\" (\n  TYPE ICEBERG,\n" +
               s"  CLIENT_ID 'cid',\n  CLIENT_SECRET '$secret'\n);",
-            Set(secret)
+            Set(secret),
+            None
           )
         ),
       runOnNode = (_, _) =>
@@ -268,7 +269,8 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
         IO.pure(
           ResolvedFederationBlock(
             s"CREATE OR REPLACE SECRET \"qod_ice_sales\" (\n  CLIENT_ID '$resolved'\n);",
-            Set(resolved)
+            Set(resolved),
+            None
           )
         ),
       runOnNode = (_, _) => IO.pure(Left(s"HTTP Unauthorized_401 - echoed $resolved")),
@@ -373,7 +375,7 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
     val v      = new IcebergAttachVerifier(
       sourcesOf = _ => IO.pure(Nil),
       ownCatalogAliasOf = _ => IO.pure(Some("acme_db")),
-      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty)),
+      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty, None)),
       runOnNode = rec.run(Right(())),
       listCatalogs = _ => IO.delay { listed += 1; Right(Set("acme_db")) },
       liveNodes = () => List(node),
@@ -390,7 +392,7 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
     val v   = new IcebergAttachVerifier(
       sourcesOf = _ => IO.pure(List(iceSrc("sales_lake"))),
       ownCatalogAliasOf = _ => IO.pure(Some("acme_db")),
-      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty)),
+      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty, None)),
       runOnNode = rec.run(Right(())),
       listCatalogs = _ => IO.pure(Left("node unreachable")),
       liveNodes = () => List(node),
@@ -411,7 +413,7 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
     val v   = new IcebergAttachVerifier(
       sourcesOf = _ => IO.raiseError(new RuntimeException("postgres unreachable")),
       ownCatalogAliasOf = _ => IO.pure(Some("acme_db")),
-      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty)),
+      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty, None)),
       runOnNode = rec.run(Right(())),
       listCatalogs = _ => IO.pure(Right(Set("acme_db"))),
       liveNodes = () => List(node),
@@ -431,7 +433,7 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
     val v = new IcebergAttachVerifier(
       sourcesOf = _ => throw new RuntimeException("boom"),
       ownCatalogAliasOf = _ => IO.pure(Some("acme_db")),
-      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty)),
+      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty, None)),
       runOnNode = (_, _) => IO.pure(Right(())),
       listCatalogs = _ => IO.pure(Right(Set.empty)),
       liveNodes = () => List(node),
@@ -633,7 +635,7 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
       val v           = new IcebergAttachVerifier(
         sourcesOf = _ => IO.delay { sourceCalls += 1; List(iceSrc("sales_lake")) },
         ownCatalogAliasOf = _ => IO.pure(Some("acme_db")),
-        renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty)),
+        renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty, None)),
         runOnNode = (_, _) => IO.pure(Left("boom")),
         listCatalogs = _ => IO.delay { listCalls += 1; Right(Set("acme_db")) },
         liveNodes = () => List(node),
@@ -675,7 +677,7 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
     val v      = new IcebergAttachVerifier(
       sourcesOf = _ => IO.pure(List(sqlSrc)),
       ownCatalogAliasOf = _ => IO.pure(Some("acme_db")),
-      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty)),
+      renderOne = _ => IO.pure(ResolvedFederationBlock("", Set.empty, None)),
       runOnNode = rec.run(Right(())),
       listCatalogs = _ => IO.delay { listed += 1; Right(Set("acme_db")) },
       liveNodes = () => List(node),
@@ -813,4 +815,64 @@ class IcebergAttachVerifierSpec extends AnyFlatSpec with Matchers with OptionVal
     val reader = new ScriptedCatalogReader(List(List("acme_db")), failAt = Some(1))
     IcebergAttachVerifier.decodeCatalogNames(reader, () => closed = true)
     closed shouldBe true
+  }
+
+  // --- postgres / mysql: verified like iceberg, and the secret is dropped after a failed batch ---
+
+  private def pgSrc(alias: String) = FederatedSource(
+    id = "fs-" + alias,
+    tenantDbId = "td-1",
+    alias = alias,
+    sourceType = FederatedSourceType.Postgres,
+    config = Some("{}")
+  )
+
+  "verify (postgres / mysql)" should "re-issue a missing postgres catalog and latch once it attaches" in {
+    val rec      = new Recorder
+    val (v, reg) = verifier(List(pgSrc("shop_pg")), Set("acme_db"), rec.run(Right(())))
+    v.verify(node).unsafeRunSync()
+    rec.sent.get shouldBe List("-- rendered shop_pg")
+    reg.latched(node.nodeId, startedAtMs) shouldBe true
+  }
+
+  it should "run the block's cleanup after a failed attach, and record the failure" in {
+    val rec = new Recorder
+    val reg = new AttachStatusRegistry()
+    val v   = new IcebergAttachVerifier(
+      sourcesOf = _ => IO.pure(List(pgSrc("shop_pg"))),
+      ownCatalogAliasOf = _ => IO.pure(Some("acme_db")),
+      renderOne = s =>
+        IO.pure(
+          ResolvedFederationBlock(
+            s"-- rendered ${s.alias}",
+            Set("pw-1234"),
+            Some("DROP SECRET IF EXISTS \"qod_pg_shop_pg\";")
+          )
+        ),
+      runOnNode = (_, sql) =>
+        IO.delay {
+          rec.sent.updateAndGet(sql :: _)
+          if sql.startsWith("--") then
+            Left("IO Error: Unable to connect to Postgres at \"\": refused")
+          else Right(())
+        },
+      listCatalogs = _ => IO.pure(Right(Set("acme_db"))),
+      liveNodes = () => List(node),
+      registry = reg
+    )
+    v.verify(node).unsafeRunSync()
+    rec.sent.get.reverse shouldBe List(
+      "-- rendered shop_pg",
+      "DROP SECRET IF EXISTS \"qod_pg_shop_pg\";"
+    )
+    reg.latched(node.nodeId, startedAtMs) shouldBe false
+    reg.failuresFor(node.nodeId, startedAtMs).map(_.alias) shouldBe List("shop_pg")
+  }
+
+  it should "not run any cleanup when the block carries none (iceberg)" in {
+    val rec      = new Recorder
+    val (v, reg) = verifier(List(iceSrc("sales_lake")), Set("acme_db"), rec.run(Left("boom")))
+    v.verify(node).unsafeRunSync()
+    rec.sent.get shouldBe List("-- rendered sales_lake")
+    reg.latched(node.nodeId, startedAtMs) shouldBe false
   }

@@ -20,11 +20,16 @@ final case class TableExtraction(tables: List[Table], unsupported: List[String])
 /** Extracts all table references from a JSqlParser Select AST.
   *
   * Walks the AST comprehensively: FROM clauses, JOINs, subqueries in WHERE/SELECT/HAVING, set
-  * operations (UNION/INTERSECT/EXCEPT), and CTE bodies. Filters out CTE self-references; table
+  * operations (UNION/INTERSECT/EXCEPT), and CTE bodies. Filters out names bound to a CTE; table
   * functions, string-literal file references (e.g., DuckDB 'file.parquet') and unrecognized node
   * types are reported as `unsupported` so the ACL validator can deny rather than silently admit.
   */
 object TableExtractor:
+
+  /** The prefix of the `unsupported` marker of a table DuckDB reads as a file (a string literal, or
+    * a name with a path separator or glob character); the tenant file screen keys off it.
+    */
+  val FileReferencePrefix: String = "file reference "
 
   /** DuckDB's catalog-introspection table functions the edge metadata filter narrows to the session
     * catalog and the principal's grants (issue #114). The single list both the walk below and
@@ -107,7 +112,7 @@ object TableExtractor:
     */
   def catalogFunctionName(raw: String): Option[String] =
     Option(raw)
-      .map(_.trim.stripPrefix("\"").stripSuffix("\"").toLowerCase(Locale.ROOT))
+      .map(r => ai.starlake.sql.QuotedIdentifier.unquote(r.trim).toLowerCase(Locale.ROOT))
       .filter(DuckDbCatalogFunctions.contains)
 
   /** Some(canonical name) when `call` is exactly the argument-free call `name()` of one of
@@ -134,6 +139,79 @@ object TableExtractor:
       marker.drop(TableFunctionMarkerPrefix.length)
     )
 
+  /** The table function a DuckDB 2.0 quack client's INSERT through an attached catalog reads its
+    * rows from (duckdb-quack `src/storage/quack_insert.cpp`): `INSERT INTO <t> SELECT * FROM
+    * scan_data_from_quack_client('<uuid>', NULL::STRUCT(...), ordered := true|false)`, the rows
+    * then arriving as SEND_DATA messages on the same connection.
+    *
+    * It reads nothing but those messages: its bind needs the quack server's per-connection session
+    * state and CREATES a fresh stream there (refusing an id that already exists), SEND_DATA looks
+    * the stream up in the session of the connection that sent it, and the next statement or an
+    * abort clears every stream of that session. So it reaches no table, file or other session, and
+    * has no grantable object. It is still reported (under [[clientDataScanMarker]], never as an
+    * ordinary table function) so a consumer that does not know it fails closed;
+    * [[gatedUnsupported]] sets it aside where it is the source of a write AND the statement came
+    * through the native Quack front door, the one edge that relays SEND_DATA. On any other edge
+    * nothing can feed the stream and the statement would wait on the node forever.
+    */
+  val ClientDataScanFunction = "scan_data_from_quack_client"
+
+  // The stream id the client mints: UUID::ToString, lowercase hex.
+  private val ClientStreamId =
+    "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}".r
+
+  /** True only for the exact call shape the client composes: the unqualified, unquoted name; a
+    * single-quoted uuid literal; `NULL` cast to a STRUCT type (a type, so no expression or subquery
+    * can ride in it); `ordered := true|false`; nothing else on the call (no LATERAL, DISTINCT,
+    * ORDER BY, FILTER or attribute, checked by re-printing the call from its three arguments, and
+    * no `WITH ORDINALITY`). An alias is allowed: it names the scan's output and reads nothing.
+    */
+  private[parser] def isClientDataScan(tf: TableFunction): Boolean =
+    val f      = tf.getFunction
+    val params =
+      Option(f).flatMap(fn => Option(fn.getParameters)).map(_.asScala.toList).getOrElse(Nil)
+    val nameOk = Option(f).exists(fn =>
+      Option(fn.getMultipartName).exists(_.size == 1) &&
+        Option(fn.getName).exists(_.equalsIgnoreCase(ClientDataScanFunction))
+    )
+    val argsOk = params match
+      case List(id: StringValue, proto: CastExpression, ordered: PostgresNamedFunctionParameter) =>
+        ClientStreamId.matches(id.getValue) &&
+        proto.getLeftExpression.isInstanceOf[NullValue] &&
+        Option(proto.getColDataType)
+          .flatMap(t => Option(t.getDataType))
+          .exists(_.trim.equalsIgnoreCase("STRUCT")) &&
+        Option(ordered.getName).exists(_.equalsIgnoreCase("ordered")) &&
+        Option(ordered.getExpression).map(_.toString.toLowerCase(Locale.ROOT)).exists { v =>
+          v == "true" || v == "false"
+        }
+      case _ => false
+    nameOk && argsOk && tf.getPrefix == null && tf.getWithClause == null &&
+    f.getNamedParameters == null &&
+    f.toString == s"${f.getName}(${params.mkString(", ")})"
+
+  private val ClientDataScanMarkerPrefix = "client data scan "
+
+  /** The `unsupported` marker for a call [[isClientDataScan]] accepted. */
+  def clientDataScanMarker(call: String): String = ClientDataScanMarkerPrefix + call
+
+  def isClientDataScanMarker(marker: String): Boolean =
+    marker != null && marker.startsWith(ClientDataScanMarkerPrefix)
+
+  /** The `unsupported` markers of one statement that still deny: all of them, except client data
+    * scans in a statement that writes a table (the client's INSERT, whose target stays a gated
+    * Write) when `clientDataScans` says the statement came through the native Quack front door. A
+    * client data scan anywhere else, or from any other edge, keeps denying.
+    */
+  def gatedUnsupported(
+      accesses: Set[TableAccess],
+      unsupported: List[String],
+      clientDataScans: Boolean
+  ): List[String] =
+    if clientDataScans && accesses.exists(_.verb == Verb.Write) then
+      unsupported.filterNot(isClientDataScanMarker)
+    else unsupported
+
   /** The marker for a DuckDB default view referenced by a bare table name. Deliberately NOT a
     * [[tableFunctionMarker]]: the manager cannot tell whether a real table of that name shadows the
     * system view on the node, so this spelling is never admitted (only wildcard ALL and superusers,
@@ -146,6 +224,90 @@ object TableExtractor:
     else
       s"DuckDB system view $name referenced by its bare name (no grantable table behind it; " +
         "qualify a real table with its catalog)"
+
+  /** DuckDB statements that may stand, parenthesized, in table position (`FROM (SUMMARIZE t)`,
+    * `FROM (TABLE t)`, `FROM (DESCRIBE t)`, `FROM (SHOW t)`), checked against DuckDB 2.0.
+    */
+  private val StatementSourceKeywords: Set[String] =
+    Set("summarize", "describe", "desc", "show", "table")
+
+  /** Some(source) when `pfi` is a parenthesized DuckDB statement in table position. JSqlParser
+    * reads `(SUMMARIZE t)` as a table NAMED `SUMMARIZE` aliased `t`, so a walk keyed on the table
+    * name would check the keyword, while DuckDB reads `t` (all of it for TABLE and SUMMARIZE).
+    * DuckDB parses the keyword there as the statement even when a table of that name exists, and
+    * only an unquoted keyword is one; an alias with a column list or a join inside the parentheses
+    * is not this shape.
+    *
+    * The source is `t` read back exactly as `FROM t` would parse it, so a string literal stays one
+    * (the caller's file-reference handling applies) and a quoted name keeps its parts. Left(raw)
+    * when that re-read fails: the caller must refuse it, since the table is then unknown.
+    */
+  def statementSource(pfi: ParenthesedFromItem): Option[Either[String, Table]] =
+    pfi.getFromItem match
+      case t: Table
+          if t.getSchemaName == null && t.getAlias != null && t.getAlias.getAliasColumns == null &&
+            Option(t.getName)
+              .exists(n => StatementSourceKeywords.contains(n.toLowerCase(Locale.ROOT))) &&
+            Option(pfi.getJoins).forall(_.isEmpty) =>
+        val raw = t.getAlias.getName
+        Some(asFromTable(raw).toRight(raw))
+      case _ => None
+
+  /** Some(sources) when `f` holds a TABLE statement in expression position: DuckDB's
+    * `ARRAY(TABLE t)` and the quantified comparison `x = ANY | ALL | SOME (TABLE t)`, each reading
+    * every row of `t` (checked against DuckDB 2.0, where `t` binds like a FROM item: a CTE of that
+    * name first). JSqlParser holds either as a function flagged with the TABLE keyword whose
+    * argument is a COLUMN named `t`, so a walk that reads it as an expression sees no table at all.
+    *
+    * Each argument is read back exactly as `FROM <arg>` would parse it; Left(raw) when that fails
+    * (or the call has no argument), which the caller must refuse, since the table is then unknown.
+    */
+  def tableStatementSources(f: Function): Option[List[Either[String, Table]]] =
+    if !Option(f.getExtraKeyword).exists(_.trim.equalsIgnoreCase("TABLE")) then None
+    else
+      val args = Option(f.getParameters).map(_.asScala.toList).getOrElse(Nil)
+      if args.isEmpty then Some(List(Left(f.toString)))
+      else Some(args.map(a => asFromTable(String.valueOf(a)).toRight(String.valueOf(a))))
+
+  /** Some((anchor arms, recursive-term arms)) when DuckDB runs `body` as a recursive CTE: its top
+    * level is a UNION or UNION ALL (not BY NAME), parentheses aside. DuckDB reads `A op B op C`
+    * left-associatively with INTERSECT binding tighter, so the top level is the LAST union or
+    * except of the list: the arms after it are the recursive term (an INTERSECT chain included),
+    * the arms up to it the anchor. An EXCEPT, BY NAME or INTERSECT-only top level is not recursive
+    * on the 2.0 CLI (the body reads the real table), and neither is a body with a WITH clause of
+    * its own here (walked without the name, so a self reference is gated: fail-closed).
+    */
+  def recursiveSplit(body: Select): Option[(List[Select], List[Select])] =
+    body match
+      case ps: ParenthesedSelect if Option(ps.getWithItemsList).forall(_.isEmpty) =>
+        Option(ps.getSelect).flatMap(recursiveSplit)
+      case sol: SetOperationList if Option(sol.getWithItemsList).forall(_.isEmpty) =>
+        val ops  = Option(sol.getOperations).map(_.asScala.toList).getOrElse(Nil)
+        val arms = Option(sol.getSelects).map(_.asScala.toList).getOrElse(Nil)
+        val top  = ops.lastIndexWhere(!_.isInstanceOf[IntersectOp])
+        Option
+          .when(top >= 0 && arms.size == ops.size + 1)(ops(top))
+          .collect {
+            case u: UnionOp if !u.toString.toUpperCase(Locale.ROOT).contains("BY NAME") =>
+              (arms.take(top + 1), arms.drop(top + 1))
+          }
+      case _ => None
+
+  /** `raw` (a single name as JSqlParser printed it) read back exactly as `FROM <raw>` parses it, or
+    * None when that is not one bare table. The Table constructor is no substitute: it splits a
+    * string literal, or a quoted name, on its dots.
+    */
+  def asFromTable(raw: String): Option[Table] =
+    scala.util
+      .Try(net.sf.jsqlparser.parser.CCJSqlParserUtil.parse(s"SELECT * FROM $raw"))
+      .toOption
+      .collect {
+        case ps: PlainSelect
+            if Option(ps.getJoins).forall(_.isEmpty) && ps.getWhere == null &&
+              ps.getWithItemsList == null =>
+          ps.getFromItem
+      }
+      .collect { case src: Table if src.getAlias == null => src }
 
   /** Extract all Table references from a parsed Select statement.
     *
@@ -174,38 +336,110 @@ private[parser] class TableExtractorVisitor:
   def result: TableExtraction = TableExtraction(tables.toList, unsupported.toList)
 
   def process(select: Select): Unit =
-    processWithItems(select.getWithItemsList)
-    // Visit the main select body
+    // The select's own WITH clause is scoped by visitSelect / visitParenthesedSelect.
     visitSelect(select)
 
-  /** Register a WITH clause's CTE names (so unqualified self-references are not extracted as base
-    * tables) and walk each CTE body for read sources. Also the entry point for the STATEMENT-level
-    * WITH of INSERT/UPDATE/DELETE/MERGE: those clauses live on the DML node, not on its inner
-    * Select, so without this call a CTE body could launder a read of any table behind a CTE named
-    * after a table the caller holds a grant on.
+  /** The STATEMENT-level WITH of INSERT/UPDATE/DELETE/MERGE: those clauses live on the DML node,
+    * not on its inner Select, so without this call a CTE body could launder a read of any table
+    * behind a CTE named after a table the caller holds a grant on. Each body is walked with
+    * DuckDB's visibility ([[walkCteBodies]]); every name then stays in scope for the rest of the
+    * statement, which the caller walks next.
     */
   private[parser] def processWithItems(
       withItems: java.util.List[net.sf.jsqlparser.statement.select.WithItem[?]]
   ): Unit =
-    if withItems != null then
-      // Collect CTE names first, so a CTE body referencing a later CTE is not extracted either.
-      withItems.asScala.foreach { wi =>
-        val aliasName = wi.getUnquotedAliasName
-        if aliasName != null then cteNames += aliasName.toLowerCase(Locale.ROOT)
-      }
-      withItems.asScala.foreach { wi =>
-        val cteSelect = wi.getSelect
-        if cteSelect != null then visitSelect(cteSelect)
-      }
+    if withItems != null && !withItems.isEmpty then
+      val items = withItems.asScala.toList
+      walkCteBodies(items)
+      cteNames ++= items.flatMap(cteName)
+
+  private def cteName(wi: net.sf.jsqlparser.statement.select.WithItem[?]): Option[String] =
+    Option(wi.getUnquotedAliasName).map(_.toLowerCase(Locale.ROOT))
+
+  private def setScope(names: Set[String]): Unit =
+    cteNames.clear()
+    cteNames ++= names
+
+  /** Walk the bodies of one WITH clause with the names each one sees in DuckDB (checked on the 2.0
+    * CLI with distinct rows in the real table and the CTE), leaving the scope as it found it. Body
+    * i sees the enclosing scopes' CTEs and the ones declared BEFORE it in the clause: never its own
+    * name, never a later sibling's, which both bind to the real table (`WITH orders AS (SELECT *
+    * FROM orders)` reads the table orders), MATERIALIZED or not. In a WITH RECURSIVE clause the one
+    * exception is the recursive term of a union body (`TableExtractor.recursiveSplit`), where the
+    * CTE's own name binds to the CTE.
+    */
+  private def walkCteBodies(items: List[net.sf.jsqlparser.statement.select.WithItem[?]]): Unit =
+    val enclosing = cteNames.toSet
+    // JSqlParser flags only the clause's first item; the keyword covers the whole clause.
+    val recursive = items.exists(_.isRecursive)
+    items.zipWithIndex.foreach { (wi, i) =>
+      if visited.add(wi) then
+        setScope(enclosing ++ items.take(i).flatMap(cteName))
+        visitCteBody(wi, if recursive then cteName(wi) else None)
+    }
+    setScope(enclosing)
+
+  /** Walks one CTE body. `WithItem.getSelect` casts unconditionally and throws on a data-modifying
+    * CTE (`WITH w AS (INSERT/UPDATE/DELETE ... RETURNING *) ...`, DuckDB 2.0). Its target is a
+    * write this read walk would drop or misread as a read, so it is reported unsupported and the
+    * gate fails closed (a wildcard ALL grant still covers it).
+    *
+    * `recursiveName` is the CTE's own name when its clause is WITH RECURSIVE: the arms of the
+    * recursive term are walked with it in scope, everything else without it.
+    */
+  private def visitCteBody(
+      wi: net.sf.jsqlparser.statement.select.WithItem[?],
+      recursiveName: Option[String]
+  ): Unit =
+    wi.getParenthesedStatement match
+      case null      => ()
+      case s: Select =>
+        recursiveName.flatMap(n => TableExtractor.recursiveSplit(s).map(n -> _)) match
+          case Some((name, (anchor, term))) =>
+            anchor.foreach(visitSelect)
+            val before = cteNames.toSet
+            cteNames += name
+            term.foreach(visitSelect)
+            setScope(before)
+            // What is left (the wrappers, the set operation's own clauses) without the name.
+            visitSelect(s)
+          case None => visitSelect(s)
+      case other => unsupported += s"data-modifying CTE (${other.getClass.getSimpleName})"
 
   private def visitSelect(select: Select): Unit =
     if select != null && visited.add(select) then
-      matchSelect(select)
-      // Symmetric completeness: descend reflectively into every child of the SELECT node too, so a
-      // subquery in a clause the hand-walk omits (GROUP BY, DISTINCT ON, QUALIFY, named WINDOW,
-      // GROUPING SETS, ...) cannot be dropped. recordBareTable = true because a bare Table reached
-      // directly from a SELECT/holder is a real FROM/JOIN read, not a column qualifier.
-      descendChildren(select, recordBareTable = true)
+      // A ParenthesedSelect scopes its own WITH clause (visitParenthesedSelect).
+      val withItems = select match
+        case _: ParenthesedSelect => null
+        case _                    => select.getWithItemsList
+      withScopedCtes(withItems) {
+        matchSelect(select)
+        // Symmetric completeness: descend reflectively into every child of the SELECT node too,
+        // so a subquery in a clause the hand-walk omits (GROUP BY, DISTINCT ON, QUALIFY, named
+        // WINDOW, GROUPING SETS, ...) cannot be dropped. recordBareTable = true because a bare
+        // Table reached directly from a SELECT/holder is a real FROM/JOIN read, not a column
+        // qualifier.
+        descendChildren(select, recordBareTable = true)
+      }
+
+  /** Walk `body` with the CTE names of `withItems` in scope, then restore the scope: a CTE shadows
+    * a bare name only inside the query that declares it, so a CTE named after a table in a nested
+    * query (`ARRAY(WITH c AS (..) SELECT .. FROM c)`, a derived table) must neither be gated as a
+    * table there nor hide a read of the real table elsewhere in the statement. Names already in
+    * scope (an enclosing CTE of the same name) stay in scope. The CTE bodies themselves see only
+    * what DuckDB lets them see ([[walkCteBodies]]).
+    */
+  private def withScopedCtes(
+      withItems: java.util.List[net.sf.jsqlparser.statement.select.WithItem[?]]
+  )(body: => Unit): Unit =
+    if withItems == null || withItems.isEmpty then body
+    else
+      val enclosing = cteNames.toSet
+      val items     = withItems.asScala.toList
+      walkCteBodies(items)
+      cteNames ++= items.flatMap(cteName)
+      body
+      setScope(enclosing)
 
   private def matchSelect(select: Select): Unit =
     select match
@@ -234,6 +468,13 @@ private[parser] class TableExtractorVisitor:
             val onExpressions = j.getOnExpressions
             if onExpressions != null then onExpressions.asScala.foreach(visitExpression)
           }
+      case ts: TableStatement =>
+        // `TABLE t` reads every row and column of t: `SELECT * FROM t`. JSqlParser 5.4.16x reads
+        // it as this statement wherever it appears (`FROM (TABLE t)`, `x = ANY (TABLE t)`,
+        // `IN (TABLE t)`, `EXISTS (TABLE t)`), so it is a read of t like any FROM item.
+        Option(ts.getTable) match
+          case Some(t) => visitFromItem(t)
+          case None    => unsupported += "a TABLE statement with no table"
       case other =>
         // Fail closed: a Select subtype this walker does not recognize may
         // carry table refs we would otherwise silently drop.
@@ -284,18 +525,11 @@ private[parser] class TableExtractorVisitor:
     if selects != null then selects.asScala.foreach(visitSelect)
 
   private def visitParenthesedSelect(psel: ParenthesedSelect): Unit =
-    // ParenthesedSelect wraps another Select
-    val inner = psel.getSelect
-    if inner != null then visitSelect(inner)
-    // Also check if it has its own WITH items
-    val withItems = psel.getWithItemsList
-    if withItems != null then
-      withItems.asScala.foreach { wi =>
-        val aliasName = wi.getUnquotedAliasName
-        if aliasName != null then cteNames += aliasName.toLowerCase(Locale.ROOT)
-        val cteSelect = wi.getSelect
-        if cteSelect != null then visitSelect(cteSelect)
-      }
+    // ParenthesedSelect wraps another Select, possibly under a WITH clause of its own.
+    withScopedCtes(psel.getWithItemsList) {
+      val inner = psel.getSelect
+      if inner != null then visitSelect(inner)
+    }
 
   private[parser] def visitFromItem(fromItem: FromItem): Unit =
     if fromItem != null && visited.add(fromItem) then
@@ -316,7 +550,7 @@ private[parser] class TableExtractorVisitor:
           val isQualified = table.getSchemaName != null ||
             (table.getDatabase != null && table.getDatabase.getDatabaseName != null)
           val isCteName = !isQualified && cteNames.contains(name.toLowerCase(Locale.ROOT))
-          val isFileRef = table.getName != null && table.getName.startsWith("'")
+          val isFileRef = DuckDBDialectMapper.isFileReference(table)
           // `FROM sqlite_master`, `FROM pg_class`, `FROM duckdb_tables`: DuckDB resolves a bare
           // name to its default view in system.main / system.pg_catalog unless a table shadows
           // it, for the unqualified, `main`-qualified and `system`-qualified spellings.
@@ -335,7 +569,7 @@ private[parser] class TableExtractorVisitor:
           if isFileRef then
             // DuckDB `FROM 'file.parquet'` reads straight from storage, escaping
             // the tenant-catalog boundary; there is no table to grant on.
-            unsupported += s"file reference ${table.getName}"
+            unsupported += DuckDBDialectMapper.fileReferenceMarker(table)
           else if isBareCatalogFn then
             unsupported += TableExtractor.bareSystemViewMarker(name.toLowerCase(Locale.ROOT))
           else if !isCteName then tables += table
@@ -349,11 +583,20 @@ private[parser] class TableExtractorVisitor:
         // filtered-metadata flag (TableExtractor.catalogFunctionCall reads it back);
         // a ROWS FROM list has no single function and prints as itself.
         val call = Option(tf.getFunction).map(_.toString).getOrElse(tf.toString)
-        unsupported += TableExtractor.tableFunctionMarker(call)
+        if TableExtractor.isClientDataScan(tf) then
+          unsupported += TableExtractor.clientDataScanMarker(call)
+        else unsupported += TableExtractor.tableFunctionMarker(call)
       case pfi: ParenthesedFromItem =>
         // `FROM (a JOIN b ON ...)`: recurse into the wrapped item and its joins.
         val inner = pfi.getFromItem
-        if inner != null then visitFromItem(inner)
+        TableExtractor.statementSource(pfi) match
+          case Some(source) =>
+            // `(SUMMARIZE t)` / `(TABLE t)`: the keyword table is never a read; `t` is.
+            visited.add(inner): Unit
+            source match
+              case Right(table) => visitFromItem(table)
+              case Left(raw)    => unsupported += s"unreadable statement source $raw"
+          case None => if inner != null then visitFromItem(inner)
         val joins = pfi.getJoins
         if joins != null then
           joins.asScala.foreach { j =>
@@ -374,6 +617,17 @@ private[parser] class TableExtractorVisitor:
         unsupported += s"unrecognized FROM item ${other.getClass.getSimpleName}"
 
   private[parser] def visitExpression(expr: Expression): Unit =
+    expr match
+      // A select reached in expression position (a scalar subquery, or DuckDB's
+      // `ARRAY(SELECT ...)`, which parses as a function whose argument is a BARE select) is walked
+      // as a select, exactly once. It used to be marked visited here first, so the select arm
+      // below found it already visited and skipped it, and the reflective pass reached its FROM
+      // table only as a column qualifier: the read vanished and the statement was admitted with
+      // no gated access at all.
+      case sel: Select => visitSelect(sel)
+      case _           => visitNonSelectExpression(expr)
+
+  private def visitNonSelectExpression(expr: Expression): Unit =
     if expr != null && visited.add(expr) then
       matchExpression(expr)
       // Completeness backstop: after the explicit arms, unconditionally descend into every
@@ -385,11 +639,9 @@ private[parser] class TableExtractorVisitor:
       descendChildren(expr, recordBareTable = false)
 
   private def matchExpression(expr: Expression): Unit =
+    // Selects never reach here: visitExpression hands every Select (ParenthesedSelect included)
+    // to visitSelect.
     expr match
-      case psel: ParenthesedSelect =>
-        visitParenthesedSelect(psel)
-      case sel: Select =>
-        visitSelect(sel)
       case bin: BinaryExpression =>
         val left = bin.getLeftExpression
         if left != null then visitExpression(left)
@@ -425,6 +677,13 @@ private[parser] class TableExtractorVisitor:
       case exprList: ExpressionList[?] =>
         exprList.asScala.foreach(e => visitExpression(e.asInstanceOf[Expression]))
       case func: Function =>
+        // `ARRAY(TABLE t)` / `x = ANY (TABLE t)`: the argument is a read of t, not a column.
+        TableExtractor
+          .tableStatementSources(func)
+          .foreach(_.foreach {
+            case Right(table) => visitFromItem(table)
+            case Left(raw)    => unsupported += s"unreadable TABLE statement argument $raw"
+          })
         val params = func.getParameters
         if params != null then visitExpression(params)
       case analytic: AnalyticExpression =>
@@ -468,65 +727,50 @@ private[parser] class TableExtractorVisitor:
     * a column qualifier).
     */
   private def descendChildren(node: AnyRef, recordBareTable: Boolean): Unit =
-    TableExtractorVisitor.childAccessors(node.getClass).foreach { m =>
-      try routeChild(m.invoke(node), recordBareTable)
-      catch case _: Throwable => ()
+    // Only the reflective read is guarded (AstChildren.read): the walk of what it returns is not,
+    // so a failure there reaches SqlParser as a parse error instead of dropping the subtree.
+    AstChildren.accessors(node.getClass).foreach { m =>
+      routeChild(AstChildren.read(m, node), recordBareTable)
     }
 
-  /** Route one reflectively-fetched child value to the right walk. `Expression` is tested before
-    * `Select` so a `ParenthesedSelect` (both) takes the visited-guarded expression path. A bare
+  /** Route one reflectively-fetched child value to the right walk. A `Select` (also an
+    * `Expression`) is tested first and always walked as a select, guarded by `visitSelect`'s own
+    * visited check: DuckDB's `ARRAY(SELECT ...)` hands a BARE select to a function as its argument,
+    * and walking it as an expression marked it visited before `visitSelect` could walk it. A bare
     * `Table` records only when it was reached from a select / from-item / holder; reached from an
     * expression it is a column qualifier and is skipped. Any other jsqlparser node is an
     * intermediate holder (GroupByElement, Distinct, WindowDefinition, Join, Top, Pivot, ...): guard
     * it and descend reflectively, so no holder type needs to be enumerated by hand.
+    *
+    * Children JSqlParser keeps outside its node types are followed too: a MAP literal's entries
+    * (`Map.Entry`, both key and value) and any `java.util.Map`. A value of a type with no rule here
+    * is recorded as unsupported, so a child the walk cannot see into denies rather than vanishes.
     */
   private def routeChild(value: Any, recordBareTable: Boolean): Unit =
     value match
-      case null                      => ()
-      case e: Expression             => visitExpression(e)
-      case t: Table                  => if recordBareTable then visitFromItem(t)
-      case s: Select                 => visitSelect(s)
-      case fi: FromItem              => visitFromItem(fi)
-      case oe: OrderByElement        => Option(oe.getExpression).foreach(visitExpression)
-      case si: SelectItem[?]         => Option(si.getExpression).foreach(visitExpression)
-      case it: java.lang.Iterable[?] => it.asScala.foreach(routeChild(_, recordBareTable))
-      case arr: Array[?]             => arr.foreach(routeChild(_, recordBareTable))
-      case holder: AnyRef if isJsqlNode(holder) =>
+      case null                         => ()
+      case s: Select                    => visitSelect(s)
+      case e: Expression                => visitExpression(e)
+      case t: Table                     => if recordBareTable then visitFromItem(t)
+      case fi: FromItem                 => visitFromItem(fi)
+      case oe: OrderByElement           => Option(oe.getExpression).foreach(visitExpression)
+      case si: SelectItem[?]            => Option(si.getExpression).foreach(visitExpression)
+      case it: java.lang.Iterable[?]    => it.asScala.foreach(routeChild(_, recordBareTable))
+      case arr: Array[?]                => arr.foreach(routeChild(_, recordBareTable))
+      case e: java.util.Map.Entry[?, ?] =>
+        routeChild(e.getKey, recordBareTable)
+        routeChild(e.getValue, recordBareTable)
+      case m: java.util.Map[?, ?] => m.entrySet.asScala.foreach(routeChild(_, recordBareTable))
+      case wi: net.sf.jsqlparser.statement.select.WithItem[?] =>
+        // A WITH item no scoped walk reached first: which siblings it may see is unknown here, so
+        // its body is walked with no CTE in scope (every bare name gated: fail-closed).
+        if visited.add(wi) then
+          val before = cteNames.toSet
+          setScope(Set.empty)
+          visitCteBody(wi, None)
+          setScope(before)
+      case holder: AnyRef if AstChildren.isAstNode(holder) =>
         if visited.add(holder) then descendChildren(holder, recordBareTable)
-      case _ => ()
-
-  private def isJsqlNode(value: AnyRef): Boolean =
-    val n = value.getClass.getName
-    n.startsWith("net.sf.jsqlparser.") && !n.startsWith("net.sf.jsqlparser.parser.")
-
-private[parser] object TableExtractorVisitor:
-  import java.lang.reflect.Method
-
-  private val accessorCache =
-    new java.util.concurrent.ConcurrentHashMap[Class[?], Array[Method]]()
-
-  /** The no-arg `get*` accessors of `cls` that can reach a child AST node: return type is a
-    * collection (`Iterable`, so a raw `List<OrderByElement>` / `List<Join>` / `List<SelectItem>` is
-    * reached), an array, or any jsqlparser AST type OUTSIDE the `net.sf.jsqlparser.parser` package.
-    * The parser package (SimpleNode and friends) is excluded so the walk never follows an upward
-    * parent link into a cycle; primitives, String, and other library types are excluded so leaves
-    * (Column, literals) cost only the memoized lookup. routeChild filters values further by runtime
-    * type, so admitting the whole AST-node space here is safe and makes the walk complete.
-    */
-  def childAccessors(cls: Class[?]): Array[Method] =
-    accessorCache.computeIfAbsent(
-      cls,
-      c =>
-        c.getMethods.filter { m =>
-          val rt = m.getReturnType
-          m.getParameterCount == 0 &&
-          m.getName.startsWith("get") &&
-          (classOf[java.lang.Iterable[?]].isAssignableFrom(rt) ||
-            rt.isArray ||
-            isJsqlAstType(rt))
-        }
-    )
-
-  private def isJsqlAstType(rt: Class[?]): Boolean =
-    val n = rt.getName
-    n.startsWith("net.sf.jsqlparser.") && !n.startsWith("net.sf.jsqlparser.parser.")
+      case leaf if AstChildren.isLeaf(leaf) => ()
+      case other                            =>
+        unsupported += s"unwalked syntax node ${other.getClass.getName}"

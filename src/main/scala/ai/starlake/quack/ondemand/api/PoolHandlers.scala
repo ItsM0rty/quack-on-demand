@@ -1,7 +1,13 @@
 package ai.starlake.quack.ondemand.api
 
 import ai.starlake.quack.edge.adapter.{EngineStatsTracker, NodeLoadTracker}
-import ai.starlake.quack.model.{AutoscaleBand, LockdownTriState, PoolKey, QuantitySyntax}
+import ai.starlake.quack.model.{
+  AutoscaleBand,
+  InitSqlScreen,
+  LockdownTriState,
+  PoolKey,
+  QuantitySyntax
+}
 import ai.starlake.quack.ondemand.{PoolSupervisor, SupervisorError}
 import ai.starlake.quack.ondemand.auth.SessionScope
 import ai.starlake.quack.ondemand.telemetry.{AuditActions, AuditRecorder}
@@ -206,6 +212,7 @@ final class PoolHandlers(
           bandShapeErr.getOrElse("elastic pools cannot use authored cohorts (scaling clears them)")
         )
       else bandShapeErr
+    val initSqlErr = req.initSql.flatMap(InitSqlScreen.error("initSql", _))
     LockdownTriState.parse(req.lockdown) match
       case Left(msg) =>
         IO.pure(Left((StatusCode.BadRequest, ErrorResponse("invalid", msg))))
@@ -225,6 +232,15 @@ final class PoolHandlers(
               (
                 StatusCode.BadRequest,
                 ErrorResponse("invalid", "cpu/memory must be Kubernetes quantities")
+              )
+            )
+          )
+        else if initSqlErr.isDefined then
+          IO.pure(
+            Left(
+              (
+                StatusCode.BadRequest,
+                ErrorResponse("invalid", initSqlErr.getOrElse("invalid initSql"))
               )
             )
           )

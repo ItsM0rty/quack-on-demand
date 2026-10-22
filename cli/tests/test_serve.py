@@ -4,9 +4,13 @@ import time
 import httpx
 from click import unstyle
 import pytest
+import respx
 
 from qod_cli import launcher
 from qod_cli.config import load_settings, load_start_env
+from tests import _duckdb_cache
+
+_REAL_ENSURE_CLI, _REAL_ENSURE_LIB = launcher.ensure_duckdb_cli, launcher.ensure_libduckdb
 
 BASE = "http://localhost:20900"
 
@@ -21,10 +25,10 @@ def wired(monkeypatch, tmp_path):
     captured = {}
     monkeypatch.setattr(launcher, "find_java", lambda: "/usr/bin/java")
     monkeypatch.setattr(
-        launcher, "ensure_duckdb_cli", lambda cache_dir=None, **kw: tmp_path / "duckdb" / "bin"
+        launcher, "ensure_duckdb_cli", lambda cache_dir=None, **kw: tmp_path / "duckdb" / launcher.DUCKDB_CLI_VERSION / "bin"
     )
     monkeypatch.setattr(
-        launcher, "ensure_libduckdb", lambda cache_dir=None, **kw: tmp_path / "duckdb" / "lib"
+        launcher, "ensure_libduckdb", lambda cache_dir=None, **kw: tmp_path / "duckdb" / launcher.DUCKDB_CLI_VERSION / "lib"
     )
     monkeypatch.setattr(
         launcher, "materialize_spawn_scripts", lambda dest: (tmp_path / "s.sh", tmp_path / "s.ps1")
@@ -91,6 +95,21 @@ def test_serve_sets_the_embedded_control_plane_env(runner, wired, tmp_path):
     assert env["QOD_PG_EMBEDDED"] == "true"
     assert env["QOD_PG_EMBEDDED_PORT"] == "25432"
     assert env["QOD_PG_EMBEDDED_DATA_DIR"] == str(tmp_path / "state" / "pg")
+
+
+def test_serve_hands_the_jvm_a_preloadable_libduckdb(runner, wired, tmp_path, monkeypatch):
+    # The real ensure_* over a provisioned cache: DUCKDB_CACHE_DIR must name it, since a
+    # SIP-protected /usr/bin/java never sees DYLD_LIBRARY_PATH.
+    monkeypatch.setattr(launcher, "ensure_duckdb_cli", _REAL_ENSURE_CLI)
+    monkeypatch.setattr(launcher, "ensure_libduckdb", _REAL_ENSURE_LIB)
+    _, lib_dir = _duckdb_cache.plant(tmp_path / "cache")
+    f = tmp_path / "sales.duckdb"
+    f.write_bytes(b"")
+    with respx.mock:  # no routes: a provisioned cache must not hit the network
+        result = _invoke(runner, wired, str(f))
+    assert result.exit_code == 0, result.output
+    target = _duckdb_cache.preload_target(wired["env"])
+    assert target.is_file() and target.parent == lib_dir
 
 
 def test_serve_turns_acl_on_explicitly(runner, wired, tmp_path):

@@ -142,6 +142,13 @@ class SqlCommentStripperSpec extends AnyFlatSpec with Matchers:
       "PREPARE p AS SELECT $1, * FROM read_csv('/etc/passwd.csv') /*c*/"
     ) shouldBe "PREPARE p AS SELECT $1, * FROM read_csv('/etc/passwd.csv')  "
 
+  it should "not open a dollar-quoted string inside an identifier that continues through `$`" in:
+    // DuckDB 2.0 (verified): `x$a$` is one identifier, so the comment after it is a real comment
+    // and is stripped; reading `$a$ ... $a$` as a quoted region would have left it in place.
+    SqlCommentStripper.stripComments(
+      "SELECT 1 AS x$a$, /*c*/ 2 AS y$a$"
+    ) shouldBe "SELECT 1 AS x$a$,   2 AS y$a$"
+
   it should "not read a dollar with no matching closing tag as a quote opener" in:
     // An unmatched opener is a parser error on DuckDB, so nothing executes either way; treating
     // the remainder as one long "string" would nonetheless stop stripping comments from it, which
@@ -223,4 +230,57 @@ class SqlCommentStripperSpec extends AnyFlatSpec with Matchers:
         offenders shouldBe empty
       }
     finally src.close()
+  }
+
+  // ---- one DuckDB 2.0-faithful lexer (SqlLexer) shared with the splitter and the classifier ----
+
+  it should "strip a comment that follows an identifier ending in a dollar-tag shape" in:
+    // `a$q$` is one identifier on DuckDB (identifiers continue through `$`), so nothing opens.
+    SqlCommentStripper.stripComments("SELECT a$q$ /* x */ FROM t") should not include "/*"
+
+  it should "read a non-ASCII dollar tag as a tag, keeping a comment marker inside it" in:
+    // DuckDB: `SELECT $<EURO>$ /* $<EURO>$ AS x` returns the string ` /* `.
+    SqlCommentStripper.stripComments(
+      "SELECT $\u20AC$ /* $\u20AC$ AS x"
+    ) shouldBe "SELECT $\u20AC$ /* $\u20AC$ AS x"
+
+  it should "not take an e after a non-ASCII identifier character as an escape-string prefix" in:
+    // `<EURO>e` is one identifier, so `'a\'` is a complete PLAIN string and the comment after it
+    // is a real comment.
+    SqlCommentStripper.stripComments(
+      "SELECT \u20ACe'a\\' /* b */ FROM t"
+    ) shouldBe "SELECT \u20ACe'a\\'   FROM t"
+
+  it should "take an e right after a number as an escape-string prefix, as DuckDB does" in:
+    // DuckDB lexes `1e'...'` as the number 1 then an escape string: the `\'` does not close it.
+    SqlCommentStripper.stripComments(
+      "SELECT 1e'a\\' /* b */' AS s /* c */"
+    ) shouldBe "SELECT 1e'a\\' /* b */' AS s  "
+
+  it should "keep a comment marker inside a backtick identifier (DuckDB 2.0)" in:
+    SqlCommentStripper.stripComments(
+      "SELECT 1 AS `a/*b`, 2 AS `c*/d`"
+    ) shouldBe "SELECT 1 AS `a/*b`, 2 AS `c*/d`"
+
+  it should "follow DuckDB's unicode-space pre-pass around a dollar-tag-shaped identifier" in:
+    // The `'` in the first comment makes DuckDB's pre-pass keep both NBSPs, so `a<NBSP>$q$` is one
+    // identifier and `/* x */` is a real comment (DuckDB returns two columns for this statement).
+    SqlCommentStripper.stripComments(
+      "SELECT 1 /* ' */ AS a\u00A0$q$ /* x */, 2 AS b\u00A0$q$ /* ' */"
+    ) should not include "/* x */"
+
+  // DuckDB turns its Unicode space set into ASCII spaces before lexing, so a dollar quote right
+  // after one of them opens (verified on 1.5.6 and 2.0 for U+00A0, U+200B, U+2003, U+202F, U+205F,
+  // U+3000, U+FEFF). Reading the `$` as the tail of an identifier there would turn a `--` inside
+  // the quoted body into a comment that hides the rest of the line from every screen.
+  "stripComments" should "open a dollar quote right after a Unicode space character" in
+    List("\u00a0", "\u200b", "\u2003", "\u202f", "\u205f", "\u3000", "\ufeff").foreach { sp =>
+      val out = SqlCommentStripper.stripComments("SELECT" + sp + "$$--$$, f(1)")
+      withClue(f"U+${sp.head.toInt}%04X")(out should include("$$--$$, f(1)"))
+    }
+
+  it should "read an escape string only at the start of a token" in {
+    // `x$e'a\'` is the identifier `x$e` followed by the plain string `'a\'`: the quote after the
+    // backslash closes it, so the comment after it is a real comment and is stripped.
+    SqlCommentStripper.stripComments("SELECT x$e'a\\' /* c */ FROM t") should not include "/*"
   }

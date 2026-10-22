@@ -73,7 +73,7 @@ class MaintenanceWiringSpec extends AnyFlatSpec with Matchers:
         store = new InMemoryControlPlaneStore()
       )
       val adapter = new QuackHttpAdapter(
-        new QuackHttpClient(new RootAllocator(), nativeClient = false, nodeDisableSsl = true),
+        new QuackHttpClient(new RootAllocator()),
         new NodeLoadTracker()
       )
       val wiring = new MaintenanceWiring(

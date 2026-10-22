@@ -1,6 +1,6 @@
 package ai.starlake.acl.parser
 
-import ai.starlake.acl.model.{Config, TableRef}
+import ai.starlake.acl.model.{Config, DenyReason, TableRef}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -202,6 +202,31 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
     ) shouldBe true
   }
 
+  test("MERGE matched delete-action AND predicate subquery captures the read source") {
+    val sql =
+      "MERGE INTO db.main.t USING (SELECT 1 AS n) s ON t.k = s.n " +
+        "WHEN MATCHED AND (SELECT count(*) FROM db.main.secret) > 0 THEN DELETE"
+    val accesses = extracted(sql).accesses
+    accesses.exists(a =>
+      a.table == TableRef("db", "main", "secret") && a.verb == Verb.Read
+    ) shouldBe true
+    accesses.exists(a =>
+      a.table == TableRef("db", "main", "t") && a.verb == Verb.Write
+    ) shouldBe true
+  }
+
+  test(
+    "MERGE not-matched-by-source delete-action AND predicate subquery captures the read source"
+  ) {
+    val sql =
+      "MERGE INTO db.main.t USING db.main.s ON t.k = s.k " +
+        "WHEN NOT MATCHED BY SOURCE AND EXISTS (SELECT 1 FROM db.main.secret) THEN DELETE"
+    val accesses = extracted(sql).accesses
+    accesses.exists(a =>
+      a.table == TableRef("db", "main", "secret") && a.verb == Verb.Read
+    ) shouldBe true
+  }
+
   // --- 3f: top-level WITH on DML statements is walked (CTE bodies are read sources,
   //         and an unqualified CTE reference does not launder as a base-table read) ---
 
@@ -278,6 +303,45 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
     SqlParser.extract("USE db1", config).statements.head shouldBe a[StatementResult.ControlFlow]
   }
 
+  // --- SET VARIABLE evaluates its value as a query: DuckDB (1.5.6 and 2.0) runs
+  // `SET VARIABLE x = (SELECT v FROM db.other.t)` and `getvariable('x')` hands the row back, so a
+  // SET whose value reads a table is a read, not table-free control flow ---
+
+  test("SET VARIABLE whose value reads a table is not admitted as control flow") {
+    List(
+      "SET VARIABLE x = (SELECT v FROM db.other.t)",
+      "SET VARIABLE x = (SELECT v FROM t)",
+      "SET VARIABLE x = (SELECT string_agg(v, ',') FROM t WHERE v IN (SELECT v FROM db.other.u))",
+      "SET VARIABLE x = (SELECT content FROM read_text('/etc/passwd'))",
+      "EXPLAIN SET VARIABLE x = (SELECT v FROM db.other.t)"
+    ).foreach { sql =>
+      withClue(sql) {
+        SqlParser.extract(sql, config).statements.head shouldBe a[StatementResult.ParseError]
+      }
+    }
+  }
+
+  test("a bare select passed as a function argument is walked (DuckDB ARRAY(SELECT ...))") {
+    extracted("SELECT ARRAY(SELECT v FROM db.other.t)").accesses shouldBe Set(
+      TableAccess(TableRef("db", "other", "t"), Verb.Read)
+    )
+    extracted("SELECT ARRAY(SELECT v FROM t)").accesses shouldBe Set(
+      TableAccess(TableRef("db", "main", "t"), Verb.Read)
+    )
+    SqlParser
+      .extract("SET VARIABLE x = ARRAY(SELECT v FROM db.other.t)", config)
+      .statements
+      .head shouldBe a[StatementResult.ParseError]
+  }
+
+  test("SET / SET VARIABLE with a table-free value stays control flow") {
+    List("SET VARIABLE x = 42", "SET VARIABLE x = [1, 2, 3]", "SET threads = 4").foreach { sql =>
+      withClue(sql) {
+        SqlParser.extract(sql, config).statements.head shouldBe a[StatementResult.ControlFlow]
+      }
+    }
+  }
+
   // --- metadata enumeration: DESCRIBE / SHOW <table> reveal a table's shape, so they
   // are Read accesses on that table rather than unconditionally admitted control flow ---
 
@@ -326,4 +390,72 @@ class SqlParserAclBypassSpec extends AnyFunSuite with Matchers:
   test("SHOW DATABASES and SHOW SCHEMAS stay ControlFlow, whatever their case") {
     for stmt <- List("SHOW DATABASES", "SHOW SCHEMAS", "show databases", "show schemas") do
       SqlParser.extract(stmt, config).statements.head shouldBe a[StatementResult.ControlFlow]
+  }
+
+  test("a data-modifying CTE is unsupported, not a crash (DuckDB 2.0 DML inside WITH)") {
+    Seq(
+      "WITH w AS (INSERT INTO db.main.t VALUES (1) RETURNING *) SELECT * FROM w",
+      "WITH w AS (DELETE FROM db.main.t RETURNING *) SELECT * FROM w",
+      "WITH w AS (UPDATE db.main.t SET a = 1 RETURNING *) SELECT * FROM w"
+    ).foreach { sql =>
+      withClue(sql) {
+        extracted(sql).unsupported.exists(_.startsWith("data-modifying CTE")) shouldBe true
+      }
+    }
+  }
+
+  test("a data-modifying CTE inside a subquery is unsupported and its target is not a read") {
+    val e = extracted(
+      "SELECT * FROM (WITH w AS (DELETE FROM db.main.t RETURNING *) SELECT * FROM w) s"
+    )
+    e.unsupported.exists(_.startsWith("data-modifying CTE")) shouldBe true
+    e.accesses.map(_.table) should not contain TableRef("db", "main", "t")
+  }
+
+  test("an ordinary CTE still extracts its reads") {
+    val e = extracted("WITH w AS (SELECT * FROM db.main.t) SELECT * FROM w")
+    e.unsupported shouldBe empty
+    e.accesses.map(_.table) should contain(TableRef("db", "main", "t"))
+  }
+
+  test("a four-part (nested schema) name is a qualification error, never a three-part ref") {
+    val e = extracted("SELECT * FROM db.finance.reports.r")
+    e.qualificationErrors should contain(DenyReason.NestedSchemaRef("db.finance.reports.r"))
+    e.accesses.map(_.table) should not contain TableRef("finance", "reports", "r")
+  }
+
+  test("a four-part DML target is a qualification error too") {
+    extracted("INSERT INTO db.finance.reports.r VALUES (1)").qualificationErrors should contain(
+      DenyReason.NestedSchemaRef("db.finance.reports.r")
+    )
+  }
+
+  // QOD_ACL_DIALECT=generic maps names through the ANSI mapper: the guard must hold there too, or
+  // a four-part name qualifies as some three-part ref the grants may cover.
+  private val genericConfig = Config.forGeneric("db", "main")
+
+  private def extractedGeneric(sql: String): StatementResult.Extracted =
+    SqlParser.extract(sql, genericConfig).statements.head match
+      case e: StatementResult.Extracted => e
+      case other => fail(s"expected Extracted, got ${other.getClass.getSimpleName}: $other")
+
+  test("a four-part name is a qualification error on the generic dialect") {
+    val e = extractedGeneric("SELECT * FROM db.finance.reports.r")
+    e.qualificationErrors should contain(DenyReason.NestedSchemaRef("db.finance.reports.r"))
+    e.accesses shouldBe empty
+  }
+
+  test("a four-part DML target is a qualification error on the generic dialect") {
+    val e = extractedGeneric("INSERT INTO db.finance.reports.r SELECT * FROM db.main.t")
+    e.qualificationErrors should contain(DenyReason.NestedSchemaRef("db.finance.reports.r"))
+    e.accesses.map(_.table) should not contain TableRef("finance", "reports", "r")
+  }
+
+  test("three-part and shorter names still qualify on the generic dialect") {
+    extractedGeneric("SELECT * FROM db.main.t JOIN s.u ON true JOIN v ON true").accesses
+      .map(_.table) shouldBe Set(
+      TableRef("db", "main", "t"),
+      TableRef("db", "s", "u"),
+      TableRef("db", "main", "v")
+    )
   }

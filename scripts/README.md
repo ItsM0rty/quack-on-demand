@@ -19,7 +19,7 @@ Everything else lives in a subfolder by audience.
 | `load-tpcds-dbgen.sh` / `.ps1` | Seed TPC-DS (`dsdgen()`, default `globex_tpcds.tpcds1`; needs the `tpcds` extension download). |
 | `load-ssb-dbgen.sh` / `.ps1` | Seed the Star Schema Benchmark, derived from TPC-H (default `acme_tpch.ssb1`). |
 | `_load-common.sh` / `_load-common.ps1` | Shared helpers sourced by the three loaders (functions only). The loaders stay at the top level because `run-jar`, the Docker image and the CLI wheel all ship them next to the spawn script. |
-| `kill-quack-nodes.sh` | Kill stray `spawn-quack-node.sh` processes and their DuckDB children without touching the manager. This is the recovery step after an unclean manager exit. |
+| `kill-quack-nodes.sh` | Kill one manager's stray `spawn-quack-node.sh` processes and their DuckDB children without touching the manager (`--port <rest-port>`, default `QOD_ON_DEMAND_PORT`); `--unmarked` stops only wrappers whose argv ends at the port (a `qod fleet join` node on this host); `--all` sweeps every node on the host, and is the only mode that stops the orphans of a manager from an earlier release (their wrappers carry the node token as the second argument). This is the recovery step after an unclean manager exit. |
 | `install.sh` | `curl \| sh` installer: bootstraps `uv`, then installs the `qod` CLI. Its URL is published, so it must not move. |
 
 ## `docker/`: container launchers
@@ -37,7 +37,7 @@ Everything else lives in a subfolder by audience.
 | `release.sh` | Cut a release: verify, stamp versions, tag, push. Pushing the tag makes CI (`release.yml`) publish everything. |
 | `release-lib.sh` | Shared helpers sourced by `release.sh`, `release-docker.sh` and `release.yml`. |
 | `release-docker.sh` | Manual fallback for publishing the Docker image when the CI channel is broken. |
-| `announce-release-discord.sh` | Post a version's CHANGELOG section to Discord. Run by CI, and can be re-run by hand. |
+| `announce-release-discord.sh` | Post a digest of a version's CHANGELOG section (entry titles plus a link to the full section) to Discord. Run by CI, and can be re-run by hand; `ANNOUNCE_POST=0` prints it instead. |
 | `refresh-quackwire-binaries.sh` | Rebuild and download the vendored `libquackwire` binaries, then stop so you can review and commit them. |
 
 ## `bench/`: clients and load tests

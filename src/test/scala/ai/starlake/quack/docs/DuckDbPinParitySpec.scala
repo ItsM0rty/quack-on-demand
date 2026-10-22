@@ -59,17 +59,47 @@ class DuckDbPinParitySpec extends AnyFlatSpec with Matchers:
       "ARG DUCKDB_VERSION"
     )
 
-  "build.sbt libquackwireVersion" should "carry the same DuckDB ABI segment" in {
+  private lazy val libquackwireVersion: String =
     val buildSbt = Files.readString(Paths.get("build.sbt"))
     val re       = """val libquackwireVersion\s*=\s*"([^"]+)"""".r
-    val coord    = re
-      .findFirstMatchIn(buildSbt)
+    re.findFirstMatchIn(buildSbt)
       .map(_.group(1))
       .getOrElse(fail("could not parse libquackwireVersion from build.sbt"))
+
+  "build.sbt libquackwireVersion" should "carry the same DuckDB ABI segment" in {
+    val coord = libquackwireVersion
     withClue(
       s"libquackwireVersion `$coord` links a different DuckDB ABI than Versions.duckdb " +
         s"($enginePin); nodes and the native client would disagree at runtime. "
     ) {
       coord should startWith(s"$enginePin-")
     }
+  }
+
+  // quackwire.yml builds the natives the refresh script vendors. It derives the DuckDB release from
+  // project/Versions.scala instead of carrying a copy, so the parity to guard is that it still does
+  // and that no literal release tag crept back in (a hard-coded v1.5.6 is how CI kept producing
+  // 1.5.6 natives under a 2.0 stamp).
+  ".github/workflows/quackwire.yml" should "build against the DuckDB release read from the pin" in {
+    val path = ".github/workflows/quackwire.yml"
+    val yml  = Files.readString(Paths.get(path))
+    withClue(s"$path must read `val duckdb` from project/Versions.scala: ") {
+      yml should include("project/Versions.scala")
+      yml should include("DUCKDB_VERSION: ${{ needs.pin.outputs.duckdb }}")
+    }
+    val literalTag = """(releases/download/|--branch\s+)v\d+\.\d+\.\d+""".r
+    withClue(s"$path hard-codes a DuckDB release tag instead of using $$DUCKDB_VERSION: ") {
+      literalTag.findAllIn(yml).toList shouldBe Nil
+    }
+  }
+
+  // The Windows shim copies DuckDB internals by hand; naming the pin it was derived at makes a bump
+  // that forgets to revisit it fail here instead of at a Windows link (or silently on the wire).
+  "native/quackwire/src/win_duckdb_compat.cpp" should "name the libquackwire pin it was derived at" in {
+    val pinNoRev = libquackwireVersion.split('-').take(2).mkString("-")
+    fileMustContain(
+      "native/quackwire/src/win_duckdb_compat.cpp",
+      s"\"$pinNoRev-*\"",
+      "the re-derivation header"
+    )
   }

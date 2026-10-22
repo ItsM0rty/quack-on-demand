@@ -1,5 +1,6 @@
 package ai.starlake.quack.ondemand.branch
 
+import ai.starlake.quack.ondemand.runtime.NodePaths
 import com.typesafe.scalalogging.LazyLogging
 import org.postgresql.PGConnection
 
@@ -59,40 +60,54 @@ final class BranchCloner(
       src.setAutoCommit(false)
       src.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ)
       // A first read pins the snapshot for the rest of the transaction.
-      val schema = metaSchema(src).getOrElse(
-        return Left(s"database '$parentDb' holds no DuckLake metadata (ducklake_metadata missing)")
+      val pinned =
+        for
+          schema <- metaSchema(src).toRight(
+            s"database '$parentDb' holds no DuckLake metadata (ducklake_metadata missing)"
+          )
+          fork <- maxSnapshot(src, schema).toRight(s"database '$parentDb' has no snapshots")
+        yield (schema, fork)
+      pinned.flatMap((schema, fork) =>
+        copyAt(src, schema, fork, parentDb, branchDb, branchDataPath)
       )
-      val fork = maxSnapshot(src, schema).getOrElse(
-        return Left(s"database '$parentDb' has no snapshots")
-      )
-      val tables = listTables(src, schema)
-      val dst    = connect(branchDb)
-      try
-        dst.setAutoCommit(false)
-        var rows = 0L
-        ensureSchema(dst, schema)
-        tables.foreach { t =>
-          createLike(src, dst, schema, t)
-          rows += copyRows(src, dst, schema, t)
-        }
-        rewrite(dst, schema, branchDataPath)
-        dst.commit()
-        logger.info(
-          s"branch clone: '$parentDb' -> '$branchDb' at snapshot $fork " +
-            s"(${tables.size} tables, $rows rows, data_path '$branchDataPath')"
-        )
-        Right(CloneResult(fork, tables.size, rows))
-      catch
-        case NonFatal(e) =>
-          try dst.rollback()
-          catch case NonFatal(_) => ()
-          Left(s"clone failed: ${e.getMessage}")
-      finally dst.close()
     catch case NonFatal(e) => Left(s"clone failed: ${e.getMessage}")
     finally
       try src.rollback()
       catch case NonFatal(_) => ()
       src.close()
+
+  /** The copy itself, inside `src`'s REPEATABLE READ transaction pinned at `fork`. */
+  private def copyAt(
+      src: Connection,
+      schema: String,
+      fork: Long,
+      parentDb: String,
+      branchDb: String,
+      branchDataPath: String
+  ): Either[String, CloneResult] =
+    val tables = listTables(src, schema)
+    val dst    = connect(branchDb)
+    try
+      dst.setAutoCommit(false)
+      var rows = 0L
+      ensureSchema(dst, schema)
+      tables.foreach { t =>
+        createLike(src, dst, schema, t)
+        rows += copyRows(src, dst, schema, t)
+      }
+      rewrite(dst, schema, branchDataPath)
+      dst.commit()
+      logger.info(
+        s"branch clone: '$parentDb' -> '$branchDb' at snapshot $fork " +
+          s"(${tables.size} tables, $rows rows, data_path '$branchDataPath')"
+      )
+      Right(CloneResult(fork, tables.size, rows))
+    catch
+      case NonFatal(e) =>
+        try dst.rollback()
+        catch case NonFatal(_) => ()
+        Left(s"clone failed: ${e.getMessage}")
+    finally dst.close()
 
   private def metaSchema(c: Connection): Option[String] =
     val ps = c.prepareStatement(
@@ -210,7 +225,9 @@ final class BranchCloner(
     val s  = q(schema)
     val st = dst.createStatement()
     try
-      val parentPath = {
+      // A relative data_path is resolved the way a node resolves it: nodes run in an empty
+      // directory of their own, where a relative file path would find nothing.
+      val parentPath = NodePaths.resolve {
         val rs = st.executeQuery(s"SELECT value FROM $s.ducklake_metadata WHERE key = 'data_path'")
         try if rs.next() then rs.getString(1) else ""
         finally rs.close()

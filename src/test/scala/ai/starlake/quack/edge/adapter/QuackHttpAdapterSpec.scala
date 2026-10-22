@@ -52,11 +52,7 @@ class QuackHttpAdapterSpec extends AnyFlatSpec with Matchers:
     * ArrowReader instances are single-use.
     */
   final class FakeClient(canned: Map[String, () => QuackResponse])
-      extends QuackHttpClient(
-        TestArrow.sharedAllocator,
-        nativeClient = true,
-        nodeDisableSsl = true
-      ):
+      extends QuackHttpClient(TestArrow.sharedAllocator):
     override def query(
         endpoint: String,
         token: String,
@@ -143,7 +139,7 @@ class QuackHttpAdapterSpec extends AnyFlatSpec with Matchers:
   "send with stampPrelude" should "route to queryStamped when supplied and to query when not" in:
     val recorded = scala.collection.mutable.ListBuffer.empty[String]
     val client   =
-      new QuackHttpClient(TestArrow.sharedAllocator, nativeClient = true, nodeDisableSsl = true):
+      new QuackHttpClient(TestArrow.sharedAllocator):
         override def query(
             endpoint: String,
             token: String,
@@ -290,7 +286,7 @@ class QuackHttpAdapterSpec extends AnyFlatSpec with Matchers:
   "send" should "release inFlight when the client raises" in:
     val boom   = new RuntimeException("socket reset")
     val client =
-      new QuackHttpClient(TestArrow.sharedAllocator, nativeClient = true, nodeDisableSsl = true):
+      new QuackHttpClient(TestArrow.sharedAllocator):
         override def query(e: String, t: String, s: String, ss: Option[String]): IO[QuackResponse] =
           IO.raiseError(boom)
     val tracker = new NodeLoadTracker

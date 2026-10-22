@@ -19,9 +19,9 @@ import sttp.model.StatusCode
   * answer it by itself.
   *
   * What answers the "mint a successor" half is the revocation cascade: a PAT-minted child always
-  * carries its minting token as `parentId` ([[PatStore.mint]]), and [[PatStore.revoke]] cascades
-  * over the whole subtree in one statement. Revoking a stolen token therefore kills every successor
-  * it ever minted in the same call -- roll-forward stops working. The cascade is not an operational
+  * carries its minting token as `parentId` (`PatStore.mint`), and `PatStore.revoke` cascades over
+  * the whole subtree in one statement. Revoking a stolen token therefore kills every successor it
+  * ever minted in the same call -- roll-forward stops working. The cascade is not an operational
   * convenience here, it is the precondition that makes admitting a PAT at all safe; removing it
   * would silently reopen the hole the original refusal closed.
   *
@@ -62,7 +62,7 @@ import sttp.model.StatusCode
   *   that was never provisioned) resolves to `None` and is refused `401`.
   * @param maxDepth
   *   [[ai.starlake.quack.PatConfig.maxDepth]] (env `QOD_PAT_MAX_DEPTH`, default 8). An operational
-  *   backstop on the delegation chain, not a security boundary -- see [[TokenRestriction.narrow]],
+  *   backstop on the delegation chain, not a security boundary -- see `TokenRestriction.narrow`,
   *   which already guarantees a child cannot exceed its parent regardless of depth.
   */
 final class PatHandlers(

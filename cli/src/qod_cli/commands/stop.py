@@ -254,19 +254,37 @@ def _finish_starflow_stop(pgid: int) -> None:
 
 
 def _stop_manager_and_nodes():
-    mgr_port = int(os.environ.get("QOD_ON_DEMAND_PORT", "20900"))
-    edge_port = int(os.environ.get("PROXY_PORT", "31338"))
-    force_after = int(os.environ.get("FORCE_AFTER", "10"))
+    # Same resolution as `qod start` and `qod status`: a real env var over a value `qod setup`
+    # persisted, over the default. Reading the environment alone stopped (and, for nodes, scoped
+    # to) port 20900 when the manager had been set up on another port.
+    merged = {**load_start_env(), **os.environ}
+    mgr_port = int(merged.get("QOD_ON_DEMAND_PORT") or "20900")
+    edge_port = int(merged.get("PROXY_PORT") or "31338")
+    force_after = int(merged.get("FORCE_AFTER") or "10")
+
+    # Only this manager's nodes: each wrapper's argv and node directory carry the manager's marker
+    # `<rest-port>-<boot id>` (LocalQuackBackend.managerMarker), so another manager on this host
+    # (an isolated test stack) keeps its nodes.
+    spawn_re = rf"spawn-quack-node\.sh [0-9]+ {mgr_port}-[0-9a-f]+"
+    duck_re = rf"duckdb .*-init .*quack-node\.{mgr_port}-[0-9a-f]+\."
 
     def discover() -> set[int]:
-        pids = {_listening_pid(mgr_port), _listening_pid(edge_port), *_pgrep("spawn-quack-node")}
+        pids = {_listening_pid(mgr_port), _listening_pid(edge_port), *_pgrep(spawn_re)}
         return {int(p) for p in pids if p}
+
+    # Unmarked nodes (a manager older than the marker) are left alone, as stop-jar.sh does; say so.
+    unmarked = [p for p in _pgrep(r"spawn-quack-node\.sh [0-9]+$") if p]
+    if unmarked:
+        typer.echo(
+            f"note: leaving {len(unmarked)} unmarked spawn-quack-node.sh process(es) alone "
+            "(an older manager's; scripts/kill-quack-nodes.sh --unmarked stops them)."
+        )
 
     pids = discover()
     if not pids:
         typer.echo(
             f"nothing running on ports {mgr_port} / {edge_port} "
-            "and no spawn-quack-node processes."
+            "and no spawn-quack-node processes of that manager."
         )
         return
 
@@ -281,8 +299,10 @@ def _stop_manager_and_nodes():
 
     typer.echo(f"still running after {force_after}s; sending SIGKILL.", err=True)
     # Re-discover: the spawn scripts trap TERM, but their duckdb children can
-    # survive a killed wrapper; sweep both.
-    leftovers = pids | discover() | {int(p) for p in _pgrep("^duckdb") if p}
+    # survive a killed wrapper; sweep both. A node runs as
+    # `<abs path>/duckdb -init <tmp>/quack-node.<marker>.XXX/init`, so match that argv with this
+    # manager's marker (a bare `^duckdb` never matches the absolute path the spawn script uses).
+    leftovers = pids | discover() | {int(p) for p in _pgrep(duck_re) if p}
     _kill_all(leftovers, signal.SIGKILL)
     time.sleep(2)
     if discover():

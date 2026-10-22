@@ -101,8 +101,13 @@ class KubernetesQuackBackendSpec
     val env = container.getEnv.asScala.map(e => e.getName -> e.getValue).toMap
 
     env.get("QOD_S3_ENDPOINT") shouldBe Some("http://seaweedfs:8333")
-    env.get("QOD_S3_ACCESS_KEY_ID") shouldBe Some("quack")
-    env.get("QOD_S3_SECRET_ACCESS_KEY") shouldBe Some("quackquack")
+    // The credentials are files of the secrets volume (via the node-env Secret), never env vars.
+    env.contains("QOD_S3_ACCESS_KEY_ID") shouldBe false
+    env.contains("QOD_S3_SECRET_ACCESS_KEY") shouldBe false
+    container.getEnv.asScala.map(_.getValue) should not contain "quackquack"
+    val pod = server.getClient.pods.inNamespace("default").withName(node.podName.get).get()
+    SecretsVolumeView.files(pod).get("QOD_S3_SECRET_ACCESS_KEY") shouldBe
+      Some(("qod-nodeenv-acme-acme-default-sales", "QOD_S3_SECRET_ACCESS_KEY"))
     env.get("QOD_S3_REGION") shouldBe Some("us-east-1")
     env.get("QOD_S3_URL_STYLE") shouldBe Some("path")
     env.get("QOD_S3_USE_SSL") shouldBe Some("false")
@@ -236,20 +241,12 @@ class KubernetesQuackBackendSpec
       )
     payload shouldBe FedSql
 
-    // The pod has an `extraSetupSql` env entry whose value comes from a
-    // SecretKeyRef pointing at the same Secret + same key.
-    val container = server.getClient.pods
-      .inNamespace("default")
-      .withName(node.podName.get)
-      .get()
-      .getSpec
-      .getContainers
-      .get(0)
-    val fedEnv = container.getEnv.asScala.find(_.getName == "extraSetupSql").value
-    fedEnv.getValue shouldBe null // value-from, not value
-    val ref = fedEnv.getValueFrom.getSecretKeyRef
-    ref.getName shouldBe FedName
-    ref.getKey shouldBe KubernetesQuackBackend.FederationSecretKey
+    // The pod reads it as the `extraSetupSql` file of the secrets volume, never as an env var.
+    val pod       = server.getClient.pods.inNamespace("default").withName(node.podName.get).get()
+    val container = pod.getSpec.getContainers.get(0)
+    container.getEnv.asScala.map(_.getName) should not contain "extraSetupSql"
+    SecretsVolumeView.files(pod).get("extraSetupSql") shouldBe
+      Some((FedName, KubernetesQuackBackend.FederationSecretKey))
 
   it should "GC the federation Secret on stop even when the pod is already gone" in:
     val backend = fedBackend
@@ -420,20 +417,12 @@ class KubernetesQuackBackendSpec
       )
     payload shouldBe ObjectStoreSql
 
-    // The pod has an `objectStoreSql` env entry whose value comes from a
-    // SecretKeyRef pointing at the same Secret + same key (not inlined).
-    val container = server.getClient.pods
-      .inNamespace("default")
-      .withName(node.podName.get)
-      .get()
-      .getSpec
-      .getContainers
-      .get(0)
-    val storeEnv = container.getEnv.asScala.find(_.getName == "objectStoreSql").value
-    storeEnv.getValue shouldBe null // value-from, not value
-    val ref = storeEnv.getValueFrom.getSecretKeyRef
-    ref.getName shouldBe objectStoreSecretName("quack-store-1")
-    ref.getKey shouldBe KubernetesQuackBackend.ObjectStoreSecretKey
+    // The pod reads it as the `objectStoreSql` file of the secrets volume, never as an env var.
+    val pod       = server.getClient.pods.inNamespace("default").withName(node.podName.get).get()
+    val container = pod.getSpec.getContainers.get(0)
+    container.getEnv.asScala.map(_.getName) should not contain "objectStoreSql"
+    SecretsVolumeView.files(pod).get("objectStoreSql") shouldBe
+      Some((objectStoreSecretName("quack-store-1"), KubernetesQuackBackend.ObjectStoreSecretKey))
 
   it should "skip the Secret + env entry entirely when objectStoreSql is empty" in:
     val backend = fedBackend
@@ -498,7 +487,7 @@ class KubernetesQuackBackendSpec
         new String(java.util.Base64.getDecoder.decode(b64), java.nio.charset.StandardCharsets.UTF_8)
       }
 
-  "token persistence" should "create a per-pod Secret and reference it from QOD_NODE_TOKEN" in:
+  "token persistence" should "create a per-pod Secret and mount it as the QOD_NODE_TOKEN file" in:
     val backend = fedBackend
     val node    = backend
       .start(
@@ -514,21 +503,24 @@ class KubernetesQuackBackendSpec
     secret should not be null
     readTokenPayload(secret) shouldBe node.token
 
-    // The pod's QOD_NODE_TOKEN env is a SecretKeyRef pointing at the same
-    // Secret + key. The plain `value` field stays null -- the bearer never
-    // lands in the pod manifest.
-    val container = server.getClient.pods
-      .inNamespace("default")
-      .withName(node.podName.get)
-      .get()
-      .getSpec
-      .getContainers
-      .get(0)
-    val tokenEnv = container.getEnv.asScala.find(_.getName == "QOD_NODE_TOKEN").value
-    tokenEnv.getValue shouldBe null
-    val ref = tokenEnv.getValueFrom.getSecretKeyRef
-    ref.getName shouldBe tokenSecretName("quack-tok-1")
-    ref.getKey shouldBe KubernetesQuackBackend.TokenSecretKey
+    // The token is the QOD_NODE_TOKEN file of the read-only secrets volume: neither in the pod
+    // manifest nor in the node's process environment.
+    val pod       = server.getClient.pods.inNamespace("default").withName(node.podName.get).get()
+    val container = pod.getSpec.getContainers.get(0)
+    container.getEnv.asScala.map(_.getName) should not contain "QOD_NODE_TOKEN"
+    SecretsVolumeView.files(pod).get("QOD_NODE_TOKEN") shouldBe
+      Some((tokenSecretName("quack-tok-1"), KubernetesQuackBackend.TokenSecretKey))
+    val volume = pod.getSpec.getVolumes.asScala
+      .find(_.getName == KubernetesQuackBackend.SecretsVolumeName)
+      .value
+    volume.getProjected.getDefaultMode shouldBe Integer.parseInt("400", 8)
+    val mount = container.getVolumeMounts.asScala
+      .find(_.getName == KubernetesQuackBackend.SecretsVolumeName)
+      .value
+    mount.getMountPath shouldBe KubernetesQuackBackend.SecretsMountPath
+    mount.getReadOnly shouldBe true
+    container.getEnv.asScala.find(_.getName == "QOD_SECRETS_DIR").value.getValue shouldBe
+      KubernetesQuackBackend.SecretsMountPath
 
   it should "delete the token Secret on stop()" in:
     val backend = fedBackend
@@ -803,7 +795,8 @@ class KubernetesQuackBackendSpec
     val pod = server.getClient.pods.inNamespace(ns).withName(baseSpec.nodeId).get
     pod.getSpec.getContainers.asScala.map(_.getName) should contain allOf ("quack", "sidecar")
     val quack = pod.getSpec.getContainers.asScala.find(_.getName == "quack").get
-    quack.getEnv.asScala.map(_.getName) should contain("QOD_NODE_TOKEN")
+    quack.getEnv.asScala.map(_.getName) should contain("QOD_SECRETS_DIR")
+    SecretsVolumeView.files(pod).keySet should contain("QOD_NODE_TOKEN")
     quack.getImage shouldBe image
 
   it should "ignore a stored template and build from scratch when the gate is off" in:
@@ -874,7 +867,7 @@ class KubernetesQuackBackendSpec
       .get
     val envNames = quack.getEnv.asScala.map(_.getName).toSet
     envNames should not contain "MY_SECRET"
-    envNames should contain("QOD_NODE_TOKEN")
+    envNames should contain("QOD_SECRETS_DIR")
 
   it should "apply the configured serviceAccount and Service type to spawned resources" in:
     val backend = new KubernetesQuackBackend(

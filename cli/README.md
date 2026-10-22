@@ -55,7 +55,10 @@ same provisioning as the demo, plus the libduckdb native client. It honors
 the `scripts/run-jar.sh` env-var surface: `QOD_VERSION` (release pin or
 `latest`), `JAVA_BIN`, `JAVA_OPTS`, `JAR_CACHE_DIR`, `DUCKDB_VERSION`,
 `DUCKDB_CACHE_DIR`, the `LOAD_TPCH` / `LOAD_TPCDS` / `LOAD_SSB` / `LOAD_TPC`
-benchmark seeders, `DEMO=full|minimal`, and `NUKE=1`. State (DuckLake data,
+benchmark seeders, `DEMO=full|minimal`, and `NUKE=1`. The duckdb CLI and
+libduckdb are cached per release under the platform user cache dir
+(`qod/duckdb/<version>/{bin,lib}`, the `DUCKDB_CACHE_DIR` layout), and the
+manager is handed that cache through `DUCKDB_CACHE_DIR`. State (DuckLake data,
 TLS certs) anchors under the platform user data dir. `qod stop` finds the
 running manager by its ports and tears it and its nodes down (SIGTERM, then
 SIGKILL after `FORCE_AFTER` seconds).

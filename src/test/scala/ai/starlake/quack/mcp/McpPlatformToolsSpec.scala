@@ -383,6 +383,52 @@ class McpPlatformToolsSpec extends AnyFlatSpec with Matchers:
       out.swap.toOption.get should include("authType")
     }
 
+  it should "create a postgres source from a typed connection, read-only by default" in
+    withTools(withFederation = true) { (tools, _) =>
+      val created = call(
+        tools,
+        "upsert_federated_source",
+        McpPrincipal.StaticKey,
+        "tenant"      -> Json.fromString(Tenant0),
+        "database"    -> Json.fromString(TenantDb),
+        "alias"       -> Json.fromString("shop_pg"),
+        "source_type" -> Json.fromString("postgres"),
+        "connection"  -> Json.obj(
+          "host"     -> Json.fromString("pg.example.com"),
+          "port"     -> Json.fromInt(6432),
+          "database" -> Json.fromString("shop"),
+          "user"     -> Json.fromString("reader"),
+          "password" -> Json.fromString("{{secret.PG_PWD}}"),
+          "sslMode"  -> Json.fromString("require")
+        )
+      )
+      withClue(created)(created.isRight shouldBe true)
+      val cur = onlySource(tools)
+      cur.get[String]("sourceType").toOption shouldBe Some("postgres")
+      cur.get[Boolean]("readOnly").toOption shouldBe Some(true)
+      val conn = cur.downField("connection")
+      conn.get[String]("host").toOption shouldBe Some("pg.example.com")
+      conn.get[Int]("port").toOption shouldBe Some(6432)
+      conn.get[String]("password").toOption shouldBe Some("{{secret.PG_PWD}}")
+      conn.get[String]("sslMode").toOption shouldBe Some("require")
+    }
+
+  it should "reject a malformed connection argument instead of dropping it" in
+    withTools(withFederation = true) { (tools, _) =>
+      val out = call(
+        tools,
+        "upsert_federated_source",
+        McpPrincipal.StaticKey,
+        "tenant"      -> Json.fromString(Tenant0),
+        "database"    -> Json.fromString(TenantDb),
+        "alias"       -> Json.fromString("shop_pg"),
+        "source_type" -> Json.fromString("postgres"),
+        "connection"  -> Json.obj("host" -> Json.fromString("h"), "port" -> Json.fromString("x"))
+      )
+      withClue(out)(out.isLeft shouldBe true)
+      out.swap.toOption.get should include("connection")
+    }
+
   /** Alias normalization (Task 5) lives in FederatedSourceHandlers, and the MCP tool inherits it
     * only for as long as it keeps building a FederatedSourceCreateRequest and calling that handler.
     * This pins the inherited behaviour so that giving the MCP path its own request-building code

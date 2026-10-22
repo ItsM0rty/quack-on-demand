@@ -1,5 +1,6 @@
 package ai.starlake.quack.ondemand.demo
 
+import ai.starlake.quack.ondemand.{CatalogPgSecret, InProcessDuckDb}
 import com.typesafe.scalalogging.LazyLogging
 
 import java.nio.file.Files
@@ -33,11 +34,18 @@ object DemoSeed extends LazyLogging:
     val ctas = Tables
       .map(t => s"CREATE TABLE $dbName.$schema.$t AS SELECT * FROM memory.main.$t;")
       .mkString("\n")
-    s"""INSTALL ducklake; LOAD ducklake;
-       |INSTALL postgres; LOAD postgres;
-       |INSTALL tpch;     LOAD tpch;
-       |ATTACH 'ducklake:postgres:host=${pg.host} port=${pg.port} dbname=$dbName user=${pg.user} password=${pg.password}' AS $dbName
-       |  (DATA_PATH '$dataPath');
+    // The password rides a temporary secret, never the attach path ([[CatalogPgSecret]]).
+    val secret = CatalogPgSecret.Name
+    s"""INSTALL ducklake;
+       |LOAD ducklake;
+       |INSTALL postgres;
+       |LOAD postgres;
+       |INSTALL tpch;
+       |LOAD tpch;
+       |${CatalogPgSecret.createSql(secret, pg.password)};
+       |ATTACH 'ducklake:postgres:host=${pg.host} port=${pg.port} dbname=$dbName user=${pg.user}' AS $dbName
+       |  (DATA_PATH '$dataPath', ${CatalogPgSecret.metadataParameters(secret)});
+       |${CatalogPgSecret.dropSql(secret)};
        |CREATE SCHEMA IF NOT EXISTS $dbName.$schema;
        |CALL dbgen(sf = $sf);
        |$ctas
@@ -63,6 +71,16 @@ object DemoSeed extends LazyLogging:
       s"DROP SCHEMA IF EXISTS $dbName.$schema CASCADE;\n$createSchema"
     buildInitSql(pg, dbName, schema, dataPath, sf).replace(createSchema, dropThenCreate)
 
+  /** The first lines fed to every seed run. DuckDB loads every persistent secret of its secret
+    * directory on first secret use, and the default is the OS user's `~/.duckdb/stored_secrets`;
+    * the manager's unreachable [[InProcessDuckDb.secretDirectory]] replaces it before any
+    * statement. Under `.bail on`, so a failure aborts the run instead of loading the default; piped
+    * input otherwise carries on past errors, as before.
+    */
+  private[demo] def secretPrelude: String =
+    val dir = InProcessDuckDb.secretDirectory.toString.replace("'", "''")
+    s".bail on\nSET secret_directory = '$dir';\nSELECT count(*) FROM duckdb_secrets();\n.bail off\n"
+
   /** Run the `duckdb` CLI against `sql` once. Returns the process exit code and captured stderr.
     *
     * Uses `java.lang.ProcessBuilder` with stdin/stderr fully redirected to/from files rather than
@@ -76,8 +94,12 @@ object DemoSeed extends LazyLogging:
     val sqlFile = Files.createTempFile("qod-demo-seed-", ".sql")
     val errFile = Files.createTempFile("qod-demo-seed-", ".err")
     try
-      Files.writeString(sqlFile, sql)
-      val pb = new java.lang.ProcessBuilder(duckdb)
+      Files.writeString(sqlFile, secretPrelude + sql)
+      // -no-init: never the OS user's ~/.duckdbrc.
+      val pb = new java.lang.ProcessBuilder(duckdb, "-no-init")
+      // DuckDB 2.0's CLI turns errors into JSON under an agent env var (AI_AGENT, CLAUDECODE)
+      // when stdout is not a terminal; keep the plain stderr this seeder reports.
+      pb.environment().put("DUCKDB_AGENT_MODE", "0")
       pb.redirectInput(sqlFile.toFile)
       pb.redirectOutput(java.lang.ProcessBuilder.Redirect.DISCARD)
       pb.redirectError(errFile.toFile)

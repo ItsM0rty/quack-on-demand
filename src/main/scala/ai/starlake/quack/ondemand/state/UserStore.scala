@@ -545,12 +545,14 @@ object UserStore:
 
   /** Failure of [[UserStore.changePassword]].
     *
-    *   - [[InvalidCredentials]]: unknown user, wrong current password, and disabled account are
-    *     deliberately indistinguishable to the caller (anti-enumeration).
-    *   - [[Locked]]: the row is locked out (only reachable with lockout enabled). Surfaced
-    *     distinctly so the handler can answer `account_locked` and point the user at the reset
-    *     flow, mirroring the login path. A locked account already reveals its state on login, so
-    *     this is not a new existence oracle.
+    *   - [[ai.starlake.quack.ondemand.state.UserStore.ChangePasswordError.InvalidCredentials InvalidCredentials]]:
+    *     unknown user, wrong current password, and disabled account are deliberately
+    *     indistinguishable to the caller (anti-enumeration).
+    *   - [[ai.starlake.quack.ondemand.state.UserStore.ChangePasswordError.Locked Locked]]: the row
+    *     is locked out (only reachable with lockout enabled). Surfaced distinctly so the handler
+    *     can answer `account_locked` and point the user at the reset flow, mirroring the login
+    *     path. A locked account already reveals its state on login, so this is not a new existence
+    *     oracle.
     */
   enum ChangePasswordError:
     case InvalidCredentials

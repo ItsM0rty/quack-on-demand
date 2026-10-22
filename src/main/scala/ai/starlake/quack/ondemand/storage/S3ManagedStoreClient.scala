@@ -19,8 +19,8 @@ import java.net.URI
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
-/** AWS SDK v2 [[S3Client]] impl of [[ManagedStoreClient]] for the operator root bucket. The client
-  * is built lazily so wiring this up with `enabled=false` never touches the SDK.
+/** AWS SDK v2 `S3Client` impl of [[ManagedStoreClient]] for the operator root bucket. The client is
+  * built lazily so wiring this up with `enabled=false` never touches the SDK.
   */
 final class S3ManagedStoreClient(cfg: ManagedObjectStoreConfig) extends ManagedStoreClient:
 

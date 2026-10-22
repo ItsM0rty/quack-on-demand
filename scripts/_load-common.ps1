@@ -118,7 +118,7 @@ function Resolve-Storage($cfg) {
   switch -Regex ($dp) {
     '^(s3|s3a|gs|r2)://' {
       $isRemote = $true
-      $storageSql = "INSTALL httpfs; LOAD httpfs;"
+      $storageSql = "INSTALL httpfs;`nLOAD httpfs;"
       if ($env:QOD_S3_ACCESS_KEY_ID -and $env:QOD_S3_SECRET_ACCESS_KEY) {
         $ep = $env:QOD_S3_ENDPOINT
         if ($ep) { $ep = $ep -replace '^https?://','' -replace '/$','' }
@@ -139,7 +139,7 @@ CREATE OR REPLACE SECRET quack_s3 (
     }
     '^(az|azure|abfss)://' {
       $isRemote = $true
-      $storageSql = "INSTALL azure; LOAD azure;"
+      $storageSql = "INSTALL azure;`nLOAD azure;"
       if ($env:QOD_AZURE_CONNECTION_STRING) {
         $storageSql += @"
 
@@ -160,9 +160,15 @@ CREATE OR REPLACE SECRET quack_azure (
   return [pscustomobject]@{ Sql = $storageSql; DataPath = $dp }
 }
 
-# The DuckLake ATTACH statement shared by the probe and the load script.
+# The DuckLake ATTACH statement shared by the probe and the load script. The password rides a
+# temporary secret, never the attach path (which DuckDB prints in duckdb_databases() and in
+# errors); dropped once attached. Mirrors _load-common.sh.
 function Get-AttachSql($cfg) {
-  "ATTACH 'ducklake:postgres:host=$($cfg.PgHost) port=$($cfg.PgPort) dbname=$($cfg.DbName) user=$($cfg.PgUser) password=$($cfg.PgPass)' AS $($cfg.DbName)`n  (DATA_PATH '$($cfg.DataPath)');"
+  $pw = ([string]$cfg.PgPass).Replace("'", "''")
+  "CREATE OR REPLACE TEMPORARY SECRET qod_catalog_pg (TYPE postgres, PASSWORD '$pw');`n" +
+  "ATTACH 'ducklake:postgres:host=$($cfg.PgHost) port=$($cfg.PgPort) dbname=$($cfg.DbName) user=$($cfg.PgUser)' AS $($cfg.DbName)`n" +
+  "  (DATA_PATH '$($cfg.DataPath)', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});`n" +
+  "DROP SECRET IF EXISTS qod_catalog_pg;"
 }
 
 # Stream SQL to the DuckDB CLI via `-c ".read '<tempfile>'"`. Writes the temp
@@ -180,6 +186,8 @@ function Get-AttachSql($cfg) {
 function Invoke-DuckDb {
   param([Parameter(Mandatory)] [string]$Sql, [switch]$Quiet)
   $duck = Get-DuckDbExe
+  # The 2.0 CLI otherwise prints JSON errors under an agent env var (AI_AGENT, CLAUDECODE).
+  $env:DUCKDB_AGENT_MODE = '0'
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ("qod-load-" + [Guid]::NewGuid().ToString('N') + ".sql")
   [IO.File]::WriteAllText($tmp, $Sql, (New-Object System.Text.UTF8Encoding($false)))
   $argLine = '-c ".read ''{0}''"' -f ($tmp -replace '\\','/')
@@ -219,8 +227,10 @@ function Test-AlreadyLoaded {
   param($cfg, [string]$StorageSql, [Parameter(Mandatory)] [string]$ProbeTable, [string]$ProbeColumn = '*')
   $attach = Get-AttachSql $cfg
   $countSql = @"
-INSTALL ducklake; LOAD ducklake;
-INSTALL postgres; LOAD postgres;
+INSTALL ducklake;
+LOAD ducklake;
+INSTALL postgres;
+LOAD postgres;
 $StorageSql
 $attach
 .mode csv
@@ -233,8 +243,10 @@ SELECT count(*) FROM $($cfg.DbName).$($cfg.Schema).$ProbeTable;
 
   # count(*) says rows exist; verify the parquet files are actually reachable.
   $fileSql = @"
-INSTALL ducklake; LOAD ducklake;
-INSTALL postgres; LOAD postgres;
+INSTALL ducklake;
+LOAD ducklake;
+INSTALL postgres;
+LOAD postgres;
 $StorageSql
 $attach
 .mode csv

@@ -13,16 +13,16 @@ import java.nio.charset.StandardCharsets.UTF_8
   * id it does not know.
   *
   * The manager never decodes or encodes result chunks: `PREPARE_RESPONSE` and `FETCH_RESPONSE`
-  * bytes travel from node to client untouched, and chunk-carrying requests (APPEND, SEND_DATA)
-  * travel from client to node with only the header rewritten. See the design note
-  * `docs/superpowers/specs/2026-09-20-native-quack-front-door-design.md`, section 2, for the field
-  * tables of both protocol generations this codec accepts.
+  * bytes travel from node to client untouched, and chunk-carrying requests (SEND_DATA) travel from
+  * client to node with only the header rewritten. The field ids follow Quack protocol v3 (DuckDB
+  * 2.0, quack 974927a), whose generated serializers are vendored at
+  * `native/quackwire/thirdparty/duckdb-quack/src/serialize_quack_message.cpp`. A v3 node reads
+  * every request in full and fails on a missing `WriteProperty` field (the PREPARE query uuid, the
+  * FETCH uuid), so the encoders always write those.
   */
 object QuackWire:
 
-  /** Wire ordinals of `duckdb::MessageType` (non-sequential upstream). Type 9 is APPEND_REQUEST in
-    * protocol generation 1 and SEND_DATA_REQUEST in generation 3; the negotiated version tells them
-    * apart.
+  /** Wire ordinals of `duckdb::MessageType` (non-sequential upstream). Type 9 is SEND_DATA_REQUEST.
     */
   object Type:
     val ConnectionRequest  = 1
@@ -65,9 +65,10 @@ object QuackWire:
 
   final case class PrepareRequest(sql: String, queryUuid: Option[Hugeint], inlineRows: Option[Long])
 
-  final case class AppendRequest(schema: String, table: String)
-
-  final case class FetchRequest(uuid: Hugeint)
+  /** `batchIndex` is the 1-based batch asked for, `ackIndex` the last batch the client holds; both
+    * default to 0 when absent.
+    */
+  final case class FetchRequest(uuid: Hugeint, batchIndex: Long = 0L, ackIndex: Long = 0L)
 
   final case class ConnectionResponse(
       serverDuckdbVersion: String,
@@ -139,6 +140,21 @@ object QuackWire:
       val upper = varintS()
       val lower = varintU()
       Hugeint(upper, lower)
+
+    /** Skip an `unordered_map<string, string>`: a varint count of `{0: key, 1: value}` objects. */
+    def skipStringMap(): Unit =
+      val count = varintU()
+      if count < 0 || count > remaining then throw DecodeError("truncated map")
+      else
+        var i = 0L
+        while i < count do
+          var done = false
+          while !done do
+            u16() match
+              case Terminator => done = true
+              case 0 | 1      => string()
+              case other      => throw DecodeError(s"unknown field $other in map entry")
+          i += 1
 
     def remaining: Int = bytes.length - pos
 
@@ -273,46 +289,32 @@ object QuackWire:
       PrepareRequest(sql, uuid, inline)
     }
 
-  /** Reads the schema and table of a generation 1 APPEND_REQUEST and stops at the chunk list (field
-    * 3), which is never decoded: the bytes are forwarded to a node as they are.
-    */
-  def decodeAppendRequest(f: Frame): Either[DecodeError, AppendRequest] =
-    attempt("APPEND_REQUEST") {
-      val r      = bodyReader(f)
-      var schema = Option.empty[String]
-      var table  = Option.empty[String]
-      var done   = false
-      while !done do
-        r.u16() match
-          case Terminator => done = true
-          case 1          => schema = Some(r.string())
-          case 2          => table = Some(r.string())
-          case 3          => done = true
-          case other      => throw DecodeError(s"unknown field $other in APPEND_REQUEST")
-      (schema, table) match
-        case (Some(s), Some(t)) => AppendRequest(s, t)
-        case _                  => throw DecodeError("APPEND_REQUEST without schema and table")
-    }
-
-  /** Reads the uuid (field 1) of a FETCH_REQUEST; the generation 3 batch and ack indexes are
-    * skipped, since a forwarded FETCH keeps its original body bytes.
+  /** Reads a FETCH_REQUEST: the uuid (field 1), the batch index (2) and the ack index (3). A
+    * forwarded FETCH keeps its original body bytes regardless.
     */
   def decodeFetchRequest(f: Frame): Either[DecodeError, FetchRequest] =
     attempt("FETCH_REQUEST") {
-      val r    = bodyReader(f)
-      var uuid = Option.empty[Hugeint]
-      var done = false
+      val r     = bodyReader(f)
+      var uuid  = Option.empty[Hugeint]
+      var batch = 0L
+      var ack   = 0L
+      var done  = false
       while !done do
         r.u16() match
           case Terminator => done = true
           case 1          => uuid = Some(r.hugeint())
-          case 2 | 3      => r.varintU()
+          case 2          => batch = r.varintU()
+          case 3          => ack = r.varintU()
           case other      => throw DecodeError(s"unknown field $other in FETCH_REQUEST")
       uuid match
-        case Some(u) => FetchRequest(u)
+        case Some(u) => FetchRequest(u, batch, ack)
         case None    => throw DecodeError("FETCH_REQUEST without a uuid")
     }
 
+  /** The message (field 1) of an ERROR_RESPONSE. The exception type (2), the transferable extra
+    * info map (3) and the `must_invalidate` flag (4) are read past: the client gets the node's
+    * bytes verbatim, so the manager only needs the text for its own logs and history.
+    */
   def decodeErrorMessage(bytes: Array[Byte]): Either[DecodeError, String] =
     frame(bytes).flatMap { f =>
       attempt("ERROR_RESPONSE") {
@@ -323,6 +325,9 @@ object QuackWire:
           r.u16() match
             case Terminator => done = true
             case 1          => msg = r.string()
+            case 2          => r.string()
+            case 3          => r.skipStringMap()
+            case 4          => r.bool()
             case other      => throw DecodeError(s"unknown field $other in ERROR_RESPONSE")
         msg
       }
@@ -387,14 +392,25 @@ object QuackWire:
   ): Array[Byte] =
     val w = header(new Writer, Header(Type.PrepareRequest, connectionId, clientQueryId))
     if r.sql.nonEmpty then w.u16(1).string(r.sql)
-    r.queryUuid.foreach(u => w.u16(2).hugeint(u))
+    // `WriteProperty` upstream: always present, and a v3 node refuses a PREPARE without it.
+    w.u16(2).hugeint(r.queryUuid.getOrElse(Hugeint(0L, 0L)))
     r.inlineRows.foreach(n => w.u16(3).varintU(n))
     w.end().bytes
 
-  def encodeFetchRequest(connectionId: String, clientQueryId: Long, uuid: Hugeint): Array[Byte] =
+  def encodeFetchRequest(
+      connectionId: String,
+      clientQueryId: Long,
+      uuid: Hugeint,
+      batchIndex: Long
+  ): Array[Byte] =
+    // Quack v3: field 2 is the 1-based batch index, field 3 the ack (every batch before it).
     header(new Writer, Header(Type.FetchRequest, connectionId, clientQueryId))
       .u16(1)
       .hugeint(uuid)
+      .u16(2)
+      .varintU(batchIndex)
+      .u16(3)
+      .varintU(batchIndex - 1)
       .end()
       .bytes
 
@@ -425,10 +441,10 @@ object QuackWire:
   def messageType(bytes: Array[Byte]): Int =
     frame(bytes).map(_.header.msgType).getOrElse(-1)
 
-  /** True when a FETCH_RESPONSE carries no chunks, in either generation: generation 1 omits the
-    * empty `results` list (field 1) altogether, generation 3 omits a zero `chunk_count` (also field
-    * 1). A non-terminal response of either generation starts its body with field 1 holding a
-    * non-zero count. Unreadable bytes count as terminal so a broken stream is released.
+  /** True when a FETCH_RESPONSE carries no chunks: the terminal response omits a zero `chunk_count`
+    * (field 1) and may carry only `total_batches` (field 2). A response with data starts its body
+    * with field 1 holding a non-zero count. Unreadable bytes count as terminal so a broken stream
+    * is released.
     */
   def isTerminalFetch(bytes: Array[Byte]): Boolean =
     frame(bytes) match

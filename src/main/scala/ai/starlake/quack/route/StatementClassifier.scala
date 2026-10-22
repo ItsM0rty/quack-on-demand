@@ -2,7 +2,7 @@ package ai.starlake.quack.route
 
 import java.util.Locale
 import ai.starlake.quack.model.StatementKind
-import ai.starlake.sql.{SqlCommentStripper, SqlTrivia}
+import ai.starlake.sql.{SqlCommentStripper, SqlLexer, SqlTrivia}
 
 /** Per-bucket keyword sets used to classify a statement by its first non-blank token. Sets are
   * uppercased on construction so matching is case-insensitive without per-call allocation.
@@ -53,7 +53,10 @@ object StatementClassifierConfig:
     *   - `dml` - write-side verbs. `COPY` covers DuckDB's data-load / data-export. `UPSERT` /
     *     `REPLACE` are dialect variants of INSERT-with-conflict-resolution.
     *   - `ddl` - schema-mutating. `ATTACH` / `DETACH` are DuckDB catalog manipulation;
-    *     `COMMENT ON ...` is metadata DDL; `GRANT` / `REVOKE` mutate ACL state.
+    *     `COMMENT ON ...` is metadata DDL; `GRANT` / `REVOKE` mutate ACL state. `CHECKPOINT` runs
+    *     DuckLake's maintenance chain on a DuckLake catalog (it merges and deletes data files), so
+    *     it must reach a writer and be stamped and audited; while it is listed, `FORCE CHECKPOINT`
+    *     and `CALL checkpoint(...)` / `CALL force_checkpoint(...)` classify with it.
     *   - `begin` - transaction start. `START TRANSACTION` is ANSI.
     *   - `commit` - transaction end. `END` is the Postgres alias.
     *   - `rollback` - transaction abort. `ABORT` is the Postgres alias.
@@ -64,8 +67,18 @@ object StatementClassifierConfig:
   val Defaults: StatementClassifierConfig = StatementClassifierConfig(
     select = Set("SELECT", "WITH", "VALUES", "SHOW", "DESCRIBE", "EXPLAIN", "FROM"),
     dml = Set("INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "REPLACE", "COPY"),
-    ddl =
-      Set("CREATE", "DROP", "ALTER", "TRUNCATE", "ATTACH", "DETACH", "COMMENT", "GRANT", "REVOKE"),
+    ddl = Set(
+      "CREATE",
+      "DROP",
+      "ALTER",
+      "TRUNCATE",
+      "ATTACH",
+      "DETACH",
+      "COMMENT",
+      "GRANT",
+      "REVOKE",
+      "CHECKPOINT"
+    ),
     begin = Set("BEGIN", "START"),
     commit = Set("COMMIT", "END"),
     rollback = Set("ROLLBACK", "ABORT")
@@ -105,10 +118,16 @@ final class StatementClassifier(
   // identical reasoning; this entry point needs its own copy because `classifyStripped` below
   // receives already-comment-stripped text and reuses it for more than just the first token (the
   // `WITH`/`EXPLAIN` arms slice into it directly).
+  //
+  // `original` rides along untouched for the WITH and EXPLAIN arms, which lex the WHOLE statement
+  // as DuckDB does instead of the comment-stripped, trivia-normalized copy: `SqlTrivia.normalize`
+  // turns a NBSP inside a dollar tag into a space (`$<NBSP>$` stops being a tag) and stripping a
+  // comment changes what DuckDB's unicode-space pre-pass keeps (see `SqlLexer`), so either copy can
+  // open a literal DuckDB does not and hide a DML verb (or an EXPLAIN's ANALYZE) behind it.
   def classify(sql: String): StatementKind =
-    classifyStripped(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(sql)))
+    classifyStripped(SqlCommentStripper.stripComments(SqlTrivia.stripLeading(sql)), sql)
 
-  private def classifyStripped(raw: String): StatementKind =
+  private def classifyStripped(raw: String, original: String): StatementKind =
     val sql = SqlTrivia.normalize(raw)
     firstToken(sql).map(_.toUpperCase(Locale.ROOT)) match
       // A WITH prefix says nothing about what the statement DOES: the verb after the
@@ -118,22 +137,52 @@ final class StatementClassifier(
       // data-write audit record. Only special-cased while WITH sits in the select
       // bucket, so an operator who reassigns it keeps full control.
       case Some("WITH") if cfg.select.contains("WITH") =>
-        verbAfterWithClause(sql) match
-          case Some(tok) =>
-            kindOf(tok) match
-              case StatementKind.Other => StatementKind.Select // unknown verb: legacy bucket
-              case k                   => k
-          case None => StatementKind.Select
-      // DuckDB's EXPLAIN ANALYZE EXECUTES the inner statement; plain EXPLAIN only
-      // plans it. Classify the executed statement, recursively so
-      // EXPLAIN ANALYZE WITH ... INSERT resolves too.
+        // DuckDB 2.0 allows DML inside a CTE body (WITH w AS (DELETE ... RETURNING *) SELECT ...),
+        // so the verb after the list alone would misroute it as a read.
+        val toks = wordTokens(original)
+        if hasDmlKeyword(toks) then StatementKind.Dml
+        else
+          verbAfterWithClause(toks) match
+            case Some(tok) =>
+              kindOf(tok) match
+                case StatementKind.Other => StatementKind.Select // unknown verb: legacy bucket
+                case k                   => k
+            case None => StatementKind.Select
+      // An executing EXPLAIN (ANALYZE / ANALYSE, or an analyze option) RUNS the explained
+      // statement; any other EXPLAIN only plans it. Classify the executed statement,
+      // recursively so EXPLAIN ANALYZE WITH ... INSERT resolves too.
       case Some("EXPLAIN") if cfg.select.contains("EXPLAIN") =>
-        val rest = sql.trim.drop("EXPLAIN".length)
-        firstToken(rest).map(_.toUpperCase(Locale.ROOT)) match
-          case Some("ANALYZE") => classifyStripped(rest.trim.drop("ANALYZE".length))
-          case _               => StatementKind.Select
+        executedByExplain(original) match
+          case Some(stmt) => classify(stmt)
+          case None       => StatementKind.Select
+      // FORCE CHECKPOINT and CALL checkpoint(...) run a checkpoint like CHECKPOINT does (see the
+      // `ddl` bucket's doc); only while CHECKPOINT sits in that bucket, so an operator who moves it
+      // keeps control.
+      case Some("FORCE" | "CALL") if cfg.ddl.contains("CHECKPOINT") && checkpoints(original) =>
+        StatementKind.Ddl
       case Some(tok) => kindOf(tok)
       case None      => StatementKind.Other
+
+  /** `FORCE CHECKPOINT ...`, or `CALL <name>(...)` naming `checkpoint` / `force_checkpoint` (bare,
+    * quoted with either delimiter or qualified: DuckDB 2.0 runs `CALL system.main."checkpoint"()`),
+    * read on DuckDB 2.0's tokens over the original text.
+    */
+  private def checkpoints(original: String): Boolean =
+    val view                         = SqlLexer.engineView(original)
+    val toks                         = SqlLexer.tokens(view).filterNot(_.isTrivia)
+    def text(t: SqlLexer.Token)      = view.substring(t.start, t.end)
+    def word(k: Int): Option[String] =
+      toks.lift(k).filter(_.kind == SqlLexer.Kind.Word).map(text(_).toUpperCase(Locale.ROOT))
+    def ident(t: SqlLexer.Token): Option[String] =
+      if t.kind == SqlLexer.Kind.Word then Some(text(t).toLowerCase(Locale.ROOT))
+      else if t.kind == SqlLexer.Kind.Literal && (view.charAt(t.start) == '"' ||
+          view.charAt(t.start) == '`')
+      then Some(ai.starlake.sql.QuotedIdentifier.unquote(text(t)).toLowerCase(Locale.ROOT))
+      else None
+    val open = toks.indexWhere(t => t.kind == SqlLexer.Kind.Punct && text(t) == "(")
+    (word(0).contains("FORCE") && word(1).contains("CHECKPOINT")) ||
+    (word(0).contains("CALL") && open >= 2 &&
+      ident(toks(open - 1)).exists(StatementClassifier.CheckpointCalls))
 
   private def kindOf(tok: String): StatementKind =
     if cfg.select.contains(tok) then StatementKind.Select
@@ -156,72 +205,160 @@ final class StatementClassifier(
     val tok = SqlTrivia.firstToken(sql).takeWhile(_ != ';').dropWhile(_ == '(')
     Option.when(tok.nonEmpty)(tok)
 
-  /** The first depth-0 keyword token after the leading WITH's CTE list, uppercased: the statement's
-    * real verb. The scan is quote-aware (single-quoted literals with '' doubling and backslash
-    * escapes in e'...' strings, double-quoted identifiers with "" doubling, dollar-quoted
-    * $tag$...$tag$ strings) so parens or verbs inside a CTE body's literals cannot desync it. CTE
-    * names, AS, RECURSIVE, MATERIALIZED and column lists are all either non-keyword words or
-    * parenthesized groups, so the first token that matches a configured bucket IS the verb
-    * (reserved words cannot be unquoted CTE names). None when the scan runs out, which the caller
-    * maps to the legacy select bucket.
+  /** The statement an EXPLAIN EXECUTES, or None when it only plans it. DuckDB 2.0's grammar is
+    * `'EXPLAIN' AnalyzeKeyword? ExplainOptionList? ExplainableStatements` with `AnalyzeKeyword <-
+    * 'ANALYZE' / 'ANALYSE'` and `ExplainOptionList <- Parens(List(ExplainOptionName Expression?))`,
+    * and its transformer turns the statement into EXPLAIN ANALYZE for the keyword and for an option
+    * NAMED analyze (any value, ignored; a quoted name is case-folded, so `("analyze")` executes
+    * too). Each of `EXPLAIN ANALYSE DELETE ...`, `EXPLAIN (ANALYZE) DELETE ...` and
+    * `EXPLAIN (FORMAT json, ANALYZE true) DELETE ...` deletes the rows on the 2.0 CLI, while
+    * `EXPLAIN DELETE ...` and `EXPLAIN (FORMAT json) DELETE ...` delete nothing.
+    *
+    * Read through `SqlLexer` over the ORIGINAL text, so an ANALYZE inside a literal or a comment is
+    * not one and a literal cannot hide one. A parenthesized group right after the keyword is an
+    * option list when its first token can name an option that runs (`ANALYZE`, `ANALYSE`, `FORMAT`,
+    * `SQL`, or a quoted identifier, which may fold to any of them); any other option name makes
+    * DuckDB refuse the statement, so every other group is the explained statement itself (`EXPLAIN
+    * ANALYZE (SELECT ...)`). Fail closed inside the list: any ANALYZE word, or quoted identifier
+    * folding to one, counts, even in a value position. The explained statement is cut from
+    * `SqlLexer.engineView`, which lexes alone exactly as it lexed in place. A statement whose first
+    * token, as DuckDB reads it, is not EXPLAIN (a leading U+00AD, a leading paren) is one DuckDB
+    * refuses, and is answered None.
     */
-  private def verbAfterWithClause(sql: String): Option[String] =
-    val s = sql.trim
-    val n = s.length
-    // start just past the leading WITH token
-    var i = 0
-    while i < n && !s(i).isWhitespace do i += 1
-    def isWordChar(c: Char) = c.isLetterOrDigit || c == '_'
-    def skipSingle(from: Int, eString: Boolean): Int =
-      // from points at the opening quote; returns index just past the closing quote
-      var p = from + 1
-      while p < n do
-        if eString && s(p) == '\\' then p += 2
-        else if s(p) == '\'' then
-          if p + 1 < n && s(p + 1) == '\'' then p += 2
-          else return p + 1
-        else p += 1
-      n
-    def skipDouble(from: Int): Int =
-      var p = from + 1
-      while p < n do
-        if s(p) == '"' then
-          if p + 1 < n && s(p + 1) == '"' then p += 2
-          else return p + 1
-        else p += 1
-      n
-    def skipDollar(from: Int): Int =
-      // from points at the opening '$'; the tag runs to the next '$'
-      var t = from + 1
-      while t < n && isWordChar(s(t)) do t += 1
-      if t >= n || s(t) != '$' then from + 1 // lone '$': not a dollar-quote, step over it
-      else
-        val tag   = s.substring(from, t + 1)
-        val close = s.indexOf(tag, t + 1)
-        if close < 0 then n else close + tag.length
+  private def executedByExplain(sql: String): Option[String] =
+    val view                                         = SqlLexer.engineView(sql)
+    val toks                                         = SqlLexer.tokens(view).filterNot(_.isTrivia)
+    def text(t: SqlLexer.Token): String              = view.substring(t.start, t.end)
+    def upper(t: SqlLexer.Token): String             = text(t).toUpperCase(Locale.ROOT)
+    def isPunct(t: SqlLexer.Token, c: Char): Boolean =
+      t.kind == SqlLexer.Kind.Punct && view.charAt(t.start) == c
+    def isWord(t: SqlLexer.Token, words: Set[String]): Boolean =
+      t.kind == SqlLexer.Kind.Word && words.contains(upper(t))
+    def isQuotedIdent(t: SqlLexer.Token): Boolean =
+      val q = view.charAt(t.start)
+      t.kind == SqlLexer.Kind.Literal && (q == '"' || q == '`')
+    def unquoted(t: SqlLexer.Token): String =
+      val q = view.charAt(t.start).toString
+      text(t).drop(1).stripSuffix(q).replace(q + q, q).toUpperCase(Locale.ROOT)
+    def isAnalyzeName(t: SqlLexer.Token): Boolean =
+      isWord(t, StatementClassifier.AnalyzeKeywords) ||
+        (isQuotedIdent(t) && StatementClassifier.AnalyzeKeywords.contains(unquoted(t)))
+    if toks.isEmpty || !isWord(toks.head, Set("EXPLAIN")) then None
+    else
+      val keyword      = toks.length > 1 && isWord(toks(1), StatementClassifier.AnalyzeKeywords)
+      val afterKeyword = if keyword then 2 else 1
+      val optionList   =
+        afterKeyword + 1 < toks.length && isPunct(toks(afterKeyword), '(') && {
+          val first = toks(afterKeyword + 1)
+          isWord(first, StatementClassifier.RunnableExplainOptions) || isQuotedIdent(first)
+        }
+      // index of the token closing the option list (or the end of input, unbalanced)
+      val close =
+        if !optionList then afterKeyword
+        else
+          var depth = 0
+          var k     = afterKeyword
+          var found = -1
+          while found < 0 && k < toks.length do
+            if isPunct(toks(k), '(') then depth += 1
+            else if isPunct(toks(k), ')') then
+              depth -= 1
+              if depth == 0 then found = k
+            k += 1
+          if found < 0 then toks.length else found
+      val analyzeOption =
+        optionList && toks.slice(afterKeyword + 1, close).exists(isAnalyzeName)
+      val stmtAt = if optionList then close + 1 else afterKeyword
+      Option.when(keyword || analyzeOption)(
+        if stmtAt < toks.length then view.substring(toks(stmtAt).start) else ""
+      )
+
+  /** The first keyword token at the leading WITH's depth after its CTE list, uppercased: the
+    * statement's real verb. Read through [[wordTokens]], so parens or verbs inside a CTE body's
+    * literals cannot desync it. The scan starts at the first `WITH` word (the statement's own, or
+    * the one after `EXPLAIN ANALYZE`). CTE names, AS, RECURSIVE, MATERIALIZED and column lists are
+    * all either non-keyword words or parenthesized groups, so the first token that matches a
+    * configured bucket IS the verb (reserved words cannot be unquoted CTE names). None when the
+    * scan runs out, which the caller maps to the legacy select bucket.
+    */
+  private def verbAfterWithClause(toks: Vector[StatementClassifier.WordToken]): Option[String] =
+    // depth relative to the leading WITH, which a parenthesized statement opens at depth 1
+    val fromWith = toks.dropWhile(_.upper != "WITH")
+    fromWith.headOption.flatMap(w =>
+      fromWith.iterator
+        .drop(1)
+        .find(t => t.depth == w.depth && kindOf(t.upper) != StatementKind.Other)
+        .map(_.upper)
+    )
+
+  /** True when any word of a WITH statement, outside literals, quoted identifiers and comments and
+    * at any paren depth, is a configured DML keyword or `TRUNCATE`: a data-modifying CTE (DuckDB
+    * 2.0, `WITH w AS (DELETE ... RETURNING *) SELECT ...`), including one behind a CTE body's own
+    * nested WITH, is a write whatever verb follows the CTE list. `TRUNCATE` joins the configured
+    * DML set here because DuckDB 2.0 accepts it as a CTE body and runs it as a DELETE (`WITH w AS
+    * (TRUNCATE t) SELECT 1` empties `t`); the rest of the DDL bucket stays out (`comment` is a
+    * common column name, and CREATE / DROP / CHECKPOINT / MERGE bodies are parse errors on 2.0).
+    * Deliberately fail closed: it does not try to tell a CTE body's verb from the same word used
+    * elsewhere, so a read that carries one of these keywords as a bare word (a column named `copy`,
+    * `update`, `delete` or `truncate`, say) is a false positive. A false positive is not free: the
+    * read routes to a writer, is author-stamped, switches prepare to SkipExecute and is refused for
+    * a branch-only token on a main pool. The one carve-out is `REPLACE` immediately followed (after
+    * optional whitespace or comments) by `(`, which is DuckDB's string function (and the `SELECT *
+    * REPLACE (...)` star modifier), not a write verb. `COPY (SELECT ...) TO ...` still counts.
+    */
+  private def hasDmlKeyword(toks: Vector[StatementClassifier.WordToken]): Boolean =
+    toks.exists(t =>
+      (cfg.dml.contains(t.upper) || t.upper == "TRUNCATE") &&
+        !(t.upper == "REPLACE" && t.beforeParen)
+    )
+
+  /** The word tokens of `sql` (the ORIGINAL statement, comments and trivia intact), uppercased,
+    * each with its paren depth and whether the next token past whitespace and comments is `(`.
+    * Every boundary comes from `ai.starlake.sql.SqlLexer`, the one reader shared with
+    * `SqlCommentStripper` and `LockdownScreen.splitStatements` and ported from DuckDB 2.0's own
+    * front end; this class keeps no quote rules or character classes of its own, because a sibling
+    * reader with its own is how a literal one reader honours and another does not hides a verb.
+    * Literals, quoted identifiers, comments and numbers are not words.
+    */
+  private def wordTokens(sql: String): Vector[StatementClassifier.WordToken] =
+    val toks  = SqlLexer.tokens(sql)
+    val out   = Vector.newBuilder[StatementClassifier.WordToken]
     var depth = 0
-    while i < n do
-      val c = s(i)
-      if c == '\'' then
-        val ePrefixed = i > 0 && (s(i - 1) == 'e' || s(i - 1) == 'E') &&
-          (i < 2 || !isWordChar(s(i - 2)))
-        i = skipSingle(i, ePrefixed)
-      else if c == '"' then i = skipDouble(i)
-      else if c == '$' then i = skipDollar(i)
-      else if c == '(' then
-        depth += 1; i += 1
-      else if c == ')' then
-        depth -= 1; i += 1
-      else if depth == 0 && isWordChar(c) then
-        var w = i
-        while w < n && isWordChar(s(w)) do w += 1
-        val word = s.substring(i, w).toUpperCase(Locale.ROOT)
-        if kindOf(word) != StatementKind.Other then return Some(word)
-        i = w
-      else i += 1
-    None
+    var k     = 0
+    while k < toks.length do
+      val t = toks(k)
+      if t.kind == SqlLexer.Kind.Punct && sql.charAt(t.start) == '(' then depth += 1
+      else if t.kind == SqlLexer.Kind.Punct && sql.charAt(t.start) == ')' then depth -= 1
+      else if t.kind == SqlLexer.Kind.Word then
+        var m = k + 1
+        while m < toks.length && toks(m).isTrivia do m += 1
+        val beforeParen =
+          m < toks.length && toks(m).kind == SqlLexer.Kind.Punct && sql.charAt(toks(m).start) == '('
+        out += StatementClassifier.WordToken(
+          sql.substring(t.start, t.end).toUpperCase(Locale.ROOT),
+          depth,
+          beforeParen
+        )
+      k += 1
+    out.result()
 
 object StatementClassifier:
+
+  /** One word of a statement outside literals: uppercased text, paren depth, and whether the next
+    * non-blank character is `(`.
+    */
+  private final case class WordToken(upper: String, depth: Int, beforeParen: Boolean)
+
+  /** The table functions that run a checkpoint, as `CALL` names them. */
+  private val CheckpointCalls: Set[String] = Set("checkpoint", "force_checkpoint")
+
+  /** DuckDB 2.0's `AnalyzeKeyword <- 'ANALYZE' / 'ANALYSE'`. */
+  private val AnalyzeKeywords: Set[String] = Set("ANALYZE", "ANALYSE")
+
+  /** The EXPLAIN option names DuckDB 2.0's transformer accepts (`format`, `sql`, `analyze`, the
+    * last also spelled through `AnalyzeKeyword`); any other name refuses the statement.
+    */
+  private val RunnableExplainOptions: Set[String] = AnalyzeKeywords ++ Set("FORMAT", "SQL")
 
   /** Default classifier instance backed by [[StatementClassifierConfig.Defaults]]. Used by tests
     * and by call sites that haven't been threaded with a config-driven instance.

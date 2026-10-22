@@ -520,10 +520,11 @@ class PoolSupervisorSpec extends AnyFlatSpec with Matchers:
   // ---------- reconcileLoop ----------
 
   "PoolSupervisor.reconcileLoop" should "run reconcile repeatedly, respawning a node that stays dead" in {
-    // CapturingBackend nodes carry pid=Some(1) with an unreachable socket, so
-    // isReachable returns false every pass: each reconcile tick finds the node
-    // dead and respawns it, appending one NodeSpec. Watching specs grow past the
-    // initial spawn proves the loop fired reconcile more than once.
+    // CapturingBackend nodes carry pid=Some(1) with an unreachable socket and
+    // startedAt=EPOCH, so every pass finds the node dead: pid 1 did not start at
+    // EPOCH (NodeProcess identity check), and EPOCH is far outside the startup
+    // window. Each tick respawns, appending one NodeSpec; watching specs grow past
+    // the initial spawn proves the loop fired reconcile more than once.
     val (sup, b) = freshSupervisorWithBackend()
     sup.createTenant(Tenant("acme")).unsafeRunSync()
     sup
@@ -1103,6 +1104,134 @@ class PoolSupervisorSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
       .isRight shouldBe true
     captured.toList.map(_._2) shouldBe List(false)
+  }
+
+  // ---------- DuckLake init outcomes: a catalog lock timeout is retry-later ----------
+
+  /** A supervisor whose initializer seam records the dbName of every call and throws whatever
+    * `failing` holds for that dbName (nothing: success). Never reaches a real Postgres.
+    */
+  private type Calls = java.util.concurrent.ConcurrentLinkedQueue[String]
+
+  private def scriptedInitializer(): (TrieMap[String, Throwable], Calls, PoolSupervisor) =
+    val failing = TrieMap.empty[String, Throwable]
+    val calls   = new Calls()
+    val sup     = new PoolSupervisor(
+      new CapturingBackend,
+      new NodeLoadTracker,
+      new InMemoryControlPlaneStore(),
+      defaultMetastore = sparseDefaults,
+      duckLakeInitializer = (m, _) =>
+        val db = m.getOrElse("dbName", "")
+        calls.add(db)
+        failing.get(db).foreach(t => throw t)
+    )
+    sup.createTenant(Tenant("acme")).unsafeRunSync()
+    (failing, calls, sup)
+
+  private def lakeDb(sup: PoolSupervisor, name: String): TenantDb =
+    sup
+      .createTenantDb("acme", name, TenantDbKind.DuckLake, Map.empty, s"/data/acme_$name")
+      .unsafeRunSync()
+      .toOption
+      .get
+
+  private def lockTimeout(db: String) =
+    DuckLakeInitializer.CatalogLockTimeoutException(
+      s"DuckLake catalog '$db': a catalog table lock was not granted",
+      new java.sql.SQLException("canceling statement due to lock timeout")
+    )
+
+  "ensureDuckLakeInitialized" should "mark a lock-timed-out tenant-db pending, never blocked, and init the rest" in {
+    val (failing, calls, sup) = scriptedInitializer()
+    val a                     = lakeDb(sup, "a")
+    val b                     = lakeDb(sup, "b")
+    failing.put("acme_a", lockTimeout("acme_a"))
+    calls.clear()
+
+    sup.ensureDuckLakeInitialized().unsafeRunSync()
+
+    calls.toArray.toSet shouldBe Set("acme_a", "acme_b")
+    sup.isDuckLakeInitPendingForTest(a.id) shouldBe true
+    sup.isDataPathBlockedForTest(a.id) shouldBe false
+    sup.isDuckLakeInitPendingForTest(b.id) shouldBe false
+  }
+
+  it should "still block, not retry, a tenant-db whose catalog disagrees with its row" in {
+    val (failing, _, sup) = scriptedInitializer()
+    val a                 = lakeDb(sup, "a")
+    failing.put(
+      "acme_a",
+      DuckLakeInitializer.DataPathMismatchException("tenant-db acme_a: mismatch")
+    )
+    sup.ensureDuckLakeInitialized().unsafeRunSync()
+    sup.isDataPathBlockedForTest(a.id) shouldBe true
+    sup.isDuckLakeInitPendingForTest(a.id) shouldBe false
+  }
+
+  it should "neither block nor retry on any other init failure" in {
+    val (failing, _, sup) = scriptedInitializer()
+    val a                 = lakeDb(sup, "a")
+    failing.put("acme_a", new java.sql.SQLException("connection refused"))
+    sup.ensureDuckLakeInitialized().unsafeRunSync()
+    sup.isDataPathBlockedForTest(a.id) shouldBe false
+    sup.isDuckLakeInitPendingForTest(a.id) shouldBe false
+  }
+
+  "retryPendingDuckLakeInit" should "re-run only the pending inits and clear one once it succeeds" in {
+    val (failing, calls, sup) = scriptedInitializer()
+    val a                     = lakeDb(sup, "a")
+    lakeDb(sup, "b")
+    failing.put("acme_a", lockTimeout("acme_a"))
+    sup.ensureDuckLakeInitialized().unsafeRunSync()
+
+    calls.clear()
+    sup.retryPendingDuckLakeInit().unsafeRunSync()
+    calls.toArray.toList shouldBe List("acme_a")
+    sup.isDuckLakeInitPendingForTest(a.id) shouldBe true // still timing out
+
+    failing.remove("acme_a")
+    sup.retryPendingDuckLakeInit().unsafeRunSync()
+    sup.isDuckLakeInitPendingForTest(a.id) shouldBe false
+
+    calls.clear()
+    sup.retryPendingDuckLakeInit().unsafeRunSync()
+    calls.isEmpty shouldBe true
+  }
+
+  it should "forget a pending tenant-db once it is deleted" in {
+    val (failing, calls, sup) = scriptedInitializer()
+    val a                     = lakeDb(sup, "a")
+    failing.put("acme_a", lockTimeout("acme_a"))
+    sup.ensureDuckLakeInitialized().unsafeRunSync()
+    sup.deleteTenantDb("acme", "acme_a").unsafeRunSync().isRight shouldBe true
+    sup.isDuckLakeInitPendingForTest(a.id) shouldBe false
+    calls.clear()
+    sup.retryPendingDuckLakeInit().unsafeRunSync()
+    calls.isEmpty shouldBe true
+  }
+
+  "reconcileLoop" should "retry a pending DuckLake init on its passes, behind its gate" in {
+    val (failing, calls, sup) = scriptedInitializer()
+    val a                     = lakeDb(sup, "a")
+    failing.put("acme_a", lockTimeout("acme_a"))
+    sup.ensureDuckLakeInitialized().unsafeRunSync()
+
+    // A follower (gate closed) never runs the init.
+    calls.clear()
+    val follower = sup.reconcileLoop(20.millis, gate = () => false).start.unsafeRunSync()
+    Thread.sleep(200)
+    follower.cancel.unsafeRunSync()
+    calls.isEmpty shouldBe true
+
+    // The leader's loop retries until the read holding the lock is gone.
+    failing.remove("acme_a")
+    val leader     = sup.reconcileLoop(20.millis).start.unsafeRunSync()
+    val deadlineMs = System.currentTimeMillis() + 3000
+    while sup.isDuckLakeInitPendingForTest(a.id) && System.currentTimeMillis() < deadlineMs do
+      Thread.sleep(10)
+    leader.cancel.unsafeRunSync()
+    sup.isDuckLakeInitPendingForTest(a.id) shouldBe false
   }
 
   "metastoreDefaults" should "expose the raw configured defaults" in {

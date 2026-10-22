@@ -21,7 +21,7 @@
                         a build when distrib\ is empty).
 
   Boot extras (parity with run-jar.sh):
-    - DuckDB CLI + libduckdb self-install (windows-amd64) onto PATH
+    - DuckDB CLI + libduckdb self-install (windows-amd64 or windows-arm64) onto PATH
     - Postgres reachability probe + PG16 version gate (when psql present)
     - NUKE=1 teardown (drop control-plane + demo tenant-db DBs, wipe local dirs)
     - idempotent CREATE DATABASE of the control-plane DB
@@ -52,7 +52,6 @@
                            (minimal = acme only, one pool, single dual node)
     DUCKDB_VERSION         pin a DuckDB release (default: derived from build.sbt)
     DUCKDB_CACHE_DIR       relocate the duckdb cache (default: <repo>\.duckdb)
-    QOD_NATIVE_CLIENT      false = embedded DuckDB-JDBC path (no quackwire.dll)
     JAVA_HOME              uses `java` on PATH if unset
     JAVA_OPTS              extra JVM flags (e.g. -Xmx2g)
 
@@ -73,6 +72,10 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+
+# DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+# (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal; pin the normal output format.
+$env:DUCKDB_AGENT_MODE = '0'
 
 $RepoDir    = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $DistribDir = Join-Path $RepoDir 'distrib'
@@ -100,7 +103,7 @@ function Get-EnvOr([string]$Name, [string]$Default) {
   return $v
 }
 
-# ---- DuckDB CLI + libduckdb self-install (windows-amd64) ------------------
+# ---- DuckDB CLI + libduckdb self-install (windows-amd64 / windows-arm64) --
 function Resolve-DuckDbVersion {
   if (-not [string]::IsNullOrEmpty($env:DUCKDB_VERSION)) { return $env:DUCKDB_VERSION }
   $buildSbt = Join-Path $RepoDir 'build.sbt'
@@ -108,11 +111,30 @@ function Resolve-DuckDbVersion {
     $line = Select-String -Path $buildSbt -Pattern '^val libquackwireVersion' | Select-Object -First 1
     if ($line -and $line.Line -match '"([0-9]+\.[0-9]+\.[0-9]+)') { return $Matches[1] }
   }
-  return '1.5.6'
+  return '2.0.0'
+}
+
+# The DuckDB build must match the JVM's architecture, not only the OS's: the JVM loads the
+# libquackwire native for its own os.arch (windows-x86_64 or windows-aarch64), and that native
+# loads duckdb.dll into the same process. An x64 JVM emulated on an ARM64 host needs x64 DuckDB.
+function Resolve-DuckDbPlatform {
+  $java = if (-not [string]::IsNullOrEmpty($env:JAVA_HOME)) { Join-Path $env:JAVA_HOME 'bin\java.exe' } else { 'java' }
+  $arch = $null
+  if (Get-Command $java -ErrorAction SilentlyContinue) {
+    $props = & { $ErrorActionPreference = 'Continue'; & $java -XshowSettings:properties -version 2>&1 }
+    $line = $props | ForEach-Object { "$_" } | Where-Object { $_ -match '^\s*os\.arch\s*=' } | Select-Object -First 1
+    if ($line -match '=\s*(\S+)') { $arch = $Matches[1] }
+  }
+  if (-not $arch) {
+    $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+  }
+  if ("$arch" -match '^(aarch64|arm64)$') { return 'windows-arm64' }
+  return 'windows-amd64'
 }
 
 function Install-DuckDb {
   $version = Resolve-DuckDbVersion
+  $plat = Resolve-DuckDbPlatform
   $cacheRoot = if ([string]::IsNullOrEmpty($env:DUCKDB_CACHE_DIR)) { Join-Path $RepoDir '.duckdb' } else { $env:DUCKDB_CACHE_DIR }
   $cache  = Join-Path $cacheRoot $version
   $binDir = Join-Path $cache 'bin'
@@ -123,8 +145,9 @@ function Install-DuckDb {
 
   $duckExe = Join-Path $binDir 'duckdb.exe'
   if (Test-Path $duckExe) {
-    $ver = & $duckExe -version 2>$null | Select-Object -First 1
-    if ($ver -match "v$([regex]::Escape($version))") {
+    # Exact match: a pre-release reports v2.0.0-alpha<N> and must not pass for v2.0.0.
+    $ver = & $duckExe -version 2>$null | Where-Object { $_ -match '^v' } | Select-Object -First 1
+    if ($ver -match "^v$([regex]::Escape($version))(\s|$)") {
       Write-Host "duckdb: cached v$version -> $duckExe"
       # Expose to the loaders + JNI client explicitly.
       $env:DUCKDB_BIN = $duckExe
@@ -132,19 +155,22 @@ function Install-DuckDb {
     }
   }
 
-  Write-Host "duckdb: installing v$version (windows-amd64) into $cache"
+  Write-Host "duckdb: installing v$version ($plat) into $cache"
   New-Item -ItemType Directory -Force -Path $binDir, $libDir | Out-Null
   $base = "https://github.com/duckdb/duckdb/releases/download/v$version"
   $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ("qod-duckdb-" + [System.Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   try {
-    Write-Host "  fetching CLI from $base/duckdb_cli-windows-amd64.zip"
-    Invoke-WebRequest -Uri "$base/duckdb_cli-windows-amd64.zip" -OutFile "$tmp\cli.zip"
-    Expand-Archive -Path "$tmp\cli.zip" -DestinationPath $binDir -Force
+    # DuckDB 2.x release assets are flat .tar.gz archives; tar.exe ships with Windows 10 1803+.
+    Write-Host "  fetching CLI from $base/duckdb-cli-$plat.tar.gz"
+    Invoke-WebRequest -Uri "$base/duckdb-cli-$plat.tar.gz" -OutFile "$tmp\cli.tar.gz"
+    tar -xzf "$tmp\cli.tar.gz" -C $binDir
+    if ($LASTEXITCODE -ne 0) { throw "failed to unpack $base/duckdb-cli-$plat.tar.gz" }
 
-    Write-Host "  fetching libduckdb from $base/libduckdb-windows-amd64.zip"
-    Invoke-WebRequest -Uri "$base/libduckdb-windows-amd64.zip" -OutFile "$tmp\lib.zip"
-    Expand-Archive -Path "$tmp\lib.zip" -DestinationPath $libDir -Force
+    Write-Host "  fetching libduckdb from $base/duckdb-shared-libs-$plat.tar.gz"
+    Invoke-WebRequest -Uri "$base/duckdb-shared-libs-$plat.tar.gz" -OutFile "$tmp\lib.tar.gz"
+    tar -xzf "$tmp\lib.tar.gz" -C $libDir
+    if ($LASTEXITCODE -ne 0) { throw "failed to unpack $base/duckdb-shared-libs-$plat.tar.gz" }
     # duckdb.dll must sit next to the CLI too so `duckdb.exe` starts standalone.
     $srcDll = Join-Path $libDir 'duckdb.dll'
     if (Test-Path $srcDll) { Copy-Item $srcDll (Join-Path $binDir 'duckdb.dll') -Force }
@@ -346,6 +372,13 @@ $pgUser    = Get-EnvOr 'QOD_PG_USER' 'postgres'
 $pgPass    = Get-EnvOr 'QOD_PG_PASSWORD' 'azizam'
 $pgAdminDb = Get-EnvOr 'QOD_PG_ADMIN_DB' 'postgres'
 $pgDbName  = Get-EnvOr 'QOD_PG_DBNAME' 'qod'
+# The demo's federated source (acme_pg in bootstrap-demo.yaml) resolves its connection from the
+# manager's env:QOD_PG_* secrets, so hand the manager the values probed here, defaults included.
+# Nodes never inherit them: LocalQuackBackend strips credential-named variables at spawn.
+$env:QOD_PG_HOST     = $pgHost
+$env:QOD_PG_PORT     = $pgPort
+$env:QOD_PG_USER     = $pgUser
+$env:QOD_PG_PASSWORD = $pgPass
 $pgReachable = $false
 
 # Run a psql -tAc query; returns trimmed stdout ('' on any failure). Uses a

@@ -6,10 +6,10 @@ import org.scalatest.matchers.should.Matchers
 class ObjectStoreSecretSpec extends AnyFlatSpec with Matchers:
 
   private val s3Map = Map(
-    "s3_region" -> "us-east-1",
-    "s3_access_key_id" -> "AKIA",
+    "s3_region"            -> "us-east-1",
+    "s3_access_key_id"     -> "AKIA",
     "s3_secret_access_key" -> "sk",
-    "s3_url_style" -> "path"
+    "s3_url_style"         -> "path"
   )
 
   "sql" should "be empty for an empty map" in {
@@ -22,7 +22,7 @@ class ObjectStoreSecretSpec extends AnyFlatSpec with Matchers:
 
   it should "emit a scoped s3 secret with httpfs" in {
     val s = ObjectStoreSecret.sql(s3Map, "s3://bucket-a/db")
-    s should include("INSTALL httpfs; LOAD httpfs;")
+    s should include("INSTALL httpfs;\nLOAD httpfs;")
     s should include("CREATE OR REPLACE SECRET qod_db_store")
     s should include("TYPE s3")
     s should include("KEY_ID 'AKIA'")
@@ -30,7 +30,7 @@ class ObjectStoreSecretSpec extends AnyFlatSpec with Matchers:
     s should include("REGION 'us-east-1'")
     s should include("URL_STYLE 'path'")
     s should include("SCOPE 's3://bucket-a/db'")
-    s should not include "ENDPOINT"   // no s3_endpoint present -> omitted
+    s should not include "ENDPOINT" // no s3_endpoint present -> omitted
   }
 
   it should "include ENDPOINT only when present, stripped of scheme" in {
@@ -43,8 +43,12 @@ class ObjectStoreSecretSpec extends AnyFlatSpec with Matchers:
 
   it should "treat r2 as an s3 secret" in {
     val s = ObjectStoreSecret.sql(
-      Map("s3_access_key_id" -> "k", "s3_secret_access_key" -> "s",
-          "s3_endpoint" -> "https://acct.r2.cloudflarestorage.com", "s3_region" -> "auto"),
+      Map(
+        "s3_access_key_id"     -> "k",
+        "s3_secret_access_key" -> "s",
+        "s3_endpoint"          -> "https://acct.r2.cloudflarestorage.com",
+        "s3_region"            -> "auto"
+      ),
       "r2://bucket/db"
     )
     s should include("TYPE s3")
@@ -53,7 +57,9 @@ class ObjectStoreSecretSpec extends AnyFlatSpec with Matchers:
 
   it should "emit a gcs secret for gs paths" in {
     val s = ObjectStoreSecret.sql(
-      Map("gcs_hmac_key_id" -> "GOOG", "gcs_hmac_secret" -> "hs"), "gs://bucket/db")
+      Map("gcs_hmac_key_id" -> "GOOG", "gcs_hmac_secret" -> "hs"),
+      "gs://bucket/db"
+    )
     s should include("TYPE gcs")
     s should include("KEY_ID 'GOOG'")
     s should include("SECRET 'hs'")
@@ -62,8 +68,10 @@ class ObjectStoreSecretSpec extends AnyFlatSpec with Matchers:
 
   it should "emit an azure secret with a connection string" in {
     val s = ObjectStoreSecret.sql(
-      Map("azure_account" -> "acct", "azure_account_key" -> "ak"), "az://container/db")
-    s should include("INSTALL azure; LOAD azure;")
+      Map("azure_account" -> "acct", "azure_account_key" -> "ak"),
+      "az://container/db"
+    )
+    s should include("INSTALL azure;\nLOAD azure;")
     s should include("TYPE azure")
     s should include("AccountName=acct")
     s should include("AccountKey=ak")

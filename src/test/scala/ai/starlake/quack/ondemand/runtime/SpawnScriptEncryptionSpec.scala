@@ -24,21 +24,38 @@ private trait SpawnScriptTempDir extends BeforeAndAfterEach:
     tempDir = Files.createTempDirectory("spawn-script-encryption-spec")
 
   override def afterEach(): Unit =
-    Files
-      .walk(tempDir)
-      .iterator()
-      .asScala
-      .toSeq
-      .sortBy(_.toString.length)
-      .reverse
-      .foreach(Files.deleteIfExists)
+    val all = Files.walk(tempDir).iterator().asScala.toSeq
+    // A SIGKILLed node leaves its read-only (0500) secret directory around a marker file.
+    all.filter(Files.isDirectory(_)).foreach(_.toFile.setWritable(true, true))
+    all.sortBy(_.toString.length).reverse.foreach(Files.deleteIfExists)
+
+  /** Run a spawn script the way the launchers do: every [[NodeSecretFiles.Keys]] entry of `env`
+    * (plus a node token) goes to an ephemeral secrets directory, the rest to the environment.
+    */
+  protected def runSpawn(cmd: Seq[String], env: Seq[(String, String)]): String =
+    val (secret, plain) = env.partition { case (k, _) => NodeSecretFiles.isKey(k) }
+    val dir             = NodeSecretFiles.writePrivateDir(
+      (Seq(NodeSecretFiles.TokenKey -> "t") ++ secret).toMap,
+      Some(tempDir)
+    )
+    Process(
+      cmd,
+      None,
+      (plain ++ Seq(
+        NodeSecretFiles.DirEnv       -> dir.toString,
+        NodeSecretFiles.EphemeralEnv -> "1"
+      ))*
+    ).!!
+
+/** The DuckLake ATTACH option naming the catalog password's temporary secret. */
+private val CatalogSecretParam = "METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'}"
 
 class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScriptTempDir:
 
   private val script = "scripts/spawn-quack-node.sh"
 
-  // PORT/TOKEN are passed positionally, exactly as LocalQuackBackend.defaultCommand invokes
-  // the script in production - the script's contract requires them as $1/$2, not env vars.
+  // PORT is passed positionally, exactly as LocalQuackBackend.defaultCommand invokes the script
+  // in production; the token and the other secrets come from the secrets directory.
   private def initSql(env: (String, String)*): String =
     val base = Seq(
       "QOD_SPAWN_DRY_RUN" -> "1",
@@ -46,7 +63,7 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "catalogAlias"      -> "acme_lake",
       "dbName"            -> "acme_lake"
     )
-    Process(Seq("bash", script, "21999", "t"), None, (base ++ env)*).!!
+    runSpawn(Seq("bash", script, "21999"), base ++ env)
 
   "the ducklake arm" should "omit ENCRYPTED when the flag is absent" in {
     val dataPath = tempDir.resolve("lake").toString
@@ -58,7 +75,7 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath');")
+    sql should include(s"(DATA_PATH '$dataPath', $CatalogSecretParam);")
     sql should not include "ENCRYPTED"
   }
 
@@ -73,8 +90,9 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED);")
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED, $CatalogSecretParam);")
+    sql should include("INSTALL httpfs;")
+    sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTED")
   }
 
@@ -94,7 +112,8 @@ class SpawnScriptEncryptionSpec extends AnyFlatSpec with Matchers with SpawnScri
       "dataPath"      -> dataPath
     )
     sql should include(s"ATTACH '$dataPath' AS \"acme_lake\" (ENCRYPTION_KEY 'c2VjcmV0');")
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include("INSTALL httpfs;")
+    sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTION_KEY")
   }
 
@@ -106,10 +125,10 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
 
   private val isWindows = System.getProperty("os.name").toLowerCase.contains("win")
 
-  // PORT/TOKEN are passed positionally, exactly as LocalQuackBackend.defaultCommand invokes the
-  // script in production - the script's contract requires them as -Port/-Token positional
-  // parameters, not env vars (no env fallback: an inherited PORT silently binding the wrong port
-  // is a worse failure mode than requiring the caller to pass it explicitly).
+  // PORT is passed positionally, exactly as LocalQuackBackend.defaultCommand invokes the script in
+  // production (no env fallback: an inherited PORT silently binding the wrong port is a worse
+  // failure mode than requiring the caller to pass it explicitly); the token and the other
+  // secrets come from the secrets directory.
   private def initSql(env: (String, String)*): String =
     val base = Seq(
       "QOD_SPAWN_DRY_RUN" -> "1",
@@ -117,11 +136,7 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "catalogAlias"      -> "acme_lake",
       "dbName"            -> "acme_lake"
     )
-    Process(
-      Seq("powershell.exe", "-File", "scripts/spawn-quack-node.ps1", "21999", "t"),
-      None,
-      (base ++ env)*
-    ).!!
+    runSpawn(Seq("powershell.exe", "-File", "scripts/spawn-quack-node.ps1", "21999"), base ++ env)
 
   "the PowerShell ducklake arm" should "omit ENCRYPTED when the flag is absent" in {
     assume(isWindows, "spawn-quack-node.ps1 runs on Windows only")
@@ -134,7 +149,7 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath');")
+    sql should include(s"(DATA_PATH '$dataPath', $CatalogSecretParam);")
     sql should not include "ENCRYPTED"
   }
 
@@ -150,8 +165,9 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "pgUser"     -> "u",
       "pgPassword" -> "p"
     )
-    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED);")
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include(s"(DATA_PATH '$dataPath', ENCRYPTED, $CatalogSecretParam);")
+    sql should include("INSTALL httpfs;")
+    sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTED")
   }
 
@@ -173,6 +189,7 @@ class SpawnScriptEncryptionWindowsSpec extends AnyFlatSpec with Matchers with Sp
       "dataPath"      -> dataPath
     )
     sql should include(s"ATTACH '$dataPath' AS \"acme_lake\" (ENCRYPTION_KEY 'c2VjcmV0');")
-    sql should include("INSTALL httpfs; LOAD httpfs;")
+    sql should include("INSTALL httpfs;")
+    sql should include("LOAD httpfs;")
     sql.indexOf("INSTALL httpfs") should be < sql.indexOf("ENCRYPTION_KEY")
   }

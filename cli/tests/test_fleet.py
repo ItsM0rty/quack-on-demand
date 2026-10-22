@@ -107,3 +107,30 @@ def test_fleet_join_reads_its_options_from_the_environment(monkeypatch, tmp_path
     assert (captured["name"], captured["advertise_host"], captured["bind_host"], captured["node_port"]) == \
         ("worker-1", "host.docker.internal", "0.0.0.0", 21901)
     assert captured["duckdb_version"] == "1.5.6"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="qod fleet join is POSIX-only")
+def test_fleet_join_reports_the_cached_binarys_probed_version_not_the_pin(monkeypatch, tmp_path):
+    # A cache provisioned by an older release must show up as such in the fleet listing.
+    import qod_cli.commands.fleet as fleet_cmd
+    captured, probed = {}, []
+
+    class FakeMember:
+        def __init__(self, manager, token, **kw):
+            captured.update(kw)
+        def run_forever(self):
+            pass
+
+    monkeypatch.setattr(fleet_cmd, "FleetMember", FakeMember)
+    monkeypatch.setattr(fleet_cmd.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(fleet_cmd.launcher, "default_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(fleet_cmd.launcher, "materialize_spawn_scripts",
+                        lambda d: (tmp_path / "spawn.sh", tmp_path / "spawn.ps1"))
+    monkeypatch.setattr(fleet_cmd.launcher, "ensure_duckdb_cli", lambda cache: tmp_path / "bin")
+    monkeypatch.setattr(fleet_cmd, "probe_duckdb_version", lambda b: probed.append(b) or "1.5.6")
+    env = {"QOD_MANAGER_URL": "http://mgr:20900", "QOD_FLEET_JOIN_TOKEN": "tok",
+           "QOD_FLEET_ADVERTISE_HOST": "10.0.0.5"}
+    out = runner.invoke(app, ["fleet", "join", "--insecure"], env=env)
+    assert out.exit_code == 0, out.output
+    assert probed == [tmp_path / "bin" / "duckdb"] == [captured["duckdb_bin"]]
+    assert captured["duckdb_version"] == "1.5.6"

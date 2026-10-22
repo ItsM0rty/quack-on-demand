@@ -91,7 +91,7 @@ object Dependencies {
   val awsS3                 = "software.amazon.awssdk" % "s3" % Versions.awsSdk
 
   // DuckDB JDBC (for catalog resolver)
-  val duckdbJdbc            = "org.duckdb" % "duckdb_jdbc" % Versions.duckdb
+  val duckdbJdbc            = "org.duckdb" % "duckdb_jdbc" % Versions.duckdbJdbc
 
   // Micrometer metrics (prometheus, cloudwatch, azure, stackdriver registries)
   val micrometerCore        = "io.micrometer" % "micrometer-core"                   % Versions.micrometer

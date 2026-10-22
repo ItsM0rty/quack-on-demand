@@ -149,7 +149,7 @@ class PreviewEndToEndSpec
             org.scalatest.Assertions.cancel(
               s"quack node at ${node.host}:${node.port} never came up (last poll error: $lastError)"
             )
-          val client   = new QuackHttpClient(allocator, nativeClient = true, nodeDisableSsl = true)
+          val client   = new QuackHttpClient(allocator)
           val adapter  = new QuackHttpAdapter(client, tracker)
           val sessions = new ai.starlake.quack.edge.SessionRegistry
           val router   = new FlightSqlRouter(sup, sessions, tracker, adapter)

@@ -72,7 +72,7 @@
 #                                 Mirrors run-docker-compose.sh's NUKE flag for
 #                                 the native-jar path.                  (default 0)
 #
-#   DUCKDB_VERSION                pin a specific DuckDB release (e.g. 1.5.6).
+#   DUCKDB_VERSION                pin a specific DuckDB release (e.g. 2.0.0).
 #                                 Default = derived from build.sbt's
 #                                 libquackwireVersion so the CLI and libquackwire
 #                                 stay ABI-compatible. The script always installs
@@ -99,6 +99,10 @@
 #   NUKE=1 LOAD_TPC=1 ./scripts/run-jar.sh                 # wipe + fresh boot + all SF=1
 
 set -euo pipefail
+
+# DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+# (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal; pin the normal output format.
+export DUCKDB_AGENT_MODE=0
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DISTRIB_DIR="$REPO_DIR/distrib"
@@ -155,9 +159,9 @@ JAR_CACHE_DIR="${JAR_CACHE_DIR:-$HOME/.cache/quack-on-demand}"
 #          spawns via LocalQuackBackend
 #        - scripts/load-{tpch,tpcds}-dbgen.sh shell out to it for demo seeds
 #   2. libduckdb.{so,dylib} on the JVM's library path:
-#        - the JNI native client (QOD_NATIVE_CLIENT=true, default) dlopens
-#          libquackwire which itself links against libduckdb at the ABI
-#          pinned in build.sbt's libquackwireVersion
+#        - the JNI native client (the manager's only client to its nodes)
+#          dlopens libquackwire which itself links against libduckdb at the
+#          ABI pinned in build.sbt's libquackwireVersion
 #
 # Mandatory by design: even when the operator has a system duckdb on PATH,
 # an ABI mismatch against libquackwire's libduckdb crashes at first node
@@ -178,7 +182,7 @@ ensure_duckdb() {
     version="$(grep -E '^val libquackwireVersion' "$REPO_DIR/build.sbt" \
       | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
   fi
-  version="${version:-1.5.6}"
+  version="${version:-2.0.0}"
 
   local cache="$DUCKDB_CACHE_DIR/$version"
   local bin_dir="$cache/bin"
@@ -194,9 +198,10 @@ ensure_duckdb() {
   esac
 
   # Fast path: cached binary matches the pinned version (covers air-gapped
-  # operators who pre-populated the cache dir).
-  if [[ -x "$bin_dir/duckdb" ]] && "$bin_dir/duckdb" -version 2>/dev/null \
-      | head -1 | grep -q "v$version"; then
+  # operators who pre-populated the cache dir). The match is exact: a
+  # pre-release reports v2.0.0-alpha<N> and must not pass for v2.0.0.
+  if [[ -x "$bin_dir/duckdb" ]] && [[ "$("$bin_dir/duckdb" -version 2>/dev/null \
+      | awk '/^v/ { print $1; exit }')" == "v$version" ]]; then
     return 0
   fi
 
@@ -223,9 +228,9 @@ ensure_duckdb() {
       ;;
   esac
 
-  if ! command -v unzip >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-    echo "ERROR: curl + unzip are required for the duckdb self-install." >&2
-    echo "       Install them (e.g. brew install curl unzip / apt install curl unzip), or" >&2
+  if ! command -v tar >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: curl + tar are required for the duckdb self-install." >&2
+    echo "       Install them (e.g. brew install curl / apt install curl tar), or" >&2
     echo "       pre-populate $bin_dir + $lib_dir with the v$version binaries by hand." >&2
     exit 1
   fi
@@ -237,74 +242,64 @@ ensure_duckdb() {
   # shellcheck disable=SC2064  # expand $tmp now so the trap sees the right dir
   trap "rm -rf '$tmp'" RETURN
 
+  # DuckDB 2.x release assets: duckdb-cli-<plat>.tar.gz (the binary alone) and
+  # duckdb-shared-libs-<plat>.tar.gz (libduckdb plus the C headers), both flat.
   local base="https://github.com/duckdb/duckdb/releases/download/v$version"
 
-  echo "  fetching duckdb CLI from $base/duckdb_cli-$plat.zip"
-  if ! curl -fsSL -o "$tmp/cli.zip" "$base/duckdb_cli-$plat.zip"; then
-    echo "ERROR: failed to download $base/duckdb_cli-$plat.zip" >&2
+  echo "  fetching duckdb CLI from $base/duckdb-cli-$plat.tar.gz"
+  if ! curl -fsSL -o "$tmp/cli.tar.gz" "$base/duckdb-cli-$plat.tar.gz"; then
+    echo "ERROR: failed to download $base/duckdb-cli-$plat.tar.gz" >&2
     echo "       Air-gapped? Pre-populate $bin_dir/duckdb + $lib_dir/libduckdb.{so,dylib}" >&2
     echo "       with v$version artifacts and re-run." >&2
     exit 1
   fi
-  unzip -q -o "$tmp/cli.zip" -d "$bin_dir"
+  tar -xzf "$tmp/cli.tar.gz" -C "$bin_dir"
   chmod +x "$bin_dir/duckdb"
 
-  echo "  fetching libduckdb from $base/libduckdb-$plat.zip"
-  if ! curl -fsSL -o "$tmp/lib.zip" "$base/libduckdb-$plat.zip"; then
-    echo "ERROR: failed to download $base/libduckdb-$plat.zip" >&2
-    echo "       The JNI native client requires libduckdb at the same ABI as libquackwire." >&2
-    echo "       Pre-populate $lib_dir with libduckdb v$version, or set QOD_NATIVE_CLIENT=false" >&2
-    echo "       on the JVM side to fall back to the embedded (slower) path." >&2
+  echo "  fetching libduckdb from $base/duckdb-shared-libs-$plat.tar.gz"
+  if ! curl -fsSL -o "$tmp/lib.tar.gz" "$base/duckdb-shared-libs-$plat.tar.gz"; then
+    echo "ERROR: failed to download $base/duckdb-shared-libs-$plat.tar.gz" >&2
+    echo "       The JNI native client requires libduckdb at the same ABI as libquackwire," >&2
+    echo "       and the manager refuses to boot without it." >&2
+    echo "       Air-gapped? Pre-populate $lib_dir with libduckdb v$version and re-run." >&2
     exit 1
   fi
-  unzip -q -o "$tmp/lib.zip" -d "$lib_dir"
+  tar -xzf "$tmp/lib.tar.gz" -C "$lib_dir"
 
   echo "duckdb: ready -> $bin_dir/duckdb (v$version)"
 }
 ensure_duckdb
 
 # Stage the pinned DuckDB headers at $2/include for the local libquackwire
-# cmake rebuild (BUILD path only, lazy): duckdb.{h,hpp} come from the
-# libduckdb zip ensure_duckdb already unpacked into lib/, and the FULL
-# internal duckdb/ header tree comes from the v$1 source tarball - the
-# duckdb-quack message layer includes internals such as
-# duckdb/common/serializer/binary_serializer.hpp that the release zip does
-# not ship. One-time per version; the presence check makes reruns free.
-# Air-gapped: pre-populate $2/include with duckdb.{h,hpp} plus the
-# src/include/duckdb tree (same staging CI does in quackwire.yml) and this
-# becomes a no-op.
+# cmake rebuild (BUILD path only, lazy): the whole src/include tree of the
+# v$1 source tarball, i.e. duckdb.{h,hpp} plus the internal duckdb/ headers
+# the duckdb-quack message layer includes (such as
+# duckdb/common/serializer/binary_serializer.hpp). The 2.x shared-libs
+# tarball ships only the C headers. One-time per version; the presence check
+# makes reruns free. Air-gapped: pre-populate $2/include with duckdb-src's
+# src/include (same staging CI does in quackwire.yml) and this becomes a no-op.
 ensure_duckdb_headers() {
   local version="$1" home="$2"
   local inc="$home/include"
   if [[ -f "$inc/duckdb.hpp" && -f "$inc/duckdb/common/serializer/binary_serializer.hpp" ]]; then
     return 0
   fi
-  mkdir -p "$inc"
-  if [[ ! -f "$inc/duckdb.hpp" ]]; then
-    if [[ -f "$home/lib/duckdb.hpp" ]]; then
-      cp "$home/lib/duckdb.h" "$home/lib/duckdb.hpp" "$inc/"
-    else
-      echo "ERROR: duckdb.hpp not found in $home/lib (expected from the libduckdb zip)." >&2
-      echo "       Delete $home and re-run so ensure_duckdb refetches libduckdb v$version." >&2
-      exit 1
-    fi
-  fi
-  echo "duckdb: staging v$version internal headers into $inc (one-time per version)"
+  echo "duckdb: staging v$version headers into $inc (one-time per version)"
   local tmp
   tmp="$(mktemp -d -t qod-duckdb-src.XXXXXX)"
   if ! curl -fsSL -o "$tmp/src.tar.gz" \
       "https://github.com/duckdb/duckdb/archive/refs/tags/v$version.tar.gz"; then
     rm -rf "$tmp"
-    echo "ERROR: failed to download the duckdb v$version source tarball (internal headers)." >&2
-    echo "       Air-gapped? Pre-populate $inc/duckdb with duckdb-src/src/include/duckdb." >&2
+    echo "ERROR: failed to download the duckdb v$version source tarball (headers)." >&2
+    echo "       Air-gapped? Pre-populate $inc with duckdb-src/src/include." >&2
     exit 1
   fi
-  tar -xzf "$tmp/src.tar.gz" -C "$tmp" "duckdb-$version/src/include/duckdb"
-  rm -rf "$inc/duckdb"
-  mv "$tmp/duckdb-$version/src/include/duckdb" "$inc/duckdb"
+  tar -xzf "$tmp/src.tar.gz" -C "$tmp" "duckdb-$version/src/include"
+  rm -rf "$inc"
+  mv "$tmp/duckdb-$version/src/include" "$inc"
   rm -rf "$tmp"
-  [[ -f "$inc/duckdb/common/serializer/binary_serializer.hpp" ]] || {
-    echo "ERROR: header staging incomplete: binary_serializer.hpp missing under $inc/duckdb." >&2
+  [[ -f "$inc/duckdb.hpp" && -f "$inc/duckdb/common/serializer/binary_serializer.hpp" ]] || {
+    echo "ERROR: header staging incomplete: duckdb.hpp or binary_serializer.hpp missing under $inc." >&2
     exit 1; }
 }
 
@@ -612,6 +607,10 @@ pg_user="${QOD_PG_USER:-postgres}"
 pg_pass="${QOD_PG_PASSWORD:-azizam}"
 pg_admin_db="${QOD_PG_ADMIN_DB:-postgres}"
 pg_dbname="${QOD_PG_DBNAME:-qod}"
+# The demo's federated source (acme_pg in bootstrap-demo.yaml) resolves its connection from the
+# manager's env:QOD_PG_* secrets, so hand the manager the values probed here, defaults included.
+# Nodes never inherit them: LocalQuackBackend strips credential-named variables at spawn.
+export QOD_PG_HOST="$pg_host" QOD_PG_PORT="$pg_port" QOD_PG_USER="$pg_user" QOD_PG_PASSWORD="$pg_pass"
 
 pg_reachable=0
 if command -v psql >/dev/null 2>&1; then

@@ -4,9 +4,9 @@ import org.apache.arrow.vector.ipc.ArrowReader
 
 import scala.collection.concurrent.TrieMap
 
-/** Point-in-time DuckDB engine internals for one node, scraped over the same `quack_query` wire as
-  * regular statements (the node exposes no stats endpoint). All values are bytes/counts as reported
-  * by the engine's own introspection functions:
+/** Point-in-time DuckDB engine internals for one node, scraped over the same Quack wire as regular
+  * statements (the node exposes no stats endpoint). All values are bytes/counts as reported by the
+  * engine's own introspection functions:
   *   - `memoryUsedBytes` / `tempStorageBytes`: buffer-manager usage summed across `duckdb_memory()`
   *     tags (BASE_TABLE, HASH_TABLE, PARQUET_READER, ...).
   *   - `spillFiles` / `spillBytes`: live spill-to-disk files from `duckdb_temporary_files()` - the

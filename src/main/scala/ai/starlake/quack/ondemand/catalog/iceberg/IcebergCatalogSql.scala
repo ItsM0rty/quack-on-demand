@@ -17,6 +17,14 @@ object IcebergCatalogSql:
   private def target(alias: String, schema: String, table: String): String =
     s"${ident(alias)}.${ident(schema)}.${ident(table)}"
 
+  /** [[target]] as the string literal DuckDB 2.0 expects in a table function argument. A bare
+    * identifier there is deprecated (a WARNING per call) and converts to an UNQUOTED dotted string,
+    * which misresolves a name that itself contains a dot; the quoted parts inside the literal keep
+    * each name whole.
+    */
+  private def targetArg(alias: String, schema: String, table: String): String =
+    lit(target(alias, schema, table))
+
   private def id(raw: String): String =
     require(IcebergSnapshots.validId(raw), s"invalid snapshot id: $raw")
     raw
@@ -39,7 +47,7 @@ object IcebergCatalogSql:
   def files(alias: String, schema: String, table: String): String =
     "SELECT file_path, CASE WHEN manifest_content = 'DATA' THEN 'DATA' ELSE content END AS content, " +
       "file_format, record_count, manifest_sequence_number " +
-      s"FROM iceberg_metadata(${target(alias, schema, table)}) " +
+      s"FROM iceberg_metadata(${targetArg(alias, schema, table)}) " +
       "ORDER BY manifest_sequence_number DESC, file_path"
 
   enum SnapshotFilter:
@@ -74,7 +82,7 @@ object IcebergCatalogSql:
       case SnapshotFilter.AtOrBefore(ms) => List(s"ts_ms <= $ms")
       case SnapshotFilter.Current        => List("is_current")
     val whereSql = if where.isEmpty then "" else where.mkString(" WHERE ", " AND ", "")
-    s"WITH m AS (SELECT metadata::JSON AS j FROM iceberg_load_table_response(${target(alias, schema, table)})), " +
+    s"WITH m AS (SELECT metadata::JSON AS j FROM iceberg_load_table_response(${targetArg(alias, schema, table)})), " +
       "s AS (SELECT unnest(from_json(j->'snapshots', '[\"JSON\"]')) AS s, j->>'current-snapshot-id' AS cur FROM m), " +
       "r AS (SELECT s->>'snapshot-id' AS snapshot_id, s->>'parent-snapshot-id' AS parent_id, " +
       "(s->>'sequence-number')::BIGINT AS seq, (s->>'timestamp-ms')::BIGINT AS ts_ms, " +

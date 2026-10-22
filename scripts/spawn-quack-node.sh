@@ -3,13 +3,18 @@
 # Spawn one Quack node - invoked by LocalQuackBackend.
 #
 # Usage:
-#   spawn-quack-node.sh <port> <token>
+#   spawn-quack-node.sh <port> [<manager-marker>]
 #
-# The metastore connection details come from environment variables that
+# <manager-marker> (LocalQuackBackend.managerMarker: the manager's REST port and a per-boot id, e.g.
+# `20900-3fa9c1e2`) names the node directory `quack-node.<marker>.XXXXXX`, so stop-jar.sh,
+# kill-quack-nodes.sh and `qod stop` can stop one manager's nodes without touching another's. Fleet
+# servers and Kubernetes pods pass none.
+#
+# The non-sensitive metastore connection details come from environment variables that
 # LocalQuackBackend.start() sets from CreatePoolRequest.metastore. The
 # env-var keys match the UI form field names verbatim:
 #
-#   pgHost pgPort pgUser pgPassword   (Postgres for DuckLake catalog)
+#   pgHost pgPort pgUser               (Postgres for DuckLake catalog)
 #   dbName                             (Postgres DB; also the DuckDB catalog alias unless
 #                                       catalogAlias is set)
 #   catalogAlias                       (optional DuckDB catalog alias the database is ATTACHed
@@ -20,14 +25,99 @@
 #                                       like "$dbName"."customer" resolve as ambiguous.)
 #   dataPath                           (DuckLake data files directory)
 #
-# DuckDB is kept alive after `quack_serve` returns via a FIFO held open
-# by this shell, so the background quack thread keeps serving until the
-# process is terminated (SIGTERM from `LocalQuackBackend.stop`).
+# Sensitive values NEVER arrive through the environment or the command line: a node user with SQL
+# can read getenv() and /proc/<pid>/{environ,cmdline} of the duckdb process and of this script.
+# They arrive as one file per key in the directory $QOD_SECRETS_DIR (see SECRET_KEYS below; the
+# Scala twin is NodeSecretFiles.Keys). The local and fleet launchers create that directory private
+# to the current user (0700, files 0600) and set QOD_SECRETS_DIR_EPHEMERAL=1, and this script
+# deletes it as soon as the values are read. On Kubernetes it is a read-only Secret volume. A key
+# still present in the environment is ignored (with a warning) rather than used.
+#
+# The init SQL reaches duckdb through `-init` on a FIFO, never through stdin: the 2.0 CLI records
+# every statement it reads from stdin in shell_history(), which any session of the node can query,
+# and the init SQL carries the node token and the catalog / object-store / federation credentials.
+# An -init file is not recorded, and a FIFO never puts it on disk. `-init` also stops the CLI from
+# running the OS user's ~/.duckdbrc. The FIFO name is unlinked as soon as duckdb has opened it.
+#
+# duckdb's stdin is /dev/null: nothing is ever fed to it, so no statement or dot-command can be
+# injected on the node's own connection (COPY ... TO '/proc/self/fd/0' then lands on /dev/null),
+# and there is no reopenable FIFO in the working directory's parent. The node is instead kept alive
+# by a final `.shell` dot-command at the end of the init that waits on this wrapper's pid, then
+# `.exit` (quack_serve has already started its background thread). It holds no transaction, and it
+# returns when the wrapper dies, so the node ends with it (best-effort against pid reuse, see the
+# keep-alive note below); SIGTERM from LocalQuackBackend.stop ends it.
+#
+# duckdb runs in an empty, private (0700) directory of its own, created here and removed when the
+# node stops: DuckDB 2.0 replacement-scans an unquoted dotted name as a file (`SELECT * FROM x.csv`
+# reads ./x.csv), and an unquoted name cannot hold a path separator, so the working directory is
+# the one place that form reaches. Every relative path the node relies on (dataPath, the duckdb
+# binary, the spill directory) is made absolute against the directory this script started in.
 
 set -euo pipefail
 
+# DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+# (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal; pin the normal output format.
+export DUCKDB_AGENT_MODE=0
+
 PORT="${1:?port required}"
-TOKEN="${2:?token required}"
+MARKER="${2:-}"
+if [[ -n "$MARKER" && ! "$MARKER" =~ ^[0-9]+-[0-9a-f]+$ ]]; then
+  echo "ERROR: invalid manager marker '$MARKER' (expected <rest-port>-<hex boot id>)" >&2
+  exit 1
+fi
+
+# The directory relative paths resolve against (the manager's or join process's working directory,
+# where duckdb itself used to run). Physical, so it matches the manager JVM's own resolution. A
+# trailing slash is stripped so a start dir of `/` yields `/ducklake/...`, not `//ducklake/...`.
+START_DIR="$(pwd -P)"
+START_DIR="${START_DIR%/}"
+
+# Keep in sync with NodeSecretFiles.Keys (Scala), SECRET_KEYS in spawn-quack-node.ps1 and
+# _SECRET_KEYS in cli/src/qod_cli/fleet_join.py; NodeSecretFilesSpec pins all four.
+SECRET_KEYS=(pgPassword encryptionKey extraSetupSql objectStoreSql QOD_NODE_TOKEN
+  QOD_S3_ACCESS_KEY_ID QOD_S3_SECRET_ACCESS_KEY QOD_AZURE_CONNECTION_STRING QOD_GCS_KEY_ID
+  QOD_GCS_SECRET)
+for key in "${SECRET_KEYS[@]}"; do
+  if [[ -n "${!key+x}" ]]; then
+    echo "WARN: ignoring $key from the environment; secrets are read from \$QOD_SECRETS_DIR only" >&2
+    unset "$key"
+  fi
+done
+if [[ -n "${QOD_SECRETS_DIR:-}" ]]; then
+  for key in "${SECRET_KEYS[@]}"; do
+    if [[ -f "$QOD_SECRETS_DIR/$key" ]]; then
+      # read -d '' slurps the whole file (newlines included); it returns 1 at EOF by design.
+      IFS= read -r -d '' "$key" < "$QOD_SECRETS_DIR/$key" || true
+    fi
+  done
+  if [[ "${QOD_SECRETS_DIR_EPHEMERAL:-}" == "1" ]]; then
+    rm -rf -- "$QOD_SECRETS_DIR"
+  fi
+fi
+# Plain shell variables from here on: nothing below exports them, so neither duckdb nor psql
+# inherits them.
+export -n "${SECRET_KEYS[@]}" QOD_SECRETS_DIR QOD_SECRETS_DIR_EPHEMERAL 2>/dev/null || true
+TOKEN="${QOD_NODE_TOKEN:-}"
+if [[ -z "$TOKEN" ]]; then
+  echo "ERROR: no node token: \$QOD_SECRETS_DIR/QOD_NODE_TOKEN is missing or empty" >&2
+  exit 1
+fi
+
+# A line whose first non-blank character is `.` is a DuckDB CLI dot-command in the -init channel,
+# and `.shell` / `.system` run an OS command as this script's user. The manager refuses one in
+# every tenant-authored value and again before every spawn (InitSqlScreen.scala); refuse it here
+# too, so no launcher (a Kubernetes pod, a fleet server) and no stored row can get one past this
+# script. The script's own dot-commands (`.bail off`, the keep-alive) sit outside every value
+# checked. The leading newline lets the pattern also match a dot on the first line.
+DOT_LINE_RE=$'[\n\r][[:space:]]*\\.'
+has_dot_line() { [[ $'\n'"$1" =~ $DOT_LINE_RE ]]; }
+for key in dbInitSql extraSetupSql objectStoreSql lockdownSql; do
+  if has_dot_line "${!key:-}"; then
+    echo "ERROR: $key holds a line starting with '.', which the DuckDB CLI runs as a dot-command" \
+      "(.shell / .system run OS commands); refusing to start the node" >&2
+    exit 1
+  fi
+done
 
 pgHost="${pgHost:-localhost}"
 pgPort="${pgPort:-5432}"
@@ -65,7 +155,7 @@ STORAGE_SQL=""
 case "$dataPath" in
   s3://*|s3a://*|gs://*|r2://*)
     IS_REMOTE=1
-    STORAGE_SQL="INSTALL httpfs; LOAD httpfs;"
+    STORAGE_SQL="INSTALL httpfs;"$'\n'"LOAD httpfs;"
     if [[ -n "${QOD_S3_ACCESS_KEY_ID:-}" && -n "${QOD_S3_SECRET_ACCESS_KEY:-}" ]]; then
       # Strip http(s):// from the endpoint - DuckDB wants "host:port".
       ep="${QOD_S3_ENDPOINT:-}"
@@ -84,7 +174,7 @@ CREATE OR REPLACE SECRET quack_s3 (
     ;;
   az://*|azure://*|abfss://*)
     IS_REMOTE=1
-    STORAGE_SQL="INSTALL azure; LOAD azure;"
+    STORAGE_SQL="INSTALL azure;"$'\n'"LOAD azure;"
     if [[ -n "${QOD_AZURE_CONNECTION_STRING:-}" ]]; then
       STORAGE_SQL="$STORAGE_SQL
 CREATE OR REPLACE SECRET quack_azure (
@@ -94,6 +184,20 @@ CREATE OR REPLACE SECRET quack_azure (
     fi
     ;;
 esac
+
+# A relative local dataPath (the bundled default `./ducklake/tpch` is one) used to resolve against
+# duckdb's working directory; resolve it against the starting directory instead, since duckdb no
+# longer runs there. DuckLake refuses a DATA_PATH that differs from the one recorded at catalog
+# creation (still the relative spelling), so the ATTACH then passes OVERRIDE_DATA_PATH, which applies
+# to this attach only and rewrites nothing in the catalog.
+DATA_PATH_OVERRIDE=""
+if [[ "$IS_REMOTE" == "0" && -n "$dataPath" && "$dataPath" != /* ]]; then
+  while [[ "$dataPath" == ./* ]]; do dataPath="${dataPath#./}"; done
+  dataPath="$START_DIR/$dataPath"
+  DATA_PATH_OVERRIDE=", OVERRIDE_DATA_PATH true"
+fi
+# The starting directory is not validated like the rest of the metastore: double any quote.
+data_path_sql=${dataPath//\'/\'\'}
 
 # mkdir behaviour differs by kind: for `ducklake`, dataPath is a parquet
 # DIRECTORY, so mkdir -p on the path itself is correct. For `duckdb-file`,
@@ -131,7 +235,135 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
     echo "ERROR: duckdb not found (DUCKDB_BIN='${DUCKDB_BIN:-}', 'duckdb' not on PATH)" >&2
     exit 1
   }
+  # Absolute, since duckdb starts in its own directory (a relative DUCKDB_BIN or PATH entry
+  # would otherwise resolve there).
+  DUCKDB="$(command -v "$DUCKDB")"
+  [[ "$DUCKDB" == /* ]] || DUCKDB="$START_DIR/$DUCKDB"
+  # The node is held open by a `.shell` dot-command (the keep-alive below). A CLI without it would
+  # go straight to `.exit` after starting to serve, a silent crash loop; refuse up front instead.
+  # One duckdb start with no init file (-no-init: never the OS user's ~/.duckdbrc).
+  if [[ "$("$DUCKDB" -no-init -noheader -c ".shell 'echo qod-shell-ok'" < /dev/null 2>/dev/null)" != *qod-shell-ok* ]]; then
+    echo "ERROR: $DUCKDB cannot run the .shell dot-command the node keep-alive needs" >&2
+    exit 1
+  fi
 fi
+
+# The spill directory a stale node directory records (spill.path), removed only when it is one this
+# script makes: `qod-node.XXXXXX` directly under a spill root of this host (see SPILL_ROOT below),
+# a real directory owned by this user, compared on physical paths. Anything else (a planted path, a
+# spill root of another starting directory) is left in place; the `tmp` fallback inside the node
+# directory goes with that directory.
+remove_stale_spill() {
+  local sp name parent root
+  sp="$(cat "$1/spill.path" 2>/dev/null || true)"
+  name="${sp##*/}"
+  [[ "$name" =~ ^qod-node\.[A-Za-z0-9]{6}$ ]] || return 0
+  [[ -d "$sp" && ! -L "$sp" && -O "$sp" ]] || return 0
+  parent="$(cd -P -- "${sp%/*}" 2>/dev/null && pwd -P)" || return 0
+  for root in /duckdb-tmp "$START_DIR/.tmp"; do
+    root="$(cd -P -- "$root" 2>/dev/null && pwd -P)" || continue
+    if [[ "$parent" == "$root" ]]; then
+      rm -rf -- "$parent/$name" 2>/dev/null || true
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Sweep node directories left by an earlier spawn whose script died on SIGKILL (which skips the
+# trap below): the init FIFO carries no secrets to disk, but a spill directory can be large. TMPDIR
+# is often the shared, sticky /tmp, where any local user can create a `quack-node.*` entry, so an
+# entry is considered only when it is a real directory (not a symlink) owned by this user, and only
+# once its recorded owner pid is provably gone: `kill -0` also fails on another user's live process
+# (EPERM), so `ps` has the last word. A live owner's directory (this manager's or another's) and one
+# still being created (no pid file yet) are left alone. Every delete is best effort: a stray entry
+# must never abort this spawn under `set -e`.
+for d in "${TMPDIR:-/tmp}"/quack-node.*; do
+  [[ -d "$d" && ! -L "$d" && -O "$d" ]] || continue
+  op="$d/owner.pid"
+  [[ -f "$op" && ! -L "$op" ]] || continue
+  owner="$(cat "$op" 2>/dev/null || true)"
+  [[ "$owner" =~ ^[0-9]+$ ]] || continue
+  if kill -0 "$owner" 2>/dev/null || ps -p "$owner" >/dev/null 2>&1; then
+    continue
+  fi
+  remove_stale_spill "$d"
+  # The read-only secret directory holds its marker file: writable again before rm -rf. Never
+  # through a symlink, which would change the mode of whatever it points at.
+  if [[ -d "$d/secrets" && ! -L "$d/secrets" ]]; then
+    chmod 700 "$d/secrets" 2>/dev/null || true
+  fi
+  rm -rf -- "$d" 2>/dev/null || true
+done
+
+# Per-node private state, all removed by cleanup() when the node stops: NODE_DIR (0700, from mktemp)
+# holds the init FIFO, the psql passfile while it is needed, owner.pid / spill.path for the stale
+# sweep above, WORK_DIR, the empty directory duckdb runs in, and SECRET_DIR, the read-only home of
+# duckdb's unreachable secret directory. Created in dry-run mode too, so the SQL below names the same
+# directories a real spawn would.
+NODE_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/quack-node.${MARKER:+$MARKER.}XXXXXX)"
+SPILL_DIR=""
+DUCK_PID=""
+INIT_WRITER=""
+cleanup() {
+  if [[ -n "$INIT_WRITER" ]]; then
+    kill -TERM "$INIT_WRITER" 2>/dev/null || true
+  fi
+  if [[ -n "$DUCK_PID" ]]; then
+    kill -TERM "$DUCK_PID" 2>/dev/null || true
+    wait "$DUCK_PID" 2>/dev/null || true
+  fi
+  chmod 700 "$NODE_DIR/secrets" 2>/dev/null || true
+  rm -rf -- "$NODE_DIR" ${SPILL_DIR:+"$SPILL_DIR"}
+}
+STOPPING=""
+trap 'STOPPING=1; cleanup' TERM INT
+trap cleanup EXIT
+printf '%s' "$$" > "$NODE_DIR/owner.pid"
+WORK_DIR="$NODE_DIR/cwd"
+mkdir -m 700 "$WORK_DIR"
+# DuckDB loads every persistent secret of its secret directory on first secret use, and the default
+# is the OS user's ~/.duckdb/stored_secrets, which would put an operator's own cloud keys on every
+# node. The node's secret directory is SECRET_PATH instead, a path BELOW the regular file `none` of
+# the read-only (0500) directory SECRET_DIR: it can never exist as a directory, so nothing loads and
+# CREATE PERSISTENT SECRET fails ("Failed to create directory ...: File exists"), for root too.
+# Persistent secrets stay enabled: with allow_persistent_secrets = false, DuckDB 2.0 refuses every
+# postgres ATTACH that names no SECRET, inline credentials included. The marker sits in the 0500
+# directory because a marker in a writable one can be replaced by a directory through
+# `COPY ... (PARTITION_BY ..., OVERWRITE)`. Root with CAP_DAC_OVERRIDE could still do that in two
+# deliberate steps (the warning below names it; anything stored then stays in NODE_DIR). Absolute,
+# since duckdb runs in WORK_DIR.
+SECRET_DIR="$NODE_DIR/secrets"
+[[ "$SECRET_DIR" == /* ]] || SECRET_DIR="$START_DIR/$SECRET_DIR"
+mkdir -m 700 "$SECRET_DIR"
+: > "$SECRET_DIR/none"
+chmod 400 "$SECRET_DIR/none"
+chmod 500 "$SECRET_DIR"
+SECRET_PATH="$SECRET_DIR/none/s"
+# A real write probe, not `[[ -w ]]`: glibc may report uid 0 as able to write anything even with
+# every capability dropped.
+if ( : > "$SECRET_DIR/.probe" ) 2>/dev/null; then
+  rm -f -- "$SECRET_DIR/.probe"
+  echo "WARN: the node's secret directory $SECRET_DIR is writable (root with CAP_DAC_OVERRIDE?); only its marker file keeps persistent secrets off this node" >&2
+fi
+# DuckDB's spill directory defaults to `.tmp` under its working directory, which no longer persists
+# across nodes. Give each node its own, on the filesystem it spilled to before: the emptyDir
+# KubernetesQuackBackend mounts on every pod when present, else `.tmp` of the starting directory
+# (not TMPDIR, which is often RAM-backed on Linux). Per node so that under lockdown, where DuckDB
+# admits its temp directory, no node can read another's spill files. NODE_DIR when neither works.
+if [[ -d /duckdb-tmp && -w /duckdb-tmp ]]; then
+  SPILL_ROOT=/duckdb-tmp
+else
+  SPILL_ROOT="$START_DIR/.tmp"
+fi
+SPILL_DIR="$(mkdir -p "$SPILL_ROOT" 2>/dev/null && mktemp -d "$SPILL_ROOT/qod-node.XXXXXX" 2>/dev/null)" ||
+  SPILL_DIR=""
+if [[ -z "$SPILL_DIR" ]]; then
+  SPILL_DIR="$NODE_DIR/tmp"
+  mkdir -m 700 "$SPILL_DIR"
+fi
+# Recorded so the stale sweep of a later spawn can remove this spill dir if our script is SIGKILLed.
+printf '%s' "$SPILL_DIR" > "$NODE_DIR/spill.path"
 
 # Ensure the Postgres database $dbName exists. Connects to PG_ADMIN_DB (default
 # `postgres`) as admin and runs CREATE DATABASE if missing. Skipped when psql
@@ -143,41 +375,39 @@ fi
 # test's runtime depend on the test machine's network/resolver behavior.
 if [[ "$kind" == "ducklake" && "${QOD_SPAWN_DRY_RUN:-}" != "1" ]] && command -v psql >/dev/null 2>&1; then
   ADMIN_DB="${PG_ADMIN_DB:-postgres}"
-  EXISTS=$(PGPASSWORD="$pgPassword" psql -h "$pgHost" -p "$pgPort" -U "$pgUser" \
+  # The password reaches psql through a private passfile, never PGPASSWORD: psql's own
+  # environment is as readable as duckdb's while it runs. It sits in NODE_DIR, so cleanup()
+  # removes it on any exit (a kill during psql included), not only on the normal path below.
+  PGPASS_FILE="$NODE_DIR/pgpass"
+  pgpass_escaped="${pgPassword//\\/\\\\}"
+  pgpass_escaped="${pgpass_escaped//:/\\:}"
+  (umask 077 && printf '*:*:*:*:%s\n' "$pgpass_escaped" > "$PGPASS_FILE")
+  EXISTS=$(PGPASSFILE="$PGPASS_FILE" psql -w -h "$pgHost" -p "$pgPort" -U "$pgUser" \
     -d "$ADMIN_DB" -tAc "SELECT 1 FROM pg_database WHERE datname = '$dbName'" 2>/dev/null || true)
   if [[ "$EXISTS" != "1" ]]; then
     echo "spawn: creating Postgres database $dbName"
-    PGPASSWORD="$pgPassword" psql -h "$pgHost" -p "$pgPort" -U "$pgUser" \
+    PGPASSFILE="$PGPASS_FILE" psql -w -h "$pgHost" -p "$pgPort" -U "$pgUser" \
       -d "$ADMIN_DB" -tAc "CREATE DATABASE \"$dbName\"" >/dev/null || {
         echo "WARN: CREATE DATABASE $dbName failed; ATTACH below may fail" >&2
       }
   fi
+  rm -f -- "$PGPASS_FILE"
 fi
 
 # Early guard: in dry-run mode we only want the assembled INIT_SQL (below), never a live
 # duckdb process. Skip the FIFO and the duckdb launch entirely rather than starting one and
 # killing it - SpawnScriptEncryptionSpec drives this script many times per run.
 if [[ "${QOD_SPAWN_DRY_RUN:-}" != "1" ]]; then
-  # A named pipe keeps duckdb's stdin live without blocking after we feed the
-  # init SQL. fd 9 holds the writer side open until this shell exits.
-  FIFO_DIR="$(mktemp -d -t quack-fifo.XXXXXX)"
-  FIFO="$FIFO_DIR/in"
-  mkfifo "$FIFO"
+  # The init SQL is handed to duckdb through -init on a FIFO (never on disk, never recorded in
+  # shell_history()). stdin is /dev/null, so no statement can be injected on the node's own
+  # connection; the node is kept alive by a `.shell` dot-command at the end of the init that waits
+  # on this wrapper's pid (see the keep-alive note below).
+  INIT_FIFO="$NODE_DIR/init"
+  mkfifo "$INIT_FIFO"
 
-  # Start duckdb first - open() on FIFO blocks until the writer side appears.
-  "$DUCKDB" < "$FIFO" &
+  # Runs in WORK_DIR (the subshell execs it, so $! is duckdb's own pid); this script stays put.
+  (cd "$WORK_DIR" && exec "$DUCKDB" -init "$INIT_FIFO" < /dev/null) &
   DUCK_PID=$!
-
-  # Open the writer end; this unblocks duckdb's open().
-  exec 9> "$FIFO"
-
-  cleanup() {
-    kill -TERM "$DUCK_PID" 2>/dev/null || true
-    wait "$DUCK_PID" 2>/dev/null || true
-    exec 9>&- 2>/dev/null || true
-    rm -rf "$FIFO_DIR"
-  }
-  trap cleanup TERM INT EXIT
 fi
 
 # DuckDB does NOT honour the HTTP_PROXY / HTTPS_PROXY env vars for
@@ -217,11 +447,9 @@ fi
 # script shares its cgroup with the manager JVM during a local demo load
 # (hence a conservative 40%), whereas a node pod runs nothing but DuckDB,
 # so 85% (in line with general DuckDB memory-tuning guidance) is safe.
-# `/duckdb-tmp` is the emptyDir KubernetesQuackBackend already mounts on
-# every pod for `readOnlyRootFilesystem` compatibility; only point
-# temp_directory at it when it actually exists so LocalQuackBackend (no
-# such mount, no meaningful cgroup either) is unaffected.
-RESOURCE_SQL=""
+# temp_directory is the per-node SPILL_DIR chosen above, on every runtime.
+spill_dir_sql=${SPILL_DIR//\'/\'\'}
+RESOURCE_SQL="SET temp_directory = '$spill_dir_sql';"$'\n'
 if [[ -r /sys/fs/cgroup/memory.max ]]; then
   MEM_BYTES="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"        # cgroup v2
 elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
@@ -233,9 +461,6 @@ if [[ "$MEM_BYTES" =~ ^[0-9]+$ ]] && (( MEM_BYTES > 0 && MEM_BYTES < 90000000000
   MEM_MIB=$(( MEM_BYTES / 1024 / 1024 * 85 / 100 ))
   (( MEM_MIB < 256 )) && MEM_MIB=256
   RESOURCE_SQL+="SET memory_limit = '${MEM_MIB}MiB';"$'\n'
-fi
-if [[ -d /duckdb-tmp && -w /duckdb-tmp ]]; then
-  RESOURCE_SQL+="SET temp_directory = '/duckdb-tmp';"$'\n'
 fi
 if [[ -r /sys/fs/cgroup/cpu.max ]]; then
   read -r CPU_QUOTA CPU_PERIOD < /sys/fs/cgroup/cpu.max              # cgroup v2: "<quota> <period>"
@@ -268,6 +493,23 @@ fi
 # Build init SQL piecemeal based on $kind so kind=memory and
 # kind=duckdb-file skip DuckLake-specific setup entirely.
 INIT_SQL=""
+# First, before any CREATE SECRET or ATTACH: SECRET_PATH (see above) replaces the OS user's
+# ~/.duckdb/stored_secrets. Reading duckdb_secrets() then puts the secret manager in use, after which
+# DuckDB refuses to change secret_directory or allow_persistent_secrets from any session
+# (default_secret_storage stays changeable, which is harmless: a plain CREATE SECRET is temporary
+# and a persistent one can name its storage anyway). The real control is SECRET_PATH itself, which
+# can never exist as a directory, so CREATE PERSISTENT SECRET fails (see above). Both run before
+# `.bail off`, while the CLI still exits on the first error of an -init file: if either failed, the
+# node must not start on the default secret directory.
+# Quotes doubled outside double quotes: inside them bash 3.2 keeps the backslashes of `\'`.
+secret_path_sql=${SECRET_PATH//\'/\'\'}
+INIT_SQL+="SET secret_directory = '$secret_path_sql';"$'\n'
+INIT_SQL+=$'SELECT count(*) AS qod_secret_manager_ready FROM duckdb_secrets();\n'
+# A node has always carried on past a failing statement (an unreachable federated source, an offline
+# INSTALL), so keep doing that from here on.
+INIT_SQL+=$'.bail off\n'
+# Everything after this head is checked for dot-command lines before the keep-alive is appended.
+INIT_HEAD_LEN=${#INIT_SQL}
 INIT_SQL+="$PROXY_SQL"$'\n'
 # Cgroup-derived memory_limit / temp_directory / threads (see above) run
 # right after the proxy settings and before dbInitSql, so an operator's
@@ -283,7 +525,7 @@ INIT_SQL+="$RESOURCE_SQL"
 if [[ -n "${dbInitSql:-}" ]]; then
   INIT_SQL+="$dbInitSql"$'\n'
 fi
-INIT_SQL+=$'INSTALL quack;    LOAD quack;\n'
+INIT_SQL+=$'INSTALL quack;\nLOAD quack;\n'
 
 # Per-database object-store secret (objectStoreSql env, authored by ObjectStoreSecret.scala).
 # A scoped CREATE SECRET for this database's own bucket/credentials, emitted for EVERY kind:
@@ -301,34 +543,44 @@ fi
 # local encrypted database would miss it.
 ENCRYPTION_SQL=""
 if [[ "${encrypted:-}" == "true" ]]; then
-  ENCRYPTION_SQL=$'INSTALL httpfs; LOAD httpfs;\n'
+  ENCRYPTION_SQL=$'INSTALL httpfs;\nLOAD httpfs;\n'
 fi
 INIT_SQL+="$ENCRYPTION_SQL"
 
 case "$kind" in
   ducklake)
-    INIT_SQL+=$'INSTALL ducklake; LOAD ducklake;\n'
-    INIT_SQL+=$'INSTALL postgres; LOAD postgres;\n'
+    INIT_SQL+=$'INSTALL ducklake;\nLOAD ducklake;\n'
+    INIT_SQL+=$'INSTALL postgres;\nLOAD postgres;\n'
     INIT_SQL+="$STORAGE_SQL"$'\n'
-    INIT_SQL+="ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS qod_init_pg (TYPE postgres);"$'\n'
+    # The catalog password rides a TEMPORARY secret, never an ATTACH string: DuckDB prints an attach
+    # path verbatim in duckdb_databases().path and in connection errors, readable by any SQL user
+    # of the node. Both ATTACHes name the secret, and it is dropped right after them (before
+    # federation SQL and quack_serve) so no session can attach the catalog again with it. Mirrors
+    # CatalogPgSecret.scala.
+    # TenantDb.validateSafety already refuses a quote in pgPassword; double one anyway.
+    pg_password_sql=${pgPassword//\'/\'\'}
+    INIT_SQL+="CREATE OR REPLACE TEMPORARY SECRET qod_catalog_pg (TYPE postgres, PASSWORD '$pg_password_sql');"$'\n'
+    INIT_SQL+="ATTACH 'host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS qod_init_pg (TYPE postgres, SECRET qod_catalog_pg);"$'\n'
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_lock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
-    INIT_SQL+="ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser password=$pgPassword' AS \"$catalogAlias\""$'\n'
+    INIT_SQL+="ATTACH 'ducklake:postgres:host=$pgHost port=$pgPort dbname=$dbName user=$pgUser' AS \"$catalogAlias\""$'\n'
+    # Nodes attach as-is: the manager's DuckLakeInitializer migrates older catalogs once per boot.
     if [[ "${encrypted:-}" == "true" ]]; then
-      INIT_SQL+="  (DATA_PATH '$dataPath', ENCRYPTED);"$'\n'
+      INIT_SQL+="  (DATA_PATH '$data_path_sql', ENCRYPTED$DATA_PATH_OVERRIDE, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});"$'\n'
     else
-      INIT_SQL+="  (DATA_PATH '$dataPath');"$'\n'
+      INIT_SQL+="  (DATA_PATH '$data_path_sql'$DATA_PATH_OVERRIDE, METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});"$'\n'
     fi
     INIT_SQL+="SELECT * FROM postgres_query('qod_init_pg', 'SELECT pg_advisory_unlock(hashtext(''qod-ducklake-init:$dbName''))');"$'\n'
     INIT_SQL+=$'DETACH qod_init_pg;\n'
+    INIT_SQL+=$'DROP SECRET IF EXISTS qod_catalog_pg;\n'
     INIT_SQL+="USE \"$catalogAlias\";"$'\n'
     INIT_SQL+="CREATE SCHEMA IF NOT EXISTS \"$schemaName\";"$'\n'
     INIT_SQL+="USE \"$catalogAlias\".\"$schemaName\";"$'\n'
     ;;
   duckdb-file)
     if [[ "${encrypted:-}" == "true" ]]; then
-      INIT_SQL+="ATTACH '$dataPath' AS \"$catalogAlias\" (ENCRYPTION_KEY '$encryptionKey');"$'\n'
+      INIT_SQL+="ATTACH '$data_path_sql' AS \"$catalogAlias\" (ENCRYPTION_KEY '$encryptionKey');"$'\n'
     else
-      INIT_SQL+="ATTACH '$dataPath' AS \"$catalogAlias\";"$'\n'
+      INIT_SQL+="ATTACH '$data_path_sql' AS \"$catalogAlias\";"$'\n'
     fi
     INIT_SQL+="USE \"$catalogAlias\";"$'\n'
     INIT_SQL+="CREATE SCHEMA IF NOT EXISTS \"$schemaName\";"$'\n'
@@ -354,7 +606,31 @@ fi
 # fleet join process passes the server's advertised data interface so a node never listens on a
 # management NIC by accident.
 NODE_BIND="${QOD_NODE_BIND:-0.0.0.0}"
-INIT_SQL+="CALL quack_serve('quack:${NODE_BIND}:$PORT', token := '$TOKEN', allow_other_hostname := true);"$'\n'
+# DuckDB 2.0 serves HTTPS by default off localhost; the manager speaks plain HTTP (node TLS: #27).
+# SELECT only listen_url (not the CALL's row), so the node token never reaches the inherited stdout
+# (the manager console locally, `kubectl logs` on K8s).
+INIT_SQL+="SELECT listen_url FROM quack_serve('quack:${NODE_BIND}:$PORT', token := '$TOKEN', allow_other_hostname := true, disable_ssl := true);"$'\n'
+# Backstop for the per-value check at the top: no value this script interpolates (the storage
+# credentials, the proxy, the paths) may smuggle in a dot-command line either.
+if has_dot_line "${INIT_SQL:$INIT_HEAD_LEN}"; then
+  echo "ERROR: the assembled init SQL holds a line starting with '.' outside the script's own" \
+    "dot-commands; refusing to start the node" >&2
+  exit 1
+fi
+# Keep-alive: with stdin on /dev/null the CLI would reach EOF and exit once -init is read. Hold it
+# with a dot-command, NOT a query: a query would pin a DuckDB transaction (blocking CHECKPOINT on a
+# duckdb-file node and holding a catalog Postgres session "idle in transaction" on a DuckLake node),
+# and on 2.0 its worker/main-thread handshake can spin a core for the node's life. `.shell` holds no
+# transaction and no scheduler task: it waits for this wrapper's pid ($$) to disappear, so a SIGKILL
+# of the wrapper (which skips the trap) ends the loop, `.shell` returns and the CLI exits, so the
+# node does not outlive its wrapper. Best-effort only: the wait polls a bare pid, so if a
+# force-killed wrapper's pid is reused before the next poll (or before the keep-alive even starts),
+# the node lives on until that unrelated process exits. Only a force-kill from outside the manager
+# can hit this: when LocalQuackBackend force-kills a wrapper it kills the duckdb child with it.
+# `.exit` right after keeps any bytes a later writer could append to the init pipe from ever being
+# read. GNU `tail --pid` (Linux, the node image) waits without forking; where it is missing (macOS,
+# busybox) it fails at once and the `kill -0` loop, one `sleep 1` fork a second, takes over.
+INIT_SQL+=$'.shell "tail --pid='"$$"$' -f /dev/null 2>/dev/null || while kill -0 '"$$"$' 2>/dev/null; do sleep 1; done"\n.exit\n'
 
 # Test seam: print the assembled init SQL and exit without launching duckdb.
 # Used by SpawnScriptEncryptionSpec to assert the emitted SQL, which is the only
@@ -364,7 +640,21 @@ if [[ "${QOD_SPAWN_DRY_RUN:-}" == "1" ]]; then
   exit 0
 fi
 
-printf '%s' "$INIT_SQL" >&9
+# Write the init SQL into the FIFO, then unlink the FIFO name so no `../init` path lingers in the
+# working directory's parent (the fd stays valid). Backgrounded: duckdb reads -init at startup, and
+# a duckdb that exits first must still let this script end (cleanup stops the writer).
+{ printf '%s' "$INIT_SQL" > "$INIT_FIFO"; rm -f -- "$INIT_FIFO"; } &
+INIT_WRITER=$!
 
-# Block until duckdb is killed (typically SIGTERM from the manager).
-wait "$DUCK_PID"
+# Block until duckdb is killed (typically SIGTERM from the manager, which runs the trap).
+rc=0
+wait "$DUCK_PID" || rc=$?
+if [[ -n "$STOPPING" ]]; then
+  exit 143
+fi
+# duckdb ended on its own while this wrapper is alive: the keep-alive only returns once the wrapper
+# is gone, so this is a failure (a crashed node, or an init that never reached the keep-alive). Say
+# so and exit non-zero, rather than vanishing; the manager then sees the node down.
+DUCK_PID=""
+echo "ERROR: the node's duckdb exited (status $rc) while its wrapper was still running; see the node output above" >&2
+exit 1

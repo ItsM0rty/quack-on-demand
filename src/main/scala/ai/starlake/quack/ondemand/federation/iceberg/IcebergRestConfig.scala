@@ -333,8 +333,9 @@ object IcebergRestConfig:
     * sibling federated alias - the set Main.scala's `attachedCatalogsOf` computes - because an
     * alias colliding with an already-attached catalog produces `ATTACH 'x' AS "name"` for a name
     * DuckDB already holds, i.e. `Binder Error: Failed to attach database: database with name "name"
-    * already exists`. The DuckDB CLI reading piped stdin does not bail on that error, so the node
-    * comes up with a partly-failed federation blob and no loud signal. Comparison is
+    * already exists`. A node's DuckDB CLI reads its init SQL through `-init` with `.bail off`, so
+    * it does not bail on that error and the node comes up with a partly-failed federation blob and
+    * no loud signal. Comparison is
     * case-insensitive (delegated to `validate`, which already lowercases via `equalsIgnoreCase`),
     * so an entry in any case still blocks the normalized (lowercase) alias.
     */

@@ -39,11 +39,7 @@ class AdminSqlEndToEndSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     sup.createPool(poolKey, RoleDistribution(0, 0, 1)).unsafeRunSync()
 
-    val client = new QuackHttpClient(
-      TestArrow.sharedAllocator,
-      nativeClient = true,
-      nodeDisableSsl = true
-    ):
+    val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         IO.pure(TestArrow.okResponse())
     val tracker = new NodeLoadTracker

@@ -2,7 +2,14 @@ package ai.starlake.quack.edge.sql
 
 import java.util.Locale
 import ai.starlake.acl.model.{Config, DenyReason}
-import ai.starlake.acl.parser.{SqlParser, StatementResult, TableAccess, TableExtractor, Verb}
+import ai.starlake.acl.parser.{
+  ExtractionResult,
+  SqlParser,
+  StatementResult,
+  TableAccess,
+  TableExtractor,
+  Verb
+}
 
 /** What a statement needs authorized, independent of WHO decides (QoD grants or OPA).
   *   - `Refuse`: the statement cannot be authorized table by table. `wildcardCoverable` says
@@ -21,6 +28,13 @@ enum GateOutcome:
   */
 object AccessGate:
 
+  /** The refusal of a two-part name headed by an attached catalog, worded once for every step that
+    * refuses it (this gate, [[CatalogWriteScreen]], the protected-write guard).
+    */
+  def ambiguousNameReason(a: DenyReason.AmbiguousCatalogRef): String =
+    s"ambiguous two-part name '${a.tableName}': '${a.catalog}' is an attached catalog; " +
+      s"qualify fully as '${a.catalog}.<schema>.<table>'"
+
   /** The SQL parser configuration for a session: the pool's metastore catalog / schema fill in
     * unqualified references, falling back to the validator's defaults.
     */
@@ -38,26 +52,101 @@ object AccessGate:
 
   /** `sessionCatalog` must be the same catalog `parserConfig` used as its default database, so the
     * filtered-metadata admit and the parser's qualification agree (see below).
+    *
+    * `clientDataScans` is [[ValidationContext.clientDataScans]]: true only for a statement from the
+    * native Quack front door. Required, so no caller can admit the scan by omission.
     */
   def evaluate(
       statement: String,
       config: Config,
       sessionCatalog: String,
-      filteredMetadata: Boolean
+      filteredMetadata: Boolean,
+      clientDataScans: Boolean,
+      rewriteOf: Option[String] = None
   ): GateOutcome =
+    // Parsed once, by the file screen (when its lexical checks find nothing) or the gate below.
+    lazy val extraction = SqlParser.extract(statement, config)
     // Ahead of every other arm, and never wildcard-coverable: the target of these calls is
     // a string the parser cannot see, so the wildcard's tenant-catalog scoping cannot apply.
-    CatalogReachingCalls.find(statement) match
-      case Some(fn) => GateOutcome.Refuse(CatalogReachingCalls.denyReason(fn), false, "")
-      case None     => evaluateParsed(statement, config, sessionCatalog, filteredMetadata)
+    // The same holds for a batch that moves the schema or search path: every bare name after
+    // it resolves somewhere `config` does not describe, possibly in a catalog outside the
+    // tenant's (see SessionScopeScreen). The backtick screen goes first: on a DuckDB 1.x engine a
+    // backtick pair can hide separators and calls from both screens after it (see BacktickScreen).
+    // A SET of a SQL-valued setting is control flow to the parser, but its value runs later on the
+    // catalog Postgres or as the node's auth callback, outside every grant.
+    // A quoted name holding a dot is one identifier to DuckDB and a qualified name to the parser
+    // (see DottedIdentifierScreen), so the grant checked would not be the table read. A file read
+    // or write by path is no table a grant names, and is reserved to superusers whatever the
+    // grants (FileAccessScreen).
+    BacktickScreen
+      .find(statement)
+      .orElse(DottedIdentifierScreen.find(statement, rewriteOf))
+      .orElse(CatalogReachingCalls.find(statement).map(CatalogReachingCalls.denyReason))
+      .orElse(FileAccessScreen.find(statement, extraction))
+      .orElse(
+        CatalogReachingCalls.sqlValuedSetting(statement).map(CatalogReachingCalls.settingDenyReason)
+      )
+      .orElse(SessionScopeScreen.find(statement)) match
+      case Some(reason) => GateOutcome.Refuse(reason, false, "")
+      case None         =>
+        evaluateParsed(
+          statement,
+          extraction,
+          config,
+          sessionCatalog,
+          filteredMetadata,
+          clientDataScans
+        )
+
+  /** Some(reason) when `rewritten`, a statement an edge rewriter (column policies, row policies,
+    * metadata filter) printed from `original`, needs a grant on a table, or a verb, the original
+    * did not, or can no longer be authorized table by table while the original could. The router
+    * authorized `original` and runs `rewritten`: a rewrite that reaches another table (a CTE
+    * reference printed schema-qualified becomes a read of the real table of that name) would run a
+    * read nobody checked. Both are evaluated under the same `config`, so an unqualified name
+    * qualifies identically on both sides.
+    *
+    * Only the accesses that need a grant are compared: the session catalog's filterable metadata
+    * reads and catalog functions are answered by the metadata filter, which has already run on
+    * `rewritten` (it is the rewriter that introduces them, for SHOW TABLES). An original that is
+    * itself refused (admitted by a wildcard grant) cannot be compared here; the router re-validates
+    * every rewrite anyway.
+    */
+  def rewriteReachesBeyond(
+      original: String,
+      rewritten: String,
+      config: Config,
+      sessionCatalog: String,
+      clientDataScans: Boolean
+  ): Option[String] =
+    def gatedOf(o: GateOutcome): Option[Set[TableAccess]] = o match
+      case GateOutcome.Refuse(_, _, _)    => None
+      case GateOutcome.NothingGated(_, _) => Some(Set.empty)
+      case GateOutcome.Gated(gated, _)    => Some(gated)
+    def eval(sql: String, rewriteOf: Option[String]) =
+      evaluate(sql, config, sessionCatalog, filteredMetadata = true, clientDataScans, rewriteOf)
+    gatedOf(eval(original, None)).flatMap { authorized =>
+      eval(rewritten, Some(original)) match
+        case GateOutcome.Refuse(message, _, _) =>
+          Some(s"the rewritten statement cannot be authorized ($message)")
+        case other =>
+          gatedOf(other).flatMap { needed =>
+            val extra = (needed -- authorized).map(a => s"${a.table.canonical} (${a.verb})")
+            Option.when(extra.nonEmpty)(
+              "the rewritten statement reaches what the original did not: " +
+                extra.toList.sorted.mkString(", ")
+            )
+          }
+    }
 
   private def evaluateParsed(
       statement: String,
+      extraction: ExtractionResult,
       config: Config,
       sessionCatalog: String,
-      filteredMetadata: Boolean
+      filteredMetadata: Boolean,
+      clientDataScans: Boolean
   ): GateOutcome =
-    val extraction = SqlParser.extract(statement, config)
 
     // Parse errors short-circuit to Denied unless the principal holds an
     // unrestricted ALL grant (preserves prior behavior).
@@ -77,15 +166,26 @@ object AccessGate:
     // exactly `<function>()`: `duckdb_tables('x')`, `main.duckdb_tables()` and the
     // bare-name marker for `FROM duckdb_tables` are not that shape and stay
     // unsupported.
+    //
+    // A DuckDB 2.0 client's INSERT through an attached catalog reads its rows from
+    // scan_data_from_quack_client, which reads only what the same connection sends: as the
+    // source of a write it is set aside here, the INSERT target staying a gated Write
+    // (TableExtractor.gatedUnsupported). Only on the native front door, the one edge that
+    // relays SEND_DATA: from FlightSQL, MCP or `qod sql` nothing can feed the stream, the
+    // statement would park on the node forever, so the scan stays unsupported there.
     val allUnsupported = extraction.statements.collect {
-      case StatementResult.Extracted(_, _, _, _, u) if u.nonEmpty => u
+      case StatementResult.Extracted(_, _, a, _, u) if u.nonEmpty =>
+        TableExtractor.gatedUnsupported(a, u, clientDataScans)
     }.flatten
-    val (catalogFunctions, unsupported) =
+    val (catalogFunctions, parsedUnsupported) =
       if filteredMetadata then
         allUnsupported.partition(u =>
           TableExtractor.tableFunctionName(u).flatMap(TableExtractor.catalogFunctionCall).isDefined
         )
       else (Nil, allUnsupported)
+    // A scalar call returning another object's definition by oid (`pg_get_viewdef`), outside the
+    // metadata filter: unsupported like the listing it reads (CatalogDefinitionCalls).
+    val unsupported = parsedUnsupported ++ CatalogDefinitionCalls.markers(statement)
     // Qualification errors were previously ignored, silently DROPPING the
     // offending ref from the access set (fail-open). AmbiguousCatalogRef denies
     // unconditionally: admitting it under the wildcard would reopen the
@@ -107,12 +207,7 @@ object AccessGate:
       )
     else if ambiguous.nonEmpty then
       GateOutcome.Refuse(
-        ambiguous
-          .map(a =>
-            s"ambiguous two-part name '${a.tableName}': '${a.catalog}' is an attached " +
-              s"catalog; qualify fully as '${a.catalog}.<schema>.<table>'"
-          )
-          .mkString("; "),
+        ambiguous.map(ambiguousNameReason).mkString("; "),
         false,
         ""
       )

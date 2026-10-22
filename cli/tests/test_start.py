@@ -2,8 +2,12 @@ import pathlib
 import sys
 
 import pytest
+import respx
 
 from qod_cli import launcher
+from tests import _duckdb_cache
+
+_REAL_ENSURE_CLI, _REAL_ENSURE_LIB = launcher.ensure_duckdb_cli, launcher.ensure_libduckdb
 
 
 @pytest.fixture
@@ -16,10 +20,10 @@ def wired(monkeypatch, tmp_path):
     captured = {}
     monkeypatch.setattr(launcher, "find_java", lambda: "/usr/bin/java")
     monkeypatch.setattr(
-        launcher, "ensure_duckdb_cli", lambda cache_dir=None, **kw: tmp_path / "duckdb" / "bin"
+        launcher, "ensure_duckdb_cli", lambda cache_dir=None, **kw: tmp_path / "duckdb" / launcher.DUCKDB_CLI_VERSION / "bin"
     )
     monkeypatch.setattr(
-        launcher, "ensure_libduckdb", lambda cache_dir=None, **kw: tmp_path / "duckdb" / "lib"
+        launcher, "ensure_libduckdb", lambda cache_dir=None, **kw: tmp_path / "duckdb" / launcher.DUCKDB_CLI_VERSION / "lib"
     )
     monkeypatch.setattr(
         launcher,
@@ -103,7 +107,23 @@ def test_start_wires_native_client_library_path(runner, wired):
     result = runner.invoke(app, ["start", "--jar", str(wired["jar"])])
     assert result.exit_code == 0, result.output
     libvar = wired["env"].get("DYLD_LIBRARY_PATH") or wired["env"].get("LD_LIBRARY_PATH")
-    assert libvar and str(pathlib.Path("duckdb") / "lib") in libvar
+    assert libvar and str(pathlib.Path(launcher.DUCKDB_CLI_VERSION) / "lib") in libvar
+
+
+def test_start_hands_the_jvm_a_preloadable_libduckdb(runner, wired, monkeypatch, tmp_path):
+    # The real ensure_* over a provisioned cache: DUCKDB_CACHE_DIR must name it, since a
+    # SIP-protected /usr/bin/java never sees DYLD_LIBRARY_PATH.
+    from qod_cli.main import app
+
+    monkeypatch.setattr(launcher, "ensure_duckdb_cli", _REAL_ENSURE_CLI)
+    monkeypatch.setattr(launcher, "ensure_libduckdb", _REAL_ENSURE_LIB)
+    monkeypatch.setattr(launcher, "default_cache_dir", lambda: tmp_path / "cache")
+    _, lib_dir = _duckdb_cache.plant(tmp_path / "cache")
+    with respx.mock:  # no routes: a provisioned cache must not hit the network
+        result = runner.invoke(app, ["start", "--jar", str(wired["jar"])])
+    assert result.exit_code == 0, result.output
+    target = _duckdb_cache.preload_target(wired["env"])
+    assert target.is_file() and target.parent == lib_dir
 
 
 def test_start_downloads_jvm_when_missing(runner, wired, monkeypatch):

@@ -2,6 +2,7 @@ package ai.starlake.quack.ondemand.api
 
 import ai.starlake.quack.model.{NodePlacement, NodeToleration, PoolCohort, RoleDistribution}
 import ai.starlake.quack.ondemand.federation.iceberg.IcebergRestConfig
+import ai.starlake.quack.ondemand.federation.rdbms.RdbmsConfig
 import io.circe.{Codec, Decoder, DecodingFailure, Encoder, Json}
 import io.circe.derivation.{Configuration, ConfiguredCodec}
 import io.circe.generic.semiauto.deriveCodec
@@ -580,13 +581,18 @@ final case class FederatedSourceCreateRequest(
     setupSql: Option[String] = None,
     description: Option[String] = None,
     disabled: Boolean = false,
-    // "sql" (default) or "iceberg_rest".
+    // "sql" (default), "iceberg_rest", "postgres" or "mysql".
     sourceType: Option[String] = None,
     // iceberg_rest only. Credential fields carry {{secret.NAME}} placeholders, never values,
     // so this object is safe to echo back on the response.
     config: Option[IcebergRestConfig] = None,
-    // Omitted means: false for a sql source, true for an iceberg_rest source.
-    readOnly: Option[Boolean] = None
+    // Omitted means: false for a sql source, true for every typed source.
+    readOnly: Option[Boolean] = None,
+    // postgres / mysql only: the typed connection. A field of its own rather than a second shape
+    // of `config`, whose every field is defaulted, so a connection object would decode there as an
+    // empty Iceberg declaration instead of failing. `password` is a {{secret.NAME}} placeholder,
+    // never a value, so this object is safe to echo back on the response too.
+    connection: Option[RdbmsConfig] = None
 )
 
 final case class FederatedSourceResponse(
@@ -599,8 +605,9 @@ final case class FederatedSourceResponse(
     sourceType: String = "sql",
     config: Option[IcebergRestConfig] = None,
     readOnly: Boolean = false,
-    // Live attach state aggregated across the pool's nodes; filled in Task 8.
-    attachStatus: Option[String] = None
+    // Live attach state aggregated across the pool's nodes, typed (rendered) sources only.
+    attachStatus: Option[String] = None,
+    connection: Option[RdbmsConfig] = None
 )
 
 final case class FederatedSourceListResponse(sources: List[FederatedSourceResponse])

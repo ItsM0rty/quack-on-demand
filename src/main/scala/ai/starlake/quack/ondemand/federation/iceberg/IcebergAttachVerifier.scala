@@ -1,13 +1,15 @@
 package ai.starlake.quack.ondemand.federation.iceberg
 
-import ai.starlake.quack.model.{FederatedSource, FederatedSourceType, PoolKey, RunningNode}
+import ai.starlake.quack.model.{FederatedSource, PoolKey, RunningNode}
 import ai.starlake.quack.ondemand.federation.ResolvedFederationBlock
 import cats.effect.IO
 import cats.syntax.all.*
 import com.typesafe.scalalogging.LazyLogging
 import org.apache.arrow.vector.ipc.ArrowReader
 
-/** Makes a silently-failed Iceberg ATTACH visible, and heals it when it was transient.
+/** Makes a silently-failed Iceberg ATTACH visible, and heals it when it was transient. Covers every
+  * federated source whose ATTACH QoD renders (`FederatedSourceType.rendered`: Iceberg REST,
+  * Postgres, MySQL); the name predates the two relational types.
   *
   * The problem: all four auth modes authenticate ONCE, at ATTACH, during node spawn. The DuckDB CLI
   * reads the node's init SQL from a pipe with bail off, so a failed ATTACH prints its error to the
@@ -18,7 +20,7 @@ import org.apache.arrow.vector.ipc.ArrowReader
   * Per health tick, until the node's incarnation latches:
   *   1. set aside every declared alias that collides with the tenant-db's OWN catalog alias
   *   2. list the node's attached catalogs
-  *   3. diff against the remaining enabled `iceberg_rest` aliases declared for its pool
+  *   3. diff against the remaining enabled rendered (typed) aliases declared for its pool
   *   4. re-issue THAT ONE source's rendered block for each missing alias
   *
   * Step 4 heals and diagnoses at once: a returned catalog attaches with no node restart, and a
@@ -104,9 +106,9 @@ final class IcebergAttachVerifier(
                 logger.debug(s"attach verify ${node.nodeId}: source lookup failed: ${t.getMessage}")
               )
             case Right(sources) =>
-              val declared = sources.filter { s =>
-                s.sourceType == FederatedSourceType.IcebergRest && !s.disabled
-              }
+              // Every type whose ATTACH QoD renders (Iceberg, Postgres, MySQL): each fails the
+              // same silent way at spawn, and each block is QoD's own SQL to re-issue.
+              val declared = sources.filter(s => s.sourceType.rendered && !s.disabled)
               // Nothing declared: latch without ever touching the node, so the overwhelmingly
               // common pool (no Iceberg catalog at all) costs exactly zero round-trips.
               if declared.isEmpty then IO.delay(registry.markLatched(node.nodeId, startedAtMs))
@@ -189,10 +191,9 @@ final class IcebergAttachVerifier(
           // No credential set is passed, and that is deliberate rather than inherited: rendering
           // failed, so nothing was resolved and there is nothing to name. Every raise on this path
           // (FederationBlobBuilder's config, alias-collision and unresolved-secret arms) names
-          // aliases, secret NAMES and config errors, never a resolved value -- with one contrived
-          // exception, the stray-placeholder arm, which quotes the already-substituted text and so
-          // would quote a resolved secret that itself contained `{{...}}`. `scrub` is still called
-          // for that reason: its blanket arm does not need a credential set to mask an
+          // aliases, secret NAMES and config errors, never a resolved value: the stray-placeholder
+          // arm now runs on the template before any secret is resolved. `scrub` is still called as
+          // defence in depth: its blanket arm does not need a credential set to mask an
           // encoded-looking blob.
           note(node, startedAtMs, src, s"could not render attach SQL: ${t.getMessage}", Set.empty)
         case Right(block) =>
@@ -208,16 +209,41 @@ final class IcebergAttachVerifier(
             // scrub the precise credentials this attempt handed DuckDB out of whatever the catalog
             // echoed back. `credentialsIn` is unioned in as defence in depth, for a credential that
             // somehow reached the SQL without passing through substitution.
+            //
+            // A failed batch stops at the failing statement, so a Postgres / MySQL block that
+            // failed at its ATTACH never reached its own DROP SECRET: the credential-bearing
+            // secret would stay on a node that is serving users. `cleanupSql` drops it; its own
+            // failure is logged and does not replace the attach error being recorded.
             case Left(err) =>
-              note(
-                node,
-                startedAtMs,
-                src,
-                err,
-                block.secretValues ++ AttachErrorRedactor.credentialsIn(block.sql)
-              )
+              block.cleanupSql.traverse_(cleanup(node, src, _)) *>
+                note(
+                  node,
+                  startedAtMs,
+                  src,
+                  err,
+                  block.secretValues ++ AttachErrorRedactor.credentialsIn(block.sql)
+                )
           }
       }
+
+  private def cleanup(node: RunningNode, src: FederatedSource, sql: String): IO[Unit] =
+    runOnNode(node, sql).attempt.flatMap {
+      case Right(Right(_)) => IO.unit
+      case Right(Left(e))  =>
+        IO.delay(
+          logger.warn(
+            s"attach verify ${node.nodeId}: dropping the secret of '${src.alias}' after a failed " +
+              s"attach failed: ${AttachErrorRedactor.scrub(e, Set.empty)}"
+          )
+        )
+      case Left(t) =>
+        IO.delay(
+          logger.warn(
+            s"attach verify ${node.nodeId}: dropping the secret of '${src.alias}' after a failed " +
+              s"attach failed: ${AttachErrorRedactor.scrub(String.valueOf(t.getMessage), Set.empty)}"
+          )
+        )
+    }
 
   /** The one alias fold, [[ai.starlake.quack.model.FederatedAlias.fold]], used on BOTH sides of the
     * present-versus-declared match above. `AttachStatusRegistry` folds its keys through the same
@@ -233,9 +259,9 @@ final class IcebergAttachVerifier(
     *
     * The narrower half of that claim, stated because the broad version was wrong: this is NOT the
     * only place the raw error can reach the MANAGER LOG. `QuackHttpClient` logs the same string
-    * verbatim at DEBUG before `note` ever sees it (`native query failed: ...` and `quack_query
-    * failed: ...`), on both transports. That is generic adapter code outside this feature and off
-    * at the default level, but a manager running at DEBUG can still have a credential in its log.
+    * verbatim at DEBUG before `note` ever sees it (`native query failed: ...`). That is generic
+    * adapter code outside this feature and off at the default level, but a manager running at DEBUG
+    * can still have a credential in its log.
     *
     * See [[AttachErrorRedactor]] for the proven vector and for exactly what `scrub` guarantees.
     */
@@ -251,7 +277,7 @@ final class IcebergAttachVerifier(
       val noteworthy = registry.recordFailure(node.nodeId, startedAtMs, src.alias, safe)
       if noteworthy then
         logger.warn(
-          s"iceberg catalog '${src.alias}' is NOT attached on node ${node.nodeId} " +
+          s"${src.sourceType.wire} catalog '${src.alias}' is NOT attached on node ${node.nodeId} " +
             s"(tenant=${node.poolKey.tenant} db=${node.poolKey.tenantDb} " +
             s"pool=${node.poolKey.pool}): $safe"
         )

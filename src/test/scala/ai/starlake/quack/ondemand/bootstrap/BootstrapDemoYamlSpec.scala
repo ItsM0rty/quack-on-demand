@@ -57,6 +57,22 @@ class BootstrapDemoYamlSpec extends AnyFlatSpec with Matchers:
     acmePg.secrets.flatMap(_.externalRef).forall(_.startsWith("env:")) shouldBe true
   }
 
+  it should "keep the federation password out of the ATTACH string" in {
+    // duckdb_databases().path prints an attach path verbatim to every SQL user of the node: the
+    // password rides a temporary secret the ATTACH names, dropped once attached.
+    val sql =
+      manifest.tenants.find(_.name == "globex").get.tenantDbs.head.federatedSources.head.setupSql
+    val lines = sql.linesIterator.map(_.trim).toVector
+    lines.filter(_.contains("{{secret.PG_PASSWORD}}")) shouldBe Vector(
+      "CREATE OR REPLACE TEMPORARY SECRET {{alias}}_pg " +
+        "(TYPE postgres, PASSWORD '{{secret.PG_PASSWORD}}');"
+    )
+    sql.toLowerCase should not include "password="
+    sql should include("(TYPE postgres, SECRET {{alias}}_pg, READ_ONLY)")
+    lines.indexOf("DROP SECRET IF EXISTS {{alias}}_pg;") should be >
+      lines.indexWhere(_.startsWith("ATTACH"))
+  }
+
   it should "declare the documented groups" in {
     val byTenant = manifest.groups.groupBy(_.tenant).view.mapValues(_.map(_.name).toSet).toMap
     byTenant("acme") shouldBe Set("analysts", "data-eng")

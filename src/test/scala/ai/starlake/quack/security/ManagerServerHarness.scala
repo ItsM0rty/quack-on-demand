@@ -6,7 +6,7 @@ import ai.starlake.quack.edge.{ActiveStatementRegistry, RouterFailure, Statement
 import ai.starlake.quack.edge.adapter.NodeLoadTracker
 import ai.starlake.quack.edge.auth.AuthenticationService
 import ai.starlake.quack.observability.metrics.MetricsEndpoint
-import ai.starlake.quack.ondemand.{ManagerServer, PoolSupervisor}
+import ai.starlake.quack.ondemand.{InProcessDuckDb, ManagerServer, PoolSupervisor}
 import ai.starlake.quack.ondemand.api._
 import ai.starlake.quack.ondemand.catalog.DuckLakeCatalogReader
 import ai.starlake.quack.ondemand.runtime.QuackBackend
@@ -53,9 +53,7 @@ object ManagerServerHarness:
     minPort = 40000,
     maxPort = 41000,
     maxNodesTotal = 0,
-    nativeClient = false,
     stampWrites = true,
-    nodeDisableSsl = true,
     spawnScript = "",
     spawnScriptWindows = "",
     drainTimeoutSec = 5,
@@ -154,7 +152,7 @@ object ManagerServerHarness:
     // placeholder created by createTempFile so DuckDB can initialise fresh.
     tmpFile.toFile.delete()
     tmpFile.toFile.deleteOnExit()
-    val jdbcUrl = s"jdbc:duckdb:${tmpFile.toAbsolutePath}"
+    val jdbcUrl = InProcessDuckDb.url(tmpFile.toAbsolutePath.toString)
     val c       = DriverManager.getConnection(jdbcUrl)
     try
       c.createStatement()

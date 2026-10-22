@@ -10,7 +10,8 @@ import sttp.tapir.*
   * Wire shape deliberately diverges from the rest of the API:
   *   - Bodies are raw strings, not circe `jsonBody`: SCIM clients send
   *     `Content-Type: application/scim+json`, which tapir's JSON codec would refuse, and SCIM
-  *     errors must be the RFC's own envelope, not [[Dtos.ErrorResponse]]. Handlers parse and
+  *     errors must be the RFC's own envelope, not
+  *     [[ai.starlake.quack.ondemand.api.ErrorResponse Dtos.ErrorResponse]]. Handlers parse and
   *     render with circe directly.
   *   - Credentials ride `Authorization: Bearer` (the SCIM standard transport; accepted for these
   *     paths by ManagerServer's guard) as well as the usual X-API-Key / cookie pair.

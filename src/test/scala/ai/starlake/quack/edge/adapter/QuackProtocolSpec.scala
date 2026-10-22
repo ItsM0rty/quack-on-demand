@@ -9,6 +9,8 @@ import org.scalatest.matchers.should.Matchers
 import java.net.URI
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.duration.*
+import scala.jdk.CollectionConverters.*
 
 /** Pure tests for [[QuackProtocol]] driven by a fake [[QuackTransport]].
   *
@@ -34,6 +36,15 @@ class QuackProtocolSpec extends AnyFunSpec with Matchers:
       requests += ((uri, body.clone()))
       responses.next()
     }
+
+  /** Polls `cond` until it holds or `within` elapses; true iff it held. */
+  private def eventually(within: FiniteDuration)(cond: => Boolean): Boolean =
+    val deadline = System.nanoTime() + within.toNanos
+    var ok       = cond
+    while !ok && System.nanoTime() < deadline do
+      Thread.sleep(25)
+      ok = cond
+    ok
 
   private val endpoint = "quack:127.0.0.1:21900"
   private val token    = "test-token"
@@ -99,6 +110,92 @@ class QuackProtocolSpec extends AnyFunSpec with Matchers:
         e.getCause.getMessage shouldBe "boom"
         transport.postCount.get() shouldBe 0
       finally allocator.close()
+    }
+
+    it("sends HEARTBEAT_REQUESTs every lease / 3 while open, and none after close") {
+      val heartbeatType = MessageType.HeartbeatRequest.wireOrdinal
+      final class BeatTransport extends QuackTransport:
+        val types = java.util.concurrent.ConcurrentLinkedQueue[Int]()
+        def post(uri: URI, body: Array[Byte]): IO[Array[Byte]] = IO {
+          types.add(QuackNativeBridge.parseMessageType(body))
+          QuackTestFixtures.serializeSampleConnectionResponse(connId)
+        }
+      val transport = BeatTransport()
+      val allocator = new RootAllocator()
+      try
+        val protocol = new QuackProtocol(transport, allocator, nodeLeaseSec = 3) // beat every 1s
+        val conn     = protocol.open(endpoint, token).unsafeRunSync()
+        def beats    = transport.types.asScala.count(_ == heartbeatType)
+        eventually(5.seconds)(beats >= 2) shouldBe true
+        conn.close().unsafeRunSync()
+        val afterClose = beats
+        Thread.sleep(1500)
+        beats shouldBe afterClose
+      finally allocator.close()
+    }
+
+    it("asks the node for the configured lease in CONNECTION_REQUEST") {
+      val transport = FakeTransport(
+        Iterator(QuackTestFixtures.serializeSampleConnectionResponse(connId))
+      )
+      val allocator = new RootAllocator()
+      try
+        val protocol = new QuackProtocol(transport, allocator, nodeLeaseSec = 42)
+        protocol.open(endpoint, token).unsafeRunSync()
+        val sent = ai.starlake.quack.edge.quack.QuackWire
+          .frame(transport.requests.head._2)
+          .flatMap(ai.starlake.quack.edge.quack.QuackWire.decodeConnectionRequest)
+          .fold(e => fail(s"undecodable CONNECTION_REQUEST: $e"), identity)
+        sent.heartbeatTimeoutSec shouldBe 42L
+        sent.authString shouldBe token
+      finally allocator.close()
+    }
+
+    it("closes promptly, DISCONNECT included, while a heartbeat hangs") {
+      val beatStarted = new java.util.concurrent.CountDownLatch(1)
+      val releaseBeat = new java.util.concurrent.CountDownLatch(1)
+      final class HangingBeatTransport extends QuackTransport:
+        val types = java.util.concurrent.ConcurrentLinkedQueue[Int]()
+        def post(uri: URI, body: Array[Byte]): IO[Array[Byte]] = IO.defer {
+          val t = QuackNativeBridge.parseMessageType(body)
+          types.add(t)
+          if t == MessageType.HeartbeatRequest.wireOrdinal then
+            // Uninterruptible, like JdkHttpTransport's IO.blocking send to a hung node.
+            IO.blocking {
+              beatStarted.countDown()
+              releaseBeat.await()
+              QuackTestFixtures.serializeSampleConnectionResponse(connId)
+            }
+          else IO(QuackTestFixtures.serializeSampleConnectionResponse(connId))
+        }
+      val transport = HangingBeatTransport()
+      val allocator = new RootAllocator()
+      try
+        val protocol = new QuackProtocol(transport, allocator, nodeLeaseSec = 3)
+        val conn     = protocol.open(endpoint, token).unsafeRunSync()
+        beatStarted.await(5, java.util.concurrent.TimeUnit.SECONDS) shouldBe true
+        scala.concurrent.Await.result(conn.close().unsafeToFuture(), 3.seconds)
+        transport.types.asScala.count(_ == MessageType.DisconnectMessage.wireOrdinal) shouldBe 1
+      finally
+        releaseBeat.countDown()
+        allocator.close()
+    }
+
+    it("rejects a lease below one second at construction") {
+      val allocator = new RootAllocator()
+      try
+        val e = intercept[IllegalArgumentException] {
+          new QuackProtocol(new FakeTransport(Iterator.empty), allocator, nodeLeaseSec = 0)
+        }
+        e.getMessage should include("nodeLeaseSec")
+      finally allocator.close()
+    }
+
+  describe("heartbeatEvery"):
+    it("is a third of the lease, at least one second") {
+      QuackProtocol.heartbeatEvery(30) shouldBe 10.seconds
+      QuackProtocol.heartbeatEvery(3) shouldBe 1.second
+      QuackProtocol.heartbeatEvery(1) shouldBe 1.second
     }
 
   describe("execute"):
@@ -254,6 +351,29 @@ class QuackProtocolSpec extends AnyFunSpec with Matchers:
         yield reader
         val ex = intercept[QuackWireError.Permanent](program.unsafeRunSync())
         ex.getMessage should include("syntax error")
+      finally allocator.close()
+    }
+
+    // Audit F14: the schema export threw after the import, and nothing closed the imported reader,
+    // so every such statement leaked its native result for the life of the manager.
+    it("fails a column type with no Arrow mapping with a cast hint, releasing the result") {
+      val transport = FakeTransport(
+        Iterator(
+          QuackTestFixtures.serializeSampleConnectionResponse(connId),
+          QuackTestFixtures.serializeTypeColumnPrepareResponse()
+        )
+      )
+      val allocator = new RootAllocator()
+      try
+        val protocol = new QuackProtocol(transport, allocator)
+        val program  = for
+          conn   <- protocol.open(endpoint, token)
+          reader <- conn.execute("SELECT get_type(42)")
+        yield reader
+        val ex = intercept[QuackWireError.Permanent](program.unsafeRunSync())
+        ex.getMessage should include("type TYPE")
+        ex.getMessage should include("cast it to VARCHAR")
+        allocator.getAllocatedMemory shouldBe 0L
       finally allocator.close()
     }
 

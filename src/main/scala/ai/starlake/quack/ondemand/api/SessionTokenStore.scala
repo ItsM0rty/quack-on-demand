@@ -13,10 +13,10 @@ import java.util.{Base64, Date, UUID}
 import scala.concurrent.duration.{DurationInt, FiniteDuration}
 import scala.jdk.CollectionConverters._
 
-/** Session token registry for UI logins. Tokens are HS256-signed JWTs over the configured
-  * [[secret]]; the server holds no per-session row, only a small in-process denylist of revoked
-  * `jti`s. Any replica that shares the secret can verify any token, and a pinned secret across
-  * deploys means sessions survive restart.
+/** Session token registry for UI logins. Tokens are HS256-signed JWTs over the configured `secret`;
+  * the server holds no per-session row, only a small in-process denylist of revoked `jti`s. Any
+  * replica that shares the secret can verify any token, and a pinned secret across deploys means
+  * sessions survive restart.
   *
   * **Lifetime.** JWT `exp` is absolute: a session is good for exactly `maxLifetime` after
   * `mintWithScope`, regardless of activity. Revocation works while the manager process still holds
@@ -27,8 +27,8 @@ import scala.jdk.CollectionConverters._
   * cookie carrying the same JWT. [[AuthHandlers.login]] sets the cookie HttpOnly + SameSite=Lax;
   * CLI / static-key callers stay header-only.
   *
-  * The constructor argument [[secret]] is the raw HMAC key. HS256 requires >= 32 bytes; a shorter
-  * key throws at construction. Use [[SessionTokenStore.randomSecret]] for an in-process default.
+  * The constructor argument `secret` is the raw HMAC key. HS256 requires >= 32 bytes; a shorter key
+  * throws at construction. Use [[SessionTokenStore.randomSecret]] for an in-process default.
   *
   * `clock` is injectable so tests fast-forward without sleeping.
   */
@@ -63,7 +63,7 @@ object SessionTokenStore:
     case Revoked
 
   /** Generate a random HS256-safe (32-byte) secret encoded as a base64 string. Used as the fallback
-    * when no operator secret is configured -- the encoded form is still raw bytes for [[MACSigner]]
+    * when no operator secret is configured -- the encoded form is still raw bytes for `MACSigner`
     * so JWTs signed with this secret can be verified by any process that holds the same string.
     */
   def randomSecret(): String =

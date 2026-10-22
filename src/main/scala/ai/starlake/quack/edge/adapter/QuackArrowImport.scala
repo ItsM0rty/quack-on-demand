@@ -19,7 +19,11 @@ object QuackArrowImport:
   /** Imports a native `ArrowArrayStream*` (raw pointer cast to `Long`) into an `ArrowReader`. The
     * `allocator` is used by the Arrow Java importer to back the imported `VectorSchemaRoot`; pass a
     * child allocator if you want strict lifetime tracking.
+    *
+    * The importer copies the struct into one it allocates and leaves `nativePtr` released, so the
+    * native struct itself is freed here once the import returns (it leaked 40 bytes per decoded
+    * response before).
     */
   def importStream(allocator: BufferAllocator, nativePtr: Long): ArrowReader =
-    val stream = ArrowArrayStream.wrap(nativePtr)
-    Data.importArrayStream(allocator, stream)
+    try Data.importArrayStream(allocator, ArrowArrayStream.wrap(nativePtr))
+    finally QuackNativeBridge.freeStreamShell(nativePtr)

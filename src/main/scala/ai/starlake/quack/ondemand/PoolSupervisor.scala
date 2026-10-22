@@ -4,6 +4,7 @@ import java.util.Locale
 import ai.starlake.quack.edge.adapter.NodeLoadTracker
 import ai.starlake.quack.model.{
   BranchStatus,
+  InitSqlScreen,
   Names,
   NodePlacement,
   NodeSpec,
@@ -23,6 +24,8 @@ import ai.starlake.quack.ondemand.fleet.MissingSlots
 import ai.starlake.quack.ondemand.runtime.{
   NoFreeServer,
   NodeLockdown,
+  NodePaths,
+  NodeProcess,
   ObjectStoreSecret,
   QuackBackend
 }
@@ -51,8 +54,8 @@ import scala.concurrent.duration.DurationInt
 import scala.util.Try
 
 /** Patch for [[PoolSupervisor.updateTenantDb]]. Absent fields unchanged; present fields replace.
-  * Map fields carry over response-redacted keys ([[TenantDb.SecretKeys]]) the incoming map omits
-  * (see [[PoolSupervisor.mergeSecretKeys]]). An empty string clears a scalar Option field.
+  * Map fields carry over response-redacted keys (`TenantDb.SecretKeys`) the incoming map omits (see
+  * [[PoolSupervisor.mergeSecretKeys]]). An empty string clears a scalar Option field.
   */
 final case class TenantDbPatch(
     metastore: Option[Map[String, String]] = None,
@@ -71,7 +74,8 @@ final case class TenantDbUpdateResult(
     failedRestarts: List[(String, String)]
 )
 
-/** Owns the in-memory topology and mediates every mutation through [[ControlPlaneStore]]:
+/** Owns the in-memory topology and mediates every mutation through
+  * [[ai.starlake.quack.ondemand.state.ControlPlaneStore ControlPlaneStore]]:
   *   - `Tenant`: ownership umbrella (id, displayName, disabled).
   *   - `TenantDb`: one DuckLake/Postgres database under a tenant; owns (metastore, dataPath,
   *     objectStore). Pools and metastore live here.
@@ -139,7 +143,14 @@ final class PoolSupervisor(
       * stamps on the tombstone row.
       */
     managedStore: Option[ai.starlake.quack.ManagedObjectStoreConfig] = None,
-    duckLakeInitializer: (Map[String, String], Boolean) => Unit = DuckLakeInitializer.initBlocking
+    duckLakeInitializer: (Map[String, String], Boolean) => Unit = DuckLakeInitializer.initBlocking,
+    /** How long after its spawn a pid-carrying (local) node whose process is alive but whose port
+      * is still closed counts as starting rather than dead. The local backend returns at fork time,
+      * well before DuckDB finishes INSTALL/LOAD + ATTACH and listens, so without this window a
+      * reconcile tick in that gap respawns a node that is merely slow to come up. Past it, a node
+      * that never listened (an init that hangs, a port taken by a stray) is respawned as before.
+      */
+    nodeStartupGrace: scala.concurrent.duration.FiniteDuration = PoolSupervisor.NodeStartupGrace
 ) extends LazyLogging:
 
   // Surrogate-id-indexed caches of the persisted state.
@@ -175,6 +186,13 @@ final class PoolSupervisor(
   // DuckDB error. Cleared by updateTenantDb (remediation) and deleteTenantDb. In-memory only: a
   // restart also clears it and re-attempts on the next boot.
   private val dataPathBlocked = TrieMap.empty[String, String]
+
+  // tenant-db.id -> the CatalogLockTimeoutException message of its last DuckLake init: a table
+  // lock on the catalog was not granted in time (a long read or an open transaction on a node).
+  // Transient, so unlike dataPathBlocked it never skips the tenant-db's pools: reconcileLoop just
+  // re-runs the init before each pass until it succeeds. Cleared by that success and by
+  // deleteTenantDb; in-memory only, like dataPathBlocked (the next boot re-runs every init anyway).
+  private val duckLakeInitPending = TrieMap.empty[String, String]
 
   /** Module-contributed veto hooks (quota policy). Set once by Main after moduleStart; empty in
     * zero-module boots and in every existing test, so default behavior is unchanged.
@@ -333,6 +351,10 @@ final class PoolSupervisor(
   private[ondemand] def isDataPathBlockedForTest(tenantDbId: String): Boolean =
     dataPathBlocked.contains(tenantDbId)
 
+  /** Test-only seam: read back [[duckLakeInitPending]] membership. */
+  private[ondemand] def isDuckLakeInitPendingForTest(tenantDbId: String): Boolean =
+    duckLakeInitPending.contains(tenantDbId)
+
   /** Test-only seam: run the per-kind metastore resolution without spawning anything. */
   private[ondemand] def effectiveMetastoreForTest(td: TenantDb): Map[String, String] =
     effectiveMetastoreFor(td)
@@ -375,6 +397,7 @@ final class PoolSupervisor(
     // A tenant-db a peer deleted directly in the store can no longer spawn anything, so any
     // dataPath block held for it is moot; drop it rather than leaking it forever.
     dataPathBlocked.keys.toList.filterNot(snapTenantDbIds).foreach(dataPathBlocked.remove)
+    duckLakeInitPending.keys.toList.filterNot(snapTenantDbIds).foreach(duckLakeInitPending.remove)
 
     snap.tenants.foreach(t => tenants.put(t.id, t))
     snap.tenantDbs.foreach(td => tenantDbs.put(td.id, td))
@@ -540,24 +563,49 @@ final class PoolSupervisor(
     */
   def ensureDuckLakeInitialized(): IO[Unit] = IO.blocking {
     tenantDbs.values.toList.foreach { td =>
-      if td.kind == TenantDbKind.DuckLake then
-        try
-          DuckLakeInitializer.initBlocking(effectiveMetastoreFor(td), td.encrypted)
-          dataPathBlocked.remove(td.id)
-        catch
-          case t: DuckLakeInitializer.PreInitMismatchException =>
-            // Not transient: every future node spawn hits the same DuckDB DATA_PATH or encryption
-            // error, so log loudly and block this tenant-db's pools from reconcile()'s spawns (see
-            // isDataPathBlocked). The loop continues: one bad tenant-db must not abort boot.
-            dataPathBlocked.put(td.id, t.getMessage)
-            logger.error(s"ensureDuckLakeInitialized: '${td.name}' ${t.getMessage}")
-          case t: Throwable =>
-            logger.warn(
-              s"ensureDuckLakeInitialized: '${td.name}' pre-init raised ${t.getClass.getSimpleName}: " +
-                s"${t.getMessage}. First pool spawn will retry."
-            )
+      if td.kind == TenantDbKind.DuckLake then initDuckLake(td, "ensureDuckLakeInitialized")
     }
   }
+
+  /** Re-run the DuckLake init of every tenant-db whose last one hit a catalog lock timeout (see
+    * [[duckLakeInitPending]]). Run by [[reconcileLoop]] before each pass, so behind the same leader
+    * gate as reconcile; a no-op when nothing is pending.
+    */
+  def retryPendingDuckLakeInit(): IO[Unit] = IO.blocking {
+    duckLakeInitPending.keys.toList.foreach { id =>
+      tenantDbs.get(id) match
+        case Some(td) => initDuckLake(td, "retryPendingDuckLakeInit")
+        case None     => duckLakeInitPending.remove(id)
+    }
+  }
+
+  /** One tenant-db's DuckLake init with its outcome recorded. Never throws: one bad tenant-db must
+    * not abort the loop over the others, nor boot.
+    */
+  private def initDuckLake(td: TenantDb, ctx: String): Unit =
+    try
+      duckLakeInitializer(effectiveMetastoreFor(td), td.encrypted)
+      dataPathBlocked.remove(td.id)
+      duckLakeInitPending.remove(td.id)
+    catch
+      case t: DuckLakeInitializer.PreInitMismatchException =>
+        // Not transient: every future node spawn hits the same DuckDB DATA_PATH or encryption
+        // error, so log loudly and block this tenant-db's pools from reconcile()'s spawns (see
+        // isDataPathBlocked).
+        dataPathBlocked.put(td.id, t.getMessage)
+        logger.error(s"$ctx: '${td.name}' ${t.getMessage}")
+      case t: DuckLakeInitializer.CatalogLockTimeoutException =>
+        // Transient: the lock holder is a read or a transaction that ends. Retry later rather than
+        // block anything; the bounded wait already happened inside the initializer.
+        duckLakeInitPending.put(td.id, t.getMessage)
+        logger.warn(s"$ctx: tenant-db '${td.name}': ${t.getMessage}")
+      case t: Throwable =>
+        // Not retried before the next manager boot or leader promotion. A node spawn creates a
+        // catalog that does not exist yet, but never migrates one.
+        logger.warn(
+          s"$ctx: '${td.name}' pre-init raised ${t.getClass.getSimpleName}: ${t.getMessage}. " +
+            "Not retried until the next boot; node spawns attach the catalog as it is."
+        )
 
   /** Re-check every persisted node; respawn dead ones. */
   def reconcile(): IO[Unit] = IO.defer {
@@ -582,6 +630,9 @@ final class PoolSupervisor(
           s"${runnable.map(_._2.nodes.size).sum} node(s)"
       )
     ) *> skipLog *>
+      backend.reservePorts(pools.values.toList.flatMap(_.nodes)).handleErrorWith { t =>
+        IO.delay(logger.warn(s"reconcile: reserving leftover node ports failed: ${t.getMessage}"))
+      } *>
       runnable.foldLeft(IO.unit) { case (acc, (key, state)) =>
         acc *> reconcilePool(key, state).void
       }
@@ -590,13 +641,14 @@ final class PoolSupervisor(
   /** Run [[reconcile]] forever, sleeping `interval` between passes, so a node that dies while the
     * manager is up is respawned on the next tick. A throwing tick is logged and swallowed so one
     * bad pass doesn't kill the loop. Started as a cancelable fiber by `Main`; cancellation is
-    * normal shutdown. Drained pools (zero distribution) are left alone.
+    * normal shutdown. Drained pools (zero distribution) are left alone. Each pass first retries the
+    * DuckLake inits a catalog lock timeout left pending ([[retryPendingDuckLakeInit]]).
     */
   def reconcileLoop(
       interval: scala.concurrent.duration.FiniteDuration,
       gate: () => Boolean = () => true
   ): IO[Unit] =
-    ((if gate() then reconcile() else IO.unit).handleErrorWith { t =>
+    ((if gate() then retryPendingDuckLakeInit() *> reconcile() else IO.unit).handleErrorWith { t =>
       IO.delay(logger.warn(s"reconcile loop: pass failed, continuing: ${t.getMessage}"))
     } *> IO.sleep(interval)).foreverM.void
 
@@ -949,17 +1001,25 @@ final class PoolSupervisor(
       // two different tenants), so an unscoped scan could match an unrelated tenant's db.
       val parentEncrypted =
         findTenantDb(tenantName, parentDbName).exists(_.encrypted)
-      val opts =
-        if parentEncrypted then
-          s"DATA_PATH ${SqlLiterals.duckdbLiteral(branchDataPath)}, READ_ONLY, ENCRYPTED"
-        else s"DATA_PATH ${SqlLiterals.duckdbLiteral(branchDataPath)}, READ_ONLY"
+      // The merge node runs in an empty directory of its own: a relative branch prefix is attached
+      // by its absolute path, overriding the relative spelling DuckLake recorded (this attach only).
+      val dataPathOpt =
+        s"DATA_PATH ${SqlLiterals.duckdbLiteral(NodePaths.resolve(branchDataPath))}, READ_ONLY" +
+          (if NodePaths.isRelativeLocal(branchDataPath) then ", OVERRIDE_DATA_PATH true" else "")
+      val opts = if parentEncrypted then s"$dataPathOpt, ENCRYPTED" else dataPathOpt
       // Same unquoted connection-string shape as spawn-quack-node.sh: every value passed
-      // TenantDb.validateSafety (no quote, semicolon, backslash or newline).
+      // TenantDb.validateSafety (no quote, semicolon, backslash or newline). The password rides
+      // a temporary secret dropped right after the ATTACH, never the attach path, which
+      // duckdb_databases() prints ([[CatalogPgSecret]]); the node's own catalog secret is already
+      // dropped by the time this runs, hence a second name.
+      val secret = CatalogPgSecret.BranchName
       val attach =
-        s"ATTACH 'ducklake:postgres:host=${m.getOrElse("pgHost", "localhost")} " +
+        s"${CatalogPgSecret.createSql(secret, m.getOrElse("pgPassword", ""))};\n" +
+          s"ATTACH 'ducklake:postgres:host=${m.getOrElse("pgHost", "localhost")} " +
           s"port=${m.getOrElse("pgPort", "5432")} dbname=$branchDbName " +
-          s"user=${m.getOrElse("pgUser", "postgres")} password=${m.getOrElse("pgPassword", "")}' " +
-          s"AS $alias ($opts);"
+          s"user=${m.getOrElse("pgUser", "postgres")}' " +
+          s"AS $alias ($opts, ${CatalogPgSecret.metadataParameters(secret)});\n" +
+          s"${CatalogPgSecret.dropSql(secret)};"
       base.copy(
         poolKey = key,
         nodeId = s"merge-${branchDbName.takeRight(8)}-${System.nanoTime()}",
@@ -987,11 +1047,13 @@ final class PoolSupervisor(
       spawnFromDistribution(key, state)
     else
       backend.liveNodeIds(key).flatMap { live =>
-        // pid-carrying nodes (local backend) keep the existing pid+socket probe; pid-less nodes
-        // (k8s) are live iff the labeled pod list contains them. live=None means the backend can't
-        // enumerate (local mode / apiserver blip): treat as alive, heal nothing.
+        // pid-carrying nodes (local backend) are live when the row's process is still the node's
+        // (NodeProcess: pid alive AND its start instant matches startedAt) and it either is inside
+        // its startup window or accepts a connection; pid-less nodes (k8s) are live iff the labeled
+        // pod list contains them. live=None means the backend can't enumerate (local mode /
+        // apiserver blip): treat as alive, heal nothing.
         def podAlive(n: RunningNode): Boolean = n.pid match
-          case Some(_) => isReachable(n)
+          case Some(_) => NodeProcess.of(n).isDefined && (isStarting(n) || isReachable(n))
           case None    => live.fold(true)(_.contains(n.nodeId))
 
         // Heal to target: rows beyond distribution.total are pruned, but ONLY rows whose pod is
@@ -1078,7 +1140,8 @@ final class PoolSupervisor(
                   // row goes): a kept node keeps its full state, healthy = false included, so it
                   // stays unroutable and keeps its counters and an operator draining flag.
                   val wasQuarantined = tracker.snapshot(n.nodeId).quarantined
-                  startNodeEmitting(key, respawnSpec(key, spawnState, n)).attempt
+                  (backend.stopStray(n) *>
+                    startNodeEmitting(key, respawnSpec(key, spawnState, n))).attempt
                     .flatMap {
                       case Left(NoFreeServer(_, _, reason, None)) =>
                         // Fleet: no server holds the node any more (drained, removed or
@@ -1248,26 +1311,31 @@ final class PoolSupervisor(
         found
       case _ => NodePlacement.empty
 
+  /** True while `n` is inside its startup window ([[nodeStartupGrace]] from `startedAt`): its
+    * verified process may not listen yet, and reconcile must not respawn it. Judged without a
+    * socket probe, so a node still binding its port is never declared dead. A negative elapsed time
+    * (the wall clock stepped back) counts as expired: the window must stay bounded, and replacing a
+    * node early is safe now that the replacement stops it first.
+    */
+  private def isStarting(n: RunningNode): Boolean =
+    val elapsed = java.time.Duration.between(n.startedAt, java.time.Instant.now())
+    !elapsed.isNegative && elapsed.compareTo(
+      java.time.Duration.ofNanos(nodeStartupGrace.toNanos)
+    ) < 0
+
   private def isReachable(n: RunningNode): Boolean =
-    n.pid match
-      case None    => true // K8s: defer to control-plane liveness + HealthProbe.
-      case Some(p) =>
-        val pidAlive = Option(java.lang.ProcessHandle.of(p))
-          .flatMap(o => if o.isPresent then Some(o.get()) else None)
-          .exists(_.isAlive)
-        if !pidAlive then false
-        else
-          val sock = new java.net.Socket()
-          try { sock.connect(new java.net.InetSocketAddress(n.host, n.port), 250); true }
-          catch case _: Throwable => false
-          finally
-            try sock.close()
-            catch case _: Throwable => ()
+    val sock = new java.net.Socket()
+    try { sock.connect(new java.net.InetSocketAddress(n.host, n.port), 250); true }
+    catch case _: Throwable => false
+    finally
+      try sock.close()
+      catch case _: Throwable => ()
 
   // ---------- Read API ----------
 
-  /** True when the [[QuackBackend]] honors placement hints (K8s nodeSelector / tolerations).
-    * Exposed so `/client-config` can flag the UI to hide cohort controls in local mode.
+  /** True when the [[ai.starlake.quack.ondemand.runtime.QuackBackend QuackBackend]] honors
+    * placement hints (K8s nodeSelector / tolerations). Exposed so `/client-config` can flag the UI
+    * to hide cohort controls in local mode.
     */
   def supportsPlacement: Boolean = backend.supportsPlacement
 
@@ -1312,8 +1380,8 @@ final class PoolSupervisor(
     */
   def poolId(key: PoolKey): Option[String] = poolIdByKey.get(key)
 
-  /** The persisted [[Pool]] row by id, for fields the runtime [[PoolState]] doesn't carry (the
-    * cohorts placement plan).
+  /** The persisted [[ai.starlake.quack.model.Pool Pool]] row by id, for fields the runtime
+    * [[PoolState]] doesn't carry (the cohorts placement plan).
     */
   def poolEntity(id: String): Option[Pool]         = poolRows.get(id)
   def list(): List[PoolState]                      = pools.values.toList
@@ -1785,6 +1853,10 @@ final class PoolSupervisor(
                                       s"createTenantDb: DuckLake pre-init for '$full' failed; " +
                                         s"first pool spawn will retry the ATTACH. Cause: ${t.getMessage}"
                                     )
+                                    t match
+                                      case _: DuckLakeInitializer.CatalogLockTimeoutException =>
+                                        duckLakeInitPending.put(td.id, t.getMessage)
+                                      case _ => ()
                                     store.upsertTenantDb(td)
                                     recordManagedPrefix()
                                     tenantDbs.put(td.id, td)
@@ -1879,6 +1951,7 @@ final class PoolSupervisor(
                   stampManagedPrefixDeleted(td.id, tenantDbName, purgeManagedData)
                   tenantDbs.remove(td.id)
                   dataPathBlocked.remove(td.id)
+                  duckLakeInitPending.remove(td.id)
                   try onTenantDbDeleted(tn, tenantDbName)
                   catch case _: Throwable => ()
                   dbAdmin.dropDatabase(td.name) match
@@ -1897,7 +1970,7 @@ final class PoolSupervisor(
   /** Merge a patch into a tenant-db, persist, refresh caches, and restart every node of its pools
     * when node-affecting fields (metastore, objectStore, initSql) changed. Restart is all-at-once
     * via restartNode's path; per-node failures are collected, not thrown (reconcile heals).
-    * Response-redacted keys ([[TenantDb.SecretKeys]]) are preserved when omitted; an empty value
+    * Response-redacted keys (`TenantDb.SecretKeys`) are preserved when omitted; an empty value
     * removes the key. For DuckLake, clearing a required key such as `pgPassword` reverts that key
     * to the manager default at runtime.
     */
@@ -2109,6 +2182,10 @@ final class PoolSupervisor(
           )
           require(size > 0, s"role distribution must sum to at least 1: $dist")
           require(dist.isValidFor(size), s"role distribution does not sum to $size")
+          // Every create path (REST and MCP refuse it with a 400 first, the branch service, any
+          // module) lands here, so this is the choke point for the pool's own boot SQL.
+          val initSqlErr = InitSqlScreen.error("initSql", initSql)
+          require(initSqlErr.isEmpty, initSqlErr.getOrElse(""))
           // Cohorts are always persisted as authored so a local-defined pool can be exported and
           // replayed on K8s with placement intact. K8s reads `NodeSpec.placement`; local backends
           // ignore it (the UI warns before submit).
@@ -2812,9 +2889,10 @@ final class PoolSupervisor(
   // ---------- RBAC: users ----------
 
   /** Persist a new (tenant, username) principal with its bcrypt hash, and register it with the
-    * resolver so role grants can FK to it. Returns the persisted [[RbacUser]]. `tenant = None`
-    * creates a superuser. `mustChangePassword = true` marks `password` as temporary: the principal
-    * cannot log in until it is swapped through the self-service change-password path.
+    * resolver so role grants can FK to it. Returns the persisted
+    * [[ai.starlake.quack.ondemand.state.RbacUser RbacUser]]. `tenant = None` creates a superuser.
+    * `mustChangePassword = true` marks `password` as temporary: the principal cannot log in until
+    * it is swapped through the self-service change-password path.
     */
   def createUser(
       tenant: Option[String],
@@ -3737,11 +3815,12 @@ final class PoolSupervisor(
 
   /** End-to-end FlightSQL handshake gate, in order:
     *   1. resolve `(tenant, pool) -> PoolKey` + tenant/pool kill switches
-    *   2. lookup the user via [[ControlPlaneStore.findUserForLogin]]; reject `enabled = false`.
-    *      This query ALSO enforces tenant scope (returns `tenant IS NULL` superusers OR
-    *      `tenant = <tenantId>`), so no app-layer `user.tenant == tenantRow.id` re-check. If
-    *      findUserForLogin ever drops the tenant filter, reinstate the scope check between gates 2
-    *      and 3.
+    *   2. lookup the user via
+    *      [[ai.starlake.quack.ondemand.state.ControlPlaneStore.findUserForLogin ControlPlaneStore.findUserForLogin]];
+    *      reject `enabled = false`. This query ALSO enforces tenant scope (returns `tenant IS NULL`
+    *      superusers OR `tenant = <tenantId>`), so no app-layer `user.tenant == tenantRow.id`
+    *      re-check. If findUserForLogin ever drops the tenant filter, reinstate the scope check
+    *      between gates 2 and 3.
     *   3. compute the effective set (groups, roles, permissions, pool grants), carrying the
     *      request's verified token claims
     *   4. pool-access check (skipped for superusers): QoD pool grants, or the tenant's OPA in opa
@@ -3985,6 +4064,12 @@ final class PoolSupervisor(
     }
 
 object PoolSupervisor:
+
+  /** Default [[PoolSupervisor]] `nodeStartupGrace`: the same 120 s the K8s and fleet backends give
+    * a node to become ready (`QOD_K8S_STARTUP_TIMEOUT_SEC`, `QOD_FLEET_STARTUP_TIMEOUT_SEC`).
+    */
+  val NodeStartupGrace: scala.concurrent.duration.FiniteDuration =
+    scala.concurrent.duration.DurationInt(120).seconds
 
   /** Concatenate per-pool [[ai.starlake.quack.ondemand.PoolState.initSql]] with the federation blob
     * for shipment as a single `extraSetupSql` to spawn-quack-node.sh. Order: `initSql` FIRST

@@ -353,7 +353,7 @@ def ensure_jre(
 # DuckDB CLI provisioning. The spawn script runs the `duckdb` CLI; the demo
 # pins it to the libquackwire ABI version (Versions.scala first 3 segments,
 # see docs/duckdb-pin-bump-checklist.md) instead of trusting a system install.
-DUCKDB_CLI_VERSION = "1.5.6"
+DUCKDB_CLI_VERSION = "2.0.0"
 
 _DUCKDB_PLAT = {
     ("darwin", "arm64"): "osx-universal",
@@ -377,22 +377,47 @@ def duckdb_version() -> str:
     return os.environ.get("DUCKDB_VERSION") or DUCKDB_CLI_VERSION
 
 
-def _duckdb_dir(kind: str, cache_dir: Path | None) -> Path:
-    """bin/lib dir for the duckdb artifacts. `DUCKDB_CACHE_DIR` follows
-    run-jar.sh's air-gap layout ($DUCKDB_CACHE_DIR/$VERSION/{bin,lib});
-    otherwise <cache>/duckdb/{bin,lib}."""
-    env_cache = os.environ.get("DUCKDB_CACHE_DIR")
+def duckdb_cache_root(cache_dir: Path | None = None) -> Path:
+    """Root of the duckdb cache: `DUCKDB_CACHE_DIR` (run-jar.sh's air-gap
+    convention) or <cache>/duckdb. Both are laid out <root>/<version>/{bin,lib},
+    the layout the manager's libduckdb preload reads ($DUCKDB_CACHE_DIR/<abi>/lib),
+    so a version bump or a DUCKDB_VERSION override never reuses another
+    release's binaries. Earlier qod releases kept an unversioned
+    <cache>/duckdb/{bin,lib} (DuckDB 1.x); it is left in place and never read."""
+    env_cache = os.environ.get("DUCKDB_CACHE_DIR", "").strip()
     if env_cache:
-        return Path(env_cache) / duckdb_version() / kind
+        return Path(env_cache)
     base = cache_dir if cache_dir is not None else default_cache_dir()
-    return base / "duckdb" / kind
+    return base / "duckdb"
+
+
+def _duckdb_dir(kind: str, cache_dir: Path | None) -> Path:
+    """bin/lib dir for the duckdb artifacts of the release being provisioned."""
+    return duckdb_cache_root(cache_dir) / duckdb_version() / kind
+
+
+def _extract_tar_gz(archive: Path, dest: Path) -> None:
+    """Unpack a DuckDB 2.x release asset (a flat .tar.gz) into `dest`, refusing
+    members that would land outside it."""
+    import tarfile
+
+    with tarfile.open(archive, "r:gz") as t:
+        if hasattr(tarfile, "data_filter"):
+            t.extractall(dest, filter="data")
+        else:
+            root = dest.resolve()
+            for m in t.getmembers():
+                target = (dest / m.name).resolve()
+                if not (m.isfile() or m.isdir()) or not target.is_relative_to(root):
+                    raise RuntimeError(f"unexpected member {m.name!r} in {archive.name}")
+            t.extractall(dest)
 
 
 def duckdb_cli_url(os_name: str, arch: str) -> str:
     plat = _DUCKDB_PLAT[(os_name, arch.lower())]
     return (
         f"https://github.com/duckdb/duckdb/releases/download/"
-        f"v{duckdb_version()}/duckdb_cli-{plat}.zip"
+        f"v{duckdb_version()}/duckdb-cli-{plat}.tar.gz"
     )
 
 
@@ -404,7 +429,6 @@ def ensure_duckdb_cli(
     """bin dir holding the pinned `duckdb` CLI under `cache_dir`, downloading
     it from the DuckDB GitHub release on first use."""
     import platform
-    import zipfile
 
     bin_dir = _duckdb_dir("bin", cache_dir)
     duckdb = bin_dir / ("duckdb.exe" if os_name == "win32" else "duckdb")
@@ -413,15 +437,14 @@ def ensure_duckdb_cli(
 
     arch = arch if arch is not None else platform.machine()
     bin_dir.mkdir(parents=True, exist_ok=True)
-    archive = bin_dir / "duckdb_cli.zip"
+    archive = bin_dir / "duckdb-cli.tar.gz"
     try:
         _download(duckdb_cli_url(os_name, arch), archive, f"duckdb {duckdb_version()} CLI")
-        with zipfile.ZipFile(archive) as z:
-            z.extractall(bin_dir)
+        _extract_tar_gz(archive, bin_dir)
     finally:
         archive.unlink(missing_ok=True)
     if not duckdb.is_file():
-        raise RuntimeError(f"no duckdb binary found after extracting the CLI zip in {bin_dir}")
+        raise RuntimeError(f"no duckdb binary found after extracting the CLI archive in {bin_dir}")
     duckdb.chmod(0o755)
     return bin_dir
 
@@ -430,7 +453,7 @@ def libduckdb_url(os_name: str, arch: str) -> str:
     plat = _DUCKDB_PLAT[(os_name, arch.lower())]
     return (
         f"https://github.com/duckdb/duckdb/releases/download/"
-        f"v{duckdb_version()}/libduckdb-{plat}.zip"
+        f"v{duckdb_version()}/duckdb-shared-libs-{plat}.tar.gz"
     )
 
 
@@ -442,7 +465,6 @@ def ensure_libduckdb(
     """lib dir holding the pinned libduckdb shared library (required by the
     JNI native client: libquackwire links against this exact ABI)."""
     import platform
-    import zipfile
 
     lib_dir = _duckdb_dir("lib", cache_dir)
     lib_names = {"darwin": "libduckdb.dylib", "linux": "libduckdb.so", "win32": "duckdb.dll"}
@@ -452,15 +474,14 @@ def ensure_libduckdb(
 
     arch = arch if arch is not None else platform.machine()
     lib_dir.mkdir(parents=True, exist_ok=True)
-    archive = lib_dir / "libduckdb.zip"
+    archive = lib_dir / "duckdb-shared-libs.tar.gz"
     try:
         _download(libduckdb_url(os_name, arch), archive, f"libduckdb {duckdb_version()}")
-        with zipfile.ZipFile(archive) as z:
-            z.extractall(lib_dir)
+        _extract_tar_gz(archive, lib_dir)
     finally:
         archive.unlink(missing_ok=True)
     if not lib.is_file():
-        raise RuntimeError(f"no {lib.name} found after extracting the libduckdb zip in {lib_dir}")
+        raise RuntimeError(f"no {lib.name} found after extracting the libduckdb archive in {lib_dir}")
     return lib_dir
 
 
@@ -511,20 +532,26 @@ def runtime_env(
     duckdb_bin: Path,
     spawn_sh: Path,
     spawn_ps1: Path,
-    libduckdb_lib: Path | None = None,
+    libduckdb_lib: Path,
     os_name: str = sys.platform,
 ) -> dict:
     """Environment for a launched manager JVM: spawn scripts resolved
     absolutely, the pinned duckdb CLI first on PATH (spawned nodes and the demo
     seeder inherit it), DUCKDB_BIN as an absolute pointer to that same exe,
-    QOD_APP_HOME so LocalQuackBackend prefixes node PATHs the same way, and
-    (when the native client's libduckdb is provisioned) the platform
-    dynamic-loader path."""
+    QOD_APP_HOME so LocalQuackBackend prefixes node PATHs the same way, and the
+    native client's libduckdb: DUCKDB_CACHE_DIR for the manager's preload, plus
+    the platform dynamic-loader path.
+
+    `libduckdb_lib` is required: every launcher path boots a manager whose only
+    client to its nodes is the native one, which cannot load without it."""
     env = dict(base_env)
     env["QOD_SPAWN_SCRIPT"] = str(spawn_sh)
     env["QOD_SPAWN_SCRIPT_WINDOWS"] = str(spawn_ps1)
     env["QOD_APP_HOME"] = str(app_home)
-    env["PATH"] = str(duckdb_bin) + os.pathsep + env.get("PATH", "")
+    # duckdb.dll lives in the lib dir, so on Windows that dir goes on PATH too (the DLL search
+    # order has no other variable); elsewhere the loader variable below carries it.
+    path_dirs = [duckdb_bin, libduckdb_lib] if os_name == "win32" else [duckdb_bin]
+    env["PATH"] = os.pathsep.join([*map(str, path_dirs), env.get("PATH", "")])
     # Pin the provisioned duckdb by absolute path, not just on PATH. spawn-quack-node.ps1
     # prefers $env:DUCKDB_BIN over a PATH `Get-Command duckdb.exe` lookup: on Windows the
     # prepended PATH dir does not always reach the spawned PowerShell node, leaving the node
@@ -533,10 +560,18 @@ def runtime_env(
     # honours it too (Unix PATH inheritance already works, so this is belt-and-suspenders there).
     exe = "duckdb.exe" if os_name == "win32" else "duckdb"
     env["DUCKDB_BIN"] = str(duckdb_bin / exe)
-    if libduckdb_lib is not None:
-        # On Windows the DLL resolves through PATH, already prefixed above.
-        var = {"darwin": "DYLD_LIBRARY_PATH", "linux": "LD_LIBRARY_PATH"}.get(os_name)
-        if var:
-            prev = env.get(var, "")
-            env[var] = str(libduckdb_lib) + (os.pathsep + prev if prev else "")
+    # DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+    # (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal: pin the normal output for every
+    # node, loader and seeder the manager starts, even from inside an agent session.
+    env["DUCKDB_AGENT_MODE"] = "0"
+    # The manager preloads $DUCKDB_CACHE_DIR/<abi>/lib/<libduckdb> by absolute path before
+    # libquackwire, which is what makes the native load on every launcher path: macOS strips
+    # DYLD_* from a SIP-protected JVM such as /usr/bin/java, and the rpath baked into the native
+    # names its build machine. libduckdb_lib is <root>/<version>/lib (_duckdb_dir), so the root
+    # is two levels up; <version> is the libquackwire ABI unless DUCKDB_VERSION overrides it.
+    env["DUCKDB_CACHE_DIR"] = str(libduckdb_lib.parent.parent)
+    var = {"darwin": "DYLD_LIBRARY_PATH", "linux": "LD_LIBRARY_PATH"}.get(os_name)
+    if var:
+        prev = env.get(var, "")
+        env[var] = str(libduckdb_lib) + (os.pathsep + prev if prev else "")
     return env

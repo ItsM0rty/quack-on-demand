@@ -3,15 +3,27 @@
 # Refresh the vendored libquackwire binaries under libquackwire/binaries/.
 #
 # Builds the HOST platform via cmake (linked against the pinned libduckdb in
-# .duckdb/<abi>/), downloads the other platforms from the latest green
-# 'quackwire native build' CI run on main, regenerates the .sha256 companions
-# and the VERSION stamp, and STOPS. Review the diff and commit like any other
-# change. No Maven, no GPG, no Sonatype.
+# $DUCKDB_CACHE_DIR/<abi>/, default .duckdb/<abi>/), downloads the other
+# platforms from a green 'quackwire native build' CI run of the commit being
+# refreshed, checks every binary's compiled build marker against the pin
+# (Quack protocol, DuckDB release, duckdb-quack commit: see
+# quackwire-build-info.sh), regenerates the .sha256 companions and the VERSION
+# stamp, and STOPS. Nothing in libquackwire/binaries/ changes unless every
+# binary passes. Review the diff and commit like any other change. No Maven, no
+# GPG, no Sonatype.
+#
+# The CI run defaults to the latest successful quackwire.yml run whose head
+# commit is HEAD (push it and let the workflow run first, or start it with
+# workflow_dispatch); QUACKWIRE_CI_RUN=<run id> picks another run. Never "the
+# latest green run on main": that run can predate the pin and its artifacts
+# would be vendored under the new stamp. The marker check refuses them anyway.
 #
 # Usage: ./scripts/release/refresh-quackwire-binaries.sh
 set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_DIR"
+# shellcheck source=SCRIPTDIR/quackwire-build-info.sh
+source "$REPO_DIR/scripts/release/quackwire-build-info.sh"
 
 version="$(grep -E '^val libquackwireVersion' build.sbt | sed -E 's/.*"(.*)".*/\1/')"
 [[ -n "$version" ]] || { echo "cannot read libquackwireVersion from build.sbt" >&2; exit 1; }
@@ -50,7 +62,7 @@ host_platform="$host_os-$host_arch"
 # internal-header include/ tree for the pinned version). The build dir is
 # wiped because CMake caches resolved find results.
 duckdb_abi="${version%%-*}"
-duckdb_home="$REPO_DIR/.duckdb/$duckdb_abi"
+duckdb_home="${DUCKDB_CACHE_DIR:-$REPO_DIR/.duckdb}/$duckdb_abi"
 [[ -f "$duckdb_home/include/duckdb/common/serializer/binary_serializer.hpp" \
    && -e "$duckdb_home/lib" ]] \
   || { echo "pinned libduckdb cache missing at $duckdb_home (need lib/ + include/ with the internal header tree). Run 'QOD_VERSION=BUILD ./scripts/run-jar.sh' once to populate it, then re-run." >&2; exit 1; }
@@ -59,32 +71,53 @@ echo "cmake build [$host_platform] (DUCKDB_HOME=$duckdb_home)..."
   && rm -rf build \
   && DUCKDB_HOME="$duckdb_home" cmake -B build -DCMAKE_BUILD_TYPE=Release \
   && cmake --build build --config Release )
-mkdir -p "libquackwire/binaries/$host_platform"
-cp "native/quackwire/build/libquackwire.$host_ext" \
-   "libquackwire/binaries/$host_platform/libquackwire.$host_ext"
+host_built="native/quackwire/build/libquackwire.$host_ext"
+quackwire_check_build_marker "$host_built" "$version" \
+  || { echo "the host build does not match $version; nothing was changed." >&2; exit 1; }
 
 # --- fetch the other platforms from CI (ported from step 4) ---
-# Download the other platforms from the latest green quackwire CI run on
-# main - same matrix CI uses, so bit-identical binaries without a local
-# cross-compile toolchain.
-echo "looking up the latest 'quackwire native build' run on main..."
-ci_run_id=$(gh run list --workflow=quackwire.yml --branch=main --status=success \
-            --limit=1 --json databaseId --jq '.[0].databaseId')
+# Download the other platforms from a green quackwire CI run of this commit -
+# same matrix CI uses, so bit-identical binaries without a local cross-compile
+# toolchain.
+head_sha="$(git rev-parse HEAD)"
+if [[ -n "${QUACKWIRE_CI_RUN:-}" ]]; then
+  ci_run_id="$QUACKWIRE_CI_RUN"
+else
+  echo "looking up the latest successful 'quackwire native build' run of $head_sha..."
+  ci_run_id=$(gh run list --workflow=quackwire.yml --commit="$head_sha" --status=success \
+              --limit=1 --json databaseId --jq '.[0].databaseId')
+fi
 [[ -n "$ci_run_id" && "$ci_run_id" != "null" ]] \
-  || { echo "no successful quackwire native build run on main yet. Push a libquackwire change and wait for CI." >&2; exit 1; }
+  || { echo "no successful quackwire native build run of $head_sha. Push it and let quackwire.yml run (or start it with workflow_dispatch), or set QUACKWIRE_CI_RUN=<run id>." >&2; exit 1; }
 echo "downloading platform artifacts from CI run $ci_run_id..."
 tmp_artifacts=$(mktemp -d)
+trap 'rm -rf "$tmp_artifacts"' EXIT
 gh run download "$ci_run_id" --dir "$tmp_artifacts" --pattern 'quackwire-*'
+
+# Check every downloaded binary BEFORE touching the vendored tree: an artifact
+# built against another DuckDB or duckdb-quack than the pin is refused.
+staged=()
 for d in "$tmp_artifacts"/quackwire-*; do
   plat=$(basename "$d" | sed 's/^quackwire-//')
   [[ "$plat" == "$host_platform" ]] && continue
-  mkdir -p "libquackwire/binaries/$plat"
   # Unix artifacts carry libquackwire.{so,dylib}; the Windows artifact carries
-  # the un-prefixed quackwire.dll. Copy whichever is present.
-  cp "$d"/libquackwire.* "libquackwire/binaries/$plat/" 2>/dev/null || true
-  cp "$d"/quackwire.dll  "libquackwire/binaries/$plat/" 2>/dev/null || true
+  # the un-prefixed quackwire.dll.
+  for f in "$d"/libquackwire.so "$d"/libquackwire.dylib "$d"/quackwire.dll; do
+    [[ -f "$f" ]] || continue
+    quackwire_check_build_marker "$f" "$version" \
+      || { echo "CI run $ci_run_id: the $plat artifact does not match $version; nothing was changed." >&2; exit 1; }
+    staged+=("$plat:$f")
+  done
 done
-rm -rf "$tmp_artifacts"
+[[ ${#staged[@]} -gt 0 ]] || { echo "CI run $ci_run_id has no quackwire-* platform artifacts." >&2; exit 1; }
+
+mkdir -p "libquackwire/binaries/$host_platform"
+cp "$host_built" "libquackwire/binaries/$host_platform/libquackwire.$host_ext"
+for entry in "${staged[@]}"; do
+  plat="${entry%%:*}"
+  mkdir -p "libquackwire/binaries/$plat"
+  cp "${entry#*:}" "libquackwire/binaries/$plat/"
+done
 echo "staged platforms:"; ls libquackwire/binaries/*/
 
 # --- checksums + version stamp ---

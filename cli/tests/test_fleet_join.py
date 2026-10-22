@@ -1,5 +1,8 @@
 import io
+import os
+import pathlib
 import signal
+import stat
 import subprocess
 import sys
 
@@ -74,6 +77,12 @@ def assignment(epoch, node_id="quack-acme-db-bi-1", port=21900):
             "dbInitSql": "", "objectStoreSql": "", "extraSetupSql": "", "lockdownSql": ""}
 
 
+def read_secrets(env):
+    """The secret files the spawn script would read, as the launcher left them at popen time."""
+    d = pathlib.Path(env["QOD_SECRETS_DIR"])
+    return {f.name: f.read_text() for f in d.iterdir()}
+
+
 def make_member(http, popen, tmp_path, port_open=lambda p: True, **kw):
     spawn = tmp_path / "spawn.sh"; spawn.write_text("#!/bin/sh\nexit 0\n")
     kw.setdefault("capacity", lambda: (8, 64 << 30))
@@ -97,16 +106,17 @@ def test_heartbeat_carries_identity_capacity_and_no_node_initially(tmp_path):
 def test_assignment_starts_node_with_spawn_contract_and_reports_running(tmp_path):
     procs = []
     def popen(cmd, env=None, **kw):
-        procs.append((cmd, env, kw)); return FakeProc()
+        procs.append((cmd, env, kw, read_secrets(env))); return FakeProc()
     http = FakeHttp([
         FakeResponse(200, {"heartbeatSec": 5, "assignment": assignment(3)}),
         FakeResponse(200, {"heartbeatSec": 5, "assignment": assignment(3)}),
     ])
     member = make_member(http, popen, tmp_path)
     member.run_once()
-    cmd, env, kw = procs[0]
-    assert cmd[-2:] == ["21900", "tok"] and env["kind"] == "memory" and env["pgPassword"] == "pw"
-    assert env["QOD_NODE_BIND"] == "10.0.0.7"
+    cmd, env, kw, secrets = procs[0]
+    assert cmd[-1] == "21900" and env["kind"] == "memory"
+    assert secrets == {"pgPassword": "pw", "QOD_NODE_TOKEN": "tok"}
+    assert env["QOD_NODE_BIND"] == "10.0.0.7" and env["QOD_SECRETS_DIR_EPHEMERAL"] == "1"
     assert kw["start_new_session"] is True
     assert (tmp_path / "state" / "node.pid").read_text().strip() == "4242"
     member.run_once()
@@ -139,7 +149,7 @@ def test_new_token_or_node_id_under_the_same_epoch_restarts_the_node(tmp_path):
     # again, for the same or another node id, always with a new token. The old process must go.
     procs = []
     def popen(cmd, env=None, **kw):
-        p = FakeProc(pid=100 + len(procs)); procs.append(p); p.cmd = cmd; return p
+        p = FakeProc(pid=100 + len(procs)); procs.append(p); p.secrets = read_secrets(env); return p
     first = assignment(1)
     same = dict(first)
     new_token = dict(first, token="tok-2")
@@ -151,7 +161,7 @@ def test_new_token_or_node_id_under_the_same_epoch_restarts_the_node(tmp_path):
     assert len(procs) == 1 and not procs[0].terminated  # an identical assignment keeps the node
     member.run_once()
     assert procs[0].terminated and len(procs) == 2
-    assert procs[1].cmd[-1] == "tok-2"
+    assert procs[1].secrets["QOD_NODE_TOKEN"] == "tok-2"
     member.run_once()
     assert procs[1].terminated and len(procs) == 3
     assert member.node.assignment["nodeId"] == "quack-acme-db-bi-7"
@@ -239,7 +249,99 @@ def test_node_env_is_an_allowlist_and_sql_keys_come_only_from_the_assignment(tmp
     assert "QOD_FLEET_JOIN_TOKEN" not in env and "SOME_RANDOM_SECRET" not in env
     assert "PATH" in env and env["QOD_S3_ENDPOINT"] == "minio:9000"
     assert env["lockdownSql"] == "" and env["dbInitSql"] == ""
-    assert env["pgPassword"] == "pw" and env["kind"] == "memory" and env["QOD_NODE_BIND"] == "10.0.0.7"
+    assert env["kind"] == "memory" and env["QOD_NODE_BIND"] == "10.0.0.7"
+
+
+SECRET_VALUES = {"pw", "tok", "hunter2", "fed-sql-secret", "store-sql-secret", "s3-key-id", "s3-secret",
+                 "az-conn"}
+
+
+def secret_assignment():
+    return dict(assignment(1), env={"pgHost": "h", "pgPassword": "hunter2", "encryptionKey": "k3y"},
+                extraSetupSql="fed-sql-secret", objectStoreSql="store-sql-secret", token="tok")
+
+
+def test_no_secret_value_reaches_the_node_env_or_command_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("QOD_S3_ACCESS_KEY_ID", "s3-key-id")
+    monkeypatch.setenv("QOD_S3_SECRET_ACCESS_KEY", "s3-secret")
+    monkeypatch.setenv("QOD_AZURE_CONNECTION_STRING", "az-conn")
+    monkeypatch.setenv("QOD_S3_ENDPOINT", "minio:9000")
+    seen = []
+    def popen(cmd, env=None, **kw):
+        d = pathlib.Path(env["QOD_SECRETS_DIR"])
+        seen.append((cmd, env, read_secrets(env), stat.S_IMODE(d.stat().st_mode),
+                     {f.name: stat.S_IMODE(f.stat().st_mode) for f in d.iterdir()}))
+        return FakeProc()
+    http = FakeHttp([FakeResponse(200, {"heartbeatSec": 5, "assignment": secret_assignment()})])
+    make_member(http, popen, tmp_path).run_once()
+    cmd, env, secrets, dir_mode, file_modes = seen[0]
+    for value in SECRET_VALUES | {"k3y"}:
+        assert value not in env.values() and value not in cmd, value
+        assert not any(value in v for v in env.values()), value
+    assert secrets == {"pgPassword": "hunter2", "encryptionKey": "k3y", "extraSetupSql": "fed-sql-secret",
+                       "objectStoreSql": "store-sql-secret", "QOD_NODE_TOKEN": "tok",
+                       "QOD_S3_ACCESS_KEY_ID": "s3-key-id", "QOD_S3_SECRET_ACCESS_KEY": "s3-secret",
+                       "QOD_AZURE_CONNECTION_STRING": "az-conn"}
+    assert env["QOD_S3_ENDPOINT"] == "minio:9000"
+    assert dir_mode == 0o700 and set(file_modes.values()) == {0o600}
+
+
+def test_secrets_dir_is_removed_once_the_node_is_up_and_on_stop(tmp_path):
+    dirs = []
+    def popen(cmd, env=None, **kw):
+        dirs.append(pathlib.Path(env["QOD_SECRETS_DIR"])); return FakeProc()
+    http = FakeHttp([FakeResponse(200, {"heartbeatSec": 5, "assignment": a}) for a in
+                     (assignment(1), assignment(1), assignment(2), None)])
+    member = make_member(http, popen, tmp_path, port_open=lambda p: False)
+    member.run_once()
+    assert dirs[0].is_dir()  # still starting: the script may not have read it yet
+    member.port_open = lambda p: True
+    member.run_once()
+    assert not dirs[0].exists()  # running: the script has read it
+    member.port_open = lambda p: False
+    member.run_once()
+    assert dirs[1].is_dir()
+    member.run_once()  # stopped before it came up
+    assert not dirs[1].exists()
+
+
+def test_secrets_dir_is_removed_when_popen_fails(tmp_path):
+    def popen(cmd, env=None, **kw):
+        raise OSError("no bash")
+    http = FakeHttp([FakeResponse(200, {"heartbeatSec": 5, "assignment": assignment(1)})])
+    member = make_member(http, popen, tmp_path)
+    member.run_once()
+    root = tmp_path / "state" / "secrets"
+    assert not root.exists() or list(root.iterdir()) == []
+
+
+def test_stale_secrets_dirs_are_swept_at_startup(tmp_path):
+    member = make_member(FakeHttp([]), lambda *a, **k: FakeProc(), tmp_path)
+    stale = tmp_path / "state" / "secrets" / "node-old"
+    stale.mkdir(parents=True)
+    (stale / "pgPassword").write_text("hunter2")
+    member.sweep_secrets()
+    assert not stale.exists()
+
+
+def test_the_spawn_script_reads_then_deletes_the_secrets_dir(tmp_path):
+    # Runs the real bundled script in dry-run mode: the token and password come from the files,
+    # the directory is gone afterwards, and a value left in the environment is ignored.
+    from qod_cli.fleet_join import write_secrets_dir
+    script = pathlib.Path(__file__).resolve().parents[1] / "src" / "qod_cli" / "scripts" / "spawn-quack-node.sh"
+    d = write_secrets_dir(tmp_path / "secrets", {"pgPassword": "from-file", "QOD_NODE_TOKEN": "tok-file"})
+    env = {"PATH": os.environ["PATH"], "QOD_SPAWN_DRY_RUN": "1", "kind": "ducklake", "pgHost": "h",
+           "pgPort": "5432", "pgUser": "u", "dbName": "lake", "schemaName": "main",
+           "dataPath": str(tmp_path / "lake"), "QOD_SECRETS_DIR": str(d), "QOD_SECRETS_DIR_EPHEMERAL": "1",
+           "encryptionKey": "from-env"}
+    out = subprocess.run(["bash", str(script), "21999"], env=env, capture_output=True, text=True, check=True)
+    assert "PASSWORD 'from-file'" in out.stdout and "token := 'tok-file'" in out.stdout
+    # The password rides a temporary secret, never an ATTACH string (duckdb_databases() prints it).
+    attaches = [line for line in out.stdout.splitlines() if line.startswith("ATTACH")]
+    assert attaches and all("password" not in line.lower() for line in attaches)
+    assert "DROP SECRET IF EXISTS qod_catalog_pg;" in out.stdout
+    assert "from-env" not in out.stdout and "ignoring encryptionKey" in out.stderr
+    assert not d.exists()
 
 
 def test_node_env_passes_the_spawn_scripts_admin_db_and_libpq_tls_settings(tmp_path, monkeypatch):
@@ -565,6 +667,17 @@ class _Done:
 def test_probe_duckdb_version_parses_the_cli_banner(tmp_path):
     run = lambda *a, **kw: _Done("v1.5.6 (Variegata) 0b83e5d2f6\n")
     assert probe_duckdb_version(tmp_path / "duckdb", run=run) == "1.5.6"
+
+
+def test_probe_duckdb_version_runs_with_agent_mode_off(tmp_path):
+    seen = {}
+
+    def run(*a, **kw):
+        seen.update(kw.get("env") or {})
+        return _Done("v2.0.0 (Cyanoptera) b15358c371\n")
+
+    assert probe_duckdb_version(tmp_path / "duckdb", run=run) == "2.0.0"
+    assert seen.get("DUCKDB_AGENT_MODE") == "0"
 
 
 def test_probe_duckdb_version_fails_soft(tmp_path):

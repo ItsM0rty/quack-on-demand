@@ -14,8 +14,8 @@ import scala.util.control.NonFatal
   * stdin line. Break-glass recovery of superuser passwords straight in the control-plane database,
   * so it works with every login path blocked. It never starts Postgres: an external control plane
   * is reached as configured (the manager may be down), the embedded one only while a running
-  * `qod serve` owns it ([[EmbeddedControlPlane.attachRunning]]). Every named superuser that exists
-  * is reset to the same password in one store session (the default admin names are seeded as one
+  * `qod serve` owns it (`EmbeddedControlPlane.attachRunning`). Every named superuser that exists is
+  * reset to the same password in one store session (the default admin names are seeded as one
   * credential). Authority = reaching that database with the configured credentials. Exit 0 at least
   * one updated, 1 none of the names is a superuser / usage / control plane not initialized, 2
   * control plane unreachable.

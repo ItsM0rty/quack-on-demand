@@ -31,6 +31,10 @@
 
 set -euo pipefail
 
+# DuckDB 2.0's CLI switches to agent mode (markdown tables, JSON errors) when an agent env var
+# (AI_AGENT, CLAUDECODE) is set and stdout is not a terminal; pin the normal output format.
+export DUCKDB_AGENT_MODE=0
+
 # ---- Config (override via env) ----
 PG_HOST="${PG_HOST:-localhost}"
 PG_PORT="${PG_PORT:-5432}"
@@ -102,6 +106,7 @@ if [[ "$SCHEMA_NAME" != "main" ]]; then
 CREATE SCHEMA IF NOT EXISTS $SCHEMA_NAME;"
 fi
 
+PG_PASS_SQL=${PG_PASS//\'/\'\'}
 cat > "$INIT_SQL" <<SQL
 -- Extensions
 INSTALL ducklake;
@@ -113,8 +118,12 @@ LOAD quack;
 
 -- Attach the DuckLake catalog (Postgres for metadata, local files for data).
 -- Postgres database name equals the DuckDB catalog name ($DB_NAME).
-ATTACH 'ducklake:postgres:host=$PG_HOST port=$PG_PORT dbname=$DB_NAME user=$PG_USER password=$PG_PASS' AS $DB_NAME
-  (DATA_PATH '$DATA_PATH');
+-- The password rides a temporary secret, never the attach path (which DuckDB prints in
+-- duckdb_databases() and in errors); dropped once attached.
+CREATE OR REPLACE TEMPORARY SECRET qod_catalog_pg (TYPE postgres, PASSWORD '$PG_PASS_SQL');
+ATTACH 'ducklake:postgres:host=$PG_HOST port=$PG_PORT dbname=$DB_NAME user=$PG_USER' AS $DB_NAME
+  (DATA_PATH '$DATA_PATH', METADATA_PARAMETERS MAP {'SECRET': 'qod_catalog_pg'});
+DROP SECRET IF EXISTS qod_catalog_pg;
 
 $SCHEMA_CREATE
 USE $DB_NAME.$SCHEMA_NAME;
