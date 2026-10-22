@@ -37,7 +37,7 @@ Everything else lives in a subfolder by audience.
 | `release.sh` | Cut a release: verify, stamp versions, tag, push. Pushing the tag makes CI (`release.yml`) publish everything. |
 | `release-lib.sh` | Shared helpers sourced by `release.sh`, `release-docker.sh` and `release.yml`. |
 | `release-docker.sh` | Manual fallback for publishing the Docker image when the CI channel is broken. |
-| `announce-release-discord.sh` | Post a version's CHANGELOG section to Discord. Run by CI, and can be re-run by hand. |
+| `announce-release-discord.sh` | Post a digest of a version's CHANGELOG section (entry titles plus a link to the full section) to Discord. Run by CI, and can be re-run by hand; `ANNOUNCE_POST=0` prints it instead. |
 | `refresh-quackwire-binaries.sh` | Rebuild and download the vendored `libquackwire` binaries, then stop so you can review and commit them. |
 
 ## `bench/`: clients and load tests

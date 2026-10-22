@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Release announcements on Discord are a digest.** The #news post lists each changelog entry's
+  title and links to the full section at the release tag, in at most three messages, instead of
+  the whole section: 0.10.0's 70 KB section hit Discord's rate limit partway and left a cut-off
+  post. A rate-limited post is now waited out and retried.
+
 ## 0.10.0
 
 - **Fixed: the metadata filter reads a system-catalog subquery inside parentheses.** A predicate
